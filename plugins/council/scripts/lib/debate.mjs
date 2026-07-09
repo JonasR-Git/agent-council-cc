@@ -1,5 +1,7 @@
 import { interpolate, loadPrompt, runCodexStructured, runGrokStructured } from "./agents.mjs";
 import { extractJsonObject } from "./findings.mjs";
+import { SCHEMAS } from "./schemas.mjs";
+import { validate } from "./validate.mjs";
 
 const MAX_ENTRIES_PER_ROUND = 6;
 const MAX_ROUNDS = 2;
@@ -11,6 +13,54 @@ export function normalizeStance(value) {
     return stance;
   }
   return "defend";
+}
+
+export function parseDebateRebuttal(stdout, agent, id) {
+  const doc = extractJsonObject(stdout);
+  const checked = validate(SCHEMAS.debateRebuttal, doc);
+  if (!checked.valid) {
+    return {
+      id,
+      agent,
+      stance: "defend",
+      note: "",
+      revisedSeverity: null,
+      parseOk: false,
+      validationErrors: checked.errors
+    };
+  }
+  return {
+    id: String(doc.id ?? id),
+    agent,
+    stance: normalizeStance(doc.stance),
+    note: String(doc.note ?? "").trim(),
+    revisedSeverity: doc.revisedSeverity ?? null,
+    parseOk: true,
+    validationErrors: []
+  };
+}
+
+export function parseDebateCounter(stdout, agent, id) {
+  const doc = extractJsonObject(stdout);
+  const checked = validate(SCHEMAS.debateCounter, doc);
+  if (!checked.valid) {
+    return {
+      id,
+      agent,
+      upheld: true,
+      note: "",
+      parseOk: false,
+      validationErrors: checked.errors
+    };
+  }
+  return {
+    id: String(doc.id ?? id),
+    agent,
+    upheld: Boolean(doc.upheld),
+    note: String(doc.note ?? "").trim(),
+    parseOk: true,
+    validationErrors: []
+  };
 }
 
 function debateOptions(options) {
@@ -79,18 +129,14 @@ export async function runDebateRounds(cwd, backends, options, entries) {
         buildRebuttalPrompt(entry),
         `debate-${entry.id}`
       );
-      const doc = res.skipped ? null : extractJsonObject(res.stdout);
+      const parsed = parseDebateRebuttal(res.skipped ? "" : res.stdout, entry.author, entry.id);
       return {
-        id: entry.id,
-        agent: entry.author,
+        ...res,
+        ...parsed,
         round: 1,
         role: "rebuttal",
-        stance: normalizeStance(doc?.stance),
-        note: String(doc?.note ?? "").trim(),
-        revisedSeverity: doc?.revisedSeverity != null ? String(doc.revisedSeverity) : null,
-        status: res.status ?? null,
         skipped: Boolean(res.skipped),
-        parseOk: Boolean(doc)
+        artifactRound: `debate-${entry.id}`
       };
     })
   );
@@ -112,17 +158,14 @@ export async function runDebateRounds(cwd, backends, options, entries) {
           buildCounterPrompt(entry, rebuttal),
           `debate-counter-${entry.id}`
         );
-        const doc = res.skipped ? null : extractJsonObject(res.stdout);
+        const parsed = parseDebateCounter(res.skipped ? "" : res.stdout, entry.critic, entry.id);
         return {
-          id: entry.id,
-          agent: entry.critic,
+          ...res,
+          ...parsed,
           round: 2,
           role: "counter",
-          upheld: doc?.upheld != null ? Boolean(doc.upheld) : true,
-          note: String(doc?.note ?? "").trim(),
-          status: res.status ?? null,
           skipped: Boolean(res.skipped),
-          parseOk: Boolean(doc)
+          artifactRound: `debate-${entry.id}`
         };
       })
     );

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/agent-council/plan-critique.schema.json",
+  "title": "CouncilPlanCritique",
+  "type": "object",
+  "required": ["overall"],
+  "properties": {
+    "agent": { "type": "string" },
+    "about": { "type": "string" },
+    "summary": { "type": "string" },
+    "scores": {
+      "type": "object",
+      "properties": {
+        "feasibility": { "type": "number", "description": "1-5, clamped by the harness" },
+        "risk": { "type": "number", "description": "1-5, clamped by the harness" },
+        "simplicity": { "type": "number", "description": "1-5, clamped by the harness" },
+        "completeness": { "type": "number", "description": "1-5, clamped by the harness" }
+      }
+    },
+    "overall": { "type": "number", "description": "1-10, clamped by the harness" },
+    "blockers": { "type": "array", "items": { "type": "string" } },
+    "improvements": { "type": "array", "items": { "type": "string" } }
+  }
+}

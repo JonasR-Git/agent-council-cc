@@ -2,6 +2,9 @@
  * Parse / normalize / merge structured council findings.
  */
 
+import { SCHEMAS } from "./schemas.mjs";
+import { validate } from "./validate.mjs";
+
 const SEVERITY_RANK = { P0: 0, P1: 1, P2: 2, nit: 3 };
 
 function isObject(value) {
@@ -118,10 +121,79 @@ export function parseAgentFindings(stdout, agent) {
       verdict: "request_changes",
       findings: [],
       parseOk: false,
+      validationErrors: ["$: no JSON object found"],
+      raw: String(stdout ?? "")
+    };
+  }
+  const checked = validate(SCHEMAS.findings, parsed);
+  if (!checked.valid) {
+    return {
+      agent,
+      summary: firstLines(stdout, 8),
+      verdict: "request_changes",
+      findings: [],
+      parseOk: false,
+      validationErrors: checked.errors,
       raw: String(stdout ?? "")
     };
   }
   return { ...normalizeFindingsDoc(parsed, agent), raw: String(stdout ?? "") };
+}
+
+export function parseCritiqueVotes(stdout, agent, aboutAgent) {
+  const doc = extractJsonObject(stdout);
+  const raw = String(stdout ?? "");
+  if (!isObject(doc)) {
+    return {
+      agent,
+      aboutAgent,
+      summary: firstLines(stdout, 4),
+      votes: [],
+      missed: [],
+      parseOk: false,
+      validationErrors: ["$: no JSON object found"],
+      raw
+    };
+  }
+
+  const shell = { ...doc };
+  if (Array.isArray(shell.votes)) shell.votes = [];
+  const documentCheck = validate(SCHEMAS.critiqueVotes, shell);
+  if (!documentCheck.valid) {
+    return {
+      agent,
+      aboutAgent,
+      summary: String(doc.summary ?? "").trim(),
+      votes: [],
+      missed: [],
+      parseOk: false,
+      validationErrors: documentCheck.errors,
+      raw
+    };
+  }
+
+  const votes = [];
+  const validationErrors = [];
+  for (const [index, vote] of doc.votes.entries()) {
+    const checked = validate(SCHEMAS.critiqueVotes.properties.votes.items, vote);
+    if (checked.valid) votes.push(vote);
+    else {
+      validationErrors.push(
+        ...checked.errors.map((error) => error.replace(/^\$/, `$.votes[${index}]`))
+      );
+    }
+  }
+  return {
+    agent: String(doc.agent ?? agent),
+    aboutAgent: String(doc.about ?? aboutAgent),
+    about: String(doc.about ?? aboutAgent),
+    summary: String(doc.summary ?? "").trim(),
+    votes,
+    missed: Array.isArray(doc.missed) ? doc.missed : [],
+    parseOk: true,
+    validationErrors,
+    raw
+  };
 }
 
 function firstLines(text, n) {
@@ -308,8 +380,8 @@ function rebuildMerged(merged, all) {
 export function applyPeerVotes(merged, critiques) {
   const votes = [];
   for (const c of critiques) {
-    const doc = extractJsonObject(c.stdout) ?? c.parsed;
-    if (!doc) continue;
+    const doc = c.parsed ?? extractJsonObject(c.stdout);
+    if (!doc || doc.parseOk === false) continue;
     const list = Array.isArray(doc.votes) ? doc.votes : Array.isArray(doc.findings) ? [] : [];
     const rawVotes = list.length
       ? list

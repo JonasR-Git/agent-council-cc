@@ -3,7 +3,7 @@
   "$id": "https://local/agent-council/plan.schema.json",
   "title": "CouncilSolutionPlan",
   "type": "object",
-  "required": ["agent", "summary", "approach", "steps"],
+  "required": ["approach", "steps"],
   "properties": {
     "agent": {
       "type": "string",
@@ -21,7 +21,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["n", "title", "detail"],
+        "required": ["title"],
         "properties": {
           "n": { "type": "integer", "minimum": 1 },
           "title": { "type": "string" },
@@ -38,12 +38,12 @@
         "properties": {
           "risk": { "type": "string" },
           "mitigation": { "type": "string" },
-          "severity": { "type": "string", "enum": ["P0", "P1", "P2"] }
+          "severity": { "type": "string", "description": "P0|P1|P2 - normalized by the harness" }
         }
       }
     },
     "tradeoffs": { "type": "array", "items": { "type": "string" } },
-    "effort": { "type": "string", "enum": ["S", "M", "L", "XL"] },
-    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+    "effort": { "type": "string", "description": "S|M|L|XL - unknown values normalize to M" },
+    "confidence": { "type": "number", "description": "0..1, defaulted by the harness" }
   }
 }

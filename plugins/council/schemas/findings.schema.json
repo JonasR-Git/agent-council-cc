@@ -3,7 +3,7 @@
   "$id": "https://local/agent-council/findings.schema.json",
   "title": "CouncilReviewFindings",
   "type": "object",
-  "required": ["agent", "summary", "findings"],
+  "required": ["findings"],
   "properties": {
     "agent": {
       "type": "string",
@@ -21,10 +21,10 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "severity", "title", "detail"],
+        "required": ["title"],
         "properties": {
           "id": { "type": "string" },
-          "severity": { "type": "string", "enum": ["P0", "P1", "P2", "nit"] },
+          "severity": { "type": "string", "description": "P0|P1|P2|nit - unknown values normalize to P2" },
           "category": {
             "type": "string",
             "enum": [
@@ -45,7 +45,7 @@
           "detail": { "type": "string" },
           "file": { "type": ["string", "null"] },
           "line": { "type": ["integer", "null"] },
-          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+          "confidence": { "type": "number", "description": "0..1, defaulted by the harness" }
         }
       }
     }

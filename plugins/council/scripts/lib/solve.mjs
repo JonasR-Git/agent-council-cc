@@ -11,6 +11,8 @@ import {
 import { runDebateRounds } from "./debate.mjs";
 import { extractJsonObject } from "./findings.mjs";
 import { runCommand } from "./process.mjs";
+import { SCHEMAS } from "./schemas.mjs";
+import { validate } from "./validate.mjs";
 
 const REPO_HINT_MAX_FILES = 300;
 const README_HEAD_CHARS = 2000;
@@ -33,8 +35,8 @@ function firstLines(text, n) {
  */
 export function parsePlanDoc(stdout, agent) {
   const parsed = extractJsonObject(stdout);
-  const valid = isObject(parsed) && (typeof parsed.approach === "string" || Array.isArray(parsed.steps));
-  if (!valid) {
+  const checked = validate(SCHEMAS.plan, parsed);
+  if (!checked.valid) {
     return {
       agent,
       parseOk: false,
@@ -45,6 +47,7 @@ export function parsePlanDoc(stdout, agent) {
       tradeoffs: [],
       effort: "M",
       confidence: 0,
+      validationErrors: checked.errors,
       raw: String(stdout ?? "")
     };
   }
@@ -82,7 +85,8 @@ function clampScore(value, max) {
  */
 export function parsePlanCritique(stdout, agent, aboutAgent) {
   const doc = extractJsonObject(stdout);
-  if (!isObject(doc)) {
+  const checked = validate(SCHEMAS.planCritique, doc);
+  if (!checked.valid) {
     return {
       agent,
       aboutAgent,
@@ -92,6 +96,7 @@ export function parsePlanCritique(stdout, agent, aboutAgent) {
       improvements: [],
       overall: null,
       summary: firstLines(stdout, 4),
+      validationErrors: checked.errors,
       raw: String(stdout ?? "")
     };
   }
@@ -374,6 +379,7 @@ function renderSolveReport({ problem, options, r1Results, r2Results, plans, crit
     const plan = r.plan;
     if (!plan?.parseOk) {
       lines.push("_Structured parse failed - raw output:_");
+      for (const error of plan?.validationErrors?.slice(0, 3) ?? []) lines.push(`- ${error}`);
       lines.push(r.stdout?.trim() || r.stderr?.trim() || "(empty)");
       lines.push("");
       continue;
@@ -409,6 +415,7 @@ function renderSolveReport({ problem, options, r1Results, r2Results, plans, crit
     const c = r.critique;
     if (!c?.parseOk) {
       lines.push("_Structured parse failed - raw output:_");
+      if (c?.validationErrors?.[0]) lines.push(`_Critique excluded: ${c.validationErrors[0]}_`);
       lines.push(r.stdout?.trim() || r.stderr?.trim() || "(empty)");
       lines.push("");
       continue;

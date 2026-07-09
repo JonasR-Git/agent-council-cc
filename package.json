@@ -8,6 +8,8 @@
     "node": ">=18.18"
   },
   "scripts": {
+    "bump": "node scripts/bump-version.mjs",
+    "lint": "node scripts/lint.mjs",
     "test:grok-setup": "node plugins/grok/scripts/grok-companion.mjs setup --json",
     "test:council-setup": "node plugins/council/scripts/council-companion.mjs setup --json",
     "test": "node --test"

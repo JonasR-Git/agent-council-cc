@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/agent-council/debate-rebuttal.schema.json",
+  "title": "CouncilDebateRebuttal",
+  "type": "object",
+  "required": ["stance"],
+  "properties": {
+    "id": { "type": "string" },
+    "stance": { "type": "string", "description": "defend|concede|revise - unknown values normalize to defend" },
+    "note": { "type": "string" },
+    "revisedSeverity": {
+      "type": ["string", "null"],
+      "enum": ["P0", "P1", "P2", "nit", null]
+    }
+  }
+}

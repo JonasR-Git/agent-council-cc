@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/agent-council/debate-counter.schema.json",
+  "title": "CouncilDebateCounter",
+  "type": "object",
+  "required": ["upheld"],
+  "properties": {
+    "id": { "type": "string" },
+    "upheld": { "type": "boolean" },
+    "note": { "type": "string" }
+  }
+}

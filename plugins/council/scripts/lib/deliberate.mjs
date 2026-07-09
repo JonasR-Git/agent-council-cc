@@ -17,6 +17,7 @@ import {
   extractJsonObject,
   mergeFindings,
   parseAgentFindings,
+  parseCritiqueVotes,
   renderMergedMarkdown,
   slimFindingsDoc
 } from "./findings.mjs";
@@ -309,7 +310,15 @@ export async function runDeliberation(cwd, backends, options = {}) {
     }
 
     if (peerJobs.length) {
-      r2Results.push(...(await Promise.all(peerJobs)));
+      const peerResults = await Promise.all(peerJobs);
+      r2Results.push(
+        ...peerResults.map((result) => ({
+          ...result,
+          critique: result.skipped
+            ? null
+            : parseCritiqueVotes(result.stdout, result.agent, result.aboutAgent)
+        }))
+      );
     }
   }
 
@@ -321,15 +330,15 @@ export async function runDeliberation(cwd, backends, options = {}) {
       .map((r) => ({
         agent: r.agent,
         aboutAgent: r.aboutAgent,
-        stdout: r.stdout
+        parsed: r.critique
       }))
   );
 
   const rawMissedDocs = [];
   for (const r of r2Results) {
-    if (r.skipped) continue;
+    if (r.skipped || !r.critique?.parseOk) continue;
     try {
-      const obj = extractJsonObject(r.stdout);
+      const obj = r.critique;
       if (obj?.missed?.length) {
         rawMissedDocs.push(
           parseAgentFindings(
@@ -460,6 +469,7 @@ function renderDeliberationReport({
       lines.push("```");
     } else {
       lines.push("_Structured parse failed - raw output:_");
+      for (const error of doc?.validationErrors?.slice(0, 3) ?? []) lines.push(`- ${error}`);
       lines.push("");
       lines.push(r.stdout?.trim() || r.stderr?.trim() || "(empty)");
     }
@@ -475,6 +485,11 @@ function renderDeliberationReport({
         continue;
       }
       lines.push(`Exit: ${formatExit(r)}`);
+      if (r.critique && !r.critique.parseOk) {
+        lines.push(`_critique ignored: ${r.critique.validationErrors[0]}_`);
+      } else if (r.critique?.validationErrors?.length) {
+        lines.push(`_Dropped ${r.critique.validationErrors.length} invalid vote field(s)._`);
+      }
       lines.push("");
       lines.push(r.stdout?.trim() || r.stderr?.trim() || "(empty)");
       lines.push("");

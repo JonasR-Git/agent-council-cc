@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/agent-council/critique-votes.schema.json",
+  "title": "CouncilPeerCritiqueVotes",
+  "type": "object",
+  "required": ["votes"],
+  "properties": {
+    "agent": { "type": "string" },
+    "about": { "type": "string" },
+    "summary": { "type": "string" },
+    "votes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["vote"],
+        "properties": {
+          "targetId": { "type": "string" },
+          "title": { "type": "string" },
+          "vote": { "type": "string", "description": "agree|disagree|uncertain - unknown values normalize to uncertain" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "missed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["title"],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": { "type": "string", "description": "P0|P1|P2|nit - unknown values normalize to P2" },
+          "category": { "type": "string" },
+          "title": { "type": "string" },
+          "detail": { "type": "string" },
+          "file": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"] },
+          "confidence": { "type": "number" }
+        }
+      }
+    }
+  }
+}

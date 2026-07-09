@@ -37,11 +37,29 @@ Claude Code plugins that wire **Grok Build** and a **multi-agent council** (Code
 From Claude Code:
 
 ```text
-/plugin marketplace add C:/Appgehoben/agent-council-cc
+/plugin marketplace add /path/to/agent-council-cc
 /plugin install grok@agent-council
 /plugin install council@agent-council
 /reload-plugins
 ```
+
+On Windows, the marketplace path can use forward slashes, for example
+`C:/path/to/agent-council-cc`.
+
+## Use only the Grok plugin
+
+The Grok plugin is fully supported as a standalone install. Install only
+`grok@agent-council`; neither the Codex plugin nor the council plugin is required.
+
+```text
+/plugin install grok@agent-council
+/reload-plugins
+```
+
+Run `grok login` before using it. The standalone commands are `/grok:setup`,
+`/grok:review`, `/grok:adversarial-review`, `/grok:rescue`, `/grok:status`,
+`/grok:result`, and `/grok:cancel`. The council plugin is an optional layer on
+top when you want multi-agent deliberation.
 
 Smoke test without installing:
 
@@ -57,13 +75,17 @@ Round 1 is independent. Claude writes its own JSON findings first, while Codex a
 Write Claude's R1 JSON to an OS temp path outside the repo. Untracked file bodies are included in review context, so a repo-local scratch file would contaminate Codex/Grok input.
 
 ```text
+# POSIX
+/council:deliberate --claude-findings /tmp/council-claude-r1.json
+
+# Windows
 /council:deliberate --claude-findings C:\Users\you\AppData\Local\Temp\council-claude-r1.json
 ```
 
 Parallel mode starts Codex/Grok first, then waits for Claude's file:
 
 ```text
-/council:deliberate --claude-findings-wait C:\Users\you\AppData\Local\Temp\council-claude-r1.json --wait-timeout 600 --background
+/council:deliberate --claude-findings-wait /tmp/council-claude-r1.json --wait-timeout 600 --background
 ```
 
 R2 critique cost is bounded: only findings in `peer_critique_severities` (default `P0,P1`) are critiqued, critics see per-finding code evidence snippets instead of the full diff, and Grok critiques run at `r2_effort` (default `medium`).
@@ -74,6 +96,16 @@ R2 critique cost is bounded: only findings in `peer_critique_severities` (defaul
 
 ```text
 /council:solve --background how should we add offline support to the sync engine?
+```
+
+To include Claude's independent plan from a temp file, use either path style:
+
+```text
+# POSIX
+/council:solve --claude-plan /tmp/council-claude-plan.json how should we add offline support?
+
+# Windows
+/council:solve --claude-plan C:\Users\you\AppData\Local\Temp\council-claude-plan.json how should we add offline support?
 ```
 
 Optional bounded debate (never a live chat): `--debate-rounds 1` gives each disputed item's author one rebuttal turn; `--debate-rounds 2` adds one counter by the original critic. Hard caps: 6 items, 2 rounds.
@@ -152,6 +184,8 @@ npm test
 ```
 
 The test suite uses Node's built-in `node:test` runner and has no npm dependencies.
+
+Release history is recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
