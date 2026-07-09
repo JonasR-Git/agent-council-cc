@@ -40,3 +40,15 @@ skip_paths:
 max_turns_r1: 40
 max_turns_r2: 25
 deliberate_peer: true
+
+# R2 cost controls: only critique findings of these severities (empty = all),
+# and run critiques at a lower reasoning effort (Grok only; Codex effort is config-level).
+peer_critique_severities: [P0, P1]
+r2_effort: medium
+
+# Bounded debate on contested items (0 = off, max 2). Not a live chat:
+# one rebuttal per item, optionally one counter by the original critic.
+debate_rounds: 0
+
+# /council:solve - who implements the synthesized plan (exactly one writer)
+solve_writer: claude

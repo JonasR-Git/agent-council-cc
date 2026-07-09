@@ -18,7 +18,11 @@ export const DEFAULT_POLICY = {
   max_turns_r1: 40,
   max_turns_r2: 25,
   deliberate_peer: true,
-  agent_timeout_minutes: 30
+  agent_timeout_minutes: 30,
+  peer_critique_severities: ["P0", "P1"],
+  r2_effort: "medium",
+  debate_rounds: 0,
+  solve_writer: "claude"
 };
 
 /**
@@ -185,6 +189,30 @@ export function mergeOptionsWithPolicy(options, policy) {
     deliberatePeer: options.deliberatePeer ?? policy.deliberate_peer !== false,
     requireConsensusFor: options.requireConsensusFor ?? policy.require_consensus_for ?? [],
     skipPaths: options.skipPaths ?? policy.skip_paths ?? [],
+    peerCritiqueSeverities: normalizeSeverityList(
+      options.peerCritiqueSeverities ?? policy.peer_critique_severities ?? DEFAULT_POLICY.peer_critique_severities
+    ),
+    r2Effort: options.r2Effort ?? policy.r2_effort ?? DEFAULT_POLICY.r2_effort,
+    debateRounds: clampDebateRounds(options.debateRounds ?? policy.debate_rounds ?? 0),
+    solveWriter: options.solveWriter ?? policy.solve_writer ?? "claude",
     policySource: policy._source
   };
+}
+
+function normalizeSeverityList(value) {
+  const list = Array.isArray(value) ? value : String(value ?? "").split(",");
+  const valid = new Set(["P0", "P1", "P2", "nit"]);
+  const normalized = list
+    .map((s) => {
+      const token = String(s).trim();
+      return token.toLowerCase() === "nit" ? "nit" : token.toUpperCase();
+    })
+    .filter((s) => valid.has(s));
+  return normalized.length ? normalized : ["P0", "P1"];
+}
+
+function clampDebateRounds(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.min(Math.floor(n), 2);
 }

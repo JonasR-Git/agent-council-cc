@@ -11,8 +11,11 @@ Another independent reviewer (**{{ABOUT_AGENT}}**) produced findings. Your job i
 ## Their findings (JSON)
 {{OTHER_FINDINGS_JSON}}
 
-## Git context (truncated)
-{{REVIEW_INPUT_SHORT}}
+## Evidence snippets (code around each finding)
+The snippets below show the code around each finding. If you need more context,
+open the files with your own read tools.
+
+{{EVIDENCE}}
 
 ## Required output format
 Return **ONLY** JSON:

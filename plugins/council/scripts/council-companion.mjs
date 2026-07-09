@@ -10,6 +10,7 @@ import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { READONLY_DISALLOWED_TOOLS, runDeliberation } from "./lib/deliberate.mjs";
 import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover.mjs";
 import { loadPolicy, mergeOptionsWithPolicy } from "./lib/policy.mjs";
+import { runSolve } from "./lib/solve.mjs";
 import { runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
 import {
   appendLogLine,
@@ -31,17 +32,20 @@ function printUsage() {
       "Usage:",
       "  node scripts/council-companion.mjs setup [--json]",
       "  node scripts/council-companion.mjs review|adversarial|deliberate [flags] [focus text]",
+      "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "",
       "Flags:",
       "  --wait|--background  --base <ref>  --scope auto|working-tree|branch",
       "  --codex-model <id>  --grok-model <id>  --codex-effort <l>  --grok-effort <l>",
       "  --skip-codex  --skip-grok  --claude-findings <path>  --claude-findings-wait <path>",
-      "  --wait-timeout <seconds>  --json",
+      "  --wait-timeout <seconds>  --peer-severities P0,P1  --debate-rounds 0|1|2  --json",
+      "  solve only: --problem-file <path>  --claude-plan <path>  --claude-plan-wait <path>",
       "",
       "Modes:",
       "  review       - parallel Codex + Grok review (single round)",
       "  adversarial  - same, adversarial framing",
       "  deliberate   - Round1 independent -> Round2 peer critique (+ optional Claude file)",
+      "  solve        - independent solution plans -> cross-critique with scores -> ranking",
       "",
       "Policy file (repo root): .council.yml | .council.json",
       "Models default from policy or ~/.codex/config.toml + ~/.grok/config.toml"
@@ -331,6 +335,7 @@ function renderCouncilReport(job, results) {
 }
 
 function jobTitle(kind) {
+  if (kind === "solve") return "Council Solve";
   if (kind === "deliberate") return "Council Deliberation";
   if (kind === "adversarial") return "Council Adversarial Review";
   return "Council Review";
@@ -351,10 +356,11 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
   const mergedOpts = mergeOptionsWithPolicy(options, policy);
   const adversarial = Boolean(mergedOpts.adversarial);
   const deliberate = Boolean(mergedOpts.deliberate);
+  const solve = Boolean(mergedOpts.solve);
   const focusText = mergedOpts.focusText ?? "";
   const root = workspaceRoot(cwd);
 
-  const kind = deliberate ? "deliberate" : adversarial ? "adversarial" : "review";
+  const kind = solve ? "solve" : deliberate ? "deliberate" : adversarial ? "adversarial" : "review";
   const title = jobTitle(kind);
   const summary = jobSummary(mergedOpts);
   const job = existingJob
@@ -403,6 +409,36 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       "Codex reasoning effort comes from ~/.codex/config.toml (model_reasoning_effort); --codex-effort/codex_effort is ignored.";
     console.error(warning);
     appendLogLine(job.logFile, warning);
+  }
+
+  if (solve) {
+    appendLogLine(job.logFile, "Solve protocol: independent plans -> plan critique -> ranking");
+    const solveRun = await runSolve(cwd, backends, {
+      ...mergedOpts,
+      policyFocus: policy.focus
+    });
+    const r1Failed = solveRun.r1.some((r) => !r.skipped && r.status !== 0);
+    const allSkipped = solveRun.r1.every((r) => r.skipped && r.agent !== "claude");
+    const finished = {
+      ...job,
+      status: allSkipped ? "failed" : r1Failed ? "completed_with_errors" : "completed",
+      phase: "done",
+      exitCode: allSkipped ? 1 : 0,
+      results: [...solveRun.r1, ...solveRun.r2],
+      solve: {
+        ranking: solveRun.ranking,
+        plans: solveRun.plans.map((p) => ({ ...p, raw: undefined })),
+        debates: solveRun.debates
+      },
+      report: solveRun.report,
+      output: solveRun.report,
+      finishedAt: nowIso(),
+      updatedAt: nowIso(),
+      pid: null
+    };
+    upsertJob(root, finished);
+    appendLogLine(job.logFile, `Solve report stored (${solveRun.report.length} chars)`);
+    return finished;
   }
 
   if (deliberate) {
@@ -490,7 +526,7 @@ function secondsToMs(value, flagName) {
   return Math.round(seconds * 1000);
 }
 
-async function handleReview(argv, adversarial, deliberate = false) {
+async function handleReview(argv, adversarial, deliberate = false, solve = false) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: [
       "base",
@@ -503,6 +539,11 @@ async function handleReview(argv, adversarial, deliberate = false) {
       "claude-findings",
       "claude-findings-wait",
       "wait-timeout",
+      "peer-severities",
+      "debate-rounds",
+      "problem-file",
+      "claude-plan",
+      "claude-plan-wait",
       "cwd"
     ],
     booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok"]
@@ -513,6 +554,7 @@ async function handleReview(argv, adversarial, deliberate = false) {
   const request = {
     adversarial,
     deliberate,
+    solve,
     focusText,
     base: options.base,
     scope: options.scope,
@@ -527,6 +569,13 @@ async function handleReview(argv, adversarial, deliberate = false) {
     claudeFindingsWaitPath: options["claude-findings-wait"]
       ? path.resolve(cwd, options["claude-findings-wait"])
       : null,
+    problemFile: options["problem-file"] ? path.resolve(cwd, options["problem-file"]) : null,
+    claudePlanPath: options["claude-plan"] ? path.resolve(cwd, options["claude-plan"]) : null,
+    claudePlanWaitPath: options["claude-plan-wait"]
+      ? path.resolve(cwd, options["claude-plan-wait"])
+      : null,
+    peerCritiqueSeverities: options["peer-severities"] ?? undefined,
+    debateRounds: options["debate-rounds"] != null ? Number(options["debate-rounds"]) : undefined,
     waitTimeoutMs,
     skipCodex: Boolean(options["skip-codex"]),
     skipGrok: Boolean(options["skip-grok"])
@@ -534,7 +583,7 @@ async function handleReview(argv, adversarial, deliberate = false) {
 
   if (options.background) {
     const root = workspaceRoot(cwd);
-    const kind = deliberate ? "deliberate" : adversarial ? "adversarial" : "review";
+    const kind = solve ? "solve" : deliberate ? "deliberate" : adversarial ? "adversarial" : "review";
     const job = {
       id: generateJobId("council"),
       kind,
@@ -721,6 +770,9 @@ async function main() {
       case "deliberate":
       case "deliberation":
         await handleReview(rest, false, true);
+        break;
+      case "solve":
+        await handleReview(rest, false, false, true);
         break;
       case "status":
         handleStatus(rest);

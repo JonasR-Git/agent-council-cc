@@ -13,6 +13,7 @@ description: >
 | Mode | Command | When |
 |------|---------|------|
 | **Deliberate (best)** | `/council:deliberate` | Before merge, risky changes, user wants mutual evaluation |
+| **Solve** | `/council:solve` | Open problem: independent plans -> scored critique -> synthesis -> one writer -> council review |
 | Dual review | `/council:review` | Faster second opinions (no peer round) |
 | Adversarial | `/council:adversarial` | Challenge design/direction |
 | Single | `/codex:review` or `/grok:review` | One vendor only |
@@ -40,9 +41,20 @@ Or start Codex/Grok first and wait for the file:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings-wait "$TMPDIR/council-claude-r1.json" --wait-timeout 600
 ```
 
+## Solve protocol (plans instead of findings)
+
+```text
+Phase 0: Claude condenses the problem to an OS-temp file
+Phase 1: companion starts Codex+Grok plans; Claude plans in parallel (--claude-plan-wait)
+Phase 2: cross-critique with scores (1-10) + blockers -> ranking [+ bounded debate]
+Phase 3: Claude synthesizes final plan -> user approval
+Phase 4: ONE writer implements on a branch (policy solve_writer)
+Phase 5: /council:deliberate on the diff; writer's verdict does not count
+```
+
 ## Policy
 
-Repo file `.council.yml` (see marketplace `.council.example.yml`): models, focus, consensus categories, skip paths, and `agent_timeout_minutes`.
+Repo file `.council.yml` (see marketplace `.council.example.yml`): models, focus, consensus categories, skip paths, `agent_timeout_minutes`, `peer_critique_severities`, `r2_effort`, `debate_rounds`, `solve_writer`.
 
 ## Models
 

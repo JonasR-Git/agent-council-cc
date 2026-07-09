@@ -1,10 +1,15 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import process from "node:process";
-import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
 
+import {
+  READONLY_DISALLOWED_TOOLS,
+  interpolate,
+  loadPrompt,
+  runCodexStructured,
+  runGrokStructured,
+  waitForFile
+} from "./agents.mjs";
+import { applyDebateOutcomes, renderDebateSection, runDebateRounds } from "./debate.mjs";
 import {
   applyConsensusPolicy,
   applyPeerVotes,
@@ -16,140 +21,68 @@ import {
   slimFindingsDoc
 } from "./findings.mjs";
 import { collectReviewContext, resolveReviewTarget } from "./git-context.mjs";
-import { findGrokBinary } from "./discover.mjs";
-import { runCommandAsync } from "./process.mjs";
 
-export const READONLY_DISALLOWED_TOOLS =
-  "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal";
+export { READONLY_DISALLOWED_TOOLS, runCodexStructured, runGrokStructured };
 
-const PROMPTS_DIR = path.resolve(fileURLToPath(new URL("../../prompts", import.meta.url)));
+const EVIDENCE_LINES = 25;
+const EVIDENCE_PER_FINDING_CHARS = 1500;
+const EVIDENCE_TOTAL_CHARS = 16_000;
+const EVIDENCE_FALLBACK_CHARS = 8000;
 
-function loadPrompt(name) {
-  return fs.readFileSync(path.join(PROMPTS_DIR, `${name}.md`), "utf8");
-}
-
-function interpolate(template, values) {
-  return template.replace(/\{\{(\w+)\}\}/g, (_, key) =>
-    values[key] != null ? String(values[key]) : ""
-  );
-}
-
-function writeTempPrompt(content) {
-  const file = path.join(os.tmpdir(), `council-prompt-${Date.now()}-${Math.random().toString(16).slice(2)}.md`);
-  fs.writeFileSync(file, content, "utf8");
-  return file;
+/**
+ * Keep only findings whose severity warrants a peer critique round.
+ * An empty/missing severity list means "critique everything".
+ */
+export function filterDocForCritique(doc, severities) {
+  const total = doc?.findings?.length ?? 0;
+  const allowed = new Set(severities ?? []);
+  if (!allowed.size) {
+    return { doc, critiqued: total, total };
+  }
+  const findings = (doc?.findings ?? []).filter((f) => allowed.has(f.severity));
+  return {
+    doc: { ...doc, findings },
+    critiqued: findings.length,
+    total
+  };
 }
 
 /**
- * Run Grok headless with a full prompt (structured R1/R2).
+ * Per-finding code evidence (±N lines around each finding) instead of a bulk
+ * diff excerpt — the critic can open files with its own tools if it needs more.
  */
-export async function runGrokStructured(cwd, backends, options, prompt) {
-  const bin = backends.grok?.bin || findGrokBinary();
-  const promptFile = writeTempPrompt(prompt);
-  const args = [
-    "--prompt-file",
-    promptFile,
-    "--cwd",
-    cwd,
-    "--always-approve",
-    "--disallowed-tools",
-    READONLY_DISALLOWED_TOOLS,
-    "--max-turns",
-    String(options.maxTurns ?? 40),
-    "--output-format",
-    "plain"
-  ];
-  if (options.grokModel) args.push("--model", options.grokModel);
-  if (options.grokEffort) args.push("--effort", options.grokEffort);
-
-  try {
-    const result = await runCommandAsync(bin, args, { cwd, timeoutMs: options.agentTimeoutMs });
-    return {
-      agent: "grok",
-      backend: "grok-cli",
-      status: result.status,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      timedOut: Boolean(result.timedOut),
-      truncated: Boolean(result.truncated),
-      model: options.grokModel ?? "(default)",
-      command: `${bin} --prompt-file ...`
-    };
-  } finally {
+export function buildEvidence(repoRoot, findings, fallbackContent = "") {
+  const sections = [];
+  let totalChars = 0;
+  for (const f of findings ?? []) {
+    if (!f?.file) continue;
+    let text;
     try {
-      fs.unlinkSync(promptFile);
+      text = fs.readFileSync(path.join(repoRoot, f.file), "utf8");
     } catch {
-      /* ignore */
+      continue;
     }
-  }
-}
-
-/**
- * Run Codex via companion task (read-only-ish prompt for structured review).
- * Falls back to adversarial-review with focus embedding the prompt snippet.
- */
-export async function runCodexStructured(cwd, backends, options, prompt, label) {
-  if (!backends.codex?.companionAvailable) {
-    return {
-      agent: "codex",
-      skipped: true,
-      reason: "codex companion not found",
-      stdout: "",
-      stderr: ""
-    };
-  }
-
-  const companion = backends.codex.companion;
-  const promptFile = writeTempPrompt(prompt);
-  const args = [companion, "task", "--prompt-file", promptFile];
-  if (options.codexModel) args.push("--model", options.codexModel);
-
-  try {
-    const result = await runCommandAsync(process.execPath, args, {
-      cwd,
-      timeoutMs: options.agentTimeoutMs
-    });
-    if (result.status !== 0 && !result.timedOut && !result.stdout?.trim()) {
-      const focus = `Return ONLY JSON findings. Context label: ${label}. Follow structured review schema with agent=codex.`;
-      const fallbackArgs = [companion, "adversarial-review"];
-      if (options.base) fallbackArgs.push("--base", options.base);
-      if (options.scope) fallbackArgs.push("--scope", options.scope);
-      if (options.codexModel) fallbackArgs.push("--model", options.codexModel);
-      fallbackArgs.push(focus);
-      const fb = await runCommandAsync(process.execPath, fallbackArgs, {
-        cwd,
-        timeoutMs: options.agentTimeoutMs
-      });
-      return {
-        agent: "codex",
-        backend: "codex-companion-adversarial-fallback",
-        status: fb.status,
-        stdout: fb.stdout,
-        stderr: fb.stderr,
-        timedOut: Boolean(fb.timedOut),
-        truncated: Boolean(fb.truncated),
-        model: options.codexModel ?? "(default)",
-        command: `node ... adversarial-review`
-      };
+    const lines = text.split(/\r?\n/);
+    const line = f.line != null && Number.isFinite(Number(f.line)) ? Number(f.line) : 1;
+    const start = Math.max(1, line - EVIDENCE_LINES);
+    const end = Math.min(lines.length, line + EVIDENCE_LINES);
+    let snippet = lines
+      .slice(start - 1, end)
+      .map((content, idx) => `${start + idx}: ${content}`)
+      .join("\n");
+    if (snippet.length > EVIDENCE_PER_FINDING_CHARS) {
+      snippet = `${snippet.slice(0, EVIDENCE_PER_FINDING_CHARS)}\n[... truncated ...]`;
     }
-    return {
-      agent: "codex",
-      backend: "codex-companion-task",
-      status: result.status,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      timedOut: Boolean(result.timedOut),
-      truncated: Boolean(result.truncated),
-      model: options.codexModel ?? "(default)",
-      command: `node ... task --prompt-file`
-    };
-  } finally {
-    try {
-      fs.unlinkSync(promptFile);
-    } catch {
-      /* ignore */
-    }
+    const section = `### ${f.id ?? "finding"} — ${f.file}:${f.line ?? "?"}\n\`\`\`\n${snippet}\n\`\`\``;
+    if (totalChars + section.length > EVIDENCE_TOTAL_CHARS) break;
+    totalChars += section.length;
+    sections.push(section);
   }
+  if (!sections.length) {
+    const fallback = String(fallbackContent ?? "").slice(0, EVIDENCE_FALLBACK_CHARS);
+    return fallback || "(no file evidence available)";
+  }
+  return sections.join("\n\n");
 }
 
 function buildR1Prompt(agent, context, options) {
@@ -168,24 +101,12 @@ function buildR1Prompt(agent, context, options) {
 
 function buildR2Prompt(agent, aboutAgent, aboutFindings, context) {
   const template = loadPrompt("r2-peer-critique");
-  const short = context.content.length > 40_000 ? `${context.content.slice(0, 40_000)}\n[truncated]` : context.content;
   return interpolate(template, {
     AGENT: agent,
     ABOUT_AGENT: aboutAgent,
     OTHER_FINDINGS_JSON: JSON.stringify(slimFindingsDoc(aboutFindings), null, 2),
-    REVIEW_INPUT_SHORT: short
+    EVIDENCE: buildEvidence(context.repoRoot, aboutFindings.findings, context.content)
   });
-}
-
-async function waitForClaudeFindings(waitPath, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline) {
-    if (fs.existsSync(waitPath)) {
-      return waitPath;
-    }
-    await delay(2000);
-  }
-  return null;
 }
 
 async function loadClaudeDoc(options) {
@@ -198,7 +119,7 @@ async function loadClaudeDoc(options) {
     const waitTimeoutMs = Number(options.waitTimeoutMs ?? 300_000);
     const found = fs.existsSync(options.claudeFindingsWaitPath)
       ? options.claudeFindingsWaitPath
-      : await waitForClaudeFindings(options.claudeFindingsWaitPath, waitTimeoutMs);
+      : await waitForFile(options.claudeFindingsWaitPath, waitTimeoutMs);
     if (found) {
       const text = fs.readFileSync(found, "utf8");
       return parseAgentFindings(text, "claude");
@@ -206,6 +127,45 @@ async function loadClaudeDoc(options) {
   }
 
   return null;
+}
+
+function r2Options(options) {
+  return {
+    ...options,
+    maxTurns: options.maxTurnsR2,
+    grokEffort: options.r2Effort ?? options.grokEffort
+  };
+}
+
+function buildDebateEntries(merged, options) {
+  const skipped = new Set(
+    [options.skipCodex ? "codex" : null, options.skipGrok ? "grok" : null].filter(Boolean)
+  );
+  return merged.all
+    .filter((item) => item.contested)
+    .map((item) => {
+      const author = item.agents.find((agent) => agent !== "claude" && !skipped.has(agent));
+      if (!author) return null;
+      const disagree = (item.peerVotes ?? []).filter((v) => v.vote === "disagree");
+      const critic = disagree
+        .map((v) => v.from)
+        .find((from) => from !== author && from !== "claude" && !skipped.has(from));
+      return {
+        id: item.ids[0],
+        author,
+        critic: critic ?? null,
+        payload: {
+          title: item.title,
+          severity: item.severity,
+          category: item.category,
+          file: item.file,
+          line: item.line,
+          detail: item.detail,
+          critiques: disagree.map((v) => ({ from: v.from, note: v.note }))
+        }
+      };
+    })
+    .filter(Boolean);
 }
 
 /**
@@ -276,43 +236,52 @@ export async function runDeliberation(cwd, backends, options = {}) {
   }
 
   const r2Results = [];
+  const critiqueStats = [];
   if (options.deliberatePeer !== false) {
+    const severities = options.peerCritiqueSeverities ?? null;
     const codexDoc = r1Docs.find((d) => d.agent === "codex" && d.parseOk);
     const grokDoc = r1Docs.find((d) => d.agent === "grok" && d.parseOk);
 
-    const peerJobs = [];
+    const critiqued = new Map();
+    for (const doc of [codexDoc, grokDoc, claudeDoc?.parseOk ? claudeDoc : null].filter(Boolean)) {
+      const filtered = filterDocForCritique(doc, severities);
+      critiqued.set(doc.agent, filtered.doc);
+      critiqueStats.push({ agent: doc.agent, critiqued: filtered.critiqued, total: filtered.total });
+    }
 
-    if (codexDoc && !options.skipGrok) {
+    const peerJobs = [];
+    const codexSlim = critiqued.get("codex");
+    const grokSlim = critiqued.get("grok");
+    const claudeSlim = critiqued.get("claude");
+
+    if (codexSlim?.findings.length && !options.skipGrok) {
       peerJobs.push(
-        runGrokStructured(
-          cwd,
-          backends,
-          { ...options, maxTurns: options.maxTurnsR2 },
-          buildR2Prompt("grok", "codex", codexDoc, context)
-        ).then((r) => ({ ...r, aboutAgent: "codex", role: "peer" }))
+        runGrokStructured(cwd, backends, r2Options(options), buildR2Prompt("grok", "codex", codexSlim, context)).then(
+          (r) => ({ ...r, aboutAgent: "codex", role: "peer" })
+        )
       );
     }
 
-    if (grokDoc && !options.skipCodex) {
+    if (grokSlim?.findings.length && !options.skipCodex) {
       peerJobs.push(
         runCodexStructured(
           cwd,
           backends,
-          { ...options, maxTurns: options.maxTurnsR2 },
-          buildR2Prompt("codex", "grok", grokDoc, context),
+          r2Options(options),
+          buildR2Prompt("codex", "grok", grokSlim, context),
           "r2"
         ).then((r) => ({ ...r, aboutAgent: "grok", role: "peer" }))
       );
     }
 
-    if (claudeDoc?.parseOk) {
+    if (claudeSlim?.findings.length) {
       if (!options.skipGrok) {
         peerJobs.push(
           runGrokStructured(
             cwd,
             backends,
-            { ...options, maxTurns: options.maxTurnsR2 },
-            buildR2Prompt("grok", "claude", claudeDoc, context)
+            r2Options(options),
+            buildR2Prompt("grok", "claude", claudeSlim, context)
           ).then((r) => ({ ...r, aboutAgent: "claude", role: "peer" }))
         );
       }
@@ -321,8 +290,8 @@ export async function runDeliberation(cwd, backends, options = {}) {
           runCodexStructured(
             cwd,
             backends,
-            { ...options, maxTurns: options.maxTurnsR2 },
-            buildR2Prompt("codex", "claude", claudeDoc, context),
+            r2Options(options),
+            buildR2Prompt("codex", "claude", claudeSlim, context),
             "r2-claude"
           ).then((r) => ({ ...r, aboutAgent: "claude", role: "peer" }))
         );
@@ -378,12 +347,21 @@ export async function runDeliberation(cwd, backends, options = {}) {
 
   merged = applyConsensusPolicy(merged, options.requireConsensusFor ?? []);
 
+  let debates = [];
+  if ((options.debateRounds ?? 0) > 0) {
+    const entries = buildDebateEntries(merged, options);
+    debates = await runDebateRounds(cwd, backends, options, entries);
+    merged = applyDebateOutcomes(merged, debates);
+  }
+
   const report = renderDeliberationReport({
     context,
     options,
     r1Results,
     r2Results,
     merged,
+    critiqueStats,
+    debates,
     claudeIncluded: Boolean(claudeDoc)
   });
 
@@ -399,6 +377,7 @@ export async function runDeliberation(cwd, backends, options = {}) {
     r1: r1Results,
     r2: r2Results,
     merged,
+    debates,
     claudeIncluded: Boolean(claudeDoc),
     report
   };
@@ -412,7 +391,16 @@ function shortHead(head) {
   return head === "(no commits)" ? head : head.slice(0, 12);
 }
 
-function renderDeliberationReport({ context, options, r1Results, r2Results, merged, claudeIncluded }) {
+function renderDeliberationReport({
+  context,
+  options,
+  r1Results,
+  r2Results,
+  merged,
+  critiqueStats,
+  debates,
+  claudeIncluded
+}) {
   const lines = [];
   lines.push(`# Council Deliberation`);
   lines.push("");
@@ -429,9 +417,19 @@ function renderDeliberationReport({ context, options, r1Results, r2Results, merg
   lines.push(`- Claude R1 file: ${claudeIncluded ? "yes" : "no (run /council:deliberate so Claude writes findings first)"}`);
   if (options.policySource) lines.push(`- Policy: \`${options.policySource}\``);
   if (options.focusText) lines.push(`- Focus: ${options.focusText}`);
+  if (critiqueStats?.length) {
+    const stats = critiqueStats.map((s) => `${s.agent}: ${s.critiqued}/${s.total}`).join(", ");
+    lines.push(
+      `- R2 critique scope (severities: ${(options.peerCritiqueSeverities ?? []).join(",") || "all"}): ${stats}`
+    );
+  }
   lines.push("");
 
   lines.push(renderMergedMarkdown(merged, { includeVotes: true }));
+
+  if (debates?.length) {
+    lines.push(renderDebateSection(debates));
+  }
 
   lines.push("## Round 1 - Independent reviews");
   for (const r of r1Results) {
