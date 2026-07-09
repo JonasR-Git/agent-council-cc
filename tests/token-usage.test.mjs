@@ -9,6 +9,7 @@ import {
   collectClaudeTokens,
   collectCodexRateLimits,
   collectCodexTokens,
+  collectGrokLimits,
   collectGrokTokens,
   parseClaudeLimits
 } from "../plugins/council/scripts/lib/token-usage.mjs";
@@ -50,6 +51,16 @@ function makeHome() {
   fs.writeFileSync(
     path.join(grokSession, "updates.jsonl"),
     ['{"totalTokens":100}', '{"totalTokens":1500}', '{"totalTokens":1750}'].join("\n"),
+    "utf8"
+  );
+  fs.mkdirSync(path.join(home, ".grok", "logs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".grok", "logs", "unified.jsonl"),
+    [
+      '{"ts":"2026-07-09T10:00:00Z","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":0.5,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-07-16T00:00:00+00:00"}}}}',
+      '{"ts":"2026-07-10T00:00:00Z","msg":"other log line"}',
+      '{"ts":"2026-07-10T01:00:00Z","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":1.0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-07-16T14:56:46+00:00"}}}}'
+    ].join("\n"),
     "utf8"
   );
   return home;
@@ -100,6 +111,19 @@ test("codex rate limits: newest local snapshot with 5h/weekly windows", () => {
   }
 });
 
+test("grok limits: newest weekly billing entry from the CLI log", () => {
+  const home = makeHome();
+  try {
+    const limits = collectGrokLimits(path.join(home, ".grok"));
+    assert.equal(limits.window, "weekly");
+    assert.equal(limits.usedPercent, 1);
+    assert.equal(limits.resetsAt, "2026-07-16T14:56:46+00:00");
+    assert.equal(limits.fetchedAt, "2026-07-10T01:00:00Z");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("collectors yield zeros/null when stores are absent", () => {
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), "council-usage-empty-"));
   try {
@@ -107,6 +131,7 @@ test("collectors yield zeros/null when stores are absent", () => {
     assert.equal(collectCodexTokens(path.join(empty, ".codex"), 0).sessions, 0);
     assert.equal(collectGrokTokens(path.join(empty, ".grok"), 0).sessions, 0);
     assert.equal(collectCodexRateLimits(path.join(empty, ".codex")), null);
+    assert.equal(collectGrokLimits(path.join(empty, ".grok")), null);
   } finally {
     fs.rmSync(empty, { recursive: true, force: true });
   }

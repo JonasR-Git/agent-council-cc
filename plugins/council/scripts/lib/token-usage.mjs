@@ -258,13 +258,58 @@ export async function fetchClaudeLimits(claudeDir, { timeoutMs = 8000 } = {}) {
   }
 }
 
+const GROK_LOG_TAIL_BYTES = 512 * 1024;
+
+/**
+ * The Grok CLI logs its billing/credits config ("billing: fetched credits
+ * config") into ~/.grok/logs/unified.jsonl on every run - weekly window only
+ * (Grok has no 5h window). Parses the newest complete entry from the log tail.
+ */
+export function collectGrokLimits(grokDir) {
+  const logFile = path.join(grokDir, "logs", "unified.jsonl");
+  let tail;
+  try {
+    const size = fs.statSync(logFile).size;
+    const start = Math.max(0, size - GROK_LOG_TAIL_BYTES);
+    const fd = fs.openSync(logFile, "r");
+    try {
+      const buffer = Buffer.alloc(size - start);
+      fs.readSync(fd, buffer, 0, buffer.length, start);
+      tail = buffer.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  const lines = tail.split("\n");
+  for (let i = lines.length - 1; i > 0; i -= 1) {
+    if (!lines[i].includes("creditUsagePercent")) continue;
+    try {
+      const entry = JSON.parse(lines[i]);
+      const config = entry?.ctx?.config;
+      if (!config || !Number.isFinite(Number(config.creditUsagePercent))) continue;
+      return {
+        window: config.currentPeriod?.type === "USAGE_PERIOD_TYPE_WEEKLY" ? "weekly" : config.currentPeriod?.type ?? "unknown",
+        usedPercent: Number(config.creditUsagePercent),
+        resetsAt: config.currentPeriod?.end ?? null,
+        fetchedAt: entry.ts ?? entry.time ?? null,
+        source: logFile
+      };
+    } catch {
+      /* partial or foreign line - keep scanning */
+    }
+  }
+  return null;
+}
+
 function formatWindow(name, w) {
   if (!w) return `  ${name}: (no data)`;
   const reset = w.resetsAt ? ` (resets ${w.resetsAt})` : "";
   return `  ${name}: ${w.usedPercent}% used${reset}`;
 }
 
-export function renderLimits({ claude, codex }) {
+export function renderLimits({ claude, codex, grok }) {
   const lines = ["Provider window limits:"];
   lines.push("claude (live via OAuth usage endpoint - undocumented, may change):");
   if (claude?.error) {
@@ -280,7 +325,14 @@ export function renderLimits({ claude, codex }) {
     lines.push(formatWindow(codex.primary?.window === "5h" ? "5h window" : codex.primary?.window ?? "primary", codex.primary));
     lines.push(formatWindow(codex.secondary?.window === "weekly" ? "weekly" : codex.secondary?.window ?? "secondary", codex.secondary));
   }
-  lines.push("grok: window limits are not exposed locally or headless - check the xAI console (grok.com).");
+  lines.push("grok (local CLI billing log; weekly window only - Grok has no 5h window):");
+  if (!grok) {
+    lines.push("  unavailable: no billing entry in ~/.grok/logs/unified.jsonl (run the grok CLI once)");
+  } else {
+    lines.push(
+      `  ${grok.window}: ${grok.usedPercent}% used${grok.resetsAt ? ` (resets ${grok.resetsAt})` : ""}${grok.fetchedAt ? ` [as of ${grok.fetchedAt}]` : ""}`
+    );
+  }
   return lines.join("\n");
 }
 

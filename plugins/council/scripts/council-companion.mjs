@@ -15,6 +15,7 @@ import { runSolve } from "./lib/solve.mjs";
 import {
   collectAllTokenUsage,
   collectCodexRateLimits,
+  collectGrokLimits,
   fetchClaudeLimits,
   renderLimits,
   renderTokenUsage
@@ -849,7 +850,8 @@ async function handleUsage(argv) {
   const limits = options.limits
     ? {
         claude: await fetchClaudeLimits(path.join(homeDir, ".claude")),
-        codex: collectCodexRateLimits(path.join(homeDir, ".codex"))
+        codex: collectCodexRateLimits(path.join(homeDir, ".codex")),
+        grok: collectGrokLimits(path.join(homeDir, ".grok"))
       }
     : null;
   const jobs = listJobs(root).map((slim) => readJobFile(root, slim.id) ?? slim);

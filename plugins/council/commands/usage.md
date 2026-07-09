@@ -16,7 +16,8 @@ What each part shows:
     change; the token is only sent to api.anthropic.com).
   - **Codex**: 5h + weekly used % with reset times, parsed **locally** from the newest
     rollout snapshot in `~/.codex/sessions` (no network).
-  - **Grok**: not exposed locally or headless; point the user to the xAI console.
+  - **Grok**: weekly used % with period end, parsed **locally** from the CLI billing
+    log (`~/.grok/logs/unified.jsonl`; refreshed on every grok run). Grok has no 5h window.
 - `--tokens` - token consumption over the last `--days` (default 7), parsed from the
   local session logs of all three CLIs (`~/.claude`, `~/.codex`, `~/.grok`).
 - Always included: council job statistics for this workspace (jobs per kind, per-agent
