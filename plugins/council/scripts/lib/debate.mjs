@@ -60,7 +60,13 @@ export async function runDebateRounds(cwd, backends, options, entries) {
   }
 
   const results = [];
-  const capped = entries.slice(0, MAX_ENTRIES_PER_ROUND);
+  const severityRank = { P0: 0, P1: 1, P2: 2, nit: 3 };
+  const capped = [...entries]
+    .sort(
+      (a, b) =>
+        (severityRank[a.payload?.severity] ?? 2) - (severityRank[b.payload?.severity] ?? 2)
+    )
+    .slice(0, MAX_ENTRIES_PER_ROUND);
   const opts = debateOptions(options);
 
   const rebuttals = await Promise.all(

@@ -89,6 +89,11 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
 export function runCommandAsync(command, args = [], options = {}) {
   return new Promise((resolve) => {
     const prepared = prepareSpawn(command, args);
+    // On POSIX a tree-kill needs a process group leader: detach by default
+    // whenever a timeout may have to kill the child's whole tree.
+    const detached =
+      options.detached ??
+      (process.platform !== "win32" && options.timeoutMs != null && Number(options.timeoutMs) > 0);
     let child;
     try {
       child = spawn(prepared.command, prepared.args, {
@@ -96,7 +101,7 @@ export function runCommandAsync(command, args = [], options = {}) {
         env: options.env ?? process.env,
         shell: prepared.shell,
         windowsHide: true,
-        detached: Boolean(options.detached),
+        detached: Boolean(detached),
         stdio: ["ignore", "pipe", "pipe"]
       });
     } catch (error) {

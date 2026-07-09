@@ -201,6 +201,9 @@ export function mergeOptionsWithPolicy(options, policy) {
 
 function normalizeSeverityList(value) {
   const list = Array.isArray(value) ? value : String(value ?? "").split(",");
+  // "all" (or an explicit empty policy list) means: critique every finding.
+  if (Array.isArray(value) && value.length === 0) return [];
+  if (list.some((s) => String(s).trim().toLowerCase() === "all")) return [];
   const valid = new Set(["P0", "P1", "P2", "nit"]);
   const normalized = list
     .map((s) => {

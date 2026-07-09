@@ -174,7 +174,11 @@ function fuzzyMatch(a, b) {
   if (!file || file !== normalizedFile(b.file)) {
     return false;
   }
-  return lineClose(a, b) || titleSimilarity(a.title, b.title) >= 0.4;
+  // Line proximity alone must never merge: two unrelated findings a few lines
+  // apart would fabricate consensus. Nearby lines only count with at least one
+  // shared title token; otherwise require strong title similarity.
+  const similarity = titleSimilarity(a.title, b.title);
+  return (lineClose(a, b) && similarity > 0) || similarity >= 0.4;
 }
 
 function shouldMergeBuckets(a, b) {

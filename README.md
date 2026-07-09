@@ -130,7 +130,7 @@ debate_rounds: 0
 solve_writer: claude
 ```
 
-`skip_paths` applies to Git status/diff pathspecs and untracked file body inclusion. `agent_timeout_minutes` bounds Codex/Grok subprocesses.
+`skip_paths` applies to Git status/diff pathspecs and untracked file body inclusion in the council deliberate/solve context; the cheaper `/council:review` and `/council:adversarial` paths delegate context collection to the codex/grok companions and do not apply `skip_paths`. `agent_timeout_minutes` bounds Codex/Grok subprocesses. `peer_critique_severities: [all]` critiques every finding.
 
 Codex reasoning effort comes from `~/.codex/config.toml` (`model_reasoning_effort`). The council `codex_effort` policy key and `--codex-effort` flag are accepted for compatibility but ignored.
 

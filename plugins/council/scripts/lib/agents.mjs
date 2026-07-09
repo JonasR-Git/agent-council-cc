@@ -31,13 +31,24 @@ export function writeTempPrompt(content) {
 
 export async function waitForFile(waitPath, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  // Return only once the file size is non-zero and stable across two polls —
+  // the writer may still be mid-write when the file first appears.
+  let lastSize = -1;
   while (Date.now() <= deadline) {
     if (fs.existsSync(waitPath)) {
-      return waitPath;
+      try {
+        const size = fs.statSync(waitPath).size;
+        if (size > 0 && size === lastSize) {
+          return waitPath;
+        }
+        lastSize = size;
+      } catch {
+        lastSize = -1;
+      }
     }
     await delay(2000);
   }
-  return null;
+  return fs.existsSync(waitPath) ? waitPath : null;
 }
 
 /**
@@ -109,7 +120,11 @@ export async function runCodexStructured(cwd, backends, options, prompt, label) 
       cwd,
       timeoutMs: options.agentTimeoutMs
     });
-    if (result.status !== 0 && !result.timedOut && !result.stdout?.trim()) {
+    // The adversarial-review fallback only carries a short focus string, never
+    // the structured prompt — it can only stand in for a plain R1 review.
+    // R2/debate/solve calls must fail visibly instead of degrading silently.
+    const fallbackAllowed = String(label ?? "") === "r1";
+    if (result.status !== 0 && !result.timedOut && !result.stdout?.trim() && fallbackAllowed) {
       const focus = `Return ONLY JSON findings. Context label: ${label}. Follow structured review schema with agent=codex.`;
       const fallbackArgs = [companion, "adversarial-review"];
       if (options.base) fallbackArgs.push("--base", options.base);

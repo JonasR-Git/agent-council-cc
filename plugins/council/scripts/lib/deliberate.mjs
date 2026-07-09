@@ -54,11 +54,20 @@ export function filterDocForCritique(doc, severities) {
 export function buildEvidence(repoRoot, findings, fallbackContent = "") {
   const sections = [];
   let totalChars = 0;
+  const rootResolved = path.resolve(repoRoot);
   for (const f of findings ?? []) {
     if (!f?.file) continue;
+    // Findings come from model output — confine evidence reads to the repo.
+    const resolved = path.resolve(rootResolved, String(f.file));
+    const insideRepo =
+      process.platform === "win32"
+        ? resolved.toLowerCase() === rootResolved.toLowerCase() ||
+          resolved.toLowerCase().startsWith(`${rootResolved.toLowerCase()}${path.sep}`)
+        : resolved === rootResolved || resolved.startsWith(`${rootResolved}${path.sep}`);
+    if (!insideRepo) continue;
     let text;
     try {
-      text = fs.readFileSync(path.join(repoRoot, f.file), "utf8");
+      text = fs.readFileSync(resolved, "utf8");
     } catch {
       continue;
     }

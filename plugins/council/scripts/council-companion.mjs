@@ -411,6 +411,29 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
     appendLogLine(job.logFile, warning);
   }
 
+  // Any throw below (bad base ref, git failure, empty problem, ...) must not
+  // leave the job stuck in status=running — mark it failed, then rethrow.
+  try {
+    return await executeKind();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const failed = {
+      ...job,
+      status: "failed",
+      phase: "error",
+      exitCode: 1,
+      stderr: message,
+      output: message,
+      finishedAt: nowIso(),
+      updatedAt: nowIso(),
+      pid: null
+    };
+    upsertJob(root, failed);
+    appendLogLine(job.logFile, `Failed: ${message}`);
+    throw error;
+  }
+
+  async function executeKind() {
   if (solve) {
     appendLogLine(job.logFile, "Solve protocol: independent plans -> plan critique -> ranking");
     const solveRun = await runSolve(cwd, backends, {
@@ -419,9 +442,14 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
     });
     const r1Failed = solveRun.r1.some((r) => !r.skipped && r.status !== 0);
     const allSkipped = solveRun.r1.every((r) => r.skipped && r.agent !== "claude");
+    const planParseFailures = solveRun.plans.filter((p) => !p.parseOk).length;
     const finished = {
       ...job,
-      status: allSkipped ? "failed" : r1Failed ? "completed_with_errors" : "completed",
+      status: allSkipped
+        ? "failed"
+        : r1Failed || planParseFailures
+          ? "completed_with_errors"
+          : "completed",
       phase: "done",
       exitCode: allSkipped ? 1 : 0,
       results: [...solveRun.r1, ...solveRun.r2],
@@ -502,6 +530,7 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
   upsertJob(root, finished);
   appendLogLine(job.logFile, `Stored report (${report.length} chars)`);
   return finished;
+  }
 }
 
 function spawnBackgroundWorker(cwd, jobId) {
