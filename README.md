@@ -23,7 +23,9 @@ Claude Code plugins that wire **Grok Build** and a **multi-agent council** (Code
 | `/council:solve` | 3-way problem solving: independent plans, scored critique, synthesis, one writer, council review |
 | `/council:review` | Faster dual Codex + Grok review |
 | `/council:adversarial` | Dual adversarial review |
-| `/council:status` / `result` / `cancel` | Council job control |
+| `/council:status` / `result` / `cancel` | Council job control (`result --summary` prints only the decision-relevant sections) |
+| `/council:wait` | Block until a background job finishes (watchers get process-exit semantics) |
+| `/council:usage` | Per-kind job stats + per-agent call/failure/timeout counts, with provider quota pointers |
 
 ## Requirements
 
@@ -159,8 +161,11 @@ skip_paths:
 peer_critique_severities: [P0, P1]
 r2_effort: medium
 debate_rounds: 0
+debate_resume: false
 solve_writer: claude
 ```
+
+`debate_resume: true` lets Grok authors defend contested findings inside their own R1 session (context continuity via `--resume`); Codex debate turns stay fresh slim calls because its companion only supports resume-last.
 
 `skip_paths` applies to Git status/diff pathspecs and untracked file body inclusion in the council deliberate/solve context; the cheaper `/council:review` and `/council:adversarial` paths delegate context collection to the codex/grok companions and do not apply `skip_paths`. `agent_timeout_minutes` bounds Codex/Grok subprocesses. `peer_critique_severities: [all]` critiques every finding.
 
