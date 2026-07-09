@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -11,6 +12,13 @@ import { READONLY_DISALLOWED_TOOLS, runDeliberation } from "./lib/deliberate.mjs
 import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover.mjs";
 import { loadPolicy, mergeOptionsWithPolicy } from "./lib/policy.mjs";
 import { runSolve } from "./lib/solve.mjs";
+import {
+  collectAllTokenUsage,
+  collectCodexRateLimits,
+  fetchClaudeLimits,
+  renderLimits,
+  renderTokenUsage
+} from "./lib/token-usage.mjs";
 import { runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -37,7 +45,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs review|adversarial|deliberate [flags] [focus text]",
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--timeout <s>] [--interval <s>]",
-      "  node scripts/council-companion.mjs usage [--json]",
+      "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
       "  node scripts/council-companion.mjs result [job-id] [--summary] [--json]",
       "",
       "Flags:",
@@ -823,10 +831,27 @@ async function handleWait(argv) {
   if (!finished) process.exitCode = 1;
 }
 
-function handleUsage(argv) {
-  const { options } = parseCommandInput(argv, { booleanOptions: ["json", "all"] });
+async function handleUsage(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["days"],
+    booleanOptions: ["json", "all", "tokens", "limits"]
+  });
   const cwd = process.cwd();
   const root = workspaceRoot(cwd);
+  const days = options.days != null ? Number(options.days) : 7;
+  if (!Number.isFinite(days) || days <= 0) {
+    throw new Error("--days must be a positive number");
+  }
+  const homeDir = os.homedir();
+  const tokens = options.tokens
+    ? collectAllTokenUsage({ homeDir, sinceMs: Date.now() - days * 86_400_000 })
+    : null;
+  const limits = options.limits
+    ? {
+        claude: await fetchClaudeLimits(path.join(homeDir, ".claude")),
+        codex: collectCodexRateLimits(path.join(homeDir, ".codex"))
+      }
+    : null;
   const jobs = listJobs(root).map((slim) => readJobFile(root, slim.id) ?? slim);
   const kinds = {};
   const agents = {};
@@ -852,10 +877,20 @@ function handleUsage(argv) {
     "Grok: the xAI console (grok.com) shows plan usage."
   ];
   if (options.json) {
-    outputResult({ stateDir: resolveStateDir(cwd), jobs: jobs.length, kinds, agents, notes }, true);
+    outputResult(
+      { stateDir: resolveStateDir(cwd), jobs: jobs.length, kinds, agents, tokens, limits, notes },
+      true
+    );
     return;
   }
-  const lines = [`Council usage (${jobs.length} jobs in this workspace):`];
+  const lines = [];
+  if (limits) {
+    lines.push(renderLimits(limits), "");
+  }
+  if (tokens) {
+    lines.push(renderTokenUsage(tokens, days), "");
+  }
+  lines.push(`Council usage (${jobs.length} jobs in this workspace):`);
   for (const [kind, entry] of Object.entries(kinds)) {
     const statuses = Object.entries(entry.byStatus)
       .map(([status, count]) => `${status}=${count}`)
@@ -934,7 +969,7 @@ async function main() {
         await handleWait(rest);
         break;
       case "usage":
-        handleUsage(rest);
+        await handleUsage(rest);
         break;
       case "cancel":
         handleCancel(rest);
