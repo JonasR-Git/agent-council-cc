@@ -4,7 +4,8 @@ import test from "node:test";
 
 const pairs = [
   ["plugins/council/scripts/lib/args.mjs", "plugins/grok/scripts/lib/args.mjs"],
-  ["plugins/council/scripts/lib/process.mjs", "plugins/grok/scripts/lib/process.mjs"]
+  ["plugins/council/scripts/lib/process.mjs", "plugins/grok/scripts/lib/process.mjs"],
+  ["plugins/council/scripts/lib/markdown-fence.mjs", "plugins/grok/scripts/lib/markdown-fence.mjs"]
 ];
 
 test("shared duplicated libs stay byte-identical", () => {

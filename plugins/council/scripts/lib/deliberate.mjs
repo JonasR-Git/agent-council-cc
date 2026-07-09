@@ -21,6 +21,7 @@ import {
   slimFindingsDoc
 } from "./findings.mjs";
 import { collectReviewContext, resolveReviewTarget } from "./git-context.mjs";
+import { wrapMarkdownFence } from "./markdown-fence.mjs";
 
 export { READONLY_DISALLOWED_TOOLS, runCodexStructured, runGrokStructured };
 
@@ -82,7 +83,7 @@ export function buildEvidence(repoRoot, findings, fallbackContent = "") {
     if (snippet.length > EVIDENCE_PER_FINDING_CHARS) {
       snippet = `${snippet.slice(0, EVIDENCE_PER_FINDING_CHARS)}\n[... truncated ...]`;
     }
-    const section = `### ${f.id ?? "finding"} — ${f.file}:${f.line ?? "?"}\n\`\`\`\n${snippet}\n\`\`\``;
+    const section = `### ${f.id ?? "finding"} — ${f.file}:${f.line ?? "?"}\n${wrapMarkdownFence(snippet)}`;
     if (totalChars + section.length > EVIDENCE_TOTAL_CHARS) break;
     totalChars += section.length;
     sections.push(section);

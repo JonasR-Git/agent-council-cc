@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { closeDanglingFence, wrapMarkdownFence } from "./markdown-fence.mjs";
 import { runCommand, runCommandChecked } from "./process.mjs";
 
 const MAX_DIFF_CHARS = 120_000;
@@ -141,7 +142,7 @@ function clip(text, max = MAX_DIFF_CHARS) {
   if (text.length <= max) {
     return text;
   }
-  return `${text.slice(0, max)}\n\n[... truncated ${text.length - max} chars ...]`;
+  return closeDanglingFence(`${text.slice(0, max)}\n\n[... truncated ${text.length - max} chars ...]`);
 }
 
 function hashLite(text) {
@@ -214,7 +215,7 @@ function collectUntrackedSections(repoRoot, skipPaths) {
     if (isSkipped(file, skipRegexps) || likelyBinaryFile(repoRoot, file)) {
       continue;
     }
-    sections.push(["", `## new file: ${file}`, "```", readUntrackedFile(repoRoot, file), "```"].join("\n"));
+    sections.push(["", `## new file: ${file}`, wrapMarkdownFence(readUntrackedFile(repoRoot, file))].join("\n"));
   }
   return sections;
 }
