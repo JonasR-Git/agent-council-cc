@@ -3,3 +3,5 @@ node_modules/
 *.log
 .idea/
 .vscode/
+.council-claude-r1.json
+.council-*.json

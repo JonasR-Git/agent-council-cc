@@ -3,14 +3,19 @@ export function splitRawArgumentString(raw) {
   if (!text) {
     return [];
   }
+
   const tokens = [];
   let current = "";
   let quote = null;
+
   for (let i = 0; i < text.length; i += 1) {
     const ch = text[i];
     if (quote) {
-      if (ch === quote) quote = null;
-      else current += ch;
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
       continue;
     }
     if (ch === '"' || ch === "'") {
@@ -26,7 +31,10 @@ export function splitRawArgumentString(raw) {
     }
     current += ch;
   }
-  if (current) tokens.push(current);
+
+  if (current) {
+    tokens.push(current);
+  }
   return tokens;
 }
 
@@ -43,10 +51,12 @@ export function parseArgs(argv, config = {}) {
       positionals.push(token);
       continue;
     }
+
     if (token === "--") {
       positionals.push(...argv.slice(i + 1));
       break;
     }
+
     let name = token.startsWith("--") ? token.slice(2) : token.slice(1);
     let inlineValue = null;
     if (name.includes("=")) {
@@ -54,11 +64,14 @@ export function parseArgs(argv, config = {}) {
       inlineValue = name.slice(eq + 1);
       name = name.slice(0, eq);
     }
+
     name = aliasMap[name] ?? name;
+
     if (booleanOptions.has(name)) {
       options[name] = true;
       continue;
     }
+
     if (valueOptions.has(name)) {
       if (inlineValue != null) {
         options[name] = inlineValue;
@@ -72,7 +85,13 @@ export function parseArgs(argv, config = {}) {
       i += 1;
       continue;
     }
-    positionals.push(token);
+
+    const known = [...valueOptions, ...booleanOptions]
+      .sort((a, b) => a.localeCompare(b))
+      .map((flag) => `--${flag}`)
+      .join(", ");
+    throw new Error(`Unknown flag --${name}. Known flags: ${known || "(none)"}`);
   }
+
   return { options, positionals };
 }

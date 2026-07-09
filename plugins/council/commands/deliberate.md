@@ -1,6 +1,6 @@
 ---
-description: 3-agent deliberation — independent reviews then peer critique (Claude + Codex + Grok)
-argument-hint: "[--wait|--background] [--base <ref>] [--codex-model <id>] [--grok-model <id>] [focus text]"
+description: 3-agent deliberation - independent reviews then peer critique (Claude + Codex + Grok)
+argument-hint: "[--wait|--background] [--base <ref>] [--codex-model <id>] [--grok-model <id>] [--claude-findings <path>|--claude-findings-wait <path> --wait-timeout <seconds>] [focus text]"
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), Write, AskUserQuestion
 ---
@@ -14,11 +14,11 @@ Raw arguments:
 
 ## Protocol (follow exactly)
 
-### Phase A — YOU (Claude) independent review FIRST
+### Phase A - YOU (Claude) independent review FIRST
 
 1. Inspect the review target (working tree or `--base` branch) with git + code tools.
 2. Write structured findings **without** calling Codex/Grok and **without** reading their opinions.
-3. Save JSON to a temp file in the repo (or OS temp), e.g. `.council-claude-r1.json`:
+3. Save JSON to an OS temp path **outside the repo**, for example `%TEMP%\council-claude-r1.json` on Windows or `/tmp/council-claude-r1.json` on POSIX. Do not write it in the repo root: untracked file bodies are included in R1 review input, so repo-local scratch JSON contaminates Codex/Grok context.
 
 ```json
 {
@@ -40,25 +40,31 @@ Raw arguments:
 }
 ```
 
-### Phase B — Codex + Grok (R1 independent + R2 peer critique)
+### Phase B - Codex + Grok (R1 independent + R2 peer critique)
 
-Run (prefer background for large diffs):
+Run after Phase A finishes:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings .council-claude-r1.json $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings "$TMPDIR/council-claude-r1.json" $ARGUMENTS
+```
+
+Parallel mode for large reviews: start the companion first, then write the Claude JSON file when Phase A ends:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings-wait "$TMPDIR/council-claude-r1.json" --wait-timeout 600 $ARGUMENTS
 ```
 
 What the companion does:
 - **Round 1:** Codex and Grok each produce independent structured findings (parallel).
-- **Round 2:** Grok critiques Codex findings; Codex critiques Grok findings; both critique Claude if the file was provided.
+- **Round 2:** Grok critiques Codex findings; Codex critiques Grok findings; both critique Claude if the file was provided or appeared in wait mode.
 - Merges consensus vs unique + peer votes into one report.
 
-### Phase C — YOU peer-evaluate and decide
+### Phase C - YOU peer-evaluate and decide
 
 After the report (or `/council:result`):
 1. Vote on Codex/Grok consensus items: agree / disagree / uncertain.
 2. Scrutinize unique findings (especially auth, concurrency, data-loss).
-3. Produce a **decision table**: Fix now | Verify | Ignore — with `file:line` checks.
+3. Produce a **decision table**: Fix now | Verify | Ignore - with `file:line` checks.
 4. **Do not implement fixes** unless the user asks.
 
 ## Rules

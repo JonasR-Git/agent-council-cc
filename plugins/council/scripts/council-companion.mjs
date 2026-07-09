@@ -7,7 +7,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
-import { runDeliberation } from "./lib/deliberate.mjs";
+import { READONLY_DISALLOWED_TOOLS, runDeliberation } from "./lib/deliberate.mjs";
 import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover.mjs";
 import { loadPolicy, mergeOptionsWithPolicy } from "./lib/policy.mjs";
 import { runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
@@ -35,12 +35,13 @@ function printUsage() {
       "Flags:",
       "  --wait|--background  --base <ref>  --scope auto|working-tree|branch",
       "  --codex-model <id>  --grok-model <id>  --codex-effort <l>  --grok-effort <l>",
-      "  --skip-codex  --skip-grok  --claude-findings <path>  --json",
+      "  --skip-codex  --skip-grok  --claude-findings <path>  --claude-findings-wait <path>",
+      "  --wait-timeout <seconds>  --json",
       "",
       "Modes:",
-      "  review       — parallel Codex + Grok review (single round)",
-      "  adversarial  — same, adversarial framing",
-      "  deliberate   — Round1 independent → Round2 peer critique (+ optional Claude file)",
+      "  review       - parallel Codex + Grok review (single round)",
+      "  adversarial  - same, adversarial framing",
+      "  deliberate   - Round1 independent -> Round2 peer critique (+ optional Claude file)",
       "",
       "Policy file (repo root): .council.yml | .council.json",
       "Models default from policy or ~/.codex/config.toml + ~/.grok/config.toml"
@@ -95,7 +96,8 @@ async function handleSetup(argv) {
       default_mode: policy.default_mode,
       codex_model: policy.codex_model,
       grok_model: policy.grok_model,
-      focus: policy.focus
+      focus: policy.focus,
+      agent_timeout_minutes: policy.agent_timeout_minutes
     },
     stateDir: resolveStateDir(cwd),
     nextSteps: []
@@ -129,7 +131,7 @@ async function handleSetup(argv) {
     `  codex cli: ${backends.codex.cli.available ? backends.codex.cli.detail : backends.codex.cli.detail}`,
     `  grok companion: ${backends.grok.companionAvailable ? backends.grok.companion : "not found"}`,
     `  grok cli: ${backends.grok.cli.available ? backends.grok.cli.detail : backends.grok.cli.detail}`,
-    `  policy: ${policy._source ?? "(none — using defaults)"}`,
+    `  policy: ${policy._source ?? "(none - using defaults)"}`,
     `  state: ${report.stateDir}`,
     "Next:"
   ];
@@ -138,8 +140,6 @@ async function handleSetup(argv) {
 }
 
 function resolveAgentModels(options = {}) {
-  // Per-agent flags win. Legacy --model applies to both only when the
-  // specific flag is omitted (discouraged — different vendors).
   const legacy = options.model ?? null;
   return {
     codexModel: options.codexModel ?? options["codex-model"] ?? legacy ?? null,
@@ -154,8 +154,6 @@ function buildCodexReviewArgs(options, adversarial, focusText) {
   const args = [];
   if (options.base) args.push("--base", options.base);
   if (options.scope) args.push("--scope", options.scope);
-  // codex-companion review only accepts --model (not --effort) among model knobs.
-  // Effort for Codex reviews comes from ~/.codex/config.toml model_reasoning_effort.
   if (codexModel) args.push("--model", codexModel);
   if (adversarial && focusText) args.push(focusText);
   return args;
@@ -184,8 +182,10 @@ async function runCodexReview(cwd, backends, options, adversarial, focusText) {
   const command = adversarial ? "adversarial-review" : "review";
   const childArgs = buildCodexReviewArgs(options, adversarial, focusText);
   const args = [backends.codex.companion, command, ...childArgs];
-  // Real OpenAI codex-plugin companion → local Codex CLI / app-server.
-  const result = await runCommandAsync(process.execPath, args, { cwd });
+  const result = await runCommandAsync(process.execPath, args, {
+    cwd,
+    timeoutMs: options.agentTimeoutMs
+  });
   return {
     agent: "codex",
     backend: "codex-companion",
@@ -195,6 +195,8 @@ async function runCodexReview(cwd, backends, options, adversarial, focusText) {
     status: result.status,
     stdout: result.stdout,
     stderr: result.stderr,
+    timedOut: Boolean(result.timedOut),
+    truncated: Boolean(result.truncated),
     command: `node ${args.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`
   };
 }
@@ -210,8 +212,10 @@ async function runGrokReview(cwd, backends, options, adversarial, focusText) {
     const command = adversarial ? "adversarial-review" : "review";
     const childArgs = buildGrokReviewArgs(options, adversarial, focusText);
     const args = [backends.grok.companion, command, ...childArgs];
-    // Our grok-companion → local Grok Build CLI (`grok.exe`).
-    const result = await runCommandAsync(process.execPath, args, { cwd });
+    const result = await runCommandAsync(process.execPath, args, {
+      cwd,
+      timeoutMs: options.agentTimeoutMs
+    });
     return {
       agent: "grok",
       backend: "grok-companion",
@@ -221,11 +225,12 @@ async function runGrokReview(cwd, backends, options, adversarial, focusText) {
       status: result.status,
       stdout: result.stdout,
       stderr: result.stderr,
+      timedOut: Boolean(result.timedOut),
+      truncated: Boolean(result.truncated),
       command: `node ${args.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`
     };
   }
 
-  // Direct grok CLI fallback
   if (!backends.grok.cli.available) {
     return { agent: "grok", skipped: true, reason: "grok CLI not found" };
   }
@@ -251,7 +256,7 @@ async function runGrokReview(cwd, backends, options, adversarial, focusText) {
     cwd,
     "--always-approve",
     "--disallowed-tools",
-    "search_replace",
+    READONLY_DISALLOWED_TOOLS,
     "--max-turns",
     "40",
     "--output-format",
@@ -260,7 +265,7 @@ async function runGrokReview(cwd, backends, options, adversarial, focusText) {
   if (grokModel) args.push("--model", grokModel);
   if (grokEffort) args.push("--effort", grokEffort);
 
-  const result = await runCommandAsync(bin, args, { cwd });
+  const result = await runCommandAsync(bin, args, { cwd, timeoutMs: options.agentTimeoutMs });
   try {
     fs.unlinkSync(promptFile);
   } catch {
@@ -275,13 +280,19 @@ async function runGrokReview(cwd, backends, options, adversarial, focusText) {
     status: result.status,
     stdout: result.stdout,
     stderr: result.stderr,
+    timedOut: Boolean(result.timedOut),
+    truncated: Boolean(result.truncated),
     command: `${bin} ${args.filter((a) => a !== promptFile).join(" ")}`
   };
 }
 
+function formatExit(result) {
+  return `${result.status}${result.timedOut ? " (timed out)" : ""}${result.truncated ? " (output truncated)" : ""}`;
+}
+
 function renderCouncilReport(job, results) {
   const lines = [
-    `# Council Review — ${job.id}`,
+    `# Council Review - ${job.id}`,
     `Status: ${job.status}`,
     `Kind: ${job.kind}`,
     `Summary: ${job.summary}`,
@@ -303,7 +314,7 @@ function renderCouncilReport(job, results) {
     lines.push(`Backend: ${result.backend ?? "unknown"}`);
     lines.push(`Model: ${result.model ?? "default"}`);
     if (result.companion) lines.push(`Binary/companion: ${result.companion}`);
-    lines.push(`Exit: ${result.status}`);
+    lines.push(`Exit: ${formatExit(result)}`);
     if (result.command) lines.push(`Command: \`${result.command}\``);
     lines.push("");
     lines.push(result.stdout?.trim() || result.stderr?.trim() || "(no output)");
@@ -311,15 +322,30 @@ function renderCouncilReport(job, results) {
   }
 
   lines.push("## Claude synthesis checklist");
-  lines.push("1. List consensus findings (mentioned by ≥2 agents).");
+  lines.push("1. List consensus findings (mentioned by >=2 agents).");
   lines.push("2. List unique high-severity findings with file:line verification.");
   lines.push("3. Drop nits unless cheap and clearly correct.");
-  lines.push("4. Propose a minimal fix plan — do not implement unless the user asks.");
+  lines.push("4. Propose a minimal fix plan - do not implement unless the user asks.");
   lines.push("");
   return lines.join("\n");
 }
 
-async function executeCouncilReview(cwd, options) {
+function jobTitle(kind) {
+  if (kind === "deliberate") return "Council Deliberation";
+  if (kind === "adversarial") return "Council Adversarial Review";
+  return "Council Review";
+}
+
+function jobSummary(mergedOpts) {
+  const focusText = mergedOpts.focusText ?? "";
+  return focusText
+    ? focusText.slice(0, 100)
+    : mergedOpts.base
+      ? `branch vs ${mergedOpts.base}`
+      : "uncommitted / auto target";
+}
+
+async function executeCouncilReview(cwd, options, existingJob = null) {
   const backends = probeBackends(cwd, ROOT_DIR);
   const policy = loadPolicy(cwd);
   const mergedOpts = mergeOptionsWithPolicy(options, policy);
@@ -329,44 +355,65 @@ async function executeCouncilReview(cwd, options) {
   const root = workspaceRoot(cwd);
 
   const kind = deliberate ? "deliberate" : adversarial ? "adversarial" : "review";
-  const job = {
-    id: generateJobId("council"),
-    kind,
-    title: deliberate
-      ? "Council Deliberation"
-      : adversarial
-        ? "Council Adversarial Review"
-        : "Council Review",
-    summary: focusText
-      ? focusText.slice(0, 100)
-      : mergedOpts.base
-        ? `branch vs ${mergedOpts.base}`
-        : "uncommitted / auto target",
-    status: "running",
-    phase: deliberate ? "r1" : "running",
-    workspaceRoot: root,
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-    finishedAt: null,
-    pid: process.pid,
-    logFile: null,
-    exitCode: null,
-    results: null,
-    report: null,
-    deliberation: null
-  };
-  job.logFile = createJobLogFile(root, job.id);
+  const title = jobTitle(kind);
+  const summary = jobSummary(mergedOpts);
+  const job = existingJob
+    ? {
+        ...existingJob,
+        kind,
+        title,
+        summary,
+        status: "running",
+        phase: deliberate ? "r1" : "running",
+        workspaceRoot: root,
+        updatedAt: nowIso(),
+        finishedAt: null,
+        pid: process.pid,
+        exitCode: null,
+        results: null,
+        report: null,
+        output: null,
+        deliberation: null
+      }
+    : {
+        id: generateJobId("council"),
+        kind,
+        title,
+        summary,
+        status: "running",
+        phase: deliberate ? "r1" : "running",
+        workspaceRoot: root,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        finishedAt: null,
+        pid: process.pid,
+        logFile: null,
+        exitCode: null,
+        results: null,
+        report: null,
+        deliberation: null
+      };
+  job.createdAt = job.createdAt ?? nowIso();
+  job.logFile = job.logFile || createJobLogFile(root, job.id);
   upsertJob(root, job);
   appendLogLine(job.logFile, `Starting ${job.title}`);
   if (mergedOpts.policySource) appendLogLine(job.logFile, `Policy: ${mergedOpts.policySource}`);
+  if (mergedOpts.codexEffort) {
+    const warning =
+      "Codex reasoning effort comes from ~/.codex/config.toml (model_reasoning_effort); --codex-effort/codex_effort is ignored.";
+    console.error(warning);
+    appendLogLine(job.logFile, warning);
+  }
 
   if (deliberate) {
-    appendLogLine(job.logFile, "Deliberate protocol: R1 independent → R2 peer critique");
+    appendLogLine(job.logFile, "Deliberate protocol: R1 independent -> R2 peer critique");
     const deliberation = await runDeliberation(cwd, backends, {
       ...mergedOpts,
       skipCodex: mergedOpts.skipCodex,
       skipGrok: mergedOpts.skipGrok,
       claudeFindingsPath: mergedOpts.claudeFindingsPath,
+      claudeFindingsWaitPath: mergedOpts.claudeFindingsWaitPath,
+      waitTimeoutMs: mergedOpts.waitTimeoutMs,
       policyFocus: policy.focus
     });
     const r1Failed = deliberation.r1.some((r) => !r.skipped && r.status !== 0);
@@ -434,6 +481,15 @@ function spawnBackgroundWorker(cwd, jobId) {
   return child;
 }
 
+function secondsToMs(value, flagName) {
+  if (value == null) return null;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error(`${flagName} must be a positive number of seconds.`);
+  }
+  return Math.round(seconds * 1000);
+}
+
 async function handleReview(argv, adversarial, deliberate = false) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: [
@@ -445,12 +501,15 @@ async function handleReview(argv, adversarial, deliberate = false) {
       "codex-effort",
       "grok-effort",
       "claude-findings",
+      "claude-findings-wait",
+      "wait-timeout",
       "cwd"
     ],
     booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok"]
   });
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const focusText = positionals.join(" ").trim();
+  const waitTimeoutMs = secondsToMs(options["wait-timeout"], "--wait-timeout");
   const request = {
     adversarial,
     deliberate,
@@ -465,20 +524,21 @@ async function handleReview(argv, adversarial, deliberate = false) {
     claudeFindingsPath: options["claude-findings"]
       ? path.resolve(cwd, options["claude-findings"])
       : null,
+    claudeFindingsWaitPath: options["claude-findings-wait"]
+      ? path.resolve(cwd, options["claude-findings-wait"])
+      : null,
+    waitTimeoutMs,
     skipCodex: Boolean(options["skip-codex"]),
     skipGrok: Boolean(options["skip-grok"])
   };
 
   if (options.background) {
     const root = workspaceRoot(cwd);
+    const kind = deliberate ? "deliberate" : adversarial ? "adversarial" : "review";
     const job = {
       id: generateJobId("council"),
-      kind: deliberate ? "deliberate" : adversarial ? "adversarial" : "review",
-      title: deliberate
-        ? "Council Deliberation"
-        : adversarial
-          ? "Council Adversarial Review"
-          : "Council Review",
+      kind,
+      title: jobTitle(kind),
       summary: focusText.slice(0, 100) || (options.base ? `vs ${options.base}` : "auto"),
       status: "queued",
       phase: "queued",
@@ -490,19 +550,19 @@ async function handleReview(argv, adversarial, deliberate = false) {
       logFile: null,
       request,
       results: null,
-      report: null
+      report: null,
+      output: null
     };
     job.logFile = createJobLogFile(root, job.id);
+    upsertJob(root, job);
+    appendLogLine(job.logFile, "Queued council background run.");
+
     const child = spawnBackgroundWorker(cwd, job.id);
     job.pid = child.pid ?? null;
     job.status = "running";
     job.phase = "running";
+    job.updatedAt = nowIso();
     upsertJob(root, job);
-    appendLogLine(job.logFile, "Queued council background run.");
-
-    // Persist request on disk for worker
-    const full = { ...job, request };
-    upsertJob(root, full);
 
     outputResult(
       options.json
@@ -535,23 +595,7 @@ async function handleWorker(argv) {
 
   try {
     const request = job.request ?? {};
-    // Re-enter full executor but bind to existing job id by copying outcome
-    const outcome = await executeCouncilReview(cwd, request);
-    const finished = {
-      ...job,
-      status: outcome.status,
-      phase: "done",
-      exitCode: outcome.exitCode,
-      results: outcome.results,
-      deliberation: outcome.deliberation ?? null,
-      report: outcome.report,
-      output: outcome.report,
-      finishedAt: nowIso(),
-      updatedAt: nowIso(),
-      pid: null,
-      childJobId: outcome.id
-    };
-    upsertJob(root, finished);
+    await executeCouncilReview(cwd, request, job);
   } catch (error) {
     const finished = {
       ...job,
@@ -605,7 +649,7 @@ function handleStatus(argv) {
   }
   console.log("Council jobs (newest first):");
   for (const job of jobs.slice(0, options.all ? 50 : 10)) {
-    console.log(`  ${job.id}  ${String(job.status).padEnd(22)}  ${job.title} — ${job.summary ?? ""}`);
+    console.log(`  ${job.id}  ${String(job.status).padEnd(22)}  ${job.title} - ${job.summary ?? ""}`);
   }
   console.log("");
 }

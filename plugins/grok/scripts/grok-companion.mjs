@@ -348,11 +348,13 @@ function enqueueBackground(cwd, kind, payload) {
     request: payload
   };
   job.logFile = createJobLogFile(workspaceRoot, job.id);
+  upsertJob(workspaceRoot, job);
   appendLogLine(job.logFile, "Queued for background execution.");
   const child = spawnBackgroundWorker(cwd, kind, job.id);
   job.pid = child.pid ?? null;
   job.status = "running";
   job.phase = "running";
+  job.updatedAt = nowIso();
   upsertJob(workspaceRoot, job);
   return job;
 }

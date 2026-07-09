@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { workspaceRoot } from "./state.mjs";
 
-const DEFAULT_POLICY = {
+export const DEFAULT_POLICY = {
   version: 1,
   codex_model: null,
   grok_model: null,
@@ -17,7 +17,8 @@ const DEFAULT_POLICY = {
   skip_paths: [],
   max_turns_r1: 40,
   max_turns_r2: 25,
-  deliberate_peer: true
+  deliberate_peer: true,
+  agent_timeout_minutes: 30
 };
 
 /**
@@ -42,7 +43,7 @@ export function parseSimpleYaml(text) {
       continue;
     }
     const key = m[1];
-    let val = m[2];
+    let val = stripInlineComment(m[2].trimEnd()).trim();
 
     if (val === "|" || val === ">") {
       const block = [];
@@ -62,14 +63,14 @@ export function parseSimpleYaml(text) {
     }
 
     if (val === "" || val === null) {
-      // possible list follows
       const list = [];
       let j = i + 1;
       while (j < lines.length) {
         const l = lines[j];
         const lm = l.match(/^\s*-\s+(.*)$/);
         if (!lm) break;
-        list.push(stripQuotes(lm[1].trim()));
+        const item = stripInlineComment(lm[1].trimEnd()).trim();
+        list.push(stripQuotes(item));
         j += 1;
       }
       if (list.length) {
@@ -82,12 +83,11 @@ export function parseSimpleYaml(text) {
       continue;
     }
 
-    // inline list [a, b]
     if (val.startsWith("[") && val.endsWith("]")) {
       obj[key] = val
         .slice(1, -1)
         .split(",")
-        .map((s) => stripQuotes(s.trim()))
+        .map((s) => stripQuotes(stripInlineComment(s.trimEnd()).trim()))
         .filter(Boolean);
       i += 1;
       continue;
@@ -98,6 +98,19 @@ export function parseSimpleYaml(text) {
   }
 
   return obj;
+}
+
+function stripInlineComment(s) {
+  const trimmed = String(s ?? "").trimStart();
+  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+    return s;
+  }
+  for (let i = 0; i < s.length; i += 1) {
+    if (s[i] === "#" && (i === 0 || /\s/.test(s[i - 1]))) {
+      return s.slice(0, i).trimEnd();
+    }
+  }
+  return s;
 }
 
 function stripQuotes(s) {
@@ -146,6 +159,8 @@ export function loadPolicy(cwd) {
 }
 
 export function mergeOptionsWithPolicy(options, policy) {
+  const timeoutMinutes = Number(policy.agent_timeout_minutes ?? DEFAULT_POLICY.agent_timeout_minutes);
+  const policyTimeoutMs = Number.isFinite(timeoutMinutes) && timeoutMinutes > 0 ? timeoutMinutes * 60_000 : null;
   return {
     ...options,
     adversarial: Boolean(options.adversarial),
@@ -153,6 +168,9 @@ export function mergeOptionsWithPolicy(options, policy) {
     skipCodex: Boolean(options.skipCodex),
     skipGrok: Boolean(options.skipGrok),
     claudeFindingsPath: options.claudeFindingsPath ?? null,
+    claudeFindingsWaitPath: options.claudeFindingsWaitPath ?? null,
+    waitTimeoutMs: options.waitTimeoutMs ?? null,
+    agentTimeoutMs: options.agentTimeoutMs ?? policyTimeoutMs,
     base: options.base ?? policy.base ?? undefined,
     scope: options.scope ?? policy.scope ?? "auto",
     codexModel: options.codexModel ?? options["codex-model"] ?? policy.codex_model ?? options.model,
@@ -165,8 +183,8 @@ export function mergeOptionsWithPolicy(options, policy) {
     maxTurnsR1: options.maxTurnsR1 ?? policy.max_turns_r1 ?? 40,
     maxTurnsR2: options.maxTurnsR2 ?? policy.max_turns_r2 ?? 25,
     deliberatePeer: options.deliberatePeer ?? policy.deliberate_peer !== false,
-    requireConsensusFor: policy.require_consensus_for ?? [],
-    skipPaths: policy.skip_paths ?? [],
+    requireConsensusFor: options.requireConsensusFor ?? policy.require_consensus_for ?? [],
+    skipPaths: options.skipPaths ?? policy.skip_paths ?? [],
     policySource: policy._source
   };
 }

@@ -4,6 +4,10 @@ import path from "node:path";
 
 import { binaryAvailable, runCommand } from "./process.mjs";
 
+const READONLY_DISALLOWED_TOOLS =
+  "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal";
+const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+
 function resolveGrokBinary() {
   const fromEnv = process.env.GROK_BIN || process.env.GROK_PATH;
   if (fromEnv && fs.existsSync(fromEnv)) {
@@ -33,8 +37,6 @@ export function getGrokAvailability(cwd) {
 }
 
 export function getGrokAuthHint(cwd) {
-  const bin = resolveGrokBinary();
-  // Best-effort: auth.json presence; full login is interactive.
   const authFile = path.join(os.homedir(), ".grok", "auth.json");
   const hasAuthFile = fs.existsSync(authFile);
   if (!hasAuthFile) {
@@ -77,11 +79,7 @@ export function runGrokPrompt(cwd, options = {}) {
     args.push("--effort", options.effort);
   }
   if (options.readOnly) {
-    // Allow exploration tools; block file mutations.
-    args.push(
-      "--disallowed-tools",
-      "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video"
-    );
+    args.push("--disallowed-tools", READONLY_DISALLOWED_TOOLS);
   }
   if (options.alwaysApprove || options.write) {
     args.push("--always-approve");
@@ -94,7 +92,7 @@ export function runGrokPrompt(cwd, options = {}) {
   const result = runCommand(bin, args, {
     cwd,
     env: process.env,
-    timeout: options.timeoutMs ?? 0
+    timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   });
 
   try {

@@ -6,6 +6,7 @@ version: 1
 # Optional model overrides (else ~/.codex/config.toml + ~/.grok/config.toml)
 # codex_model: gpt-5.5
 # grok_model: grok-4.5
+# Codex effort is ignored here; set ~/.codex/config.toml model_reasoning_effort instead.
 # codex_effort: xhigh
 # grok_effort: high
 
@@ -16,12 +17,15 @@ default_mode: deliberate
 scope: auto
 # base: main
 
+# Per-agent command timeout.
+agent_timeout_minutes: 30
+
 # Always-on focus for this project (appended to R1 prompts)
 focus: |
   Soft-delete (deletedAt), auth ownership, concurrency/TOCTOU,
   compliance exports, i18n de+en, no Prisma in edge proxy.
 
-# Categories that need ≥2-agent consensus (or human) before acting on unique findings
+# Categories that need >=2-agent consensus (or human) before acting on unique findings
 require_consensus_for:
   - auth
   - concurrency

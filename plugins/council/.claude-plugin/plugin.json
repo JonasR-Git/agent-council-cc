@@ -1,6 +1,6 @@
 {
   "name": "council",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Multi-agent council: dual review + deliberate (independent then peer critique) with Codex + Grok + Claude.",
   "author": {
     "name": "local"

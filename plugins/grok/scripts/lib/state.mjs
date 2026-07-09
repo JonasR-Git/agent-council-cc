@@ -2,24 +2,17 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
-const STATE_VERSION = 1;
-const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+const STATE_ROOT_ENV = "AGENT_COUNCIL_GROK_STATE_DIR";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.homedir(), ".claude", "agent-council-state", "grok");
 const MAX_JOBS = 40;
+const ACTIVE_STATUSES = new Set(["running", "queued"]);
 
-function nowIso() {
+export function nowIso() {
   return new Date().toISOString();
-}
-
-function defaultState() {
-  return {
-    version: STATE_VERSION,
-    config: {},
-    jobs: []
-  };
 }
 
 export function resolveStateDir(cwd) {
@@ -34,8 +27,7 @@ export function resolveStateDir(cwd) {
     path.basename(workspaceRoot).replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") ||
     "workspace";
   const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+  const stateRoot = process.env[STATE_ROOT_ENV] || FALLBACK_STATE_ROOT_DIR;
   return path.join(stateRoot, `${slug}-${hash}`);
 }
 
@@ -47,52 +39,81 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
-export function loadState(cwd) {
-  const stateFile = path.join(resolveStateDir(cwd), "state.json");
-  if (!fs.existsSync(stateFile)) {
-    return defaultState();
+export function writeFileAtomic(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, data, "utf8");
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (error) {
+      const code = /** @type {NodeJS.ErrnoException} */ (error).code;
+      if (attempt === 0 && (code === "EPERM" || code === "EBUSY")) {
+        continue;
+      }
+      break;
+    }
   }
   try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
-  } catch {
-    return defaultState();
+    fs.writeFileSync(file, data, "utf8");
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
   }
-}
-
-export function saveState(cwd, state) {
-  ensureStateDir(cwd);
-  const stateFile = path.join(resolveStateDir(cwd), "state.json");
-  fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
 export function generateJobId(prefix = "job") {
   return `${prefix}-${randomBytes(4).toString("hex")}`;
 }
 
+function jobFile(cwd, jobId) {
+  return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+}
+
 export function writeJobFile(cwd, jobId, job) {
   ensureStateDir(cwd);
-  const file = path.join(resolveJobsDir(cwd), `${jobId}.json`);
-  fs.writeFileSync(file, `${JSON.stringify(job, null, 2)}\n`, "utf8");
+  const file = jobFile(cwd, jobId);
+  writeFileAtomic(file, `${JSON.stringify(job, null, 2)}\n`);
   return file;
 }
 
 export function readJobFile(cwd, jobId) {
-  const file = path.join(resolveJobsDir(cwd), `${jobId}.json`);
+  const file = jobFile(cwd, jobId);
   if (!fs.existsSync(file)) {
     return null;
   }
-  return JSON.parse(fs.readFileSync(file, "utf8"));
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
 }
 
-export function upsertJob(cwd, job) {
-  const state = loadState(cwd);
-  const idx = state.jobs.findIndex((j) => j.id === job.id);
-  const slim = {
+function readJobEntries(cwd) {
+  const dir = resolveJobsDir(cwd);
+  if (!fs.existsSync(dir)) {
+    return [];
+  }
+  return fs
+    .readdirSync(dir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => {
+      const file = path.join(dir, name);
+      try {
+        return { file, job: JSON.parse(fs.readFileSync(file, "utf8")) };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function slimJob(job) {
+  return {
     id: job.id,
     kind: job.kind,
     title: job.title,
@@ -100,25 +121,70 @@ export function upsertJob(cwd, job) {
     phase: job.phase,
     summary: job.summary,
     createdAt: job.createdAt,
-    updatedAt: job.updatedAt ?? nowIso(),
+    updatedAt: job.updatedAt,
     finishedAt: job.finishedAt ?? null,
     pid: job.pid ?? null,
     logFile: job.logFile ?? null,
     exitCode: job.exitCode ?? null
   };
-  if (idx >= 0) {
-    state.jobs[idx] = slim;
-  } else {
-    state.jobs.unshift(slim);
+}
+
+function createdAtMs(job) {
+  const time = Date.parse(job.createdAt ?? "");
+  return Number.isFinite(time) ? time : 0;
+}
+
+export function pruneJobs(cwd) {
+  const entries = readJobEntries(cwd);
+  if (entries.length <= MAX_JOBS) {
+    return;
   }
-  state.jobs = state.jobs.slice(0, MAX_JOBS);
-  saveState(cwd, state);
-  writeJobFile(cwd, job.id, job);
-  return job;
+
+  let count = entries.length;
+  const removable = entries
+    .filter(({ job }) => !ACTIVE_STATUSES.has(job.status))
+    .sort((a, b) => createdAtMs(a.job) - createdAtMs(b.job));
+
+  for (const { file, job } of removable) {
+    if (count <= MAX_JOBS) {
+      break;
+    }
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      /* ignore */
+    }
+    const logFiles = new Set([
+      job.logFile,
+      path.join(path.dirname(file), `${path.basename(file, ".json")}.log`)
+    ]);
+    for (const logFile of logFiles) {
+      if (!logFile) continue;
+      try {
+        fs.unlinkSync(logFile);
+      } catch {
+        /* ignore */
+      }
+    }
+    count -= 1;
+  }
+}
+
+export function upsertJob(cwd, job) {
+  const next = {
+    ...job,
+    updatedAt: job.updatedAt ?? nowIso()
+  };
+  writeJobFile(cwd, next.id, next);
+  pruneJobs(cwd);
+  return next;
 }
 
 export function listJobs(cwd) {
-  return loadState(cwd).jobs;
+  return readJobEntries(cwd)
+    .map(({ job }) => slimJob(job))
+    .sort((a, b) => createdAtMs(b) - createdAtMs(a))
+    .slice(0, MAX_JOBS);
 }
 
 export function createJobLogFile(cwd, jobId) {
@@ -129,10 +195,7 @@ export function createJobLogFile(cwd, jobId) {
 }
 
 export function appendLogLine(logFile, line) {
-  if (!logFile) {
-    return;
+  if (logFile) {
+    fs.appendFileSync(logFile, `${line}\n`, "utf8");
   }
-  fs.appendFileSync(logFile, `${line}\n`, "utf8");
 }
-
-export { nowIso };

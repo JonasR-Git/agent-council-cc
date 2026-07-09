@@ -19,22 +19,30 @@ description: >
 
 ## Deliberate protocol (3 agents)
 
-```
-Round 1 independent:  Claude → Codex → Grok   (no peeking)
+```text
+Round 1 independent:  Claude, Codex, Grok (no peeking)
 Round 2 peer:         Grok critiques Codex, Codex critiques Grok
                       (+ both critique Claude if file provided)
 Then:                 Claude final decision table (Fix/Verify/Ignore)
 ```
 
-Claude **must** write `.council-claude-r1.json` first, then run:
+Claude **must** write its R1 JSON outside the repo, preferably to an OS temp path. Repo-local scratch files contaminate review input because untracked file bodies are now included.
+
+Run after Claude R1 is written:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings .council-claude-r1.json
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings "$TMPDIR/council-claude-r1.json"
+```
+
+Or start Codex/Grok first and wait for the file:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings-wait "$TMPDIR/council-claude-r1.json" --wait-timeout 600
 ```
 
 ## Policy
 
-Repo file `.council.yml` (see marketplace `.council.example.yml`): models, focus, consensus categories.
+Repo file `.council.yml` (see marketplace `.council.example.yml`): models, focus, consensus categories, skip paths, and `agent_timeout_minutes`.
 
 ## Models
 

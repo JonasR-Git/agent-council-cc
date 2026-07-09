@@ -86,7 +86,11 @@ export function parseArgs(argv, config = {}) {
       continue;
     }
 
-    positionals.push(token);
+    const known = [...valueOptions, ...booleanOptions]
+      .sort((a, b) => a.localeCompare(b))
+      .map((flag) => `--${flag}`)
+      .join(", ");
+    throw new Error(`Unknown flag --${name}. Known flags: ${known || "(none)"}`);
   }
 
   return { options, positionals };
