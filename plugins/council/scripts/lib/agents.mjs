@@ -57,7 +57,7 @@ export async function waitForFile(waitPath, timeoutMs) {
 export async function runGrokStructured(cwd, backends, options, prompt) {
   const bin = backends.grok?.bin || findGrokBinary();
   const promptFile = writeTempPrompt(prompt);
-  const args = [
+  const baseArgs = [
     "--prompt-file",
     promptFile,
     "--cwd",
@@ -70,20 +70,35 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
     "--output-format",
     "plain"
   ];
+  const args = [...baseArgs];
+  const hasOverrides = Boolean(options.grokModel || options.grokEffort);
   if (options.grokModel) args.push("--model", options.grokModel);
   if (options.grokEffort) args.push("--effort", options.grokEffort);
 
   try {
-    const result = await runCommandAsync(bin, args, { cwd, timeoutMs: options.agentTimeoutMs });
+    let result = await runCommandAsync(bin, args, { cwd, timeoutMs: options.agentTimeoutMs });
+    let retriedWithoutOverrides = false;
+    // Valid model/effort ids depend on the CLI login (e.g. "grok models" may not
+    // list a configured id at all). Rather than failing the whole round, retry
+    // once with the CLI's own defaults.
+    if (
+      hasOverrides &&
+      result.status !== 0 &&
+      !result.timedOut &&
+      /invalid params|unknown model/i.test(`${result.stderr}\n${result.stdout}`)
+    ) {
+      result = await runCommandAsync(bin, baseArgs, { cwd, timeoutMs: options.agentTimeoutMs });
+      retriedWithoutOverrides = true;
+    }
     return {
       agent: "grok",
-      backend: "grok-cli",
+      backend: retriedWithoutOverrides ? "grok-cli (model/effort overrides rejected, CLI defaults used)" : "grok-cli",
       status: result.status,
       stdout: result.stdout,
       stderr: result.stderr,
       timedOut: Boolean(result.timedOut),
       truncated: Boolean(result.truncated),
-      model: options.grokModel ?? "(default)",
+      model: retriedWithoutOverrides ? "(CLI default after rejected override)" : options.grokModel ?? "(default)",
       command: `${bin} --prompt-file ...`
     };
   } finally {

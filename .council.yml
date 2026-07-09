@@ -2,10 +2,11 @@
 
 version: 1
 
-# Pinned per-repo (matching ~/.codex/config.toml + ~/.grok/config.toml).
+# Pinned per-repo (matching ~/.codex/config.toml).
 # Codex reasoning effort (xhigh) comes from ~/.codex/config.toml model_reasoning_effort.
 codex_model: gpt-5.6-sol
-grok_model: grok-4.5
+# grok_model intentionally NOT pinned: the installed Grok CLI login only offers
+# grok-composer-2.5-fast / grok-build ("grok models"); an invalid pin breaks runs.
 grok_effort: high
 
 # Default slash mode hint for humans/skills: review | deliberate
