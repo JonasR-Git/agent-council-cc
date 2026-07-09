@@ -1,0 +1,34 @@
+# Council policy for agent-council-cc (loaded automatically by /council:* commands).
+
+version: 1
+
+# Model overrides come from ~/.codex/config.toml + ~/.grok/config.toml;
+# uncomment to pin per-repo:
+# codex_model: gpt-5.5
+# grok_model: grok-4.5
+# codex_effort: xhigh
+# grok_effort: high
+
+# Default slash mode hint for humans/skills: review | deliberate
+default_mode: deliberate
+
+# Review target defaults
+scope: auto
+
+# Always-on focus for this project (appended to R1 prompts)
+focus: |
+  Node ESM plugin scripts: cross-platform correctness (Windows paths,
+  quoting/escaping when spawning codex/grok CLIs), child-process error
+  handling and timeouts, background-job state consistency under
+  concurrent runs, robust JSON parsing of CLI output, and consistency
+  between command markdown, prompts, and findings.schema.json.
+
+# Categories that need >=2-agent consensus (or human) before acting on unique findings
+require_consensus_for:
+  - security
+  - concurrency
+  - data-loss
+
+max_turns_r1: 40
+max_turns_r2: 25
+deliberate_peer: true

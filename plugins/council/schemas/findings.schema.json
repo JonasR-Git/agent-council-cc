@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/agent-council/findings.schema.json",
+  "title": "CouncilReviewFindings",
+  "type": "object",
+  "required": ["agent", "summary", "findings"],
+  "properties": {
+    "agent": {
+      "type": "string",
+      "description": "Reviewer id: claude | codex | grok"
+    },
+    "summary": {
+      "type": "string",
+      "description": "2-5 sentence overall assessment"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "approve_with_nits", "request_changes", "block"]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "title", "detail"],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": { "type": "string", "enum": ["P0", "P1", "P2", "nit"] },
+          "category": {
+            "type": "string",
+            "enum": [
+              "bug",
+              "security",
+              "concurrency",
+              "data-loss",
+              "auth",
+              "compliance",
+              "performance",
+              "design",
+              "test",
+              "dx",
+              "other"
+            ]
+          },
+          "title": { "type": "string" },
+          "detail": { "type": "string" },
+          "file": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"] },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+# Copy to repo root as `.council.yml` (or `.council.json`).
+# Loaded automatically by /council:* commands.
+
+version: 1
+
+# Optional model overrides (else ~/.codex/config.toml + ~/.grok/config.toml)
+# codex_model: gpt-5.5
+# grok_model: grok-4.5
+# codex_effort: xhigh
+# grok_effort: high
+
+# Default slash mode hint for humans/skills: review | deliberate
+default_mode: deliberate
+
+# Review target defaults
+scope: auto
+# base: main
+
+# Always-on focus for this project (appended to R1 prompts)
+focus: |
+  Soft-delete (deletedAt), auth ownership, concurrency/TOCTOU,
+  compliance exports, i18n de+en, no Prisma in edge proxy.
+
+# Categories that need ≥2-agent consensus (or human) before acting on unique findings
+require_consensus_for:
+  - auth
+  - concurrency
+  - data-loss
+  - compliance
+  - security
+
+skip_paths:
+  - content/blog/**
+  - content/courses/**
+
+max_turns_r1: 40
+max_turns_r2: 25
+deliberate_peer: true
