@@ -49,6 +49,9 @@ r2_effort: medium
 # Bounded debate on contested items (0 = off, max 2). Not a live chat:
 # one rebuttal per item, optionally one counter by the original critic.
 debate_rounds: 0
+# Let Grok authors argue in their own R1 session (real context continuity).
+# Codex has no thread-precise resume; its turns stay fresh slim calls.
+debate_resume: false
 
 # /council:solve - who implements the synthesized plan (exactly one writer)
 solve_writer: claude

@@ -143,14 +143,31 @@ export function rankPlans(plans, critiques) {
     .sort((a, b) => (b.avgOverall ?? 0) - (a.avgOverall ?? 0));
 }
 
+const SOURCE_EXTENSIONS = new Set([
+  ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".java", ".js", ".json", ".jsx", ".kt",
+  ".md", ".mjs", ".php", ".py", ".rb", ".rs", ".sh", ".sql", ".swift", ".toml",
+  ".ts", ".tsx", ".vue", ".yaml", ".yml"
+]);
+
+function hintPriority(file) {
+  // Source-like files first, shallow paths before deep ones - assets and
+  // generated trees should not crowd planners out of the fixed budget.
+  const ext = path.extname(file).toLowerCase();
+  const depth = file.split("/").length;
+  return (SOURCE_EXTENSIONS.has(ext) ? 0 : 1000) + depth;
+}
+
 function collectRepoHints(cwd) {
   const ls = runCommand("git", ["ls-files"], { cwd });
   let tree = "";
   if (ls.status === 0 && ls.stdout.trim()) {
     const files = ls.stdout.trim().split(/\r?\n/);
-    tree = files.slice(0, REPO_HINT_MAX_FILES).join("\n");
+    const prioritized = [...files].sort(
+      (a, b) => hintPriority(a) - hintPriority(b) || a.localeCompare(b)
+    );
+    tree = prioritized.slice(0, REPO_HINT_MAX_FILES).join("\n");
     if (files.length > REPO_HINT_MAX_FILES) {
-      tree += `\n[... ${files.length - REPO_HINT_MAX_FILES} more files ...]`;
+      tree += `\n[... ${files.length - REPO_HINT_MAX_FILES} more files (lower priority) ...]`;
     }
   } else {
     try {
@@ -240,7 +257,14 @@ export async function runSolve(cwd, backends, options = {}) {
     r1Jobs.push(Promise.resolve({ agent: "codex", skipped: true, reason: "skip", stdout: "" }));
   }
   if (!options.skipGrok) {
-    r1Jobs.push(runGrokStructured(cwd, backends, r1Opts, buildProposalPrompt("grok", problem, hints, options)));
+    r1Jobs.push(
+      runGrokStructured(
+        cwd,
+        backends,
+        { ...r1Opts, captureGrokSession: Boolean(options.debateResume) },
+        buildProposalPrompt("grok", problem, hints, options)
+      )
+    );
   } else {
     r1Jobs.push(Promise.resolve({ agent: "grok", skipped: true, reason: "skip", stdout: "" }));
   }
@@ -307,10 +331,12 @@ export async function runSolve(cwd, backends, options = {}) {
         const plan = parsedPlans.find((p) => p.agent === r.agent);
         if (!plan || plan.confidence < 0.7) return null;
         const critic = r.blockers.map((b) => b.from).find((from) => from !== r.agent && !skipped.has(from));
+        const grokR1 = r1Raw.find((raw) => raw.agent === "grok" && !raw.skipped);
         return {
           id: `plan-${r.agent}`,
           author: r.agent,
           critic: critic ?? null,
+          authorSessionId: r.agent === "grok" ? grokR1?.sessionId ?? null : null,
           payload: {
             title: `Plan by ${r.agent}`,
             summary: plan.summary,
@@ -325,6 +351,12 @@ export async function runSolve(cwd, backends, options = {}) {
 
   const report = renderSolveReport({ problem, options, r1Results, r2Results, plans, critiques, ranking, debates });
 
+  const sections = {
+    header: `Problem: ${problem.trim().split(/\r?\n/)[0]}`,
+    ranking: renderRankingSection(ranking),
+    synthesis: SYNTHESIS_INSTRUCTIONS
+  };
+
   return {
     mode: "solve",
     problem,
@@ -334,8 +366,33 @@ export async function runSolve(cwd, backends, options = {}) {
     debates,
     r1: r1Results,
     r2: r2Results,
-    report
+    report,
+    sections
   };
+}
+
+const SYNTHESIS_INSTRUCTIONS = [
+  "## Your turn (Claude) - synthesis",
+  "1. Take the best-ranked plan as the skeleton; graft the strongest improvements from the others.",
+  "2. Resolve or explicitly accept every blocker (debate outcomes above help).",
+  "3. Present the final plan to the user for approval BEFORE implementing.",
+  "4. Implementation: exactly ONE writer (policy solve_writer) on a dedicated branch; then /council:deliberate on the diff. The writer's own verdict does not count towards approval."
+].join("\n");
+
+function renderRankingSection(ranking) {
+  const lines = ["## Ranking (avg peer overall)"];
+  if (!ranking.length) {
+    lines.push("(no parseable plans)");
+  }
+  for (const [index, entry] of ranking.entries()) {
+    lines.push(
+      `${index + 1}. **${entry.agent}** - avg ${formatScore(entry.avgOverall)}/10 (${entry.votes} peer votes, ${entry.blockers.length} blockers)`
+    );
+    for (const blocker of entry.blockers) {
+      lines.push(`   - blocker (${blocker.from}): ${blocker.blocker}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 function formatScore(value) {

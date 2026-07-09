@@ -52,11 +52,30 @@ export async function waitForFile(waitPath, timeoutMs) {
 }
 
 /**
+ * Grok's json output format wraps the reply: { text, sessionId, ... }.
+ * Returns null when stdout is not such an envelope.
+ */
+export function parseGrokEnvelope(stdout) {
+  try {
+    const parsed = JSON.parse(String(stdout ?? "").trim());
+    if (parsed && typeof parsed === "object" && typeof parsed.text === "string") {
+      return { text: parsed.text, sessionId: parsed.sessionId ?? null };
+    }
+  } catch {
+    /* not an envelope */
+  }
+  return null;
+}
+
+/**
  * Run Grok headless with a full prompt (structured output expected).
+ * options.captureGrokSession: use the json envelope to capture a sessionId.
+ * options.resumeSessionId: continue an existing Grok session.
  */
 export async function runGrokStructured(cwd, backends, options, prompt) {
   const bin = backends.grok?.bin || findGrokBinary();
   const promptFile = writeTempPrompt(prompt);
+  const wantSession = Boolean(options.captureGrokSession);
   const baseArgs = [
     "--prompt-file",
     promptFile,
@@ -68,8 +87,9 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
     "--max-turns",
     String(options.maxTurns ?? 40),
     "--output-format",
-    "plain"
+    wantSession ? "json" : "plain"
   ];
+  if (options.resumeSessionId) baseArgs.push("--resume", String(options.resumeSessionId));
   const args = [...baseArgs];
   const hasOverrides = Boolean(options.grokModel || options.grokEffort);
   if (options.grokModel) args.push("--model", options.grokModel);
@@ -90,14 +110,24 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
       result = await runCommandAsync(bin, baseArgs, { cwd, timeoutMs: options.agentTimeoutMs });
       retriedWithoutOverrides = true;
     }
+    let stdout = result.stdout;
+    let sessionId = null;
+    if (wantSession && result.status === 0) {
+      const envelope = parseGrokEnvelope(result.stdout);
+      if (envelope) {
+        stdout = envelope.text;
+        sessionId = envelope.sessionId;
+      }
+    }
     return {
       agent: "grok",
       backend: retriedWithoutOverrides ? "grok-cli (model/effort overrides rejected, CLI defaults used)" : "grok-cli",
       status: result.status,
-      stdout: result.stdout,
+      stdout,
       stderr: result.stderr,
       timedOut: Boolean(result.timedOut),
       truncated: Boolean(result.truncated),
+      sessionId,
       model: retriedWithoutOverrides ? "(CLI default after rejected override)" : options.grokModel ?? "(default)",
       command: `${bin} --prompt-file ...`
     };

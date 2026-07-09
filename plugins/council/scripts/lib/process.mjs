@@ -23,6 +23,16 @@ function prepareSpawn(command, args = []) {
   if (!needsCmdShell(command)) {
     return { command, args, shell: false };
   }
+  // cmd.exe expands %VAR% even inside double quotes and offers no reliable
+  // in-quote escape. Shell-bound args are our own constants (git/taskkill
+  // flags, refs, paths) and never legitimately contain % - fail closed.
+  for (const token of [command, ...args]) {
+    if (String(token).includes("%")) {
+      throw new Error(
+        `Refusing to pass '%' through cmd.exe (argument: ${token}); use an absolute executable path instead.`
+      );
+    }
+  }
   return {
     command: [command, ...args].map(quoteForCmd).join(" "),
     args: [],
@@ -31,7 +41,20 @@ function prepareSpawn(command, args = []) {
 }
 
 export function runCommand(command, args = [], options = {}) {
-  const prepared = prepareSpawn(command, args);
+  let prepared;
+  try {
+    prepared = prepareSpawn(command, args);
+  } catch (error) {
+    return {
+      command,
+      args,
+      status: 1,
+      signal: null,
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+      error
+    };
+  }
   const result = spawnSync(prepared.command, prepared.args, {
     cwd: options.cwd,
     env: options.env,
@@ -88,7 +111,24 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
 
 export function runCommandAsync(command, args = [], options = {}) {
   return new Promise((resolve) => {
-    const prepared = prepareSpawn(command, args);
+    let prepared;
+    try {
+      prepared = prepareSpawn(command, args);
+    } catch (error) {
+      resolve({
+        command,
+        args,
+        status: 1,
+        signal: null,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+        error,
+        pid: null,
+        timedOut: false,
+        truncated: false
+      });
+      return;
+    }
     // On POSIX a tree-kill needs a process group leader: detach by default
     // whenever a timeout may have to kill the child's whole tree.
     const detached =

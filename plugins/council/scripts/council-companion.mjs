@@ -12,8 +12,11 @@ import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover
 import { loadPolicy, mergeOptionsWithPolicy } from "./lib/policy.mjs";
 import { runSolve } from "./lib/solve.mjs";
 import { runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
+import { setTimeout as delay } from "node:timers/promises";
+
 import {
   appendLogLine,
+  archiveJobResults,
   createJobLogFile,
   generateJobId,
   listJobs,
@@ -33,6 +36,9 @@ function printUsage() {
       "  node scripts/council-companion.mjs setup [--json]",
       "  node scripts/council-companion.mjs review|adversarial|deliberate [flags] [focus text]",
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
+      "  node scripts/council-companion.mjs wait [job-id] [--timeout <s>] [--interval <s>]",
+      "  node scripts/council-companion.mjs usage [--json]",
+      "  node scripts/council-companion.mjs result [job-id] [--summary] [--json]",
       "",
       "Flags:",
       "  --wait|--background  --base <ref>  --scope auto|working-tree|branch",
@@ -452,13 +458,15 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
           : "completed",
       phase: "done",
       exitCode: allSkipped ? 1 : 0,
-      results: [...solveRun.r1, ...solveRun.r2],
+      stateVersion: 2,
+      results: archiveJobResults(root, job.id, [...solveRun.r1, ...solveRun.r2]),
       solve: {
         ranking: solveRun.ranking,
         plans: solveRun.plans.map((p) => ({ ...p, raw: undefined })),
         debates: solveRun.debates
       },
       report: solveRun.report,
+      reportSections: solveRun.sections ?? null,
       output: solveRun.report,
       finishedAt: nowIso(),
       updatedAt: nowIso(),
@@ -487,13 +495,15 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       status: allSkipped ? "failed" : r1Failed ? "completed_with_errors" : "completed",
       phase: "done",
       exitCode: allSkipped ? 1 : 0,
-      results: [...deliberation.r1, ...deliberation.r2],
+      stateVersion: 2,
+      results: archiveJobResults(root, job.id, [...deliberation.r1, ...deliberation.r2]),
       deliberation: {
         context: deliberation.context,
         merged: deliberation.merged,
         claudeIncluded: deliberation.claudeIncluded
       },
       report: deliberation.report,
+      reportSections: deliberation.sections ?? null,
       output: deliberation.report,
       finishedAt: nowIso(),
       updatedAt: nowIso(),
@@ -514,14 +524,30 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
   const anyFailed = results.some((r) => !r.skipped && r.status !== 0);
   const allSkipped = results.every((r) => r.skipped);
   const report = renderCouncilReport(job, results);
+  const sections = {
+    header: `Kind: ${kind} - ${summary}`,
+    merged: null,
+    review: results
+      .map((r) =>
+        r.skipped
+          ? `## ${r.agent}\n_Skipped:_ ${r.reason}`
+          : `## ${r.agent} (${r.backend ?? "?"} - exit ${formatExit(r)})\n${String(r.stdout ?? "")
+              .split(/\r?\n/)
+              .slice(0, 40)
+              .join("\n")}`
+      )
+      .join("\n\n")
+  };
 
   const finished = {
     ...job,
     status: allSkipped ? "failed" : anyFailed ? "completed_with_errors" : "completed",
     phase: "done",
     exitCode: allSkipped ? 1 : 0,
-    results,
+    stateVersion: 2,
+    results: archiveJobResults(root, job.id, results),
     report,
+    reportSections: sections,
     output: report,
     finishedAt: nowIso(),
     updatedAt: nowIso(),
@@ -575,7 +601,7 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
       "claude-plan-wait",
       "cwd"
     ],
-    booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok"]
+    booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "debate-resume"]
   });
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const focusText = positionals.join(" ").trim();
@@ -605,6 +631,7 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
       : null,
     peerCritiqueSeverities: options["peer-severities"] ?? undefined,
     debateRounds: options["debate-rounds"] != null ? Number(options["debate-rounds"]) : undefined,
+    debateResume: options["debate-resume"] ? true : undefined,
     waitTimeoutMs,
     skipCodex: Boolean(options["skip-codex"]),
     skipGrok: Boolean(options["skip-grok"])
@@ -733,7 +760,7 @@ function handleStatus(argv) {
 }
 
 function handleResult(argv) {
-  const { options, positionals } = parseCommandInput(argv, { booleanOptions: ["json"] });
+  const { options, positionals } = parseCommandInput(argv, { booleanOptions: ["json", "summary"] });
   const job = resolveJob(process.cwd(), positionals[0]);
   if (!job) throw new Error("No council jobs found.");
   if (job.status === "running" || job.status === "queued") {
@@ -743,11 +770,105 @@ function handleResult(argv) {
     );
     return;
   }
+  if (options.summary) {
+    const sections = job.reportSections;
+    if (!sections) {
+      if (!options.json) console.log("(no summary sections stored for this job - showing full report)\n");
+      outputResult(options.json ? { jobId: job.id, status: job.status, sections: null, report: job.report ?? null } : job.report || job.output || "(no report stored)", options.json);
+      return;
+    }
+    if (options.json) {
+      outputResult({ jobId: job.id, status: job.status, kind: job.kind, sections }, true);
+      return;
+    }
+    const text = [sections.header, sections.merged, sections.ranking, sections.debate, sections.synthesis, sections.review]
+      .filter(Boolean)
+      .join("\n\n");
+    console.log(text || "(empty summary)");
+    return;
+  }
   if (options.json) {
     outputResult(job, true);
     return;
   }
   console.log(job.report || job.output || "(no report stored)");
+}
+
+async function handleWait(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["timeout", "interval"],
+    booleanOptions: ["json"]
+  });
+  const cwd = process.cwd();
+  const root = workspaceRoot(cwd);
+  const jobId = positionals[0] ?? listJobs(root)[0]?.id;
+  if (!jobId) throw new Error("No council jobs found.");
+  const timeoutMs = secondsToMs(options.timeout, "--timeout") ?? 3_600_000;
+  const intervalMs = secondsToMs(options.interval, "--interval") ?? 5000;
+  const deadline = Date.now() + timeoutMs;
+
+  let job = readJobFile(root, jobId);
+  if (!job) throw new Error(`Job not found: ${jobId}`);
+  while ((job.status === "running" || job.status === "queued") && Date.now() < deadline) {
+    await delay(intervalMs);
+    job = readJobFile(root, jobId) ?? job;
+  }
+  const finished = job.status !== "running" && job.status !== "queued";
+  outputResult(
+    options.json
+      ? { jobId: job.id, status: job.status, exitCode: job.exitCode ?? null, finished }
+      : `Job ${job.id}: ${job.status}${finished ? "" : " (wait timed out)"}\n`,
+    options.json
+  );
+  if (!finished) process.exitCode = 1;
+}
+
+function handleUsage(argv) {
+  const { options } = parseCommandInput(argv, { booleanOptions: ["json", "all"] });
+  const cwd = process.cwd();
+  const root = workspaceRoot(cwd);
+  const jobs = listJobs(root).map((slim) => readJobFile(root, slim.id) ?? slim);
+  const kinds = {};
+  const agents = {};
+  for (const job of jobs) {
+    const kind = job.kind ?? "unknown";
+    const entry = (kinds[kind] = kinds[kind] ?? { jobs: 0, wallClockMs: 0, byStatus: {} });
+    entry.jobs += 1;
+    entry.byStatus[job.status] = (entry.byStatus[job.status] ?? 0) + 1;
+    const duration = Date.parse(job.finishedAt ?? "") - Date.parse(job.createdAt ?? "");
+    if (Number.isFinite(duration) && duration > 0) entry.wallClockMs += duration;
+    for (const result of job.results ?? []) {
+      if (!result || result.skipped || !result.agent) continue;
+      const stats = (agents[result.agent] = agents[result.agent] ?? { calls: 0, failures: 0, timeouts: 0 });
+      stats.calls += 1;
+      if (result.status !== 0) stats.failures += 1;
+      if (result.timedOut) stats.timeouts += 1;
+    }
+  }
+  const notes = [
+    "Token usage is not exposed by the external CLIs; the numbers above are per-call statistics from council jobs in this workspace.",
+    "Claude: /usage (plan limits) or /cost inside Claude Code.",
+    "Codex: /status inside the Codex TUI, or the ChatGPT dashboard.",
+    "Grok: the xAI console (grok.com) shows plan usage."
+  ];
+  if (options.json) {
+    outputResult({ stateDir: resolveStateDir(cwd), jobs: jobs.length, kinds, agents, notes }, true);
+    return;
+  }
+  const lines = [`Council usage (${jobs.length} jobs in this workspace):`];
+  for (const [kind, entry] of Object.entries(kinds)) {
+    const statuses = Object.entries(entry.byStatus)
+      .map(([status, count]) => `${status}=${count}`)
+      .join(", ");
+    lines.push(`  ${kind.padEnd(12)} jobs=${entry.jobs}  wall-clock=${Math.round(entry.wallClockMs / 60000)}min  (${statuses})`);
+  }
+  lines.push("Per agent (calls across all council rounds):");
+  for (const [agent, stats] of Object.entries(agents)) {
+    lines.push(`  ${agent.padEnd(12)} calls=${stats.calls}  failures=${stats.failures}  timeouts=${stats.timeouts}`);
+  }
+  lines.push("Provider usage/quota:");
+  for (const note of notes.slice(1)) lines.push(`  - ${note}`);
+  console.log(`${lines.join("\n")}\n`);
 }
 
 function handleCancel(argv) {
@@ -808,6 +929,12 @@ async function main() {
         break;
       case "result":
         handleResult(rest);
+        break;
+      case "wait":
+        await handleWait(rest);
+        break;
+      case "usage":
+        handleUsage(rest);
         break;
       case "cancel":
         handleCancel(rest);

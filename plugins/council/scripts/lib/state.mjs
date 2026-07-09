@@ -50,17 +50,26 @@ export function writeFileAtomic(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, data, "utf8");
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  // Windows AV/indexers hold transient locks: retry the rename, then try
+  // removing the destination first; only fall back to a direct (non-atomic)
+  // write as the last resort.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       fs.renameSync(tmp, file);
       return;
     } catch (error) {
       const code = /** @type {NodeJS.ErrnoException} */ (error).code;
-      if (attempt === 0 && (code === "EPERM" || code === "EBUSY")) {
-        continue;
+      if (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES") {
+        break;
       }
-      break;
     }
+  }
+  try {
+    fs.rmSync(file, { force: true });
+    fs.renameSync(tmp, file);
+    return;
+  } catch {
+    /* fall through */
   }
   try {
     fs.writeFileSync(file, data, "utf8");
@@ -75,6 +84,48 @@ export function writeFileAtomic(file, data) {
 
 export function generateJobId(prefix = "council") {
   return `${prefix}-${randomBytes(4).toString("hex")}`;
+}
+
+export function resolveArtifactsDir(cwd, jobId) {
+  return path.join(resolveStateDir(cwd), "artifacts", jobId);
+}
+
+const ARTIFACT_INLINE_CHARS = 4000;
+
+/**
+ * Persist each agent result's full stdout/stderr as sidecar files and return
+ * slim result copies for the job JSON (stateVersion 2). Reports must be
+ * rendered from the in-memory results BEFORE calling this.
+ */
+export function archiveJobResults(cwd, jobId, results) {
+  if (!Array.isArray(results) || !results.length) {
+    return results ?? null;
+  }
+  const dir = resolveArtifactsDir(cwd, jobId);
+  fs.mkdirSync(dir, { recursive: true });
+  return results.map((result, index) => {
+    if (!result || result.skipped) {
+      return result;
+    }
+    const label = [result.agent ?? "agent", result.role ?? result.aboutAgent ?? `r${index}`, index]
+      .map((part) => String(part).replace(/[^a-zA-Z0-9._-]+/g, "-"))
+      .join("-");
+    const artifactFile = path.join(dir, `${label}.txt`);
+    const body = `# stdout\n${result.stdout ?? ""}\n\n# stderr\n${result.stderr ?? ""}\n`;
+    try {
+      fs.writeFileSync(artifactFile, body, "utf8");
+    } catch {
+      return result;
+    }
+    const slim = { ...result, artifactFile };
+    for (const key of ["stdout", "stderr"]) {
+      const text = String(result[key] ?? "");
+      if (text.length > ARTIFACT_INLINE_CHARS) {
+        slim[key] = `${text.slice(0, ARTIFACT_INLINE_CHARS)}\n[... truncated, full output in ${artifactFile} ...]`;
+      }
+    }
+    return slim;
+  });
 }
 
 function jobFile(cwd, jobId) {
@@ -172,6 +223,14 @@ export function pruneJobs(cwd) {
       } catch {
         /* ignore */
       }
+    }
+    try {
+      fs.rmSync(resolveArtifactsDir(cwd, job.id ?? path.basename(file, ".json")), {
+        recursive: true,
+        force: true
+      });
+    } catch {
+      /* ignore */
     }
     count -= 1;
   }

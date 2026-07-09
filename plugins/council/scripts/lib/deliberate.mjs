@@ -148,7 +148,7 @@ function r2Options(options) {
   };
 }
 
-function buildDebateEntries(merged, options) {
+function buildDebateEntries(merged, options, sessions = {}) {
   const skipped = new Set(
     [options.skipCodex ? "codex" : null, options.skipGrok ? "grok" : null].filter(Boolean)
   );
@@ -165,6 +165,7 @@ function buildDebateEntries(merged, options) {
         id: item.ids[0],
         author,
         critic: critic ?? null,
+        authorSessionId: sessions[author] ?? null,
         payload: {
           title: item.title,
           severity: item.severity,
@@ -211,7 +212,9 @@ export async function runDeliberation(cwd, backends, options = {}) {
       runGrokStructured(
         cwd,
         backends,
-        { ...options, maxTurns: options.maxTurnsR1 },
+        // Capture the session id so debate rebuttals can resume the author's
+        // own R1 context (opt-in via debate_resume).
+        { ...options, maxTurns: options.maxTurnsR1, captureGrokSession: Boolean(options.debateResume) },
         buildR1Prompt("grok", context, r1TemplateOpts)
       )
     );
@@ -368,7 +371,9 @@ export async function runDeliberation(cwd, backends, options = {}) {
 
   let debates = [];
   if ((options.debateRounds ?? 0) > 0) {
-    const entries = buildDebateEntries(merged, options);
+    const grokR1 = r1Raw.find((r) => r.agent === "grok" && !r.skipped);
+    const sessions = { grok: grokR1?.sessionId ?? null };
+    const entries = buildDebateEntries(merged, options, sessions);
     debates = await runDebateRounds(cwd, backends, options, entries);
     merged = applyDebateOutcomes(merged, debates);
   }
@@ -384,6 +389,20 @@ export async function runDeliberation(cwd, backends, options = {}) {
     claudeIncluded: Boolean(claudeDoc)
   });
 
+  const sections = {
+    header: [
+      `Target: ${context.target.label}`,
+      `Branch: ${context.branch} @ ${shortHead(context.head)}`,
+      critiqueStats.length
+        ? `R2 critique scope: ${critiqueStats.map((s) => `${s.agent}: ${s.critiqued}/${s.total}`).join(", ")}`
+        : null
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    merged: renderMergedMarkdown(merged, { includeVotes: true }),
+    debate: debates.length ? renderDebateSection(debates) : null
+  };
+
   return {
     mode: "deliberate",
     context: {
@@ -398,7 +417,8 @@ export async function runDeliberation(cwd, backends, options = {}) {
     merged,
     debates,
     claudeIncluded: Boolean(claudeDoc),
-    report
+    report,
+    sections
   };
 }
 

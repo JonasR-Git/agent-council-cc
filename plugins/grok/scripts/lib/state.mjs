@@ -43,17 +43,26 @@ export function writeFileAtomic(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, data, "utf8");
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  // Windows AV/indexers hold transient locks: retry the rename, then try
+  // removing the destination first; only fall back to a direct (non-atomic)
+  // write as the last resort.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       fs.renameSync(tmp, file);
       return;
     } catch (error) {
       const code = /** @type {NodeJS.ErrnoException} */ (error).code;
-      if (attempt === 0 && (code === "EPERM" || code === "EBUSY")) {
-        continue;
+      if (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES") {
+        break;
       }
-      break;
     }
+  }
+  try {
+    fs.rmSync(file, { force: true });
+    fs.renameSync(tmp, file);
+    return;
+  } catch {
+    /* fall through */
   }
   try {
     fs.writeFileSync(file, data, "utf8");

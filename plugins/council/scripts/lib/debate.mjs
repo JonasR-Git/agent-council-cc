@@ -121,11 +121,16 @@ export async function runDebateRounds(cwd, backends, options, entries) {
 
   const rebuttals = await Promise.all(
     capped.map(async (entry) => {
+      // Grok authors argue in their own R1 session when debate_resume is on;
+      // codex has no thread-precise resume (companion only supports resume-last).
+      const resume = Boolean(
+        options.debateResume && entry.author === "grok" && entry.authorSessionId
+      );
       const res = await runAgentPrompt(
         entry.author,
         cwd,
         backends,
-        opts,
+        resume ? { ...opts, resumeSessionId: entry.authorSessionId } : opts,
         buildRebuttalPrompt(entry),
         `debate-${entry.id}`
       );
@@ -135,6 +140,7 @@ export async function runDebateRounds(cwd, backends, options, entries) {
         ...parsed,
         round: 1,
         role: "rebuttal",
+        resumedSession: resume,
         skipped: Boolean(res.skipped),
         artifactRound: `debate-${entry.id}`
       };
@@ -234,7 +240,9 @@ export function renderDebateSection(debates) {
   const rebuttals = debates.filter((d) => d.round === 1);
   const counters = new Map(debates.filter((d) => d.round === 2).map((d) => [d.id, d]));
   for (const r of rebuttals) {
-    lines.push(`- **${r.id}** ${r.agent} -> **${r.stance}**${r.revisedSeverity ? ` (revised: ${r.revisedSeverity})` : ""}: ${r.note || "(no note)"}`);
+    lines.push(
+      `- **${r.id}** ${r.agent}${r.resumedSession ? " (resumed own R1 session)" : ""} -> **${r.stance}**${r.revisedSeverity ? ` (revised: ${r.revisedSeverity})` : ""}: ${r.note || "(no note)"}`
+    );
     const counter = counters.get(r.id);
     if (counter) {
       lines.push(`  - counter by ${counter.agent}: ${counter.upheld ? "upholds critique" : "withdraws critique"} - ${counter.note || "(no note)"}`);

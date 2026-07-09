@@ -22,6 +22,7 @@ export const DEFAULT_POLICY = {
   peer_critique_severities: ["P0", "P1"],
   r2_effort: "medium",
   debate_rounds: 0,
+  debate_resume: false,
   solve_writer: "claude"
 };
 
@@ -194,6 +195,7 @@ export function mergeOptionsWithPolicy(options, policy) {
     ),
     r2Effort: options.r2Effort ?? policy.r2_effort ?? DEFAULT_POLICY.r2_effort,
     debateRounds: clampDebateRounds(options.debateRounds ?? policy.debate_rounds ?? 0),
+    debateResume: options.debateResume ?? policy.debate_resume === true,
     solveWriter: options.solveWriter ?? policy.solve_writer ?? "claude",
     policySource: policy._source
   };
