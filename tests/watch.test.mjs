@@ -5,6 +5,7 @@ import {
   agentR1States,
   colorize,
   formatDashboard,
+  formatDashboardMarkdown,
   formatDuration,
   isTerminal,
   progressBar,
@@ -39,6 +40,34 @@ test("summarizeProgress ignores non-Phase banner lines for lastPhase", () => {
   assert.equal(p.r2Done, 1);
   assert.equal(p.r2Total, 2);
   assert.equal(p.lastPhase, "r2: grok->codex done (1/2)");
+});
+
+test("summarizeProgress parses a live raised= count per agent", () => {
+  const p = summarizeProgress(["Phase: r1: grok done (1/3) raised=9", "Phase: r1: codex done (2/3) raised=0", "Phase: r1: claude done (3/3)"].join("\n"));
+  assert.equal(p.raisedByAgent.grok, 9);
+  assert.equal(p.raisedByAgent.codex, 0);
+  assert.equal(p.raisedByAgent.claude, undefined, "no suffix -> no live raised");
+});
+
+test("formatDashboardMarkdown renders a table, bars, status emoji, and severity squares", () => {
+  const job = { id: "council-abc123", kind: "deliberate", status: "completed", createdAt: "2026-07-10T00:00:00Z", finishedAt: "2026-07-10T00:05:00Z" };
+  const { markdown, snapshot } = formatDashboardMarkdown(job, summarizeProgress(LOG), { nowMs: Date.parse("2026-07-10T00:05:00Z"), findings: summarizeFindings(MERGED) });
+  assert.match(markdown, /🟢 Council deliberate/, "status emoji for completed");
+  assert.match(markdown, /\| Agent \| R1 \| raised \| shared \| disputed \|/, "a real markdown table");
+  assert.match(markdown, /🟥 P0|🟧 P1/, "severity squares");
+  assert.match(markdown, /🤝 2 consensus/, "consensus badge");
+  assert.match(markdown, /must-fix: \*\*2\*\* \(P0\/P1\)/);
+  assert.equal(snapshot.findingsTotal, 4);
+});
+
+test("formatDashboardMarkdown shows live raised before merge and a delta vs the prior snapshot", () => {
+  const job = { id: "council-x", kind: "deliberate", status: "running", createdAt: "2026-07-10T00:00:00Z" };
+  const progress = summarizeProgress(["Phase: r1: grok done (1/3) raised=5"].join("\n"));
+  const prior = { phase: "r1", findingsTotal: 0, r1Count: 0, r2Done: 0, consensus: 0 };
+  const { markdown } = formatDashboardMarkdown(job, progress, { nowMs: Date.parse("2026-07-10T00:01:00Z"), jobPhase: "r1: grok done (1/3)", skipped: ["claude"], prior });
+  assert.match(markdown, /\| grok \| 🟢 done \| 5 \|/, "live raised from the log, no merge yet");
+  assert.match(markdown, /Δ since last update/, "delta line present");
+  assert.match(markdown, /R1 0→1/, "delta shows R1 progress");
 });
 
 test("isTerminal treats cancelled and any non-active status as terminal", () => {

@@ -24,6 +24,7 @@ export function summarizeProgress(logText) {
     .filter(Boolean);
 
   const r1Done = new Set();
+  const raisedByAgent = {};
   let r1Expected = null;
   let r2Done = 0;
   let r2Total = null;
@@ -35,10 +36,13 @@ export function summarizeProgress(logText) {
     if (/^r1\b/.test(line)) reachedR1 = true;
     if (/^r2\b/.test(line)) reachedR2 = true;
 
-    const r1 = line.match(/^r1:\s*(\w+)\s+done(?:\s*\((\d+)\/(\d+)\))?/);
+    // e.g. "r1: grok done (1/3) raised=9" — the raised= suffix (when present) gives
+    // a LIVE per-agent finding count before the final merge fills in shared/disputed.
+    const r1 = line.match(/^r1:\s*(\w+)\s+done(?:\s*\((\d+)\/(\d+)\))?(?:\s+raised=(\d+))?/);
     if (r1) {
       r1Done.add(r1[1].toLowerCase());
       if (r1[3]) r1Expected = Number(r1[3]);
+      if (r1[4] != null) raisedByAgent[r1[1].toLowerCase()] = Number(r1[4]);
     }
     const r2 = line.match(/^r2:\s*[\w-]+->[\w-]+\s+done(?:\s*\((\d+)\/(\d+)\))?/);
     if (r2) {
@@ -49,7 +53,7 @@ export function summarizeProgress(logText) {
     if (r2start) r2Total = Number(r2start[1]);
   }
 
-  return { r1Done, r1Expected, r2Done, r2Total, reachedR1, reachedR2, lastPhase };
+  return { r1Done, raisedByAgent, r1Expected, r2Done, r2Total, reachedR1, reachedR2, lastPhase };
 }
 
 /**
@@ -211,6 +215,82 @@ export function formatDashboard(job, progress, { nowMs, etaMs = null, skipped = 
   lines.push(BOT);
   lines.push(`  → /council:status --result ${job.id}`);
   return { text: lines.join("\n"), terminal, elapsedMs };
+}
+
+// --- Markdown dashboard (for the chat, where ANSI in a code block won't render) --
+// A chat message is static Markdown, so this renders a rich SNAPSHOT (emoji status,
+// Unicode bars, a real table, severity squares, consensus badge, and a delta vs the
+// previous snapshot) instead of the terminal box. Pure: the caller supplies `prior`
+// (the last snapshot) for the delta and persists the returned `snapshot`.
+const STATUS_EMOJI = { running: "🟡", queued: "⚪", completed: "🟢", completed_with_errors: "🟠", failed: "🔴", cancelled: "🔴" };
+const R1_EMOJI = { done: "🟢", running: "🟡", pending: "⚪", skipped: "⚫", file: "🔵", unknown: "🔴" };
+const SEV_SQUARE = { P0: "🟥", P1: "🟧", P2: "🟨", nit: "⬜" };
+
+export function formatDashboardMarkdown(job, progress, { nowMs, etaMs = null, skipped = [], claudeBackend = "session", jobPhase = null, findings = null, prior = null } = {}) {
+  const created = job.createdAt ? Date.parse(job.createdAt) : null;
+  const finished = job.finishedAt ? Date.parse(job.finishedAt) : null;
+  const terminal = isTerminal(job.status);
+  const end = terminal && finished ? finished : nowMs;
+  const elapsedMs = created != null ? end - created : null;
+  const states = agentR1States(progress, { skipped, claudeBackend, status: job.status });
+  const phase = terminal ? "done" : jobPhase || progress.lastPhase || "queued";
+
+  let timeMeta = formatDuration(elapsedMs);
+  if (!terminal && etaMs && elapsedMs != null) {
+    const remaining = etaMs - elapsedMs;
+    timeMeta += remaining > 0 ? ` · ~${formatDuration(remaining)} left` : ` · over median ${formatDuration(etaMs)}`;
+  }
+
+  const r1Count = AGENTS.filter((a) => states[a] === "done" || states[a] === "file").length;
+  const r1Total = AGENTS.filter((a) => states[a] !== "skipped").length;
+  const r2Total = progress.r2Total ?? 0;
+  const hasR2 = progress.reachedR2 || r2Total > 0;
+
+  const L = [];
+  L.push(`### ${STATUS_EMOJI[job.status] ?? "⚪"} Council ${String(job.kind ?? "review")} · \`${job.id}\``);
+  L.push(`**${job.status}** · ${timeMeta} · phase \`${phase}\``);
+  L.push("");
+  let bars = `R1 \`${progressBar(r1Count, r1Total, 12)}\` ${r1Count}/${r1Total}`;
+  if (hasR2) bars += ` · R2 \`${progressBar(progress.r2Done, r2Total, 12)}\` ${progress.r2Done}/${r2Total || "?"}`;
+  L.push(bars);
+  L.push("");
+  L.push("| Agent | R1 | raised | shared | disputed |");
+  L.push("|---|---|--:|--:|--:|");
+  for (const agent of AGENTS) {
+    const fa = findings?.byAgent?.[agent];
+    const liveRaised = progress.raisedByAgent?.[agent];
+    const raised = fa ? fa.raised : liveRaised != null ? liveRaised : "–";
+    const shared = fa ? fa.shared : "–";
+    const disputed = fa ? fa.disputed : "–";
+    L.push(`| ${agent} | ${R1_EMOJI[states[agent]] ?? "⚪"} ${states[agent]} | ${raised} | ${shared} | ${disputed} |`);
+  }
+  L.push("");
+  if (findings) {
+    L.push(`**${findings.total} findings** · 🤝 ${findings.consensus} consensus · ${findings.unique} unique · ⚔️ ${findings.contested} disputed`);
+    const sev = ["P0", "P1", "P2", "nit"].filter((k) => findings.bySeverity[k]).map((k) => `${SEV_SQUARE[k]} ${k} ${findings.bySeverity[k]}`).join(" · ");
+    if (sev) L.push(sev);
+    const mustFix = findings.bySeverity.P0 + findings.bySeverity.P1;
+    if (mustFix) L.push(`must-fix: **${mustFix}** (P0/P1)`);
+  } else if (terminal) {
+    L.push("_findings: see `/council:status --result` for the full report_");
+  } else {
+    L.push("_findings pending — available when the run completes_");
+  }
+
+  const snapshot = { phase, findingsTotal: findings?.total ?? 0, r1Count, r2Done: progress.r2Done ?? 0, consensus: findings?.consensus ?? 0 };
+  if (prior) {
+    const d = [];
+    if (prior.phase !== phase) d.push(`phase \`${prior.phase}\` → \`${phase}\``);
+    if (prior.r1Count !== r1Count) d.push(`R1 ${prior.r1Count}→${r1Count}`);
+    if ((prior.r2Done ?? 0) !== (progress.r2Done ?? 0)) d.push(`R2 ${prior.r2Done ?? 0}→${progress.r2Done ?? 0}`);
+    const df = (findings?.total ?? 0) - (prior.findingsTotal ?? 0);
+    if (df !== 0) d.push(`${df > 0 ? "+" : ""}${df} findings`);
+    if (d.length) {
+      L.push("");
+      L.push(`_Δ since last update: ${d.join(" · ")}_`);
+    }
+  }
+  return { markdown: L.join("\n"), snapshot, terminal };
 }
 
 // --- optional ANSI color for the live TTY only ------------------------------

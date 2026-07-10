@@ -36,7 +36,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
-import { colorize, formatDashboard, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
+import { colorize, formatDashboard, formatDashboardMarkdown, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
 import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
@@ -1593,6 +1593,40 @@ function renderWatch(job, ctx) {
   });
 }
 
+// Markdown snapshot for the chat, with a delta vs the previous --md call for this
+// job (persisted in the state dir; a corrupt/absent prior just omits the delta).
+function renderWatchMarkdown(cwd, job, ctx) {
+  let logText = "";
+  try {
+    if (job.logFile) logText = fs.readFileSync(job.logFile, "utf8");
+  } catch {
+    /* log may not exist yet */
+  }
+  const snapFile = path.join(resolveStateDir(cwd), `watch-md-${job.id}.json`);
+  let prior = null;
+  try {
+    prior = JSON.parse(fs.readFileSync(snapFile, "utf8"));
+  } catch {
+    /* no prior snapshot */
+  }
+  const out = formatDashboardMarkdown(job, summarizeProgress(logText), {
+    nowMs: Date.now(),
+    etaMs: ctx.etaMs,
+    skipped: ctx.skipped,
+    claudeBackend: ctx.claudeBackend,
+    jobPhase: job.phase,
+    findings: summarizeFindings(job.deliberation?.merged),
+    prior
+  });
+  try {
+    fs.mkdirSync(path.dirname(snapFile), { recursive: true });
+    fs.writeFileSync(snapFile, `${JSON.stringify(out.snapshot)}\n`, "utf8");
+  } catch {
+    /* delta persistence is best-effort */
+  }
+  return out;
+}
+
 /**
  * Live dashboard for a running job. Redraws every interval until the job
  * finishes (a real terminal shows it as an updating dashboard). --once/--json
@@ -1601,7 +1635,7 @@ function renderWatch(job, ctx) {
 async function handleWatch(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["interval", "timeout"],
-    booleanOptions: ["json", "once"]
+    booleanOptions: ["json", "once", "md"]
   });
   const cwd = process.cwd();
   const root = workspaceRoot(cwd);
@@ -1614,6 +1648,13 @@ async function handleWatch(argv) {
   if (options.json) {
     const snap = renderWatch(job, ctx);
     outputResult({ jobId: job.id, status: job.status, dashboard: snap.text, terminal: snap.terminal }, true);
+    return;
+  }
+
+  // --md: a rich Markdown snapshot for the chat (where the terminal box renders as
+  // grey text). Always a single snapshot; a delta vs the last --md call is shown.
+  if (options.md) {
+    console.log(renderWatchMarkdown(cwd, job, ctx).markdown);
     return;
   }
 

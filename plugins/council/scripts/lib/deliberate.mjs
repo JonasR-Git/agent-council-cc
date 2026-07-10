@@ -289,7 +289,13 @@ export async function runDeliberation(cwd, backends, options = {}) {
     r1Jobs.map((job) =>
       Promise.resolve(job).then((r) => {
         r1Done += 1;
-        if (r && !r.skipped) onPhase(`r1: ${r.agent} done (${r1Done}/${r1Expected})`);
+        if (r && !r.skipped) {
+          // Include a live per-agent raised count so the dashboard can show it
+          // before the merge (parse is cheap; a miss just omits the suffix).
+          const parsed = r.status === 0 ? parseAgentFindings(r.stdout, r.agent) : null;
+          const raised = parsed?.parseOk ? ` raised=${parsed.findings.length}` : "";
+          onPhase(`r1: ${r.agent} done (${r1Done}/${r1Expected})${raised}`);
+        }
         return r;
       })
     )
