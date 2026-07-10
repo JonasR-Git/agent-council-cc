@@ -1,6 +1,6 @@
 {
   "name": "council",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Multi-agent code review for Claude Code: independent review then peer critique across Claude + Codex + Grok, with consensus/verification, a findings ledger, solve, benchmarking, and a live dashboard.",
   "author": {
     "name": "JonasR-Git"
