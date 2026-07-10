@@ -1,37 +1,47 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { buildGraph, findCycles, findDeadExports } from "./import-graph.mjs";
+import { buildGraph, findCycles, findOrphanModules } from "./import-graph.mjs";
 import { findDuplicateClusters } from "./dup-detect.mjs";
 import { runCommand } from "./process.mjs";
 import { workspaceRoot } from "./state.mjs";
 
-// The static fact base for /council:audit v1 (read-only). Zero-dep, deterministic.
-// Everything it emits is a CANDIDATE (confidence-tagged), never authority to change
-// anything - regex analysis cannot prove reachability/soundness.
+// The static fact base for /council:audit v1 (read-only). Zero-dep. The static
+// analysis is deterministic for a given snapshot; git churn is time-relative (its
+// window ends at run time) and is recorded explicitly. Everything emitted is a
+// CANDIDATE (confidence-tagged), never authority to change anything - regex
+// analysis cannot prove reachability/soundness.
 
 const SOURCE_RE = /\.(mjs|cjs|js)$/;
+const IGNORE_RE = /(^|\/)(node_modules|dist|build|out|coverage|vendor|\.min\.)/;
 const GOD_FILE_LOC = 400;
 const HIGH_BRANCHES = 60;
+const BIG_CLONE_LINES = 12;
 
 function toPosix(p) {
   return p.split(path.sep).join("/");
 }
 
-/** Tracked source files under the repo, optionally filtered to `areas` prefixes. */
+/**
+ * Source files under the repo (tracked + untracked, minus gitignored), optionally
+ * filtered to `areas` prefixes. Uses NUL-delimited `git ls-files` so filenames
+ * with spaces/quotes/newlines survive; falls back to an fs walk outside a repo.
+ */
 export function enumerateFiles(root, { areas } = {}) {
-  const res = runCommand("git", ["ls-files"], { cwd: root });
+  const res = runCommand("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { cwd: root });
   let rel;
-  if (res.status === 0 && res.stdout.trim()) {
-    rel = res.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  if (res.status === 0 && res.stdout.length) {
+    rel = res.stdout.split("\0").filter(Boolean);
   } else {
     rel = walk(root).map((abs) => toPosix(path.relative(root, abs)));
   }
   const prefixes = (areas ?? []).map((a) => toPosix(a).replace(/\/+$/, ""));
+  const seen = new Set();
   const files = [];
   for (const id of rel) {
-    if (!SOURCE_RE.test(id)) continue;
+    if (seen.has(id) || !SOURCE_RE.test(id) || IGNORE_RE.test(id)) continue;
     if (prefixes.length && !prefixes.some((p) => id === p || id.startsWith(`${p}/`))) continue;
+    seen.add(id);
     let text;
     try {
       text = fs.readFileSync(path.join(root, id), "utf8");
@@ -62,6 +72,9 @@ function walk(dir, acc = []) {
 function fileFacts(text) {
   const lines = String(text).split(/\r?\n/);
   const loc = lines.filter((l) => l.trim()).length;
+  // Approximate: counts every brace (incl. object/array literals + destructuring),
+  // so it overstates true block nesting for data-heavy modules. Used only as a
+  // rough hotspot input.
   let depth = 0;
   let maxNesting = 0;
   for (const ch of text) {
@@ -84,31 +97,28 @@ function fileFacts(text) {
   return { loc, maxNesting, branches, smells, smellCount };
 }
 
-/** git commits touching each file in the last `days` days -> churn map. */
-function churnMap(root, files, days) {
+/** git commits touching each file in the last `days` days -> { map, ok }. */
+function churnMap(root, days) {
   const map = new Map();
-  const res = runCommand("git", ["log", `--since=${days}.days`, "--name-only", "--pretty=format:"], { cwd: root });
-  if (res.status !== 0) return map;
+  const res = runCommand("git", ["log", `--since=${days}.days`, "--name-only", "--pretty=format:"], { cwd: root, timeout: 30_000 });
+  if (res.status !== 0 || res.error) return { map, ok: false };
   for (const line of res.stdout.split(/\r?\n/)) {
     const id = line.trim();
     if (id) map.set(id, (map.get(id) ?? 0) + 1);
   }
-  return map;
+  return { map, ok: true };
 }
 
-/** Which source modules are referenced by a *.test.* file (best-effort). */
-function testedSet(files) {
+const isTestId = (id) => /\.test\.(mjs|cjs|js)$/.test(id) || /(^|\/)tests?\//.test(id);
+
+/** Source modules a test file resolves an import to (via the graph) -> "tested". */
+function testedSet(nodes) {
   const tested = new Set();
-  const isTest = (id) => /\.test\.(mjs|cjs|js)$/.test(id) || /(^|\/)tests?\//.test(id);
-  const testFiles = files.filter((f) => isTest(f.id));
-  const sourceBases = new Map();
-  for (const f of files) if (!isTest(f.id)) sourceBases.set(path.posix.basename(f.id), f.id);
-  for (const tf of testFiles) {
-    for (const [base, id] of sourceBases) {
-      if (tf.text.includes(base)) tested.add(id);
-    }
+  for (const [id, node] of nodes) {
+    if (!isTestId(id)) continue;
+    for (const t of node.out) if (!isTestId(t)) tested.add(t);
   }
-  return { tested, isTest };
+  return tested;
 }
 
 function norm(v, max) {
@@ -123,10 +133,12 @@ export function buildCodebaseModel(cwd, { areas, churnDays = 90 } = {}) {
   const root = workspaceRoot(cwd);
   const files = enumerateFiles(root, { areas });
   const nodes = buildGraph(files);
+  // Entry points (a shebang, or the plugin CLIs) are legitimately never imported.
+  const entrypoints = new Set(files.filter((f) => f.text.startsWith("#!") || /companion\.mjs$/.test(f.id)).map((f) => f.id));
   const cycles = findCycles(nodes);
-  const deadExports = findDeadExports(nodes, files);
-  const churn = churnMap(root, files, churnDays);
-  const { tested, isTest } = testedSet(files);
+  const orphans = findOrphanModules(nodes, { entrypoints });
+  const churn = churnMap(root, churnDays);
+  const tested = testedSet(nodes);
 
   const facts = files.map((f) => {
     const ff = fileFacts(f.text);
@@ -138,11 +150,11 @@ export function buildCodebaseModel(cwd, { areas, churnDays = 90 } = {}) {
       branches: ff.branches,
       smells: ff.smells,
       smellCount: ff.smellCount,
-      churn: churn.get(f.id) ?? 0,
+      churn: churn.map.get(f.id) ?? 0,
       fanIn: node ? node.in.size : 0,
       fanOut: node ? node.out.size : 0,
       exports: node ? node.exports.size + (node.hasDefault ? 1 : 0) : 0,
-      isTest: isTest(f.id),
+      isTest: isTestId(f.id),
       tested: tested.has(f.id)
     };
   });
@@ -161,28 +173,35 @@ export function buildCodebaseModel(cwd, { areas, churnDays = 90 } = {}) {
   }
   facts.sort((a, b) => b.hotspot - a.hotspot || a.id.localeCompare(b.id));
 
-  const dupClusters = findDuplicateClusters(files, { minLines: 6 });
-  const findings = buildFindings({ facts, cycles, deadExports, dupClusters });
+  // Clones in tests/generated code are noise; scan production modules only.
+  const dupClusters = findDuplicateClusters(files.filter((f) => !isTestId(f.id)), { minLines: 6 });
+  const findings = buildFindings({ facts, cycles, orphans, dupClusters });
 
   const supplied = facts.reduce((s, x) => s + x.loc, 0);
   return {
     files: facts,
-    graph: { cycles, deadExports },
+    graph: { cycles, orphans },
     dupClusters,
     findings,
-    coverage: { modules: files.length, sourceModules: facts.filter((x) => !x.isTest).length, mappedLOC: supplied },
-    generatedAt: null
+    coverage: {
+      modules: files.length,
+      sourceModules: facts.filter((x) => !x.isTest).length,
+      mappedLOC: supplied,
+      churnWindowDays: churnDays,
+      churnAvailable: churn.ok
+    }
   };
 }
 
-function buildFindings({ facts, cycles, deadExports, dupClusters }) {
+function buildFindings({ facts, cycles, orphans, dupClusters }) {
   const f = [];
   const add = (o) => f.push({ severity: "P2", confidence: 0.6, scope: "localized", ...o });
 
   for (const c of dupClusters) {
     add({
       category: "ssot",
-      severity: "P1",
+      // Calibrate: only large clones are P1; short repeated shapes are P2.
+      severity: c.lineCount >= BIG_CLONE_LINES ? "P1" : "P2",
       scope: "cross-cutting",
       confidence: 0.75,
       title: `Duplicated ${c.lineCount}-line block in ${c.locations.length} places`,
@@ -192,10 +211,10 @@ function buildFindings({ facts, cycles, deadExports, dupClusters }) {
     });
   }
   for (const cyc of cycles) {
-    add({ category: "architecture", severity: "P1", scope: "cross-cutting", confidence: 0.5, title: `Import cycle across ${cyc.length} modules`, detail: `Cycle (candidate, regex-derived): ${cyc.join(" -> ")}`, file: cyc[0], line: null });
+    add({ category: "architecture", severity: "P1", scope: "cross-cutting", confidence: 0.5, title: `Import cycle among ${cyc.length} modules`, detail: `Cycle members (candidate, regex-derived; order is not an edge walk): ${cyc.join(", ")}`, file: cyc[0], line: null });
   }
-  for (const d of deadExports) {
-    add({ category: "dead-code", confidence: 0.35, title: `Module never imported: ${d.id}`, detail: `No in-repo importer found (LOW confidence: entry points, package exports, dynamic/external consumers are invisible - verify before removing). Exports: ${d.exports.slice(0, 8).join(", ")}${d.hasDefault ? ", default" : ""}`, file: d.id, line: null });
+  for (const d of orphans) {
+    add({ category: "orphan", confidence: 0.35, title: `Orphan module (no in-repo importer): ${d.id}`, detail: `No module in the scanned set imports it (LOW confidence & module-level only: individual unused export NAMES are not detected; entry points, package exports, dynamic/external consumers are invisible - verify before removing). Exports: ${d.exports.slice(0, 8).join(", ")}${d.hasDefault ? ", default" : ""}`, file: d.id, line: null });
   }
   for (const x of facts) {
     if (x.isTest) continue;

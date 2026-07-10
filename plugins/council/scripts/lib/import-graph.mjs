@@ -1,22 +1,27 @@
 import path from "node:path";
 
 // Zero-dep ESM import/export extraction + module graph. Regex-based, so it is a
-// CANDIDATE signal, not authority: dynamic import(), re-exports through aliases,
-// string-built specifiers and non-ESM consumers are invisible. Callers must treat
-// graph findings (cycles, dead exports) as low-confidence until agent-verified,
-// and must NEVER delete from them automatically.
+// CANDIDATE signal, not authority: dynamic import(), computed specifiers and
+// non-ESM consumers stay invisible. Callers must treat graph findings as
+// low-confidence until agent-verified, and NEVER delete from them automatically.
 
-// Anchor at a statement boundary: line start or after `;` (handles `import "x";
-// export const a=1;` on one line). Regex-based, so still best-effort.
-const FROM_IMPORT = /(?:^|[\n;])\s*import\b[^;\n]*?\bfrom\s*["']([^"']+)["']/g;
-// Side-effect import: `import "x"` - a quote directly after `import` (a from-import
-// has an identifier/brace there, so this never matches those).
+// Statement-boundary anchored; the from-clause allows newlines so multiline
+// named imports (`import {\n a,\n b\n} from "x"`) still produce an edge.
+const FROM_IMPORT = /(?:^|[\n;])\s*import\b[\s\S]*?\bfrom\s*["']([^"']+)["']/g;
 const SIDE_EFFECT_IMPORT = /(?:^|[\n;])\s*import\s+["']([^"']+)["']/g;
 const DYNAMIC_IMPORT = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
-const EXPORT_FROM = /(?:^|[\n;])\s*export\b[^;\n]*?\bfrom\s*["']([^"']+)["']/g;
+const EXPORT_FROM = /(?:^|[\n;])\s*export\b[\s\S]*?\bfrom\s*["']([^"']+)["']/g;
 const NAMED_DECL_EXPORT = /(?:^|[\n;])\s*export\s+(?:async\s+)?(?:function|const|let|var|class)\s+([A-Za-z0-9_$]+)/g;
 const EXPORT_LIST = /(?:^|[\n;])\s*export\s*\{([^}]*)\}/g;
 const DEFAULT_EXPORT = /(?:^|[\n;])\s*export\s+default\b/;
+const STAR_EXPORT = /(?:^|[\n;])\s*export\s*\*/;
+
+/** Remove block and line comments so comment text can't create phantom edges. */
+export function stripComments(src) {
+  return String(src ?? "")
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+    .replace(/(^|[^:])\/\/[^\n]*/g, (_, p) => p); // keep the char before // (avoid eating "://")
+}
 
 function matchAll(re, text) {
   const out = [];
@@ -26,13 +31,13 @@ function matchAll(re, text) {
   return out;
 }
 
-/** Extract raw import specifiers and exported names from one file's source. */
-export function parseModule(text) {
-  const src = String(text ?? "");
+/** Extract import specifiers and exported names from one file's source. */
+export function parseModule(rawText) {
+  const src = stripComments(rawText);
   const imports = new Set();
   const dynamic = new Set();
   for (const m of matchAll(FROM_IMPORT, src)) imports.add(m[1]);
-  for (const m of matchAll(EXPORT_FROM, src)) imports.add(m[1]); // re-export pulls a dep
+  for (const m of matchAll(EXPORT_FROM, src)) imports.add(m[1]);
   for (const m of matchAll(SIDE_EFFECT_IMPORT, src)) imports.add(m[1]);
   for (const m of matchAll(DYNAMIC_IMPORT, src)) dynamic.add(m[1]);
 
@@ -44,9 +49,13 @@ export function parseModule(text) {
       if (name && name !== "default") exports.add(name);
     }
   }
-  const hasDefault = DEFAULT_EXPORT.test(src);
-  const hasStarReexport = /(?:^|\n)\s*export\s*\*/.test(src);
-  return { imports: [...imports], dynamic: [...dynamic], exports: [...exports], hasDefault, hasStarReexport };
+  return {
+    imports: [...imports],
+    dynamic: [...dynamic],
+    exports: [...exports],
+    hasDefault: DEFAULT_EXPORT.test(src),
+    hasStarReexport: STAR_EXPORT.test(src)
+  };
 }
 
 /** Resolve a relative import specifier to a repo file id (posix), or null if external. */
@@ -54,21 +63,24 @@ export function resolveImport(fromFile, spec, fileSet) {
   if (!spec.startsWith(".")) return null; // bare/builtin -> external
   const dir = path.posix.dirname(fromFile);
   const base = path.posix.normalize(path.posix.join(dir, spec));
-  const candidates = [base, `${base}.mjs`, `${base}.js`, `${base}/index.mjs`, `${base}/index.js`];
+  const exts = [".mjs", ".js", ".cjs"];
+  const candidates = [base, ...exts.map((e) => `${base}${e}`), ...exts.map((e) => `${base}/index${e}`)];
   for (const c of candidates) if (fileSet.has(c)) return c;
   return null;
 }
 
 /**
- * Build the module graph. `files` = [{ id (posix rel path), text }]. Returns
- * per-file import edges (resolved), a reverse index (importedBy), and a flag for
- * modules whose exports cannot be reasoned about (star re-export / dynamic).
+ * Build the module graph. `files` = [{ id (posix rel path), text }]. Each file is
+ * parsed once. Returns per-file resolved edges + reverse index; `opaque` marks
+ * modules whose exports can't be reasoned about (star re-export / dynamic).
  */
 export function buildGraph(files) {
   const fileSet = new Set(files.map((f) => f.id));
   const nodes = new Map();
+  const parsedById = new Map();
   for (const f of files) {
     const parsed = parseModule(f.text);
+    parsedById.set(f.id, parsed);
     nodes.set(f.id, {
       id: f.id,
       exports: new Set(parsed.exports),
@@ -79,7 +91,7 @@ export function buildGraph(files) {
     });
   }
   for (const f of files) {
-    const parsed = parseModule(f.text);
+    const parsed = parsedById.get(f.id);
     for (const spec of [...parsed.imports, ...parsed.dynamic]) {
       const target = resolveImport(f.id, spec, fileSet);
       if (target && target !== f.id) {
@@ -91,62 +103,83 @@ export function buildGraph(files) {
   return nodes;
 }
 
-/** Tarjan strongly-connected components; returns cycles (components with >1 node). */
+/**
+ * Iterative Tarjan SCC (no recursion, so a deep 3000+-module graph can't blow the
+ * native stack). Returns cycles as UNORDERED node sets (the members form a cycle;
+ * the listed order is not a guaranteed edge walk).
+ */
 export function findCycles(nodes) {
   let index = 0;
-  const stack = [];
-  const onStack = new Set();
   const idx = new Map();
   const low = new Map();
+  const onStack = new Set();
+  const S = [];
   const cycles = [];
 
-  function strongconnect(v) {
-    idx.set(v, index);
-    low.set(v, index);
+  for (const start of nodes.keys()) {
+    if (idx.has(start)) continue;
+    const work = [{ v: start, edges: [...nodes.get(start).out], i: 0 }];
+    idx.set(start, index);
+    low.set(start, index);
     index += 1;
-    stack.push(v);
-    onStack.add(v);
-    for (const w of nodes.get(v).out) {
-      if (!idx.has(w)) {
-        strongconnect(w);
-        low.set(v, Math.min(low.get(v), low.get(w)));
-      } else if (onStack.has(w)) {
-        low.set(v, Math.min(low.get(v), idx.get(w)));
+    S.push(start);
+    onStack.add(start);
+
+    while (work.length) {
+      const frame = work[work.length - 1];
+      const v = frame.v;
+      if (frame.i < frame.edges.length) {
+        const w = frame.edges[frame.i];
+        frame.i += 1;
+        if (!idx.has(w)) {
+          idx.set(w, index);
+          low.set(w, index);
+          index += 1;
+          S.push(w);
+          onStack.add(w);
+          work.push({ v: w, edges: [...nodes.get(w).out], i: 0 });
+        } else if (onStack.has(w)) {
+          low.set(v, Math.min(low.get(v), idx.get(w)));
+        }
+      } else {
+        if (low.get(v) === idx.get(v)) {
+          const comp = [];
+          let w;
+          do {
+            w = S.pop();
+            onStack.delete(w);
+            comp.push(w);
+          } while (w !== v);
+          if (comp.length > 1) cycles.push(comp.sort());
+        }
+        work.pop();
+        if (work.length) {
+          const parent = work[work.length - 1].v;
+          low.set(parent, Math.min(low.get(parent), low.get(v)));
+        }
       }
     }
-    if (low.get(v) === idx.get(v)) {
-      const comp = [];
-      let w;
-      do {
-        w = stack.pop();
-        onStack.delete(w);
-        comp.push(w);
-      } while (w !== v);
-      if (comp.length > 1) cycles.push(comp.sort());
-    }
   }
-
-  for (const v of nodes.keys()) if (!idx.has(v)) strongconnect(v);
   return cycles.sort((a, b) => a[0].localeCompare(b[0]));
 }
 
 /**
- * Exported names that no other module in the set imports. LOW-CONFIDENCE: entry
- * points, package `exports`, framework hooks and any external/dynamic consumer are
- * invisible here, so these are candidates for review, never for deletion.
+ * ORPHAN modules: modules with exports that NO other module in the set imports.
+ * This is module-level only - it does NOT prove individual exported names are
+ * unused (a partially-imported module is reachable). Entry points, package
+ * exports, dynamic and external consumers are invisible, so these are
+ * low-confidence candidates for review, never for deletion. Pass `entrypoints`
+ * (a Set of ids) to exclude known CLI/entry modules.
  */
-export function findDeadExports(nodes, files) {
-  // Collect every imported name across the graph (best-effort: we only know the
-  // specifier, not which names, so we treat "imported at all" as "reachable").
+export function findOrphanModules(nodes, { entrypoints = new Set() } = {}) {
   const importedModules = new Set();
   for (const n of nodes.values()) for (const t of n.out) importedModules.add(t);
-  const dead = [];
+  const orphans = [];
   for (const n of nodes.values()) {
-    if (n.opaque) continue; // can't reason about star/dynamic modules
-    const reachable = importedModules.has(n.id);
-    if (!reachable && (n.exports.size > 0 || n.hasDefault)) {
-      dead.push({ id: n.id, exports: [...n.exports], hasDefault: n.hasDefault });
+    if (n.opaque || entrypoints.has(n.id)) continue;
+    if (!importedModules.has(n.id) && (n.exports.size > 0 || n.hasDefault)) {
+      orphans.push({ id: n.id, exports: [...n.exports], hasDefault: n.hasDefault });
     }
   }
-  return dead.sort((a, b) => a.id.localeCompare(b.id));
+  return orphans.sort((a, b) => a.id.localeCompare(b.id));
 }

@@ -4,8 +4,8 @@ argument-hint: "[--areas dir1,dir2] [--churn-days <n>] [--write-map] [--json]"
 allowed-tools: Bash(node:*)
 ---
 
-Run the whole-project static audit (v1: deterministic, **read-only**, no agents,
-changes nothing):
+Run the whole-project static audit (v1: no agents, **read-only** except
+`--write-map`, which writes `docs/codebase-map.json`):
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" audit $ARGUMENTS

@@ -64,17 +64,18 @@ export function findDuplicateClusters(files, { minLines = 6 } = {}) {
         startLine: blockNorm[0].n,
         endLine: blockNorm[blockNorm.length - 1].n,
         lineCount: blockNorm.length,
-        contentHash: hashLite(blockNorm.map((l) => l.s).join("\n"))
+        content: blockNorm.map((l) => l.s).join("\n") // exact content, not just a hash
       });
       i = end + 1;
     }
   }
 
-  // 3. group blocks with identical content into clusters (>= 2 locations)
+  // 3. group blocks by EXACT content (hashLite is a 32-bit digest, so bucketing by
+  //    hash alone would false-cluster on collisions). >= 2 distinct locations wins.
   const byContent = new Map();
   for (const b of blocks) {
-    if (!byContent.has(b.contentHash)) byContent.set(b.contentHash, []);
-    byContent.get(b.contentHash).push(b);
+    if (!byContent.has(b.content)) byContent.set(b.content, []);
+    byContent.get(b.content).push(b);
   }
   const clusters = [];
   for (const group of byContent.values()) {

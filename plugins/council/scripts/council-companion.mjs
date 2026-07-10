@@ -1644,9 +1644,10 @@ async function handleWatch(argv) {
   }
 }
 
-// v1 whole-project audit: static, read-only. Builds the codebase model and emits
-// CANDIDATE findings + hotspots + coverage. No agents, no changes (see
-// docs/audit-design.md; deeper review + safe --fix are later phases).
+// v1 whole-project audit: static. Builds the codebase model and emits CANDIDATE
+// findings + hotspots + coverage. No agents; read-only EXCEPT --write-map (which
+// writes docs/codebase-map.json). See docs/audit-design.md; deeper review + safe
+// --fix are later phases.
 function handleAudit(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days"],
@@ -1654,7 +1655,11 @@ function handleAudit(argv) {
   });
   const cwd = process.cwd();
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
-  const churnDays = options["churn-days"] != null ? Math.max(1, Number(options["churn-days"])) : 90;
+  let churnDays = 90;
+  if (options["churn-days"] != null) {
+    churnDays = Number(options["churn-days"]);
+    if (!Number.isFinite(churnDays) || churnDays < 1) throw new Error("--churn-days must be a positive number");
+  }
   const model = buildCodebaseModel(cwd, { areas, churnDays });
 
   if (options["write-map"]) {
