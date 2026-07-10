@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   interpolate,
   loadPrompt,
+  makeFenceNonce,
   runCodexStructured,
   runGrokStructured,
   waitForFile
@@ -195,6 +196,7 @@ function buildProposalPrompt(agent, problem, hints, options) {
     AGENT: agent,
     PROBLEM: problem,
     REPO_HINTS: hints,
+    NONCE: makeFenceNonce(),
     POLICY_FOCUS: options.policyFocus || "None"
   });
 }
@@ -214,6 +216,7 @@ function buildPlanCritiquePrompt(agent, plan) {
   return interpolate(template, {
     AGENT: agent,
     ABOUT_AGENT: plan.agent,
+    NONCE: makeFenceNonce(),
     PLAN_JSON: JSON.stringify(slim, null, 2)
   });
 }

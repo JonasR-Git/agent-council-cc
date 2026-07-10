@@ -5,6 +5,7 @@ import {
   READONLY_DISALLOWED_TOOLS,
   interpolate,
   loadPrompt,
+  makeFenceNonce,
   runCodexStructured,
   runGrokStructured,
   waitForFile
@@ -98,6 +99,7 @@ export function buildEvidence(repoRoot, findings, fallbackContent = "") {
 
 function buildR1Prompt(agent, context, options) {
   const template = loadPrompt("r1-independent");
+  const nonce = makeFenceNonce();
   return interpolate(template, {
     AGENT: agent,
     TARGET_LABEL: context.target.label,
@@ -106,15 +108,18 @@ function buildR1Prompt(agent, context, options) {
     SNAPSHOT_ID: context.snapshotId,
     USER_FOCUS: options.focusText || "None",
     POLICY_FOCUS: options.policyFocus || options.focusText || "None",
+    NONCE: nonce,
     REVIEW_INPUT: context.content
   });
 }
 
 function buildR2Prompt(agent, aboutAgent, aboutFindings, context) {
   const template = loadPrompt("r2-peer-critique");
+  const nonce = makeFenceNonce();
   return interpolate(template, {
     AGENT: agent,
     ABOUT_AGENT: aboutAgent,
+    NONCE: nonce,
     OTHER_FINDINGS_JSON: JSON.stringify(slimFindingsDoc(aboutFindings), null, 2),
     EVIDENCE: buildEvidence(context.repoRoot, aboutFindings.findings, context.content)
   });

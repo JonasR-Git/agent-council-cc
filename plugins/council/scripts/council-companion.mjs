@@ -55,7 +55,8 @@ function printUsage() {
       "  --wait|--background  --base <ref>  --scope auto|working-tree|branch",
       "  --codex-model <id>  --grok-model <id>  --codex-effort <l>  --grok-effort <l>",
       "  --skip-codex  --skip-grok  --claude-findings <path>  --claude-findings-wait <path>",
-      "  --wait-timeout <seconds>  --peer-severities P0,P1  --debate-rounds 0|1|2  --json",
+      "  --wait-timeout <seconds>  --peer-severities P0,P1  --debate-rounds 0|1|2  --debate-resume",
+      "  --budget-guard <percent>  --force-budget  --json",
       "  solve only: --problem-file <path>  --claude-plan <path>  --claude-plan-wait <path>",
       "",
       "Modes:",
@@ -669,24 +670,30 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
     skipGrok: Boolean(options["skip-grok"])
   };
 
-  // Budget guard: refuse to start when a provider window is over threshold.
+  // Budget guard: refuse to start the expensive multi-agent modes when a
+  // provider window is over threshold. review/adversarial are cheaper and not
+  // gated. Fails CLOSED when limits cannot be read (a guard that silently
+  // passes is worse than none).
   const guardPolicy = mergeOptionsWithPolicy(request, loadPolicy(cwd));
-  if (guardPolicy.budgetGuard > 0 && !guardPolicy.forceBudget) {
+  if ((deliberate || solve) && guardPolicy.budgetGuard > 0 && !guardPolicy.forceBudget) {
     const pressure = await gatherWindowPressure();
     const skipAgents = [request.skipCodex ? "codex" : null, request.skipGrok ? "grok" : null].filter(Boolean);
     const { breaches, checked } = evaluateBudget(pressure, guardPolicy.budgetGuard, skipAgents);
-    if (breaches.length) {
-      const msg = `Budget guard (${guardPolicy.budgetGuard}%): the following provider windows are at or above the threshold:\n${renderBudgetBreaches(breaches)}\nRe-run with --force-budget to override.`;
+    if (breaches.length || !checked) {
+      const reason = breaches.length
+        ? `the following provider windows are at or above the threshold:\n${renderBudgetBreaches(breaches)}`
+        : "no provider window data could be read (limits unavailable) - failing closed.";
+      const msg = `Budget guard (${guardPolicy.budgetGuard}%): ${reason}\nRe-run with --force-budget to override.`;
       if (options.json) {
-        outputResult({ budgetBlocked: true, threshold: guardPolicy.budgetGuard, breaches }, true);
+        outputResult(
+          { budgetBlocked: true, threshold: guardPolicy.budgetGuard, breaches, checked, reason: breaches.length ? "over-threshold" : "no-data" },
+          true
+        );
       } else {
         console.error(msg);
       }
       process.exitCode = 2;
       return;
-    }
-    if (!checked && !options.json) {
-      console.error("Budget guard: no provider window data available (limits unreadable) - proceeding.");
     }
   }
 
@@ -848,7 +855,7 @@ function handleResult(argv) {
 }
 
 async function handleDoctor(argv) {
-  const { options } = parseCommandInput(argv, { booleanOptions: ["json"] });
+  const { options } = parseCommandInput(argv, { booleanOptions: ["json", "no-ping"] });
   const cwd = process.cwd();
   const backends = probeBackends(cwd, ROOT_DIR);
   const checks = [];
@@ -892,13 +899,13 @@ async function handleDoctor(argv) {
     detail: claudeLimits?.error ?? `5h ${claudeLimits.fiveHour?.usedPercent ?? "?"}% / weekly ${claudeLimits.sevenDay?.usedPercent ?? "?"}%`
   });
 
-  // 4. Live agent pings (the expensive part - a 1-sentence round trip each)
+  // 4. Live agent pings (the expensive part - a 1-sentence round trip each).
+  // --no-ping skips them for a fast, quota-free offline check.
   const pingPrompt = "Reply with exactly: COUNCIL-OK (nothing else).";
-  const agentChecks = await Promise.all([
+  const agentChecks = options["no-ping"]
+    ? []
+    : await Promise.all([
     (async () => {
-      if (options.json === undefined) {
-        /* keep */
-      }
       const res = backends.codex.companionAvailable
         ? await runCodexStructuredPing(cwd, backends, pingPrompt)
         : { ok: false, detail: "codex companion not found" };
@@ -926,6 +933,11 @@ async function handleDoctor(argv) {
   if (!ready) process.exitCode = 1;
 }
 
+function pingFailDetail(result) {
+  const snippet = String(result.stderr || result.stdout || "").trim().replace(/\s+/g, " ").slice(0, 120);
+  return `exit ${result.status}${result.timedOut ? " (timeout)" : ""}${snippet ? ` - ${snippet}` : ""}`;
+}
+
 async function runCodexStructuredPing(cwd, backends, prompt) {
   const promptFile = path.join(resolveStateDir(cwd), `doctor-ping-${process.pid}.md`);
   fs.mkdirSync(path.dirname(promptFile), { recursive: true });
@@ -933,16 +945,16 @@ async function runCodexStructuredPing(cwd, backends, prompt) {
   const args = [backends.codex.companion, "task", "--prompt-file", promptFile];
   try {
     const result = await runCommandAsync(process.execPath, args, { cwd, timeoutMs: 120_000 });
-    fs.unlinkSync(promptFile);
     const ok = result.status === 0 && /COUNCIL-OK/.test(result.stdout);
-    return { ok, detail: ok ? "responded" : `exit ${result.status}${result.timedOut ? " (timeout)" : ""}` };
+    return { ok, detail: ok ? "responded" : pingFailDetail(result) };
   } catch (error) {
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+  } finally {
     try {
       fs.unlinkSync(promptFile);
     } catch {
       /* ignore */
     }
-    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -951,19 +963,33 @@ async function runGrokPing(cwd, backends, prompt) {
   const promptFile = path.join(resolveStateDir(cwd), `doctor-grok-${process.pid}.md`);
   fs.mkdirSync(path.dirname(promptFile), { recursive: true });
   fs.writeFileSync(promptFile, prompt, "utf8");
-  const args = ["--prompt-file", promptFile, "--cwd", cwd, "--max-turns", "1", "--output-format", "plain"];
+  // Match production grok invocation: auto-approve + read-only lockdown, else a
+  // tool attempt or approval gate hangs the ping until timeout.
+  const args = [
+    "--prompt-file",
+    promptFile,
+    "--cwd",
+    cwd,
+    "--always-approve",
+    "--disallowed-tools",
+    READONLY_DISALLOWED_TOOLS,
+    "--max-turns",
+    "1",
+    "--output-format",
+    "plain"
+  ];
   try {
     const result = await runCommandAsync(bin, args, { cwd, timeoutMs: 120_000 });
-    fs.unlinkSync(promptFile);
     const ok = result.status === 0 && /COUNCIL-OK/.test(result.stdout);
-    return { ok, detail: ok ? "responded" : `exit ${result.status}${result.timedOut ? " (timeout)" : ""}` };
+    return { ok, detail: ok ? "responded" : pingFailDetail(result) };
   } catch (error) {
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+  } finally {
     try {
       fs.unlinkSync(promptFile);
     } catch {
       /* ignore */
     }
-    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
   }
 }
 

@@ -1,9 +1,18 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+
+/**
+ * A per-run token that fences untrusted content in prompts. Hostile repo text
+ * cannot forge the closing marker because it cannot predict the nonce.
+ */
+export function makeFenceNonce() {
+  return randomBytes(6).toString("hex").toUpperCase();
+}
 
 import { findGrokBinary } from "./discover.mjs";
 import { runCommandAsync } from "./process.mjs";
