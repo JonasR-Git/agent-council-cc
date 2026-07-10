@@ -1,0 +1,242 @@
+import fs from "node:fs";
+import path from "node:path";
+
+import { buildGraph, findCycles, findDeadExports } from "./import-graph.mjs";
+import { findDuplicateClusters } from "./dup-detect.mjs";
+import { runCommand } from "./process.mjs";
+import { workspaceRoot } from "./state.mjs";
+
+// The static fact base for /council:audit v1 (read-only). Zero-dep, deterministic.
+// Everything it emits is a CANDIDATE (confidence-tagged), never authority to change
+// anything - regex analysis cannot prove reachability/soundness.
+
+const SOURCE_RE = /\.(mjs|cjs|js)$/;
+const GOD_FILE_LOC = 400;
+const HIGH_BRANCHES = 60;
+
+function toPosix(p) {
+  return p.split(path.sep).join("/");
+}
+
+/** Tracked source files under the repo, optionally filtered to `areas` prefixes. */
+export function enumerateFiles(root, { areas } = {}) {
+  const res = runCommand("git", ["ls-files"], { cwd: root });
+  let rel;
+  if (res.status === 0 && res.stdout.trim()) {
+    rel = res.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  } else {
+    rel = walk(root).map((abs) => toPosix(path.relative(root, abs)));
+  }
+  const prefixes = (areas ?? []).map((a) => toPosix(a).replace(/\/+$/, ""));
+  const files = [];
+  for (const id of rel) {
+    if (!SOURCE_RE.test(id)) continue;
+    if (prefixes.length && !prefixes.some((p) => id === p || id.startsWith(`${p}/`))) continue;
+    let text;
+    try {
+      text = fs.readFileSync(path.join(root, id), "utf8");
+    } catch {
+      continue;
+    }
+    files.push({ id, text });
+  }
+  return files.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function walk(dir, acc = []) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const e of entries) {
+    if (e.name === "node_modules" || e.name === ".git") continue;
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) walk(full, acc);
+    else if (SOURCE_RE.test(e.name)) acc.push(full);
+  }
+  return acc;
+}
+
+function fileFacts(text) {
+  const lines = String(text).split(/\r?\n/);
+  const loc = lines.filter((l) => l.trim()).length;
+  let depth = 0;
+  let maxNesting = 0;
+  for (const ch of text) {
+    if (ch === "{") {
+      depth += 1;
+      if (depth > maxNesting) maxNesting = depth;
+    } else if (ch === "}") {
+      depth = Math.max(0, depth - 1);
+    }
+  }
+  const count = (re) => (text.match(re) ?? []).length;
+  const branches = count(/\b(if|for|while|case|catch)\b/g) + count(/&&|\|\|/g) + count(/\?[^.:]/g);
+  const smells = {
+    emptyCatch: count(/catch\s*(\([^)]*\))?\s*\{\s*\}/g),
+    console: count(/\bconsole\.\w+/g),
+    todo: count(/\b(TODO|FIXME|HACK|XXX)\b/g),
+    ignore: count(/@ts-ignore|eslint-disable/g)
+  };
+  const smellCount = smells.emptyCatch + smells.console + smells.todo + smells.ignore;
+  return { loc, maxNesting, branches, smells, smellCount };
+}
+
+/** git commits touching each file in the last `days` days -> churn map. */
+function churnMap(root, files, days) {
+  const map = new Map();
+  const res = runCommand("git", ["log", `--since=${days}.days`, "--name-only", "--pretty=format:"], { cwd: root });
+  if (res.status !== 0) return map;
+  for (const line of res.stdout.split(/\r?\n/)) {
+    const id = line.trim();
+    if (id) map.set(id, (map.get(id) ?? 0) + 1);
+  }
+  return map;
+}
+
+/** Which source modules are referenced by a *.test.* file (best-effort). */
+function testedSet(files) {
+  const tested = new Set();
+  const isTest = (id) => /\.test\.(mjs|cjs|js)$/.test(id) || /(^|\/)tests?\//.test(id);
+  const testFiles = files.filter((f) => isTest(f.id));
+  const sourceBases = new Map();
+  for (const f of files) if (!isTest(f.id)) sourceBases.set(path.posix.basename(f.id), f.id);
+  for (const tf of testFiles) {
+    for (const [base, id] of sourceBases) {
+      if (tf.text.includes(base)) tested.add(id);
+    }
+  }
+  return { tested, isTest };
+}
+
+function norm(v, max) {
+  return max > 0 ? v / max : 0;
+}
+
+/**
+ * Build the codebase model + candidate findings + coverage. Pure aside from
+ * reading files/git under `cwd`.
+ */
+export function buildCodebaseModel(cwd, { areas, churnDays = 90 } = {}) {
+  const root = workspaceRoot(cwd);
+  const files = enumerateFiles(root, { areas });
+  const nodes = buildGraph(files);
+  const cycles = findCycles(nodes);
+  const deadExports = findDeadExports(nodes, files);
+  const churn = churnMap(root, files, churnDays);
+  const { tested, isTest } = testedSet(files);
+
+  const facts = files.map((f) => {
+    const ff = fileFacts(f.text);
+    const node = nodes.get(f.id);
+    return {
+      id: f.id,
+      loc: ff.loc,
+      maxNesting: ff.maxNesting,
+      branches: ff.branches,
+      smells: ff.smells,
+      smellCount: ff.smellCount,
+      churn: churn.get(f.id) ?? 0,
+      fanIn: node ? node.in.size : 0,
+      fanOut: node ? node.out.size : 0,
+      exports: node ? node.exports.size + (node.hasDefault ? 1 : 0) : 0,
+      isTest: isTest(f.id),
+      tested: tested.has(f.id)
+    };
+  });
+
+  const max = (sel) => facts.reduce((m, x) => Math.max(m, sel(x)), 0);
+  const mx = { loc: max((x) => x.loc), branches: max((x) => x.branches), churn: max((x) => x.churn), smell: max((x) => x.smellCount), fanIn: max((x) => x.fanIn) };
+  for (const x of facts) {
+    x.hotspot = Math.round(
+      20 *
+        (norm(x.loc, mx.loc) +
+          norm(x.branches, mx.branches) +
+          norm(x.churn, mx.churn) +
+          norm(x.smellCount, mx.smell) +
+          norm(x.fanIn, mx.fanIn))
+    );
+  }
+  facts.sort((a, b) => b.hotspot - a.hotspot || a.id.localeCompare(b.id));
+
+  const dupClusters = findDuplicateClusters(files, { minLines: 6 });
+  const findings = buildFindings({ facts, cycles, deadExports, dupClusters });
+
+  const supplied = facts.reduce((s, x) => s + x.loc, 0);
+  return {
+    files: facts,
+    graph: { cycles, deadExports },
+    dupClusters,
+    findings,
+    coverage: { modules: files.length, sourceModules: facts.filter((x) => !x.isTest).length, mappedLOC: supplied },
+    generatedAt: null
+  };
+}
+
+function buildFindings({ facts, cycles, deadExports, dupClusters }) {
+  const f = [];
+  const add = (o) => f.push({ severity: "P2", confidence: 0.6, scope: "localized", ...o });
+
+  for (const c of dupClusters) {
+    add({
+      category: "ssot",
+      severity: "P1",
+      scope: "cross-cutting",
+      confidence: 0.75,
+      title: `Duplicated ${c.lineCount}-line block in ${c.locations.length} places`,
+      detail: `Candidate copy-paste / parallel implementation. Consider consolidating to one source of truth. Locations: ${c.locations.map((l) => `${l.file}:${l.startLine}-${l.endLine}`).join(" · ")}`,
+      file: c.locations[0].file,
+      line: c.locations[0].startLine
+    });
+  }
+  for (const cyc of cycles) {
+    add({ category: "architecture", severity: "P1", scope: "cross-cutting", confidence: 0.5, title: `Import cycle across ${cyc.length} modules`, detail: `Cycle (candidate, regex-derived): ${cyc.join(" -> ")}`, file: cyc[0], line: null });
+  }
+  for (const d of deadExports) {
+    add({ category: "dead-code", confidence: 0.35, title: `Module never imported: ${d.id}`, detail: `No in-repo importer found (LOW confidence: entry points, package exports, dynamic/external consumers are invisible - verify before removing). Exports: ${d.exports.slice(0, 8).join(", ")}${d.hasDefault ? ", default" : ""}`, file: d.id, line: null });
+  }
+  for (const x of facts) {
+    if (x.isTest) continue;
+    if (x.loc > GOD_FILE_LOC) add({ category: "complexity", title: `Large module (${x.loc} LOC): ${x.id}`, detail: `Above ${GOD_FILE_LOC} LOC; a hotspot for bugs and a candidate to split.`, file: x.id, line: null });
+    if (x.branches > HIGH_BRANCHES) add({ category: "complexity", title: `High branch density (${x.branches}): ${x.id}`, detail: "Many control-flow branches; review the hottest functions.", file: x.id, line: null });
+    if (x.smells.emptyCatch > 0) add({ category: "correctness", severity: "P2", confidence: 0.7, title: `${x.smells.emptyCatch} empty catch block(s): ${x.id}`, detail: "Swallowed errors hide failures; confirm each is intentional.", file: x.id, line: null });
+    if (x.smells.todo > 0) add({ category: "docs", severity: "nit", confidence: 0.9, title: `${x.smells.todo} TODO/FIXME/HACK marker(s): ${x.id}`, detail: "Tracked debt markers.", file: x.id, line: null });
+    if (x.exports > 0 && !x.tested) add({ category: "test", severity: "P2", confidence: 0.4, title: `No test references ${x.id}`, detail: "Exports with no apparent test file mention (heuristic).", file: x.id, line: null });
+  }
+  const rank = { P0: 0, P1: 1, P2: 2, nit: 3 };
+  return f.sort((a, b) => rank[a.severity] - rank[b.severity] || (b.confidence - a.confidence));
+}
+
+/** Human-readable v1 report. Everything is a read-only candidate. */
+export function renderAuditReport(model, { limit = 60 } = {}) {
+  const L = [];
+  const c = model.coverage;
+  L.push("# Council Audit (v1 - static, read-only candidates)");
+  L.push("");
+  L.push(`Scanned ${c.modules} modules (${c.sourceModules} source, ${c.mappedLOC} LOC). Findings are CANDIDATES - verify before acting; nothing was changed.`);
+  L.push("");
+
+  const byCat = new Map();
+  for (const x of model.findings) byCat.set(x.category, (byCat.get(x.category) ?? 0) + 1);
+  L.push("## Findings by category");
+  for (const [cat, n] of [...byCat.entries()].sort((a, b) => b[1] - a[1])) L.push(`- ${cat}: ${n}`);
+  L.push("");
+
+  L.push(`## Findings (${model.findings.length}, most severe first)`);
+  for (const x of model.findings.slice(0, limit)) {
+    L.push(`- **${x.severity}** [${x.category}] ${x.title} · conf ${x.confidence} · ${x.scope}${x.line ? ` · ${x.file}:${x.line}` : x.file ? ` · ${x.file}` : ""}`);
+    if (x.detail) L.push(`  ${x.detail}`);
+  }
+  if (model.findings.length > limit) L.push(`… and ${model.findings.length - limit} more (use --json for all).`);
+  L.push("");
+
+  L.push("## Top hotspots (complexity × fan-in × churn × smells)");
+  for (const x of model.files.filter((f) => !f.isTest).slice(0, 12)) {
+    L.push(`- ${x.hotspot}  ${x.id}  (loc ${x.loc}, branches ${x.branches}, churn ${x.churn}, fan-in ${x.fanIn}${x.smellCount ? `, smells ${x.smellCount}` : ""})`);
+  }
+  L.push("");
+  L.push("Next: review the top hotspots + P1 candidates; consolidation of duplicated blocks is a *proposal*, not applied.");
+  return L.join("\n");
+}
