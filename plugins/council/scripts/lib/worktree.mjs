@@ -28,25 +28,62 @@ export function worktreePaths(cwd, slug) {
   return { root, branch, dir, slug: clean };
 }
 
+function branchExists(root, branch) {
+  return runCommand("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: root }).status === 0;
+}
+
 export function addWorktree(cwd, slug, baseRef) {
   const { root, branch, dir } = worktreePaths(cwd, slug);
-  const base = baseRef || "HEAD";
-  const res = runCommand("git", ["worktree", "add", "-b", branch, dir, base], { cwd: root });
-  if (res.status !== 0) {
-    return { ok: false, branch, dir, error: (res.stderr || res.stdout || "git worktree add failed").trim() };
+  // 1. A worktree for this branch already exists -> return it (crash/retry safe).
+  const existing = listWorktrees(cwd).find((e) => e.branch === branch);
+  if (existing) {
+    return { ok: true, branch, dir: existing.path, reused: true };
   }
-  return { ok: true, branch, dir };
+  // 2. The branch exists but has no worktree (remove keeps the branch for
+  //    review/merge, and the fixloop re-adds the same slug) -> attach it, no -b.
+  // 3. New branch -> create it with -b from base.
+  const reattaching = branchExists(root, branch);
+  const args = reattaching
+    ? ["worktree", "add", dir, branch]
+    : ["worktree", "add", "-b", branch, dir, baseRef || "HEAD"];
+  const res = runCommand("git", args, { cwd: root });
+  if (res.status !== 0) {
+    const detail = (res.stderr || res.stdout || "git worktree add failed").trim();
+    const hint = /already exists|already checked out/i.test(detail)
+      ? ` (target dir taken - remove it or use a new slug)`
+      : "";
+    return { ok: false, branch, dir, error: `${detail}${hint}` };
+  }
+  return { ok: true, branch, dir, reattached: reattaching };
+}
+
+export function hasUncommittedChanges(dir) {
+  const res = runCommand("git", ["status", "--porcelain"], { cwd: dir });
+  return res.status === 0 && res.stdout.trim().length > 0;
 }
 
 export function removeWorktree(cwd, slug, { force = false } = {}) {
   const { root, branch, dir } = worktreePaths(cwd, slug);
-  const args = ["worktree", "remove", dir];
+  const entry = listWorktrees(cwd).find((e) => e.branch === branch);
+  const wtDir = entry?.path ?? dir;
+  // Refuse to discard uncommitted work unless explicitly forced - `git worktree
+  // remove --force` deletes it silently otherwise.
+  if (!force && hasUncommittedChanges(wtDir)) {
+    return {
+      ok: false,
+      branch,
+      dir: wtDir,
+      uncommitted: true,
+      error: `Worktree has uncommitted changes; commit them or re-run with --force to discard.`
+    };
+  }
+  const args = ["worktree", "remove", wtDir];
   if (force) args.push("--force");
   const res = runCommand("git", args, { cwd: root });
   if (res.status !== 0) {
-    return { ok: false, branch, dir, error: (res.stderr || res.stdout || "git worktree remove failed").trim() };
+    return { ok: false, branch, dir: wtDir, error: (res.stderr || res.stdout || "git worktree remove failed").trim() };
   }
-  return { ok: true, branch, dir };
+  return { ok: true, branch, dir: wtDir };
 }
 
 export function listWorktrees(cwd) {

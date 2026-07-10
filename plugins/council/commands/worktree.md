@@ -12,7 +12,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" worktree $ARGUMENTS
   sibling worktree directory; the writer implements + commits there, leaving the
   main checkout free.
 - `worktree remove <slug> [--force]` removes the worktree (the branch is kept so it
-  can be reviewed/merged).
+  can be reviewed/merged). Refuses if the worktree has **uncommitted changes** —
+  commit them first, or pass `--force` to discard them.
 - `worktree list` shows active council-solve worktrees.
 
 Use in `/council:solve` phase 4 so exactly one writer works in isolation.

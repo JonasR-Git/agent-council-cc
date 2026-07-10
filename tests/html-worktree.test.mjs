@@ -66,7 +66,8 @@ test("worktree slug sanitizing and path convention", () => {
   assert.ok(p.dir.includes("-council-my-slug"));
 });
 
-test("worktree add/list/remove against a real temp repo", () => {
+test("worktree add/list/remove against a real temp repo, with idempotency + uncommitted guard", async () => {
+  const { hasUncommittedChanges } = await import("../plugins/council/scripts/lib/worktree.mjs");
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "council-wt-"));
   execSync("git init -q", { cwd: repo });
   execSync('git -c user.email=t@t -c user.name=t commit -q --allow-empty -m base', { cwd: repo });
@@ -76,12 +77,33 @@ test("worktree add/list/remove against a real temp repo", () => {
     assert.ok(fs.existsSync(added.dir));
     assert.equal(added.branch, "council-solve/demo");
 
-    const list = listWorktrees(repo);
-    assert.ok(list.some((e) => e.branch === "council-solve/demo"));
+    // Idempotent: adding the same slug again reuses the existing worktree.
+    const again = addWorktree(repo, "demo");
+    assert.equal(again.ok, true);
+    assert.equal(again.reused, true);
 
-    const removed = removeWorktree(repo, "demo");
+    assert.ok(listWorktrees(repo).some((e) => e.branch === "council-solve/demo"));
+
+    // Uncommitted-change guard: a new file makes remove refuse without --force.
+    fs.writeFileSync(path.join(added.dir, "dirty.txt"), "wip", "utf8");
+    assert.equal(hasUncommittedChanges(added.dir), true);
+    const refused = removeWorktree(repo, "demo");
+    assert.equal(refused.ok, false);
+    assert.equal(refused.uncommitted, true);
+    assert.ok(fs.existsSync(added.dir), "worktree kept when uncommitted work present");
+
+    // --force discards and removes.
+    const removed = removeWorktree(repo, "demo", { force: true });
     assert.equal(removed.ok, true, removed.error);
-    assert.ok(!fs.existsSync(added.dir), "worktree dir gone after remove");
+    assert.ok(!fs.existsSync(added.dir), "worktree dir gone after forced remove");
+
+    // Fixloop scenario: remove keeps the branch, so re-adding the same slug must
+    // re-attach the existing branch (no -b), not fail.
+    const readd = addWorktree(repo, "demo");
+    assert.equal(readd.ok, true, readd.error);
+    assert.equal(readd.reattached, true, "re-add attaches the kept branch");
+    assert.ok(fs.existsSync(readd.dir));
+    removeWorktree(repo, "demo", { force: true });
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }

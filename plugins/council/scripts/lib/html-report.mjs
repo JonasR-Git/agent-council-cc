@@ -19,6 +19,15 @@ export function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
+const MAX_EMBEDDED_REPORT_CHARS = 200_000;
+
+function clipReport(text) {
+  const t = String(text ?? "");
+  return t.length > MAX_EMBEDDED_REPORT_CHARS
+    ? `${t.slice(0, MAX_EMBEDDED_REPORT_CHARS)}\n\n[... report truncated; full report on disk ...]`
+    : t;
+}
+
 const SEVERITY_COLORS = {
   P0: "#b3261e",
   P1: "#c8641b",
@@ -127,7 +136,7 @@ function sortBy(key){
 ${verdictsBlock(verdicts)}
 ${findingsTable}
 ${rankingBlock(ranking)}
-<details><summary>Full report (markdown)</summary><pre>${escapeHtml(job.report ?? job.output ?? "(none)")}</pre></details>
+<details><summary>Full report (markdown)</summary><pre>${escapeHtml(clipReport(job.report ?? job.output ?? "(none)"))}</pre></details>
 <script>${script}</script>
 </body></html>`;
 }
