@@ -28,9 +28,20 @@ function withState(fn) {
 }
 
 test("fingerprintFinding is stable across title phrasing noise", () => {
-  const a = fingerprintFinding({ file: "src/A.mjs", title: "The budget guard fails open here" });
-  const b = fingerprintFinding({ file: "src\\A.mjs", title: "budget guard fails open" });
+  const a = fingerprintFinding({ file: "src/A.mjs", title: "The budget guard fails open here", line: 10 });
+  const b = fingerprintFinding({ file: "src\\A.mjs", title: "budget guard fails open", line: 12 });
   assert.equal(a, b);
+});
+
+test("fingerprintFinding disambiguates distant lines and empty-token titles", () => {
+  // Same file + same tokens but far-apart lines -> different buckets.
+  const near = fingerprintFinding({ file: "a.mjs", title: "cache leak", line: 10 });
+  const far = fingerprintFinding({ file: "a.mjs", title: "cache leak", line: 400 });
+  assert.notEqual(near, far);
+  // Two short titles with no >=4 tokens must not collapse to the same key.
+  const one = fingerprintFinding({ file: "a.mjs", title: "Bad API", line: 5 });
+  const two = fingerprintFinding({ file: "a.mjs", title: "Fix me", line: 5 });
+  assert.notEqual(one, two);
 });
 
 test("recordAndAnnotate marks seenBefore on the second run and counts timesSeen", () => {
@@ -65,6 +76,48 @@ test("absence does NOT auto-fix; resolve does", () => {
     assert.equal(readLedgerEntries(cwd).find((e) => e.fingerprint === fp).status, "fixed");
     assert.equal(resolveLedgerEntry(cwd, "no-such-fp", "fixed", "t3"), false);
   });
+});
+
+test("pruneR1Cache drops snapshots older than the age window, keeps fresh", async () => {
+  const { pruneR1Cache } = await import("../plugins/council/scripts/lib/resume.mjs");
+  const { resolveStateDir } = await import("../plugins/council/scripts/lib/state.mjs");
+  withState((cwd) => {
+    writeCachedR1(cwd, "fresh+aaaa", "codex", { agent: "codex", status: 0, stdout: "{}" });
+    writeCachedR1(cwd, "stale+bbbb", "codex", { agent: "codex", status: 0, stdout: "{}" });
+    const cacheRoot = path.join(resolveStateDir(cwd), "r1-cache");
+    const staleDir = fs.readdirSync(cacheRoot).find((d) => d.startsWith("stale"));
+    const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(path.join(cacheRoot, staleDir), old, old);
+
+    pruneR1Cache(cwd, Date.now());
+    assert.ok(readCachedR1(cwd, "fresh+aaaa", "codex"), "fresh snapshot survives");
+    assert.equal(readCachedR1(cwd, "stale+bbbb", "codex"), null, "stale snapshot pruned");
+  });
+});
+
+test("listAllJobsDirs finds per-workspace job dirs under the state root", async () => {
+  const { listAllJobsDirs, writeJobFile } = await import("../plugins/council/scripts/lib/state.mjs");
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-global-"));
+  const previous = process.env.AGENT_COUNCIL_STATE_DIR;
+  process.env.AGENT_COUNCIL_STATE_DIR = stateRoot;
+  try {
+    // Two distinct workspaces write a job each; both must be discoverable globally.
+    const wsA = fs.mkdtempSync(path.join(os.tmpdir(), "wsA-"));
+    const wsB = fs.mkdtempSync(path.join(os.tmpdir(), "wsB-"));
+    writeJobFile(wsA, "council-a", { id: "council-a", kind: "deliberate", status: "completed" });
+    writeJobFile(wsB, "council-b", { id: "council-b", kind: "solve", status: "completed" });
+    const dirs = listAllJobsDirs();
+    assert.ok(dirs.length >= 2);
+    const ids = dirs.flatMap((d) => fs.readdirSync(d.jobsDir)).filter((f) => f.endsWith(".json"));
+    assert.ok(ids.includes("council-a.json"));
+    assert.ok(ids.includes("council-b.json"));
+    fs.rmSync(wsA, { recursive: true, force: true });
+    fs.rmSync(wsB, { recursive: true, force: true });
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_COUNCIL_STATE_DIR;
+    else process.env.AGENT_COUNCIL_STATE_DIR = previous;
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  }
 });
 
 test("R1 cache round-trips only successful outputs, keyed by snapshot", () => {

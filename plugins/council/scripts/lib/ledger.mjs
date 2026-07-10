@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { resolveStateDir } from "./state.mjs";
+import { resolveStateDir, writeFileAtomic } from "./state.mjs";
 
 /**
  * A cross-run findings ledger: fingerprints each merged finding so later runs
@@ -19,19 +19,31 @@ const STOPWORDS = new Set([
   "your", "their", "which", "while", "only", "also", "just", "such", "some"
 ]);
 
+function hashLite(text) {
+  let h = 0;
+  for (let i = 0; i < text.length; i += 1) h = (h * 31 + text.charCodeAt(i)) >>> 0;
+  return h.toString(16).padStart(8, "0");
+}
+
 export function fingerprintFinding(finding) {
   const file = String(finding.file ?? "")
     .toLowerCase()
     .replace(/\\/g, "/")
     .trim();
-  const tokens = String(finding.title ?? "")
-    .toLowerCase()
-    .match(/[a-z0-9]+/g)
-    ?.filter((t) => t.length >= 4 && !STOPWORDS.has(t))
-    .sort()
-    .slice(0, 8)
-    .join("-") ?? "";
-  return `${file}::${tokens}`;
+  const titleNorm = String(finding.title ?? "").toLowerCase();
+  const tokens =
+    titleNorm
+      .match(/[a-z0-9]+/g)
+      ?.filter((t) => t.length >= 4 && !STOPWORDS.has(t))
+      .sort()
+      .slice(0, 8)
+      .join("-") ?? "";
+  // Coarse line bucket disambiguates distinct findings in the same file that
+  // share a token set; a title-hash fallback prevents an empty token side from
+  // collapsing every short-titled finding on a file into one key.
+  const bucket = Number.isFinite(Number(finding.line)) ? Math.floor(Number(finding.line) / 50) : "x";
+  const key = tokens || `h${hashLite(titleNorm.replace(/\s+/g, " ").trim())}`;
+  return `${file}::${bucket}::${key}`;
 }
 
 function readLedger(cwd) {
@@ -57,9 +69,34 @@ function readLedger(cwd) {
 
 function writeLedger(cwd, map) {
   const file = ledgerFile(cwd);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
   const entries = [...map.values()].slice(-MAX_LEDGER_ENTRIES);
-  fs.writeFileSync(file, entries.map((e) => JSON.stringify(e)).join("\n") + (entries.length ? "\n" : ""), "utf8");
+  writeFileAtomic(file, entries.map((e) => JSON.stringify(e)).join("\n") + (entries.length ? "\n" : ""));
+}
+
+/**
+ * Merge freshly-computed entries into the on-disk ledger just before writing,
+ * so a concurrent finish is not lost. Newer lastSeen / higher timesSeen wins;
+ * an explicit non-open status is preserved.
+ */
+function mergeAndWriteLedger(cwd, map) {
+  const disk = readLedger(cwd);
+  for (const [fp, entry] of map) {
+    const other = disk.get(fp);
+    if (!other) {
+      disk.set(fp, entry);
+      continue;
+    }
+    disk.set(fp, {
+      ...entry,
+      timesSeen: Math.max(entry.timesSeen ?? 0, other.timesSeen ?? 0),
+      firstSeen: [entry.firstSeen, other.firstSeen].filter(Boolean).sort()[0] ?? entry.firstSeen,
+      firstJobId: (entry.firstSeen ?? "") <= (other.firstSeen ?? "") ? entry.firstJobId : other.firstJobId,
+      lastSeen: (entry.lastSeen ?? "") >= (other.lastSeen ?? "") ? entry.lastSeen : other.lastSeen,
+      lastJobId: (entry.lastSeen ?? "") >= (other.lastSeen ?? "") ? entry.lastJobId : other.lastJobId,
+      status: other.status !== "open" ? other.status : entry.status
+    });
+  }
+  writeLedger(cwd, disk);
 }
 
 /**
@@ -70,6 +107,9 @@ function writeLedger(cwd, map) {
  */
 export function recordAndAnnotate(cwd, jobId, merged, nowIso) {
   try {
+    // Read the current ledger, then compute annotations. We re-read again just
+    // before writing (below) and merge, so a concurrent finish that landed in
+    // between is not clobbered - a lock-free best effort for this local tool.
     const map = readLedger(cwd);
     const annotated = (merged.all ?? []).map((item) => {
       const fingerprint = fingerprintFinding(item);
@@ -89,8 +129,14 @@ export function recordAndAnnotate(cwd, jobId, merged, nowIso) {
       });
       return { ...item, seenBefore: Boolean(prior), timesSeen, ledgerStatus: prior?.status ?? "new" };
     });
-    writeLedger(cwd, map);
-    return { ...merged, all: annotated };
+    mergeAndWriteLedger(cwd, map);
+    const all = annotated;
+    return {
+      ...merged,
+      all,
+      consensus: all.filter((m) => m.consensus),
+      unique: all.filter((m) => !m.consensus)
+    };
   } catch {
     return merged;
   }

@@ -527,6 +527,7 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       resume: mergedOpts.resume,
       jobId: job.id,
       nowIso: nowIso(),
+      nowMs: Date.now(),
       onPhase: makePhaseReporter(root, job)
     });
     const r1Failed = deliberation.r1.some((r) => !r.skipped && r.status !== 0);
@@ -1029,10 +1030,11 @@ async function runGrokPing(cwd, backends, prompt) {
 
 function handleHistory(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["kind", "since", "status"],
+    valueOptions: ["kind", "since", "status", "limit"],
     booleanOptions: ["json", "global"]
   });
   const cwd = process.cwd();
+  const limit = options.limit != null ? Math.max(1, Number(options.limit)) : 60;
   const sinceMs = options.since ? Date.now() - Number(options.since) * 86_400_000 : 0;
   if (options.since != null && !Number.isFinite(Number(options.since))) {
     throw new Error("--since must be a number of days");
@@ -1083,8 +1085,8 @@ function handleHistory(argv) {
     console.log("No matching council jobs.\n");
     return;
   }
-  const lines = [`Council history (${rows.length} jobs${options.global ? ", all workspaces" : ""}):`];
-  for (const r of rows.slice(0, 60)) {
+  const lines = [`Council history (${rows.length} jobs${options.global ? ", all workspaces" : ""}, showing ${Math.min(limit, rows.length)}):`];
+  for (const r of rows.slice(0, limit)) {
     const ws = options.global ? `${r.workspace.slice(0, 20).padEnd(20)}  ` : "";
     const cons = r.consensusFindings != null ? ` · consensus=${r.consensusFindings}` : "";
     lines.push(`  ${ws}${r.id}  ${String(r.status).padEnd(22)} ${String(r.kind).padEnd(11)} ${(r.createdAt ?? "").slice(0, 16)}${cons}  ${r.summary.slice(0, 50)}`);

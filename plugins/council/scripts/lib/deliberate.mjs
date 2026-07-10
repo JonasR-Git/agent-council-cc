@@ -24,7 +24,7 @@ import {
 } from "./findings.mjs";
 import { collectReviewContext, resolveReviewTarget } from "./git-context.mjs";
 import { recordAndAnnotate } from "./ledger.mjs";
-import { readCachedR1, writeCachedR1 } from "./resume.mjs";
+import { pruneR1Cache, readCachedR1, resumeContextKey, writeCachedR1 } from "./resume.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 
 export { READONLY_DISALLOWED_TOOLS, runCodexStructured, runGrokStructured };
@@ -207,10 +207,20 @@ export async function runDeliberation(cwd, backends, options = {}) {
   };
 
   // Resume: reuse cached successful R1 outputs for this snapshot so only the
-  // failed/missing agents (e.g. a timed-out codex) re-run.
+  // failed/missing agents (e.g. a timed-out codex) re-run. The cache key folds
+  // in focus/models so a different --focus never reuses the wrong R1.
   const resume = Boolean(options.resume);
-  const cachedCodex = resume ? readCachedR1(cwd, context.snapshotId, "codex") : null;
-  const cachedGrok = resume ? readCachedR1(cwd, context.snapshotId, "grok") : null;
+  const ctxKey = resumeContextKey({
+    focusText: options.focusText,
+    policyFocus: options.policyFocus,
+    codexModel: options.codexModel,
+    grokModel: options.grokModel,
+    grokEffort: options.grokEffort,
+    base: options.base,
+    scope: options.scope
+  });
+  const cachedCodex = resume ? readCachedR1(cwd, context.snapshotId, "codex", ctxKey) : null;
+  const cachedGrok = resume ? readCachedR1(cwd, context.snapshotId, "grok", ctxKey) : null;
 
   const r1Jobs = [];
   if (options.skipCodex) {
@@ -249,11 +259,6 @@ export async function runDeliberation(cwd, backends, options = {}) {
   onPhase(resume && (cachedCodex || cachedGrok) ? "r1 (resuming)" : "r1");
   const r1Raw = await Promise.all(r1Jobs);
   onPhase("r1-done");
-
-  // Cache successful R1 outputs for a future --resume of this snapshot.
-  for (const raw of r1Raw) {
-    if (raw && !raw.skipped && !raw.resumedFromCache) writeCachedR1(cwd, context.snapshotId, raw.agent, raw);
-  }
   const claudeDoc = await loadClaudeDoc(options);
 
   const r1Docs = [];
@@ -266,7 +271,11 @@ export async function runDeliberation(cwd, backends, options = {}) {
     const doc = parseAgentFindings(raw.stdout, raw.agent);
     r1Docs.push(doc);
     r1Results.push({ ...raw, findings: doc });
+    // Cache only parse-successful R1 outputs, so a status-0-but-garbage run is
+    // retried (not stuck) on the next --resume for this snapshot.
+    if (!raw.resumedFromCache && doc.parseOk) writeCachedR1(cwd, context.snapshotId, raw.agent, raw, ctxKey);
   }
+  if (options.nowMs) pruneR1Cache(cwd, options.nowMs);
   if (claudeDoc) {
     r1Docs.push(claudeDoc);
     r1Results.push({

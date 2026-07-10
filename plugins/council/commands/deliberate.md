@@ -1,6 +1,6 @@
 ---
 description: 3-agent deliberation - independent reviews then peer critique (Claude + Codex + Grok)
-argument-hint: "[--wait|--background] [--base <ref>] [--codex-model <id>] [--grok-model <id>] [--claude-findings <path>|--claude-findings-wait <path> --wait-timeout <seconds>] [--peer-severities P0,P1] [--debate-rounds 0|1|2] [--debate-resume] [focus text]"
+argument-hint: "[--wait|--background] [--base <ref>] [--codex-model <id>] [--grok-model <id>] [--claude-findings <path>|--claude-findings-wait <path> --wait-timeout <seconds>] [--peer-severities P0,P1] [--debate-rounds 0|1|2] [--debate-resume] [--resume] [focus text]"
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), Write, AskUserQuestion
 ---

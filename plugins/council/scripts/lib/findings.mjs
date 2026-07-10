@@ -526,7 +526,11 @@ function formatMergedItem(f) {
   const peers = f.peerVotes?.length
     ? ` · peers: ${f.peerVotes.map((v) => `${v.from}:${v.vote}`).join(", ")}`
     : "";
-  const flags = [f.contested ? "contested" : null, f.fromPeerMissed ? "peer-missed" : null, voters]
+  const ledger =
+    f.seenBefore && f.timesSeen > 1
+      ? `seen ${f.timesSeen}x${f.ledgerStatus && f.ledgerStatus !== "open" && f.ledgerStatus !== "new" ? ` · was ${f.ledgerStatus}` : ""}`
+      : null;
+  const flags = [f.contested ? "contested" : null, f.fromPeerMissed ? "peer-missed" : null, ledger, voters]
     .filter(Boolean)
     .join(" · ");
   return [
