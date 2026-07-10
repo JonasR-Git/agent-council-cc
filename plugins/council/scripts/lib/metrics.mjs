@@ -14,6 +14,26 @@ function metricsFile(cwd) {
 
 const MAX_METRICS_LINES = 2000;
 
+/**
+ * Per-major-phase wall-clock (ms) from a timestamped phase timeline. The duration
+ * of a phase is the gap to the next timeline entry (or `endMs` for the last). Phase
+ * names are normalized to their major (before ":"/space/"("; "-done" merged), so
+ * "r1", "r1: grok done", "r1-done" all accrue to "r1". Pure; null when unusable.
+ */
+export function phaseDurations(timeline, endMs) {
+  if (!Array.isArray(timeline) || !timeline.length) return null;
+  const major = (p) => (String(p ?? "").split(/[:\s(]/)[0].replace(/-done$/, "") || "other");
+  const out = {};
+  for (let i = 0; i < timeline.length; i += 1) {
+    const start = Number(timeline[i].atMs);
+    const next = i + 1 < timeline.length ? Number(timeline[i + 1].atMs) : Number(endMs);
+    if (!Number.isFinite(start) || !Number.isFinite(next) || next < start) continue;
+    const m = major(timeline[i].phase);
+    out[m] = (out[m] ?? 0) + (next - start);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 /** The decision-relevant outcome of a review (or null if the job carries none). */
 function reviewSummary(job) {
   const d = job.deliberation;
@@ -61,7 +81,8 @@ export function recordJobMetrics(cwd, job) {
     createdAt: job.createdAt ?? null,
     wallClockMs: Number.isFinite(wallClockMs) ? wallClockMs : null,
     agents,
-    review: reviewSummary(job)
+    review: reviewSummary(job),
+    phases: phaseDurations(job.phaseTimeline, Date.parse(job.finishedAt ?? ""))
   };
   try {
     appendJsonlCapped(metricsFile(cwd), entry, MAX_METRICS_LINES);
@@ -101,7 +122,11 @@ export function aggregateMetrics(entries) {
   const byKind = {};
   const byAgent = {};
   const review = { runs: 0, findings: [], mustFix: [], consensus: 0, contested: 0, parseFailures: 0 };
+  const phaseMs = {};
   for (const entry of entries) {
+    for (const [p, ms] of Object.entries(entry.phases ?? {})) {
+      if (Number.isFinite(Number(ms))) (phaseMs[p] = phaseMs[p] ?? []).push(Number(ms));
+    }
     const kind = (byKind[entry.kind] = byKind[entry.kind] ?? { jobs: 0, wallClockMs: [] });
     kind.jobs += 1;
     if (Number.isFinite(Number(entry.wallClockMs))) kind.wallClockMs.push(Number(entry.wallClockMs));
@@ -129,11 +154,13 @@ export function aggregateMetrics(entries) {
       { calls: v.calls, failures: v.failures, timeouts: v.timeouts, retries: v.retries, avgDurationMs: avg(v.durationsMs), medianDurationMs: median(v.durationsMs) }
     ])
   );
+  const phases = Object.keys(phaseMs).length ? Object.fromEntries(Object.entries(phaseMs).map(([p, arr]) => [p, avg(arr)])) : null;
   return {
     jobs: entries.length,
     kinds,
     agents,
-    review: review.runs ? { runs: review.runs, avgFindings: avg(review.findings), avgMustFix: avg(review.mustFix), consensus: review.consensus, contested: review.contested, parseFailures: review.parseFailures } : null
+    review: review.runs ? { runs: review.runs, avgFindings: avg(review.findings), avgMustFix: avg(review.mustFix), consensus: review.consensus, contested: review.contested, parseFailures: review.parseFailures } : null,
+    phases
   };
 }
 
@@ -154,6 +181,9 @@ export function renderMetrics(agg, days) {
     const r = agg.review;
     lines.push("Review quality:");
     lines.push(`  runs=${r.runs}  avg findings=${r.avgFindings ?? "-"}  avg must-fix=${r.avgMustFix ?? "-"}  consensus=${r.consensus}  contested=${r.contested}  parse-failures=${r.parseFailures}`);
+  }
+  if (agg.phases) {
+    lines.push(`Per phase (avg): ${Object.entries(agg.phases).map(([p, ms]) => `${p}=${min(ms)}`).join("  ")}`);
   }
   return lines.join("\n");
 }

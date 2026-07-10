@@ -498,6 +498,11 @@ function makePhaseReporter(root, job) {
     try {
       job.phase = phase;
       job.updatedAt = nowIso();
+      // Timestamped timeline for per-phase durations (metrics.phaseDurations derives
+      // them). Capped so a pathological run can't grow the job file unbounded.
+      if (!Array.isArray(job.phaseTimeline)) job.phaseTimeline = [];
+      job.phaseTimeline.push({ phase, atMs: Date.now() });
+      if (job.phaseTimeline.length > 300) job.phaseTimeline = job.phaseTimeline.slice(-300);
       upsertJob(root, job);
       appendLogLine(job.logFile, `Phase: ${phase}`);
     } catch {

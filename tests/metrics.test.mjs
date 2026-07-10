@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { aggregateMetrics, readMetrics, recordAuditMetrics, recordJobMetrics } from "../plugins/council/scripts/lib/metrics.mjs";
+import { aggregateMetrics, phaseDurations, readMetrics, recordAuditMetrics, recordJobMetrics } from "../plugins/council/scripts/lib/metrics.mjs";
 
 test("recordJobMetrics appends and readMetrics/aggregate summarize", () => {
   const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-metrics-state-"));
@@ -55,19 +55,39 @@ test("recordJobMetrics appends and readMetrics/aggregate summarize", () => {
   }
 });
 
-test("aggregateMetrics summarizes review quality + per-agent retries (pure)", () => {
+test("phaseDurations sums per major phase and normalizes r1/r1-done", () => {
+  const timeline = [
+    { phase: "collecting-context", atMs: 0 },
+    { phase: "r1", atMs: 1000 },
+    { phase: "r1: grok done (1/3)", atMs: 3000 },
+    { phase: "r1-done", atMs: 5000 },
+    { phase: "r2 (2 critiques)", atMs: 6000 },
+    { phase: "verify", atMs: 9000 }
+  ];
+  const d = phaseDurations(timeline, 10000);
+  assert.equal(d.r1, 5000, "r1 + r1:… + r1-done all accrue to r1 (1000→6000)");
+  assert.equal(d.r2, 3000);
+  assert.equal(d.verify, 1000);
+  assert.equal(d["collecting-context"], 1000);
+  assert.equal(phaseDurations([], 100), null);
+  assert.equal(phaseDurations(null, 100), null);
+});
+
+test("aggregateMetrics summarizes review quality, per-agent retries, and phase averages (pure)", () => {
   const entries = [
     {
       kind: "deliberate",
       wallClockMs: 300000,
       agents: [{ agent: "codex", status: 0, retryAttempts: 2 }, { agent: "grok", status: 0, retryAttempts: 1 }],
-      review: { findings: 6, mustFix: 2, consensus: 3, contested: 1, parseFailures: 1 }
+      review: { findings: 6, mustFix: 2, consensus: 3, contested: 1, parseFailures: 1 },
+      phases: { r1: 4000, r2: 2000 }
     },
     {
       kind: "deliberate",
       wallClockMs: 200000,
       agents: [{ agent: "codex", status: 0, retryAttempts: 1 }],
-      review: { findings: 4, mustFix: 0, consensus: 1, contested: 0, parseFailures: 0 }
+      review: { findings: 4, mustFix: 0, consensus: 1, contested: 0, parseFailures: 0 },
+      phases: { r1: 2000, r2: 4000 }
     }
   ];
   const agg = aggregateMetrics(entries);
@@ -78,6 +98,8 @@ test("aggregateMetrics summarizes review quality + per-agent retries (pure)", ()
   assert.equal(agg.review.parseFailures, 1);
   assert.equal(agg.agents.codex.retries, 1, "one retry across codex calls (attempts 2 -> +1)");
   assert.equal(agg.agents.grok.retries, 0);
+  assert.equal(agg.phases.r1, 3000);
+  assert.equal(agg.phases.r2, 3000);
 });
 
 test("recordJobMetrics pulls the review outcome from job.deliberation", () => {
