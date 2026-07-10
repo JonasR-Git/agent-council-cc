@@ -1593,14 +1593,29 @@ function watchSnapshot(cwd, root, job) {
     /* log may not exist yet */
   }
   const progress = summarizeProgress(logText);
-  const merged = mergeOptionsWithPolicy(job.request ?? {}, loadPolicy(cwd));
-  const skipped = [
-    merged.skipCodex ? "codex" : null,
-    merged.skipGrok ? "grok" : null,
-    merged.skipClaude ? "claude" : null
-  ].filter(Boolean);
+  // Only trust the job's OWN request for skip/backend derivation. Merging an
+  // absent request with today's policy would let a historical run inherit
+  // current reviewers/skip flags and mislabel who participated.
+  const hasRequest = job.request && Object.keys(job.request).length > 0;
+  let skipped = [];
+  let claudeBackend = "session";
+  if (hasRequest) {
+    const merged = mergeOptionsWithPolicy(job.request, loadPolicy(cwd));
+    skipped = [
+      merged.skipCodex ? "codex" : null,
+      merged.skipGrok ? "grok" : null,
+      merged.skipClaude ? "claude" : null
+    ].filter(Boolean);
+    claudeBackend = merged.claudeBackend;
+  }
   const etaMs = medianWallClockForKind(cwd, job.kind);
-  return formatDashboard(job, progress, { nowMs: Date.now(), etaMs, skipped });
+  return formatDashboard(job, progress, {
+    nowMs: Date.now(),
+    etaMs,
+    skipped,
+    claudeBackend,
+    jobPhase: job.phase
+  });
 }
 
 /**
@@ -1643,7 +1658,13 @@ async function handleWatch(argv) {
     job = readJobFile(root, jobId) ?? job;
     const snap = watchSnapshot(cwd, root, job);
     process.stdout.write(`\x1b[2J\x1b[H${snap.text}\n`);
-    if (snap.terminal || Date.now() >= deadline) break;
+    if (snap.terminal) return;
+    if (Date.now() >= deadline) {
+      // Mirror `wait`: a watch that hits its deadline is not a clean finish.
+      console.log(`\nwatch timed out after ${Math.round(timeoutMs / 1000)}s (job still ${job.status}).`);
+      process.exitCode = 1;
+      return;
+    }
     await delay(intervalMs);
   }
 }

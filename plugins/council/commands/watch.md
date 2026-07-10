@@ -1,6 +1,6 @@
 ---
 description: Live dashboard for a running council job (per-agent R1/R2 progress + ETA)
-argument-hint: "[job-id] [--interval <s>] [--once] [--json]"
+argument-hint: "[job-id] [--interval <s>] [--timeout <s>] [--once] [--json]"
 allowed-tools: Bash(node:*)
 ---
 
@@ -20,6 +20,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" watch $ARGUMENTS
   the smoothest live view.
 - `--once` (or non-TTY output) prints a single snapshot instead of redrawing —
   this is what shows when invoked through the chat.
+- `--timeout <s>` caps the live loop (default 1h); like `/council:wait`, hitting
+  the deadline reports the timeout and exits non-zero.
 - `--json` returns the snapshot as structured data.
 
 Pair with `/council:status` (one-line state) and `/council:result <job>` (final
