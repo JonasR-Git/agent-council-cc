@@ -51,13 +51,18 @@ export function activeReviewerCount(backends, options = {}) {
   return (reviewerActive("codex", backends, options) ? 1 : 0) + (reviewerActive("grok", backends, options) ? 1 : 0);
 }
 
-/** Non-test units ranked by hotspot, capped by maxUnits. */
-export function selectUnits(model, { maxUnits = 12 } = {}) {
+/**
+ * Non-test units ranked by hotspot, a `maxUnits` window starting at `offset`.
+ * The offset lets the endless loop advance to the NEXT band of hotspots each pass
+ * (progressive coverage) instead of re-reviewing the same top-N every time.
+ */
+export function selectUnits(model, { maxUnits = 12, offset = 0 } = {}) {
+  const off = Math.max(0, Math.floor(offset));
   return model.files
     .filter((x) => !x.isTest)
     .slice()
     .sort((a, b) => b.hotspot - a.hotspot || a.id.localeCompare(b.id))
-    .slice(0, Math.max(0, maxUnits))
+    .slice(off, off + Math.max(0, maxUnits))
     .map((x) => x.id);
 }
 
@@ -206,7 +211,7 @@ export async function globalReduce(cwd, backends, options, model, budget) {
  */
 export async function runAuditReview(cwd, model, backends, options = {}) {
   const budget = makeBudget(options.budget ?? 20);
-  const units = selectUnits(model, { maxUnits: options.maxUnits ?? 12 });
+  const units = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
   const concurrency = Math.max(1, Math.min(4, options.concurrency ?? 3));
   const costPerUnit = activeReviewerCount(backends, options);
   const reduceReserve = costPerUnit > 0 ? 1 : 0; // keep 1 charge for the global reduce
@@ -232,7 +237,10 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
   }
   await Promise.all(Array.from({ length: concurrency }, worker));
 
-  const reduce = await globalReduce(cwd, backends, options, model, budget);
+  // The global reduce is over the whole (static) map, so re-running it every pass
+  // of an endless loop just re-charges budget for identical input; callers past
+  // the first pass pass skipReduce to spend their budget on fresh unit coverage.
+  const reduce = options.skipReduce ? { all: [], consensus: [], unique: [], ran: false } : await globalReduce(cwd, backends, options, model, budget);
 
   const allFindings = [...results.flatMap((r) => r.merged.all), ...reduce.all];
   const scoped = annotateScopes({ all: allFindings, consensus: [], unique: [] });

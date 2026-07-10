@@ -40,9 +40,10 @@ import { colorize, formatDashboard, summarizeFindings, summarizeProgress } from 
 import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
-import { runAuditReview } from "./lib/audit-review.mjs";
+import { activeReviewerCount, runAuditReview } from "./lib/audit-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { runAuditFix } from "./lib/audit-fix.mjs";
+import { runEndless } from "./lib/audit-endless.mjs";
 import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
@@ -1657,8 +1658,8 @@ async function handleWatch(argv) {
 // team is a later phase.
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested"]
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak"],
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume"]
   });
   const cwd = process.cwd();
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
@@ -1746,6 +1747,66 @@ async function handleAudit(argv) {
     return;
   }
 
+  // `audit endless` (v4): bounded review passes until returns diminish / budget /
+  // max passes. A REVIEW+PROPOSE loop (never endless auto-fix). Interruptible;
+  // progress is checkpointed to the state dir.
+  if (positionals[0] === "endless") {
+    const backends = probeBackends(cwd, ROOT_DIR);
+    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    // No callable reviewer => every pass reviews nothing and would falsely report
+    // "diminishing returns"; fail loud instead of looping over empty passes.
+    if (activeReviewerCount(backends, merged) === 0) {
+      throw new Error("no callable reviewers (Codex/Grok unavailable or skipped) — endless review needs at least one");
+    }
+    const { maxUnits } = parseAuditBudgetOptions(options);
+    let budget = 60;
+    if (options.budget != null) {
+      const n = Number(options.budget);
+      if (!Number.isFinite(n) || n < 2) throw new Error("--budget must be a number >= 2");
+      budget = Math.floor(n);
+    }
+    let maxPasses = 10;
+    if (options["max-passes"] != null) {
+      const n = Number(options["max-passes"]);
+      if (!Number.isFinite(n) || n < 1) throw new Error("--max-passes must be a positive number");
+      maxPasses = Math.floor(n);
+    }
+    let dryStreak = 2;
+    if (options["dry-streak"] != null) {
+      const n = Number(options["dry-streak"]);
+      if (!Number.isFinite(n) || n < 1) throw new Error("--dry-streak must be a positive number");
+      dryStreak = Math.floor(n);
+    }
+    // Each pass advances the hotspot window (progressive coverage) and skips the
+    // global reduce after pass 1 (its input is the static map — identical every
+    // pass — so re-running it just re-charges budget).
+    const review = ({ budget: passBudget, pass }) =>
+      runAuditReview(cwd, model, backends, {
+        ...merged,
+        budget: passBudget,
+        maxUnits,
+        unitOffset: (pass - 1) * maxUnits,
+        skipReduce: pass > 1,
+        skipCodex: merged.skipCodex,
+        skipGrok: merged.skipGrok
+      });
+    const out = await runEndless(
+      cwd,
+      { budget, maxPasses, dryStreak, resume: options.resume, onProgress: options.json ? undefined : (m) => console.error(m) },
+      { review }
+    );
+    if (options.doc) {
+      const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: `endless (${out.passesRun} passes)` }, { docPath: options["doc-path"] });
+      if (!options.json) console.log(`Wrote proposals to ${docPath}`);
+    }
+    if (options.json) {
+      outputResult(out, true);
+      return;
+    }
+    console.log(renderAuditEndlessReport(out));
+    return;
+  }
+
   if (options.doc) {
     const docPath = writeAuditDoc(workspaceRoot(cwd), model.findings, { source: "static" }, { docPath: options["doc-path"] });
     if (!options.json) console.log(`Wrote proposals to ${docPath}`);
@@ -1755,6 +1816,14 @@ async function handleAudit(argv) {
     return;
   }
   console.log(renderAuditReport(model));
+}
+
+// Flatten newlines + cap length before emitting UNTRUSTED reviewer text (title/
+// detail/file, sourced from external Codex/Grok output) into a markdown list, so
+// crafted output cannot inject fake list items or instructions into the report
+// that Claude then synthesizes.
+function reportField(s, max = 500) {
+  return String(s ?? "").replace(/[\r\n]+/g, " ").replace(/`/g, "'").slice(0, max);
 }
 
 function renderAuditReviewReport(out) {
@@ -1774,8 +1843,8 @@ function renderAuditReviewReport(out) {
   L.push(`## Findings (${sorted.length})`);
   for (const f of sorted) {
     const agents = f.agents ? ` [${f.agents.join("+")}]` : "";
-    L.push(`- **${f.severity}** [${f.category}]${agents} ${f.title}${f.file ? ` · ${f.file}${f.line ? `:${f.line}` : ""}` : ""}${f.consensus ? " · consensus" : ""} · ${f.scope ?? "?"}`);
-    if (f.detail) L.push(`  ${f.detail}`);
+    L.push(`- **${f.severity}** [${reportField(f.category, 40)}]${agents} ${reportField(f.title, 200)}${f.file ? ` · ${reportField(f.file, 200)}${f.line ? `:${f.line}` : ""}` : ""}${f.consensus ? " · consensus" : ""} · ${f.scope ?? "?"}`);
+    if (f.detail) L.push(`  ${reportField(f.detail)}`);
   }
   L.push("");
   L.push("Next (Claude): verify consensus + P0/P1, produce Fix now / Verify / Ignore.");
@@ -1851,6 +1920,31 @@ function renderAuditFixReport(out) {
   }
   L.push("");
   L.push(`Review: \`git checkout ${out.branch}\` → inspect the per-fix commits → merge or discard. Nothing was auto-merged.`);
+  return L.join("\n");
+}
+
+function renderAuditEndlessReport(out) {
+  const L = [];
+  L.push("# Council Audit — endless review (v4)");
+  L.push("");
+  L.push(`Ran **${out.passesRun} pass(es)**, spent **${out.spent}/${out.budget}** agent calls, accumulated **${out.findings.length}** unique findings. Stopped: ${out.stopReason}.`);
+  L.push("");
+  L.push("## Passes");
+  for (const p of out.passes) {
+    if (p.error) L.push(`- pass ${p.pass}: ERROR — ${p.error}`);
+    else L.push(`- pass ${p.pass}: ${p.found} found, **+${p.fresh} new** (spent ${p.spent})`);
+  }
+  L.push("");
+  const rank = { P0: 0, P1: 1, P2: 2, nit: 3 };
+  const sorted = [...out.findings].sort((a, b) => (rank[a.severity] ?? 2) - (rank[b.severity] ?? 2));
+  L.push(`## Unique findings (${sorted.length})`);
+  for (const f of sorted) {
+    const agents = f.agents ? ` [${f.agents.join("+")}]` : "";
+    L.push(`- **${f.severity}** [${reportField(f.category, 40)}]${agents} ${reportField(f.title, 200)}${f.file ? ` · ${reportField(f.file, 200)}${f.line ? `:${f.line}` : ""}` : ""}${f.consensus ? " · consensus" : ""}${f.scope ? ` · ${f.scope}` : ""}`);
+    if (f.detail) L.push(`  ${reportField(f.detail)}`);
+  }
+  L.push("");
+  L.push("Findings are candidates — Claude (you) synthesizes. Progress is checkpointed atomically; re-run with `--resume` to continue accumulating.");
   return L.join("\n");
 }
 

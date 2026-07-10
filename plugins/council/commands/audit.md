@@ -1,6 +1,6 @@
 ---
-description: Whole-project audit — static candidates + deep agent review of hotspots + safe test-gated auto-fix on an isolated branch
-argument-hint: "[review|fix] [--areas dir1,dir2] [--budget <n>] [--max-units <n>] [--doc] [--from <json>] [--dry-run] [--allow-untested] [--json]"
+description: Whole-project audit — static candidates + deep agent review + safe test-gated auto-fix + endless review loop
+argument-hint: "[review|fix|endless] [--areas dir1,dir2] [--budget <n>] [--max-units <n>] [--doc] [--from <json>] [--dry-run] [--max-passes <n>] [--dry-streak <n>] [--json]"
 allowed-tools: Bash(node:*)
 ---
 
@@ -30,6 +30,16 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" audit $ARGUMENTS
   <P0|P1|P2>` sets the gate (default P2); `--max-fixes <n>` caps the number of fixes
   (default 50); `--allow-untested` fixes without a test gate (**not recommended** —
   commits are then flagged unverified).
+- **`endless`** — **bounded review loop (v4)**. Each pass advances the reviewed
+  hotspot window (progressive coverage — pass N reviews the next band, not the same
+  top-N), and keeps going until returns diminish (`--dry-streak <n>` consecutive
+  passes find nothing new, default 2), the total `--budget <n>` agent calls are
+  spent (default 60), or `--max-passes <n>` is hit (default 10) — whichever comes
+  first. Findings are deduplicated across passes with a tight key (file + category +
+  title). Progress is checkpointed atomically to the state dir; `--resume` continues
+  an interrupted run instead of re-spending the budget. This is a **review/propose**
+  loop — it never auto-fixes in a loop (use the explicit `fix` for that). `--doc`
+  writes the accumulated proposals.
 - `--areas a,b` limits the scan to those path prefixes; `--churn-days <n>` sets the
   git-churn window (default 90).
 - `--doc` writes findings as **proposals** to `docs/AUDIT.md` (cross-cutting items
@@ -53,5 +63,6 @@ opt-in artifacts `--write-map` (`docs/codebase-map.json`) and `--doc`
 (`docs/AUDIT.md`, or `--doc-path`), confined to the project root. Under `review`,
 the Codex/Grok reviewers are prompted read-only but run as external CLIs whose
 sandboxing this command cannot itself guarantee. Only `audit fix` writes code, and
-only on an isolated branch under the safety rules above. See `docs/audit-design.md`
-for the design and the remaining `--endless` phase.
+only on an isolated branch under the safety rules above. The `endless` subcommand
+is a review/propose loop and writes no code. See `docs/audit-design.md` for the
+design rationale.

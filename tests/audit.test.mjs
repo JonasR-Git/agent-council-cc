@@ -145,6 +145,9 @@ test("selectUnits ranks by hotspot, excludes tests, caps at maxUnits", () => {
   };
   assert.deepEqual(selectUnits(model, { maxUnits: 2 }), ["hot.mjs", "mid.mjs"]);
   assert.ok(!selectUnits(model, { maxUnits: 10 }).includes("x.test.mjs"), "tests excluded");
+  // offset advances the window (endless progressive coverage): next band, no overlap
+  assert.deepEqual(selectUnits(model, { maxUnits: 2, offset: 2 }), ["a.mjs"]);
+  assert.deepEqual(selectUnits(model, { maxUnits: 2, offset: 99 }), [], "offset past the end yields nothing");
 });
 
 test("renderAuditDoc splits cross-cutting proposals from localized candidates", () => {
