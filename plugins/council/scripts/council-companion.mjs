@@ -41,6 +41,7 @@ import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
 import { runAuditReview } from "./lib/audit-review.mjs";
+import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
@@ -70,7 +71,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
-      "  node scripts/council-companion.mjs audit [review] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--write-map] [--json]",
+      "  node scripts/council-companion.mjs audit [review] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
       "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
@@ -1651,8 +1652,8 @@ async function handleWatch(argv) {
 // --fix are later phases.
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units"],
-    booleanOptions: ["json", "write-map"]
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path"],
+    booleanOptions: ["json", "write-map", "doc"]
   });
   const cwd = process.cwd();
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
@@ -1684,6 +1685,10 @@ async function handleAudit(argv) {
       skipCodex: merged.skipCodex,
       skipGrok: merged.skipGrok
     });
+    if (options.doc) {
+      const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: "deep review" }, { docPath: options["doc-path"] });
+      if (!options.json) console.log(`Wrote proposals to ${docPath}`);
+    }
     if (options.json) {
       outputResult(out, true);
       return;
@@ -1692,6 +1697,10 @@ async function handleAudit(argv) {
     return;
   }
 
+  if (options.doc) {
+    const docPath = writeAuditDoc(workspaceRoot(cwd), model.findings, { source: "static" }, { docPath: options["doc-path"] });
+    if (!options.json) console.log(`Wrote proposals to ${docPath}`);
+  }
   if (options.json) {
     outputResult(model, true);
     return;

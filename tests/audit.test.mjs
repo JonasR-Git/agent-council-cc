@@ -8,6 +8,7 @@ import { buildGraph, findCycles, findOrphanModules, parseModule, resolveImport, 
 import { findDuplicateClusters } from "../plugins/council/scripts/lib/dup-detect.mjs";
 import { buildCodebaseModel } from "../plugins/council/scripts/lib/codebase-model.mjs";
 import { buildUnitPrompt, makeBudget, selectUnits } from "../plugins/council/scripts/lib/audit-review.mjs";
+import { renderAuditDoc } from "../plugins/council/scripts/lib/audit-doc.mjs";
 
 // --- import graph ------------------------------------------------------------
 
@@ -144,6 +145,18 @@ test("selectUnits ranks by hotspot, excludes tests, caps at maxUnits", () => {
   };
   assert.deepEqual(selectUnits(model, { maxUnits: 2 }), ["hot.mjs", "mid.mjs"]);
   assert.ok(!selectUnits(model, { maxUnits: 10 }).includes("x.test.mjs"), "tests excluded");
+});
+
+test("renderAuditDoc splits cross-cutting proposals from localized candidates", () => {
+  const doc = renderAuditDoc([
+    { severity: "P1", category: "ssot", title: "Dup block", scope: "cross-cutting", detail: "consolidate", file: "a.mjs" },
+    { severity: "P2", category: "correctness", title: "Empty catch", scope: "localized", file: "b.mjs", line: 5 }
+  ]);
+  assert.match(doc, /## Cross-cutting \/ consolidation proposals/);
+  assert.match(doc, /Dup block/);
+  assert.match(doc, /## Localized candidates/);
+  assert.match(doc, /Empty catch.*`b\.mjs:5`/s);
+  assert.match(doc, /proposals.*not applied/s, "states it is proposal-only");
 });
 
 test("buildUnitPrompt bounds oversized source and flags the split", () => {
