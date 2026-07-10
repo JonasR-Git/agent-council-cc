@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/agent-council/audit-finding.schema.json",
+  "title": "AuditFinding",
+  "description": "Canonical audit finding (docs/audit-schema.md §1). A fact without a location AND a failureScenario is only an observation and may not enter the gate or the fix queue, so both are required here.",
+  "type": "object",
+  "required": ["ruleId", "lens", "lifecycle", "severity", "location", "failureScenario"],
+  "properties": {
+    "schemaVersion": { "type": "integer", "minimum": 1 },
+    "ruleId": { "type": "string" },
+    "fingerprint": { "type": "string" },
+    "lens": {
+      "type": "string",
+      "enum": [
+        "correctness",
+        "concurrency_resources",
+        "security_secrets",
+        "data_integrity",
+        "architecture_ssot",
+        "performance",
+        "reliability_observability",
+        "testing",
+        "dependencies_supply_chain",
+        "compliance_governance",
+        "docs_maintainability",
+        "config_cicd_security"
+      ]
+    },
+    "category": { "type": "string" },
+    "title": { "type": "string" },
+    "lifecycle": {
+      "type": "string",
+      "enum": ["candidate", "verification_required", "confirmed", "refuted", "inconclusive", "fixed"]
+    },
+    "severity": { "type": "string", "enum": ["P0", "P1", "P2", "nit"] },
+    "likelihood": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "blastRadius": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "exploitability": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "risk": {
+      "type": "object",
+      "properties": {
+        "raw": { "type": "number", "minimum": 0 },
+        "calibrated": { "type": "number", "minimum": 0 }
+      }
+    },
+    "location": {
+      "type": "object",
+      "required": ["path", "startLine"],
+      "properties": {
+        "path": { "type": "string" },
+        "startLine": { "type": "integer", "minimum": 1 },
+        "endLine": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "failureScenario": { "type": "string" },
+    "evidence": { "type": "array", "items": { "type": "object" } },
+    "provenance": { "type": "object" },
+    "standards": { "type": "array", "items": { "type": "string" } },
+    "scope": { "type": "string", "enum": ["localized", "cross-cutting"] },
+    "consensus": { "type": "string", "enum": ["single", "consensus", "contested"] },
+    "owners": { "type": "array", "items": { "type": "string" } },
+    "baseline": { "type": "string", "enum": ["new", "baselined", "waived"] },
+    "fixDisposition": { "type": "string", "enum": ["localized", "propose-only", "inconclusive"] }
+  }
+}
