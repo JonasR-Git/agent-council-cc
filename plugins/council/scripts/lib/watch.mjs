@@ -225,8 +225,44 @@ export function formatDashboard(job, progress, { nowMs, etaMs = null, skipped = 
 const STATUS_EMOJI = { running: "🟡", queued: "⚪", completed: "🟢", completed_with_errors: "🟠", failed: "🔴", cancelled: "🔴" };
 const R1_EMOJI = { done: "🟢", running: "🟡", pending: "⚪", skipped: "⚫", file: "🔵", unknown: "🔴" };
 const SEV_SQUARE = { P0: "🟥", P1: "🟧", P2: "🟨", nit: "⬜" };
+const VERDICT_BADGE = { approve: "✅", approve_with_nits: "👍", request_changes: "🟠", block: "⛔" };
 
-export function formatDashboardMarkdown(job, progress, { nowMs, etaMs = null, skipped = [], claudeBackend = "session", jobPhase = null, findings = null, prior = null } = {}) {
+// Flatten newlines + cap length: finding titles/files come from external Codex/Grok
+// output, so they must not break the markdown table/list or inject rows.
+const flat = (s, max = 120) => String(s ?? "").replace(/[\r\n]+/g, " ").replace(/\|/g, "/").slice(0, max);
+
+/**
+ * Decision-relevant extras from a finished deliberation (null while running / for
+ * non-deliberate jobs): per-agent verdict, the top must-fix findings, the cross-run
+ * ledger split (recurring vs new), verify outcomes, and the scope split. Pure.
+ */
+export function summarizeCouncilExtras(deliberation) {
+  if (!deliberation) return null;
+  const all = Array.isArray(deliberation.merged?.all) ? deliberation.merged.all : [];
+  const verdicts = {};
+  // A persisted job slims the deliberation to a verdicts[] array; a fresh in-memory
+  // one carries the full r1[] docs. Support both shapes.
+  if (Array.isArray(deliberation.verdicts)) {
+    for (const v of deliberation.verdicts) if (v?.agent && v.verdict) verdicts[v.agent] = v.verdict;
+  } else {
+    for (const r of deliberation.r1 ?? []) if (r?.agent && r.findings?.verdict) verdicts[r.agent] = r.findings.verdict;
+  }
+  const rank = { P0: 0, P1: 1, P2: 2, nit: 3 };
+  const topFindings = [...all]
+    .filter((f) => f.severity === "P0" || f.severity === "P1")
+    .sort((a, b) => (rank[a.severity] ?? 2) - (rank[b.severity] ?? 2))
+    .slice(0, 5)
+    .map((f) => ({ severity: f.severity, title: flat(f.title), file: f.file ? flat(f.file, 80) : null, line: f.line ?? null, consensus: Boolean(f.consensus) }));
+  const recurring = all.filter((f) => f.seenBefore).length;
+  const ledger = all.length ? { recurring, fresh: all.length - recurring } : null;
+  const verify = deliberation.verification ? { verified: deliberation.verification.verifiedCount, refuted: deliberation.verification.refutedCount } : null;
+  const localized = all.filter((f) => f.scope === "localized").length;
+  const crossCutting = all.filter((f) => f.scope === "cross-cutting").length;
+  const scope = localized || crossCutting ? { localized, crossCutting } : null;
+  return { verdicts, topFindings, ledger, verify, scope };
+}
+
+export function formatDashboardMarkdown(job, progress, { nowMs, etaMs = null, skipped = [], claudeBackend = "session", jobPhase = null, findings = null, extras = null, prior = null } = {}) {
   const created = job.createdAt ? Date.parse(job.createdAt) : null;
   const finished = job.finishedAt ? Date.parse(job.finishedAt) : null;
   const terminal = isTerminal(job.status);
@@ -254,15 +290,17 @@ export function formatDashboardMarkdown(job, progress, { nowMs, etaMs = null, sk
   if (hasR2) bars += ` · R2 \`${progressBar(progress.r2Done, r2Total, 12)}\` ${progress.r2Done}/${r2Total || "?"}`;
   L.push(bars);
   L.push("");
-  L.push("| Agent | R1 | raised | shared | disputed |");
-  L.push("|---|---|--:|--:|--:|");
+  L.push("| Agent | R1 | verdict | raised | shared | disputed |");
+  L.push("|---|---|---|--:|--:|--:|");
   for (const agent of AGENTS) {
     const fa = findings?.byAgent?.[agent];
     const liveRaised = progress.raisedByAgent?.[agent];
     const raised = fa ? fa.raised : liveRaised != null ? liveRaised : "–";
     const shared = fa ? fa.shared : "–";
     const disputed = fa ? fa.disputed : "–";
-    L.push(`| ${agent} | ${R1_EMOJI[states[agent]] ?? "⚪"} ${states[agent]} | ${raised} | ${shared} | ${disputed} |`);
+    const v = extras?.verdicts?.[agent];
+    const verdict = v ? `${VERDICT_BADGE[v] ?? ""} ${v.replace(/_/g, " ")}`.trim() : "–";
+    L.push(`| ${agent} | ${R1_EMOJI[states[agent]] ?? "⚪"} ${states[agent]} | ${verdict} | ${raised} | ${shared} | ${disputed} |`);
   }
   L.push("");
   if (findings) {
@@ -275,6 +313,19 @@ export function formatDashboardMarkdown(job, progress, { nowMs, etaMs = null, sk
     L.push("_findings: see `/council:status --result` for the full report_");
   } else {
     L.push("_findings pending — available when the run completes_");
+  }
+
+  if (extras) {
+    if (extras.ledger) L.push(`♻️ ${extras.ledger.recurring} recurring · 🆕 ${extras.ledger.fresh} new (cross-run)`);
+    if (extras.verify) L.push(`🔬 verified ${extras.verify.verified} · refuted ${extras.verify.refuted}`);
+    if (extras.scope) L.push(`🎯 ${extras.scope.localized} fixable now · 📄 ${extras.scope.crossCutting} documented migration${extras.scope.crossCutting === 1 ? "" : "s"}`);
+    if (extras.topFindings?.length) {
+      L.push("");
+      L.push("**Top must-fix**");
+      for (const f of extras.topFindings) {
+        L.push(`- ${SEV_SQUARE[f.severity] ?? ""} ${f.severity} · ${f.title}${f.file ? ` · \`${f.file}${f.line ? `:${f.line}` : ""}\`` : ""}${f.consensus ? " · 🤝" : ""}`);
+      }
+    }
   }
 
   const snapshot = { phase, findingsTotal: findings?.total ?? 0, r1Count, r2Done: progress.r2Done ?? 0, consensus: findings?.consensus ?? 0 };

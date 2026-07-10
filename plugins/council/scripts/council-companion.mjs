@@ -36,7 +36,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
-import { colorize, formatDashboard, formatDashboardMarkdown, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
+import { colorize, formatDashboard, formatDashboardMarkdown, summarizeCouncilExtras, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
 import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
@@ -1616,6 +1616,7 @@ function renderWatchMarkdown(cwd, job, ctx) {
     claudeBackend: ctx.claudeBackend,
     jobPhase: job.phase,
     findings: summarizeFindings(job.deliberation?.merged),
+    extras: summarizeCouncilExtras(job.deliberation),
     prior
   });
   try {
