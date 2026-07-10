@@ -14,22 +14,11 @@ import { extractJsonObject } from "./findings.mjs";
 import { runCommand } from "./process.mjs";
 import { SCHEMAS } from "./schemas.mjs";
 import { validate } from "./validate.mjs";
+import { firstLines, isObject } from "./util.mjs";
 
 const REPO_HINT_MAX_FILES = 300;
 const README_HEAD_CHARS = 2000;
 const VALID_EFFORTS = new Set(["S", "M", "L", "XL"]);
-
-function isObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value);
-}
-
-function firstLines(text, n) {
-  return String(text ?? "")
-    .split(/\r?\n/)
-    .slice(0, n)
-    .join("\n")
-    .trim();
-}
 
 /**
  * Normalize an agent's solution plan (schemas/plan.schema.json).

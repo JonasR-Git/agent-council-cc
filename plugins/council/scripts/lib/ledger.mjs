@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { resolveStateDir, writeFileAtomic } from "./state.mjs";
+import { hashLite } from "./util.mjs";
 
 /**
  * A cross-run findings ledger: fingerprints each merged finding so later runs
@@ -18,12 +19,6 @@ const STOPWORDS = new Set([
   "when", "then", "than", "will", "would", "could", "should", "have", "does",
   "your", "their", "which", "while", "only", "also", "just", "such", "some"
 ]);
-
-function hashLite(text) {
-  let h = 0;
-  for (let i = 0; i < text.length; i += 1) h = (h * 31 + text.charCodeAt(i)) >>> 0;
-  return h.toString(16).padStart(8, "0");
-}
 
 export function fingerprintFinding(finding) {
   const file = String(finding.file ?? "")

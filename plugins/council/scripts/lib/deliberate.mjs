@@ -29,6 +29,7 @@ import { pruneR1Cache, readCachedR1, resumeContextKey, writeCachedR1 } from "./r
 import { annotateScopes } from "./scope.mjs";
 import { verifyFindings } from "./verify.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
+import { formatExit } from "./util.mjs";
 
 export { READONLY_DISALLOWED_TOOLS, runCodexStructured, runGrokStructured };
 
@@ -533,10 +534,6 @@ export async function runDeliberation(cwd, backends, options = {}) {
     report,
     sections
   };
-}
-
-function formatExit(result) {
-  return `${result.status}${result.timedOut ? " (timed out)" : ""}${result.truncated ? " (output truncated)" : ""}`;
 }
 
 function shortHead(head) {

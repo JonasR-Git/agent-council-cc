@@ -4,12 +4,9 @@
 
 import { SCHEMAS } from "./schemas.mjs";
 import { validate } from "./validate.mjs";
+import { firstLines, isObject } from "./util.mjs";
 
-const SEVERITY_RANK = { P0: 0, P1: 1, P2: 2, nit: 3 };
-
-function isObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value);
-}
+export const SEVERITY_RANK = { P0: 0, P1: 1, P2: 2, nit: 3 };
 
 function parseJsonObject(text) {
   try {
@@ -207,14 +204,6 @@ export function parseCritiqueVotes(stdout, agent, aboutAgent) {
     validationErrors,
     raw
   };
-}
-
-function firstLines(text, n) {
-  return String(text ?? "")
-    .split(/\r?\n/)
-    .slice(0, n)
-    .join("\n")
-    .trim();
 }
 
 function normalizedFile(file) {
