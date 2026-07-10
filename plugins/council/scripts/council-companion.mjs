@@ -35,7 +35,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
-import { formatDashboard, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
+import { colorize, formatDashboard, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
@@ -1575,27 +1575,28 @@ async function handleWait(argv) {
   if (!finished) process.exitCode = 1;
 }
 
-function medianWallClockForKind(cwd, kind) {
-  const durations = readMetrics(cwd)
-    .filter((e) => e.kind === kind && Number.isFinite(Number(e.wallClockMs)))
-    .map((e) => Number(e.wallClockMs))
-    .sort((a, b) => a - b);
-  if (!durations.length) return null;
-  const mid = Math.floor(durations.length / 2);
-  return durations.length % 2 ? durations[mid] : Math.round((durations[mid - 1] + durations[mid]) / 2);
+function median(sortedNums) {
+  if (!sortedNums.length) return null;
+  const mid = Math.floor(sortedNums.length / 2);
+  return sortedNums.length % 2 ? sortedNums[mid] : Math.round((sortedNums[mid - 1] + sortedNums[mid]) / 2);
 }
 
-function watchSnapshot(cwd, root, job) {
-  let logText = "";
-  try {
-    if (job.logFile) logText = fs.readFileSync(job.logFile, "utf8");
-  } catch {
-    /* log may not exist yet */
+// Median wall-clock for this kind, bucketed by participant count so a codex-only
+// run and a 3-agent run don't share one ETA. Falls back to all runs of the kind
+// when the same-size bucket is too small to be meaningful.
+function medianWallClockForKind(cwd, kind, participantCount) {
+  const entries = readMetrics(cwd).filter((e) => e.kind === kind && Number.isFinite(Number(e.wallClockMs)));
+  const dur = (list) => list.map((e) => Number(e.wallClockMs)).sort((a, b) => a - b);
+  if (participantCount != null) {
+    const sameSize = entries.filter((e) => Array.isArray(e.agents) && e.agents.length === participantCount);
+    if (sameSize.length >= 2) return median(dur(sameSize));
   }
-  const progress = summarizeProgress(logText);
-  // Only trust the job's OWN request for skip/backend derivation. Merging an
-  // absent request with today's policy would let a historical run inherit
-  // current reviewers/skip flags and mislabel who participated.
+  return median(dur(entries));
+}
+
+// Static context that does NOT change across redraws (derived from the job's own
+// request + history), so the live loop only re-reads the log each frame.
+function watchContext(cwd, job) {
   const hasRequest = job.request && Object.keys(job.request).length > 0;
   let skipped = [];
   let claudeBackend = "session";
@@ -1608,16 +1609,25 @@ function watchSnapshot(cwd, root, job) {
     ].filter(Boolean);
     claudeBackend = merged.claudeBackend;
   }
-  const etaMs = medianWallClockForKind(cwd, job.kind);
-  // Findings only exist once the merge phase ran (terminal jobs); null otherwise.
-  const findings = summarizeFindings(job.deliberation?.merged);
-  return formatDashboard(job, progress, {
+  const participantCount = 3 - skipped.length;
+  return { skipped, claudeBackend, etaMs: medianWallClockForKind(cwd, job.kind, participantCount) };
+}
+
+function renderWatch(job, ctx) {
+  let logText = "";
+  try {
+    if (job.logFile) logText = fs.readFileSync(job.logFile, "utf8");
+  } catch {
+    /* log may not exist yet */
+  }
+  return formatDashboard(job, summarizeProgress(logText), {
     nowMs: Date.now(),
-    etaMs,
-    skipped,
-    claudeBackend,
+    etaMs: ctx.etaMs,
+    skipped: ctx.skipped,
+    claudeBackend: ctx.claudeBackend,
     jobPhase: job.phase,
-    findings
+    // Findings only exist once the merge phase ran (terminal jobs); null otherwise.
+    findings: summarizeFindings(job.deliberation?.merged)
   });
 }
 
@@ -1637,9 +1647,10 @@ async function handleWatch(argv) {
   if (!jobId) throw new Error("No council jobs found.");
   let job = readJobFile(root, jobId);
   if (!job) throw new Error(`Job not found: ${jobId}`);
+  const ctx = watchContext(cwd, job); // computed once - stable across redraws
 
   if (options.json) {
-    const snap = watchSnapshot(cwd, root, job);
+    const snap = renderWatch(job, ctx);
     outputResult({ jobId: job.id, status: job.status, dashboard: snap.text, terminal: snap.terminal }, true);
     return;
   }
@@ -1647,11 +1658,14 @@ async function handleWatch(argv) {
   const intervalMs = secondsToMs(options.interval, "--interval") ?? 2000;
   const timeoutMs = secondsToMs(options.timeout, "--timeout") ?? 3_600_000;
   const deadline = Date.now() + timeoutMs;
+  // Color only for an interactive terminal; piped/redirected output stays plain
+  // (so --once in the chat and --json are never polluted with escape codes).
+  const paint = (s) => (process.stdout.isTTY ? colorize(s) : s);
 
   // Single snapshot (no live redraw) for --once or non-TTY stdout.
   if (options.once || !process.stdout.isTTY) {
-    const snap = watchSnapshot(cwd, root, job);
-    console.log(snap.text);
+    const snap = renderWatch(job, ctx);
+    console.log(paint(snap.text));
     if (!snap.terminal) console.log("\n(snapshot; re-run or use a TTY for a live view)");
     return;
   }
@@ -1659,8 +1673,8 @@ async function handleWatch(argv) {
   // Live redraw loop for an interactive terminal.
   for (;;) {
     job = readJobFile(root, jobId) ?? job;
-    const snap = watchSnapshot(cwd, root, job);
-    process.stdout.write(`\x1b[2J\x1b[H${snap.text}\n`);
+    const snap = renderWatch(job, ctx);
+    process.stdout.write(`\x1b[2J\x1b[H${paint(snap.text)}\n`);
     if (snap.terminal) return;
     if (Date.now() >= deadline) {
       // Mirror `wait`: a watch that hits its deadline is not a clean finish.

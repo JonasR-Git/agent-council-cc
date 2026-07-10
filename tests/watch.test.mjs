@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 
 import {
   agentR1States,
+  colorize,
   formatDashboard,
   formatDuration,
   isTerminal,
   progressBar,
+  stripAnsi,
   summarizeFindings,
   summarizeProgress
 } from "../plugins/council/scripts/lib/watch.mjs";
@@ -115,6 +117,51 @@ test("formatDashboard (completed) shows the findings breakdown and a right-align
     out.text.split("\n").filter((l) => /^[║╔╟╠╚]/.test(l)).map((l) => l.length)
   );
   assert.equal(borderLens.size, 1, "all box lines must be equal width");
+});
+
+test("completed dashboard highlights the must-fix (P0/P1) count", () => {
+  const out = formatDashboard(COMPLETED_JOB, summarizeProgress(LOG), {
+    nowMs: Date.parse("2026-07-10T08:40:00.000Z"),
+    findings: summarizeFindings(MERGED),
+    jobPhase: "done"
+  });
+  assert.match(out.text, /must-fix  2 \(P0\/P1\)/); // MERGED: P0 0 + P1 2
+});
+
+test("no R2 bar and a 'status' column for non-deliberate modes", () => {
+  const reviewJob = {
+    id: "council-r",
+    title: "Council Review",
+    kind: "review",
+    status: "completed",
+    createdAt: "2026-07-10T08:30:00.000Z",
+    finishedAt: "2026-07-10T08:31:00.000Z"
+  };
+  const out = formatDashboard(reviewJob, summarizeProgress("Phase: r1\nPhase: r1: codex done (1/2)"), {
+    nowMs: Date.parse("2026-07-10T08:40:00.000Z"),
+    findings: null,
+    jobPhase: "done"
+  });
+  assert.doesNotMatch(out.text, /R2 {2}/, "a review has no peer round -> no R2 bar");
+  assert.match(out.text, /agent\s+status\s+raised/, "non-deliberate uses a 'status' column");
+  assert.match(out.text, /see \/council:result/, "terminal-but-no-merged-findings points at result, not 'pending'");
+});
+
+test("colorize is layout-neutral: strips back to the exact plain text, same widths", () => {
+  const out = formatDashboard(COMPLETED_JOB, summarizeProgress(LOG), {
+    nowMs: Date.parse("2026-07-10T08:40:00.000Z"),
+    findings: summarizeFindings(MERGED),
+    claudeBackend: "session",
+    jobPhase: "done"
+  });
+  const colored = colorize(out.text);
+  assert.notEqual(colored, out.text, "should inject ANSI escapes");
+  assert.equal(stripAnsi(colored), out.text, "stripping ANSI returns the exact plain text");
+  const plain = out.text.split("\n");
+  const paint = colored.split("\n");
+  for (let i = 0; i < plain.length; i += 1) {
+    assert.equal(stripAnsi(paint[i]).length, plain[i].length, `line ${i} visible width unchanged`);
+  }
 });
 
 test("formatDashboard (running) shows remaining time and 'pending' findings", () => {
