@@ -1,5 +1,5 @@
 import { interpolate, loadPrompt, runCodexStructured, runGrokStructured } from "./agents.mjs";
-import { extractJsonObject } from "./findings.mjs";
+import { extractJsonObject, SEVERITY_RANK } from "./findings.mjs";
 import { SCHEMAS } from "./schemas.mjs";
 import { validate } from "./validate.mjs";
 
@@ -110,11 +110,10 @@ export async function runDebateRounds(cwd, backends, options, entries) {
   }
 
   const results = [];
-  const severityRank = { P0: 0, P1: 1, P2: 2, nit: 3 };
   const capped = [...entries]
     .sort(
       (a, b) =>
-        (severityRank[a.payload?.severity] ?? 2) - (severityRank[b.payload?.severity] ?? 2)
+        (SEVERITY_RANK[a.payload?.severity] ?? 2) - (SEVERITY_RANK[b.payload?.severity] ?? 2)
     )
     .slice(0, MAX_ENTRIES_PER_ROUND);
   const opts = debateOptions(options);

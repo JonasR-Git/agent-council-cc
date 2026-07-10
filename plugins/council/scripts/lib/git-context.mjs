@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { closeDanglingFence, wrapMarkdownFence } from "./markdown-fence.mjs";
 import { runCommand, runCommandChecked } from "./process.mjs";
+import { hashLite } from "./util.mjs";
 
 const MAX_DIFF_CHARS = 100_000;
 const MAX_UNTRACKED_FILE_CHARS = 24_000;
@@ -125,12 +126,6 @@ function isSkipped(file, skipRegexps) {
 function clip(text, max = MAX_DIFF_CHARS) {
   if (text.length <= max) return text;
   return closeDanglingFence(`${text.slice(0, max)}\n\n[... truncated ${text.length - max} chars ...]`);
-}
-
-function hashLite(text) {
-  let h = 0;
-  for (let i = 0; i < text.length; i += 1) h = (h * 31 + text.charCodeAt(i)) >>> 0;
-  return h.toString(16).padStart(8, "0");
 }
 
 function readHead(repoRoot) {

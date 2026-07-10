@@ -36,6 +36,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
 import { colorize, formatDashboard, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
+import { formatExit } from "./lib/util.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
@@ -467,9 +468,6 @@ async function runGrokReview(cwd, backends, options, adversarial, focusText) {
   };
 }
 
-function formatExit(result) {
-  return `${result.status}${result.timedOut ? " (timed out)" : ""}${result.truncated ? " (output truncated)" : ""}`;
-}
 
 function renderCouncilReport(job, results) {
   const lines = [
