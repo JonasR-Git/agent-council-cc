@@ -86,13 +86,23 @@ test("evaluateApproval: incomplete detection is the caller's job; approval math 
 
 test("collectVerdicts reads verdict from findings docs and skips absent/skipped", () => {
   const r1 = [
-    { agent: "codex", findings: { verdict: "approve" } },
+    { agent: "codex", status: 0, findings: { verdict: "approve", parseOk: true } },
     { agent: "grok", verdict: "request_changes" },
     { agent: "claude", skipped: true },
-    { agent: "x", findings: {} }
+    { agent: "x", status: 0, findings: {} }
   ];
   assert.deepEqual(collectVerdicts(r1), [
     { agent: "codex", verdict: "approve" },
     { agent: "grok", verdict: "request_changes" }
   ]);
+});
+
+test("collectVerdicts drops timed-out / parse-failed / non-zero-exit peers (synthetic verdicts)", () => {
+  const r1 = [
+    { agent: "codex", status: 124, timedOut: true, findings: { verdict: "request_changes", parseOk: false } },
+    { agent: "grok", status: 0, findings: { verdict: "approve", parseOk: true } },
+    { agent: "other", status: 0, findings: { verdict: "block", parseOk: false } }
+  ];
+  // Only the genuine grok verdict survives; codex (timeout) and other (parse-fail) drop.
+  assert.deepEqual(collectVerdicts(r1), [{ agent: "grok", verdict: "approve" }]);
 });

@@ -61,6 +61,13 @@ export function collectVerdicts(r1Results = []) {
   const out = [];
   for (const r of r1Results) {
     if (r?.skipped) continue;
+    // A timed-out or parse-failed R1 yields a synthetic 'request_changes' with
+    // parseOk:false - it must NOT count as a voter, else a peer timeout looks
+    // like a real (blocking) verdict and the fixloop incomplete gate misses it.
+    // The claude findings file has no status/timedOut and is always trustworthy.
+    const untrustworthy =
+      (r.status != null && r.status !== 0) || r.timedOut === true || r?.findings?.parseOk === false;
+    if (untrustworthy) continue;
     const verdict = r?.findings?.verdict ?? r?.verdict ?? null;
     if (verdict) out.push({ agent: r.agent, verdict: String(verdict) });
   }

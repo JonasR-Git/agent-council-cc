@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Final-acceptance fixes: R1 resume now preserves the Grok session id (debate_resume works after `--resume`); `fixloop-status` escalates instead of recommending more fixes on an incomplete council; `budget_guard` fails closed when any participating provider's limits are unreadable; `benchmark --judge-only` supersedes the answer-phase record instead of double-counting.
+- Final-acceptance fixes (three council review rounds): R1 resume preserves the Grok session id (debate_resume works after `--resume`); `budget_guard` fails closed when any participating provider's limits are unreadable; `benchmark --judge-only` supersedes only the latest same-task record (chronological history preserved); the `fixloop` incomplete gate keys on peer completeness, and timed-out / parse-failed peers no longer count as voters, so a peer timeout correctly escalates instead of driving more fixes.
 
 ## [0.4.0]
 
