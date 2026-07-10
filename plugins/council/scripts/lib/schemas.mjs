@@ -15,5 +15,7 @@ export const SCHEMAS = Object.freeze({
   planCritique: load("plan-critique"),
   debateRebuttal: load("debate-rebuttal"),
   debateCounter: load("debate-counter"),
-  auditFinding: load("audit-finding")
+  auditFinding: load("audit-finding"),
+  auditPolicy: load("audit-policy"),
+  auditReport: load("audit-report")
 });

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/agent-council/audit-report.schema.json",
+  "title": "AuditReport",
+  "description": "The /council:audit output envelope (docs/audit-schema.md §8): gate verdict, prioritized risk register, coverage matrix, governance decisions, false-positive rate and provenance.",
+  "type": "object",
+  "required": ["schemaVersion", "gate", "register", "coverage"],
+  "properties": {
+    "schemaVersion": { "type": "integer", "minimum": 1 },
+    "generatedAt": { "type": "string" },
+    "target": { "type": "object" },
+    "gate": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string", "enum": ["pass", "fail", "indeterminate"] },
+        "reason": { "type": "string" },
+        "newHighSeverity": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "register": { "type": "array", "items": { "type": "object" } },
+    "proposals": { "type": "array", "items": { "type": "object" } },
+    "coverage": {
+      "type": "object",
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "byState": { "type": "object" },
+        "mandatory": { "type": "object" },
+        "uncovered": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "falsePositiveRate": { "type": ["object", "null"] },
+    "governance": { "type": "object" },
+    "provenance": { "type": "object" }
+  }
+}

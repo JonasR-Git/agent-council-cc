@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/agent-council/audit-policy.schema.json",
+  "title": "AuditPolicy",
+  "description": "Drives /council:audit (docs/audit-schema.md §1): enabled lenses, targeting, budget, gate rules, external tools, standards profiles and per-lens routes. Lives in .council-audit.json; unknown enum values are rejected.",
+  "type": "object",
+  "required": ["schemaVersion"],
+  "properties": {
+    "schemaVersion": { "type": "integer", "minimum": 1 },
+    "lenses": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "correctness",
+          "concurrency_resources",
+          "security_secrets",
+          "data_integrity",
+          "architecture_ssot",
+          "performance",
+          "reliability_observability",
+          "testing",
+          "dependencies_supply_chain",
+          "compliance_governance",
+          "docs_maintainability",
+          "config_cicd_security"
+        ]
+      }
+    },
+    "criticalGlobs": { "type": "array", "items": { "type": "string" } },
+    "highFanIn": { "type": "integer", "minimum": 1 },
+    "budget": { "type": "integer", "minimum": 2 },
+    "maxPasses": { "type": "integer", "minimum": 1 },
+    "gate": {
+      "type": "object",
+      "properties": {
+        "failOn": { "type": "array", "items": { "type": "string", "enum": ["P0", "P1", "P2", "nit"] } },
+        "waivableSeverities": { "type": "array", "items": { "type": "string", "enum": ["P1", "P2", "nit"] } }
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "argv"],
+        "properties": {
+          "id": { "type": "string" },
+          "argv": { "type": "array", "items": { "type": "string" } },
+          "timeoutMs": { "type": "integer", "minimum": 0 },
+          "network": { "type": "boolean" },
+          "required": { "type": "boolean" }
+        }
+      }
+    },
+    "standardsProfiles": { "type": "array", "items": { "type": "string", "enum": ["OWASP", "CWE", "SOC2", "PCI", "PRIVACY"] } },
+    "routes": { "type": "object" }
+  }
+}
