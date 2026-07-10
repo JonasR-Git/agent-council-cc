@@ -110,7 +110,7 @@ test("formatDashboard (completed) shows the findings breakdown and a right-align
   assert.match(out.text, /disputed/, "table has a disputed column");
   assert.match(out.text, /4 findings\s+│\s+2 consensus\s+│\s+2 unique\s+│\s+1 disputed/);
   assert.match(out.text, /severity\s+P1 2\s+P2 1\s+nit 1/);
-  assert.match(out.text, /\/council:result council-abc/);
+  assert.match(out.text, /\/council:status --result council-abc/);
 
   // Alignment invariant: every bordered line has the same length.
   const borderLens = new Set(
@@ -144,7 +144,7 @@ test("no R2 bar and a 'status' column for non-deliberate modes", () => {
   });
   assert.doesNotMatch(out.text, /R2 {2}/, "a review has no peer round -> no R2 bar");
   assert.match(out.text, /agent\s+status\s+raised/, "non-deliberate uses a 'status' column");
-  assert.match(out.text, /see \/council:result/, "terminal-but-no-merged-findings points at result, not 'pending'");
+  assert.match(out.text, /see \/council:status --result/, "terminal-but-no-merged-findings points at the report, not 'pending'");
 });
 
 test("colorize is layout-neutral: strips back to the exact plain text, same widths", () => {

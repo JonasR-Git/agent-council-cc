@@ -1,9 +1,10 @@
 ---
 name: council-workflow
 description: >
-  Multi-model code review: Claude + Codex + Grok. Prefer /council:deliberate when the
-  user wants agents to think independently then evaluate each other. Use /council:review
-  for a cheaper dual review without peer round.
+  Multi-model code review: Claude + Codex + Grok. /council:review runs the 3-way
+  deliberate protocol by default (independent then mutual critique); add --quick for a
+  cheaper dual review, --adversarial to challenge, or --loop to fix-and-re-review.
+  /council:plan designs an approach; /council:solve implements it.
 ---
 
 # Council workflow
@@ -12,11 +13,12 @@ description: >
 
 | Mode | Command | When |
 |------|---------|------|
-| **Deliberate (best)** | `/council:deliberate` | Before merge, risky changes, user wants mutual evaluation |
-| **Solve** | `/council:solve` | Open problem: independent plans -> scored critique -> synthesis -> one writer -> council review |
-| Dual review | `/council:review` | Faster second opinions (no peer round) |
-| Adversarial | `/council:adversarial` | Challenge design/direction |
-| Single | `/codex:review` or `/grok:review` | One vendor only |
+| **Deliberate (best)** | `/council:review` | Before merge, risky changes, user wants mutual evaluation |
+| Dual review | `/council:review --quick` | Faster second opinions (no peer round) |
+| Adversarial | `/council:review --adversarial` | Challenge design/direction |
+| Fix-loop | `/council:review --loop` | Drive a change to approval (review -> fix -> re-review) |
+| **Plan** | `/council:plan` | Design an approach: independent plans -> scored critique -> ranked synthesis (no code) |
+| **Solve** | `/council:solve` | Plan + one writer implements + council review |
 
 ## Deliberate protocol (3 agents)
 
@@ -49,7 +51,7 @@ Phase 1: companion starts Codex+Grok plans; Claude plans in parallel (--claude-p
 Phase 2: cross-critique with scores (1-10) + blockers -> ranking [+ bounded debate]
 Phase 3: Claude synthesizes final plan -> user approval
 Phase 4: ONE writer implements on a branch (policy solve_writer)
-Phase 5: /council:deliberate on the diff; writer's verdict does not count
+Phase 5: /council:review on the diff; writer's verdict does not count
 ```
 
 ## Policy

@@ -387,7 +387,7 @@ const SYNTHESIS_INSTRUCTIONS = [
   "1. Take the best-ranked plan as the skeleton; graft the strongest improvements from the others.",
   "2. Resolve or explicitly accept every blocker (debate outcomes above help).",
   "3. Present the final plan to the user for approval BEFORE implementing.",
-  "4. Implementation: exactly ONE writer (policy solve_writer) on a dedicated branch; then /council:deliberate on the diff. The writer's own verdict does not count towards approval."
+  "4. Implementation: exactly ONE writer (policy solve_writer) on a dedicated branch; then /council:review on the diff. The writer's own verdict does not count towards approval."
 ].join("\n");
 
 export function renderSolveDebates(debates) {
@@ -432,7 +432,7 @@ function renderSolveReport({ problem, options, r1Results, r2Results, plans, crit
   lines.push("## Protocol");
   lines.push("1. **Plans (independent):** each agent proposes a solution plan without seeing the others.");
   lines.push("2. **Plan critique:** each agent scores the other plans (feasibility/risk/simplicity/completeness, overall 1-10).");
-  lines.push("3. **Claude synthesis (you):** build the final plan from the best-ranked skeleton + grafted improvements; get user approval; then ONE writer implements on a branch and /council:deliberate reviews the diff.");
+  lines.push("3. **Claude synthesis (you):** build the final plan from the best-ranked skeleton + grafted improvements; get user approval; then ONE writer implements on a branch and /council:review reviews the diff.");
   lines.push("");
   lines.push("## Problem");
   lines.push(problem.trim());
@@ -528,7 +528,7 @@ function renderSolveReport({ problem, options, r1Results, r2Results, plans, crit
   lines.push("1. Take the best-ranked plan as the skeleton; graft the strongest improvements from the others.");
   lines.push("2. Resolve or explicitly accept every blocker (debate outcomes above help).");
   lines.push("3. Present the final plan to the user for approval BEFORE implementing.");
-  lines.push("4. Implementation: exactly ONE writer (policy solve_writer) on a dedicated branch; then /council:deliberate on the diff. The writer's own verdict does not count towards approval.");
+  lines.push("4. Implementation: exactly ONE writer (policy solve_writer) on a dedicated branch; then /council:review on the diff. The writer's own verdict does not count towards approval.");
   lines.push("");
 
   return lines.join("\n");

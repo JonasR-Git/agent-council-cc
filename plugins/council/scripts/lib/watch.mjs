@@ -204,12 +204,12 @@ export function formatDashboard(job, progress, { nowMs, etaMs = null, skipped = 
     lines.push(box(`must-fix  ${mustFix} (P0/P1)`));
     lines.push(box(`severity  ${sev || "none"}`));
   } else if (terminal) {
-    lines.push(box("findings  see /council:result for the full report"));
+    lines.push(box("findings  see /council:status --result for the full report"));
   } else {
     lines.push(box("findings  pending — available when the run completes"));
   }
   lines.push(BOT);
-  lines.push(`  → /council:result ${job.id}`);
+  lines.push(`  → /council:status --result ${job.id}`);
   return { text: lines.join("\n"), terminal, elapsedMs };
 }
 

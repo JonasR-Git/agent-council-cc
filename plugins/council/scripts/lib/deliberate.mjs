@@ -562,7 +562,7 @@ function renderDeliberationReport({
   lines.push(`- Branch: \`${context.branch}\` · HEAD: \`${shortHead(context.head)}\``);
   lines.push(`- Snapshot: \`${context.snapshotId}\``);
   lines.push(`- Diff summary: ${context.summary}`);
-  lines.push(`- Claude R1 file: ${claudeIncluded ? "yes" : "no (run /council:deliberate so Claude writes findings first)"}`);
+  lines.push(`- Claude R1 file: ${claudeIncluded ? "yes" : "no (run /council:review so Claude writes findings first)"}`);
   if (options.policySource) lines.push(`- Policy: \`${options.policySource}\``);
   if (options.focusText) lines.push(`- Focus: ${options.focusText}`);
   if (critiqueStats?.length) {

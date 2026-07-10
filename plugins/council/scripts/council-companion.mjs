@@ -211,7 +211,7 @@ async function handleSetup(argv) {
     );
   }
   if (ready) {
-    report.nextSteps.push("Try `/council:deliberate` (3-way protocol) or `/council:review --background`.");
+    report.nextSteps.push("Try `/council:review` (3-way deliberate by default) or `/council:review --quick --background`.");
   }
   if (!policy._source) {
     report.nextSteps.push("No .council.yml found - run `/council:setup --init` to scaffold one.");

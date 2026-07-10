@@ -11,6 +11,9 @@ Three agents (Claude + Codex + Grok) solve a problem together: independent plans
 then mutual critique with scores, then ONE synthesized plan, ONE writer, and a council
 review of the result. No free-running chat — structured, bounded rounds only.
 
+To only design the approach without implementing it, use `/council:plan` (Phases 0-3,
+then stop).
+
 Raw arguments:
 `$ARGUMENTS`
 
@@ -59,7 +62,7 @@ Do NOT read their plans first. The companion picks your file up automatically.
 
 ### Phase 5 - council review of the result
 
-- Run `/council:deliberate` on the branch diff (`--base <default-branch>`).
+- Run `/council:review` on the branch diff (`--base <default-branch>`).
 - Approval rule: at least 2 agents `approve`/`approve_with_nits`; the writer's own verdict does not count.
 - Fix loop until approved; then hand back to the user for merge.
 
@@ -67,5 +70,5 @@ Do NOT read their plans first. The companion picks your file up automatically.
 
 - Phases 0-3 are read-only for everyone.
 - Never let an agent see the other plans before its own is written (independence).
-- Prefer `--background` + `/council:status` + `/council:result` for anything non-trivial.
+- Prefer `--background` + `/council:status` (add `--result` for the report) for anything non-trivial.
 - Debate is opt-in and bounded (max 2 rounds, max 6 items) — never a free chat.

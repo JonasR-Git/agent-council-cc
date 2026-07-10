@@ -7,22 +7,19 @@ clear "fix now / verify / ignore" decision instead of one model's opinion.
 
 ## What it does
 
+Six slash commands:
+
 | Command | Purpose |
 |---------|---------|
-| `/council:setup` | Check backends (Claude/Codex/Grok) + scaffold `.council.yml` (`--init`) |
-| `/council:deliberate` | 3-way independent review, then peer critique + consensus |
-| `/council:review` | Faster dual review (no peer round) |
-| `/council:adversarial` | Challenge-style review + focus text |
-| `/council:solve` | 3-way problem solving: independent plans → scored critique → one writer → review |
-| `/council:fixloop` | Bounded review → fix → re-review until clean |
-| `/council:watch` | Live dashboard for a running job (per-agent progress, findings, ETA) |
-| `/council:status` · `result` · `wait` · `cancel` | Job control (`result --summary` / `--html`) |
-| `/council:usage` | Provider window limits (5h/weekly) + local token/job stats |
-| `/council:metrics` · `history` | Per-agent durations and cross-run job history |
-| `/council:ledger` · `overview` | Cross-run findings ledger + per-category calibration |
-| `/council:benchmark` | Blind peer-scored model benchmarking over time |
-| `/council:worktree` | Isolated git worktrees for single-writer solve implementations |
+| `/council:review` | Code review — 3-way deliberate (default), `--quick` dual, `--adversarial`, or `--loop` (review→fix→re-review) |
+| `/council:plan` | Design an approach: independent plans → scored critique → ranked synthesis (no code) |
+| `/council:solve` | Plan + one writer implements on a branch + council review |
+| `/council:status` | Job control: list/status, `--watch` (live dashboard), `--result` (`--summary`/`--html`), `--wait`, `--cancel` |
+| `/council:setup` | Check backends + scaffold `.council.yml` (`--init`) + `--usage` (limits/tokens) |
 | `/council:doctor` | End-to-end self-test (CLIs, state dir, limits, live agent pings) |
+
+Power-user analytics (`metrics`, `history`, `ledger`, `overview`, `benchmark`,
+`worktree`) stay available as `node scripts/council-companion.mjs <subcommand>`.
 
 Highlights: verification-first (adversarially refute P0/P1 before surfacing),
 model-agnostic consensus + a findings ledger that recognizes issues across runs,
@@ -95,17 +92,17 @@ contaminate Codex/Grok input.
 
 ```text
 # POSIX
-/council:deliberate --claude-findings /tmp/council-claude-r1.json
+/council:review --claude-findings /tmp/council-claude-r1.json
 
 # Windows
-/council:deliberate --claude-findings C:\Users\you\AppData\Local\Temp\council-claude-r1.json
+/council:review --claude-findings C:\Users\you\AppData\Local\Temp\council-claude-r1.json
 ```
 
 With `--claude-backend spawn` you skip that step — the spawned Claude produces
 R1 itself. Parallel mode starts the agents first, then waits for Claude's file:
 
 ```text
-/council:deliberate --claude-findings-wait /tmp/council-claude-r1.json --wait-timeout 600 --background
+/council:review --claude-findings-wait /tmp/council-claude-r1.json --wait-timeout 600 --background
 ```
 
 R2 cost is bounded: only `peer_critique_severities` (default `P0,P1`) are
@@ -118,7 +115,7 @@ Grok critiques run at `r2_effort`.
 writes an independent plan, then scores the others (feasibility/risk/simplicity/
 completeness, overall 1-10). The report ranks the plans; Claude synthesizes the
 final one, gets approval, and exactly ONE writer (`solve_writer`) implements it
-on a branch. `/council:deliberate` then reviews the diff — the writer's own
+on a branch. `/council:review` then reviews the diff — the writer's own
 verdict does not count towards approval.
 
 ```text
@@ -132,8 +129,8 @@ original critic. Hard caps: 6 items, 2 rounds.
 ## Live dashboard
 
 ```text
-/council:deliberate --background
-/council:watch            # most recent job
+/council:review --background
+/council:status --watch            # most recent job
 ```
 
 `watch` shows per-agent Round 1 state, R1/R2 progress bars, elapsed + remaining
@@ -147,9 +144,9 @@ run it in a separate terminal pane for the smooth live view.
 ```text
 /council:review --background
 /council:status
-/council:result
+/council:status --result
 
-/council:adversarial --background look for race conditions and soft-delete mistakes
+/council:review --adversarial --background look for race conditions and soft-delete mistakes
 ```
 
 ## State and environment
@@ -194,7 +191,7 @@ accepted for compatibility but ignored.
 Prefer per-agent flags (or the matching `.council.yml` keys):
 
 ```text
-/council:deliberate --codex-model gpt-5.5 --grok-model grok-4.5 --claude-model claude-opus-4-8
+/council:review --codex-model gpt-5.5 --grok-model grok-4.5 --claude-model claude-opus-4-8
 ```
 
 Grok effort: `--grok-effort`. Codex effort: configure in Codex itself.

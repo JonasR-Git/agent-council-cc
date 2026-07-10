@@ -1,10 +1,10 @@
 ---
-description: Check council backends (Claude/Codex/Grok) and scaffold .council.yml
-argument-hint: "[--init [--reviewers claude,codex,grok] [--claude-backend session|spawn] [--claude-model <id>] [--codex-model <id>] [--grok-model <id>] [--default-mode review|deliberate] [--force]]"
+description: Set up the council — check backends, scaffold .council.yml, or show provider usage/limits
+argument-hint: "[--init [--reviewers ...] [--claude-backend session|spawn] [--claude-model <id>] [--codex-model <id>] [--grok-model <id>] [--force]] [--usage [--days <n>]]"
 allowed-tools: Bash(node:*), Bash(grok:*), Bash(codex:*)
 ---
 
-Run:
+If `--usage` is present, jump to **Usage mode** below. Otherwise run:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" setup --json $ARGUMENTS
@@ -36,3 +36,23 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" setup --init \
   `--grok-model`, `--default-mode`. Anything not given keeps the documented default.
 - Logins are per-CLI, not stored here: run `codex login` / `grok login`, and for the
   Claude spawn backend run `claude` once so the CLI is authenticated.
+
+Install commands if a backend is missing: Codex `npm i -g @openai/codex`; Grok
+`curl -fsSL https://x.ai/cli/install.sh | bash` (binary at `~/.grok/bin/grok`; set
+`GROK_BIN` if it exists but isn't on PATH); Claude `npm i -g @anthropic-ai/claude-code`.
+
+## Usage mode (`--usage`)
+
+Provider window limits + local token/job stats:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" usage --limits --tokens $ARGUMENTS
+```
+
+- `--limits`: Claude 5h + weekly % (live OAuth endpoint), Codex 5h + weekly % (local
+  `~/.codex/sessions`), Grok weekly % (local billing log; no 5h window).
+- `--tokens`: token consumption over the last `--days` (default 7) from the local
+  session logs of all three CLIs.
+- Always included: this workspace's job stats (per-kind, per-agent call/failure/timeout).
+
+For a deeper health check (live agent pings), use `/council:doctor`.
