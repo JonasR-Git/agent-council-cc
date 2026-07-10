@@ -23,7 +23,8 @@ export const DEFAULT_POLICY = {
   r2_effort: "medium",
   debate_rounds: 0,
   debate_resume: false,
-  solve_writer: "claude"
+  solve_writer: "claude",
+  budget_guard: 0
 };
 
 /**
@@ -197,8 +198,16 @@ export function mergeOptionsWithPolicy(options, policy) {
     debateRounds: clampDebateRounds(options.debateRounds ?? policy.debate_rounds ?? 0),
     debateResume: options.debateResume ?? policy.debate_resume === true,
     solveWriter: options.solveWriter ?? policy.solve_writer ?? "claude",
+    budgetGuard: clampPercent(options.budgetGuard ?? policy.budget_guard ?? 0),
+    forceBudget: options.forceBudget ?? false,
     policySource: policy._source
   };
+}
+
+function clampPercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(100, n);
 }
 
 function normalizeSeverityList(value) {

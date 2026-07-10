@@ -55,3 +55,8 @@ debate_resume: false
 
 # /council:solve - who implements the synthesized plan (exactly one writer)
 solve_writer: claude
+
+# Budget guard: refuse to start deliberate/solve when any provider's most-pressed
+# window (5h or weekly) is at/above this percent. 0 = off. Override per run with
+# --force-budget. Reads the same limits as `usage --limits`.
+budget_guard: 0

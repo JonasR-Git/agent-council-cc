@@ -12,6 +12,7 @@ import { READONLY_DISALLOWED_TOOLS, runDeliberation } from "./lib/deliberate.mjs
 import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover.mjs";
 import { loadPolicy, mergeOptionsWithPolicy } from "./lib/policy.mjs";
 import { runSolve } from "./lib/solve.mjs";
+import { evaluateBudget, gatherWindowPressure, renderBudgetBreaches } from "./lib/budget.mjs";
 import {
   collectAllTokenUsage,
   collectCodexRateLimits,
@@ -47,6 +48,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
+      "  node scripts/council-companion.mjs doctor [--json]",
       "  node scripts/council-companion.mjs result [job-id] [--summary] [--json]",
       "",
       "Flags:",
@@ -626,9 +628,10 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
       "problem-file",
       "claude-plan",
       "claude-plan-wait",
+      "budget-guard",
       "cwd"
     ],
-    booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "debate-resume"]
+    booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "debate-resume", "force-budget"]
   });
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const focusText = positionals.join(" ").trim();
@@ -659,10 +662,33 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
     peerCritiqueSeverities: options["peer-severities"] ?? undefined,
     debateRounds: options["debate-rounds"] != null ? Number(options["debate-rounds"]) : undefined,
     debateResume: options["debate-resume"] ? true : undefined,
+    budgetGuard: options["budget-guard"] != null ? Number(options["budget-guard"]) : undefined,
+    forceBudget: options["force-budget"] ? true : undefined,
     waitTimeoutMs,
     skipCodex: Boolean(options["skip-codex"]),
     skipGrok: Boolean(options["skip-grok"])
   };
+
+  // Budget guard: refuse to start when a provider window is over threshold.
+  const guardPolicy = mergeOptionsWithPolicy(request, loadPolicy(cwd));
+  if (guardPolicy.budgetGuard > 0 && !guardPolicy.forceBudget) {
+    const pressure = await gatherWindowPressure();
+    const skipAgents = [request.skipCodex ? "codex" : null, request.skipGrok ? "grok" : null].filter(Boolean);
+    const { breaches, checked } = evaluateBudget(pressure, guardPolicy.budgetGuard, skipAgents);
+    if (breaches.length) {
+      const msg = `Budget guard (${guardPolicy.budgetGuard}%): the following provider windows are at or above the threshold:\n${renderBudgetBreaches(breaches)}\nRe-run with --force-budget to override.`;
+      if (options.json) {
+        outputResult({ budgetBlocked: true, threshold: guardPolicy.budgetGuard, breaches }, true);
+      } else {
+        console.error(msg);
+      }
+      process.exitCode = 2;
+      return;
+    }
+    if (!checked && !options.json) {
+      console.error("Budget guard: no provider window data available (limits unreadable) - proceeding.");
+    }
+  }
 
   if (options.background) {
     const root = workspaceRoot(cwd);
@@ -819,6 +845,126 @@ function handleResult(argv) {
     return;
   }
   console.log(job.report || job.output || "(no report stored)");
+}
+
+async function handleDoctor(argv) {
+  const { options } = parseCommandInput(argv, { booleanOptions: ["json"] });
+  const cwd = process.cwd();
+  const backends = probeBackends(cwd, ROOT_DIR);
+  const checks = [];
+
+  // 1. CLI availability / versions
+  checks.push({ name: "node", ok: backends.node.available, detail: backends.node.detail });
+  checks.push({
+    name: "codex-cli",
+    ok: backends.codex.cli.available,
+    detail: backends.codex.cli.detail
+  });
+  checks.push({
+    name: "codex-companion",
+    ok: backends.codex.companionAvailable,
+    detail: backends.codex.companion ?? "not found"
+  });
+  checks.push({ name: "grok-cli", ok: backends.grok.cli.available, detail: backends.grok.cli.detail });
+
+  // 2. State dir writable
+  let stateOk = false;
+  let stateDetail = "";
+  try {
+    const dir = resolveStateDir(cwd);
+    fs.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, `.doctor-${process.pid}.tmp`);
+    fs.writeFileSync(probe, "ok");
+    fs.unlinkSync(probe);
+    stateOk = true;
+    stateDetail = dir;
+  } catch (error) {
+    stateDetail = error instanceof Error ? error.message : String(error);
+  }
+  checks.push({ name: "state-dir writable", ok: stateOk, detail: stateDetail });
+
+  // 3. Window limits reachable
+  const homeDir = os.homedir();
+  const claudeLimits = await fetchClaudeLimits(path.join(homeDir, ".claude"));
+  checks.push({
+    name: "claude limits",
+    ok: !claudeLimits?.error,
+    detail: claudeLimits?.error ?? `5h ${claudeLimits.fiveHour?.usedPercent ?? "?"}% / weekly ${claudeLimits.sevenDay?.usedPercent ?? "?"}%`
+  });
+
+  // 4. Live agent pings (the expensive part - a 1-sentence round trip each)
+  const pingPrompt = "Reply with exactly: COUNCIL-OK (nothing else).";
+  const agentChecks = await Promise.all([
+    (async () => {
+      if (options.json === undefined) {
+        /* keep */
+      }
+      const res = backends.codex.companionAvailable
+        ? await runCodexStructuredPing(cwd, backends, pingPrompt)
+        : { ok: false, detail: "codex companion not found" };
+      return { name: "codex ping", ...res };
+    })(),
+    (async () => {
+      const res = backends.grok.cli.available
+        ? await runGrokPing(cwd, backends, pingPrompt)
+        : { ok: false, detail: "grok cli not found" };
+      return { name: "grok ping", ...res };
+    })()
+  ]);
+  checks.push(...agentChecks);
+
+  const ready = checks.every((c) => c.ok);
+  if (options.json) {
+    outputResult({ ready, checks, stateDir: resolveStateDir(cwd) }, true);
+    return;
+  }
+  const lines = [`Council doctor: ${ready ? "ALL OK" : "PROBLEMS FOUND"}`];
+  for (const c of checks) {
+    lines.push(`  [${c.ok ? "ok" : "!!"}] ${c.name.padEnd(20)} ${c.detail ?? ""}`);
+  }
+  console.log(`${lines.join("\n")}\n`);
+  if (!ready) process.exitCode = 1;
+}
+
+async function runCodexStructuredPing(cwd, backends, prompt) {
+  const promptFile = path.join(resolveStateDir(cwd), `doctor-ping-${process.pid}.md`);
+  fs.mkdirSync(path.dirname(promptFile), { recursive: true });
+  fs.writeFileSync(promptFile, prompt, "utf8");
+  const args = [backends.codex.companion, "task", "--prompt-file", promptFile];
+  try {
+    const result = await runCommandAsync(process.execPath, args, { cwd, timeoutMs: 120_000 });
+    fs.unlinkSync(promptFile);
+    const ok = result.status === 0 && /COUNCIL-OK/.test(result.stdout);
+    return { ok, detail: ok ? "responded" : `exit ${result.status}${result.timedOut ? " (timeout)" : ""}` };
+  } catch (error) {
+    try {
+      fs.unlinkSync(promptFile);
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function runGrokPing(cwd, backends, prompt) {
+  const bin = backends.grok.bin ?? findGrokBinary();
+  const promptFile = path.join(resolveStateDir(cwd), `doctor-grok-${process.pid}.md`);
+  fs.mkdirSync(path.dirname(promptFile), { recursive: true });
+  fs.writeFileSync(promptFile, prompt, "utf8");
+  const args = ["--prompt-file", promptFile, "--cwd", cwd, "--max-turns", "1", "--output-format", "plain"];
+  try {
+    const result = await runCommandAsync(bin, args, { cwd, timeoutMs: 120_000 });
+    fs.unlinkSync(promptFile);
+    const ok = result.status === 0 && /COUNCIL-OK/.test(result.stdout);
+    return { ok, detail: ok ? "responded" : `exit ${result.status}${result.timedOut ? " (timeout)" : ""}` };
+  } catch (error) {
+    try {
+      fs.unlinkSync(promptFile);
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 async function handleWait(argv) {
@@ -990,6 +1136,9 @@ async function main() {
         break;
       case "usage":
         await handleUsage(rest);
+        break;
+      case "doctor":
+        await handleDoctor(rest);
         break;
       case "cancel":
         handleCancel(rest);
