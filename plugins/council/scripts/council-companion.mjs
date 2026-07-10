@@ -197,13 +197,18 @@ async function handleSetup(argv) {
   };
 
   if (wants("codex") && !backends.codex.companionAvailable && !backends.codex.cli.available) {
-    report.nextSteps.push("Codex: install the Codex plugin (/plugin install codex@openai-codex) and run `codex login`.");
+    report.nextSteps.push("Codex: `npm i -g @openai/codex` (or /plugin install codex@openai-codex), then `codex login`.");
   }
   if (wants("grok") && !backends.grok.cli.available) {
-    report.nextSteps.push("Grok: install the Grok Build CLI (https://x.ai/cli) and run `grok login`.");
+    report.nextSteps.push(
+      "Grok: the binary lives at ~/.grok/bin/grok - if it exists but isn't on PATH, set GROK_BIN to it. " +
+        "To install: `curl -fsSL https://x.ai/cli/install.sh | bash` then `grok login` (needs a SuperGrok/X Premium+ plan; run this in a real terminal, the URL bot-blocks headless curls)."
+    );
   }
   if (wants("claude") && claudeBackend === "spawn" && !backends.claude.cli.available) {
-    report.nextSteps.push("Claude (spawn backend): install the Claude CLI or set CLAUDE_BIN; run `claude` once to log in. Or use claude_backend: session.");
+    report.nextSteps.push(
+      "Claude (spawn backend): `npm i -g @anthropic-ai/claude-code`, then run `claude` once to log in (or set CLAUDE_BIN). Or use claude_backend: session (no separate CLI)."
+    );
   }
   if (ready) {
     report.nextSteps.push("Try `/council:deliberate` (3-way protocol) or `/council:review --background`.");

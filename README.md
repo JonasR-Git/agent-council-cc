@@ -35,12 +35,18 @@ hardening, and cross-platform (Windows/macOS/Linux) with zero runtime deps.
 
 - Node.js >= 18.18
 - Claude Code with plugin support
-- Codex plugin or CLI (recommended: `codex@openai-codex`), `codex login`
-- Grok Build CLI from xAI, `grok login`
-- (optional) Claude CLI for the `spawn` reviewer backend
 
-You only need the backends listed in your `reviewers`; drop an agent and it is
-skipped.
+Reviewer backends (you only need the ones in your `reviewers` — check with
+`which <tool>` first, don't reinstall if present):
+
+| Backend | Install | Login | Notes |
+|---------|---------|-------|-------|
+| **Codex** | `npm i -g @openai/codex` (or `/plugin install codex@openai-codex`) | `codex login` | npm global |
+| **Grok** | `curl -fsSL https://x.ai/cli/install.sh \| bash` | `grok login` | standalone binary at `~/.grok/bin/grok`; if present but not on PATH, set `GROK_BIN`; needs a SuperGrok/X Premium+ plan; run the installer in a real terminal (headless curls to the URL bot-block) |
+| **Claude** (spawn backend only) | `npm i -g @anthropic-ai/claude-code` | run `claude` once | not needed for the default `session` backend |
+
+`/council:doctor` verifies all of this end-to-end; `/council:setup` prints the
+exact next step for anything missing.
 
 ## Install
 
