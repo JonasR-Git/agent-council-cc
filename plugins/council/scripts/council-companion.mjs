@@ -1646,10 +1646,14 @@ async function handleWatch(argv) {
   }
 }
 
-// v1 whole-project audit: static. Builds the codebase model and emits CANDIDATE
-// findings + hotspots + coverage. No agents; read-only EXCEPT --write-map (which
-// writes docs/codebase-map.json). See docs/audit-design.md; deeper review + safe
-// --fix are later phases.
+// Whole-project audit. `audit` (default) is static: it builds the codebase model
+// and emits CANDIDATE findings + hotspots + coverage, reading source only. Writes
+// are opt-in: --write-map writes docs/codebase-map.json and --doc writes the
+// proposal doc (both under the project root). `audit review` additionally runs
+// Codex/Grok over the hotspots — those reviewers are prompted read-only, but they
+// are external CLIs whose sandboxing this command cannot itself enforce. Reviewed
+// code is never auto-edited here. See docs/audit-design.md; the safe --fix agent
+// team is a later phase.
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path"],
@@ -1676,8 +1680,18 @@ async function handleAudit(argv) {
   if (positionals[0] === "review") {
     const backends = probeBackends(cwd, ROOT_DIR);
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
-    const budget = options.budget != null ? Math.max(2, Number(options.budget)) : 20;
-    const maxUnits = options["max-units"] != null ? Math.max(1, Number(options["max-units"])) : 12;
+    let budget = 20;
+    if (options.budget != null) {
+      const n = Number(options.budget);
+      if (!Number.isFinite(n) || n < 2) throw new Error("--budget must be a number >= 2");
+      budget = Math.floor(n);
+    }
+    let maxUnits = 12;
+    if (options["max-units"] != null) {
+      const n = Number(options["max-units"]);
+      if (!Number.isFinite(n) || n < 1) throw new Error("--max-units must be a positive number");
+      maxUnits = Math.floor(n);
+    }
     const out = await runAuditReview(cwd, model, backends, {
       ...merged,
       budget,
@@ -1713,7 +1727,12 @@ function renderAuditReviewReport(out) {
   const L = [];
   L.push("# Council Audit — deep review (v2)");
   L.push("");
-  L.push(`Reviewed ${c.unitsReviewed}/${c.unitsSelected} hotspot modules with Codex+Grok (budget ${c.budgetSpent}/${c.budgetTotal} agent calls). ${c.suppliedChars}/${c.totalCharsOfReviewed} chars of reviewed modules supplied. Findings are candidates — Claude (you) should synthesize a decision table.`);
+  const reviewers = c.reviewers ? Object.entries(c.reviewers).filter(([, on]) => on).map(([k]) => k).join("+") || "none" : "Codex+Grok";
+  const extras = [];
+  if (c.reduceRan === false) extras.push("global SSOT/architecture reduce SKIPPED (budget/reviewers)");
+  if (c.truncatedUnits) extras.push(`${c.truncatedUnits} module(s) truncated — tail unreviewed`);
+  if (c.unitsFailed) extras.push(`${c.unitsFailed} unit(s) failed`);
+  L.push(`Reviewed ${c.unitsReviewed}/${c.unitsSelected} hotspot modules with ${reviewers} (budget ${c.budgetSpent}/${c.budgetTotal} agent calls). ${c.suppliedChars}/${c.totalCharsOfReviewed} chars of reviewed modules supplied.${extras.length ? ` ⚠ ${extras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);
   L.push("");
   const rank = { P0: 0, P1: 1, P2: 2, nit: 3 };
   const sorted = [...out.findings].sort((a, b) => (rank[a.severity] ?? 2) - (rank[b.severity] ?? 2));

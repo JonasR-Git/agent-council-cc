@@ -7,8 +7,8 @@ import test from "node:test";
 import { buildGraph, findCycles, findOrphanModules, parseModule, resolveImport, stripComments } from "../plugins/council/scripts/lib/import-graph.mjs";
 import { findDuplicateClusters } from "../plugins/council/scripts/lib/dup-detect.mjs";
 import { buildCodebaseModel } from "../plugins/council/scripts/lib/codebase-model.mjs";
-import { buildUnitPrompt, makeBudget, selectUnits } from "../plugins/council/scripts/lib/audit-review.mjs";
-import { renderAuditDoc } from "../plugins/council/scripts/lib/audit-doc.mjs";
+import { activeReviewerCount, buildUnitPrompt, makeBudget, reviewerActive, runAuditReview, selectUnits } from "../plugins/council/scripts/lib/audit-review.mjs";
+import { renderAuditDoc, writeAuditDoc } from "../plugins/council/scripts/lib/audit-doc.mjs";
 
 // --- import graph ------------------------------------------------------------
 
@@ -169,6 +169,38 @@ test("buildUnitPrompt bounds oversized source and flags the split", () => {
   assert.equal(p.split, true);
   assert.match(p.prompt, /hotspot=5/);
   assert.match(p.prompt, /truncated to 20 of 50/);
+});
+
+test("reviewerActive/activeReviewerCount reflect policy AND probed availability", () => {
+  const both = { codex: { companionAvailable: true }, grok: { cli: { available: true } } };
+  assert.equal(activeReviewerCount(both, {}), 2);
+  assert.equal(activeReviewerCount(both, { skipGrok: true }), 1, "policy skip drops a reviewer");
+  assert.equal(reviewerActive("grok", both, { skipGrok: true }), false);
+  const noCodex = { codex: { companionAvailable: false }, grok: { cli: { available: true } } };
+  assert.equal(activeReviewerCount(noCodex, {}), 1, "unavailable backend is not counted");
+  assert.equal(activeReviewerCount({ codex: { companionAvailable: false }, grok: { cli: { available: false } } }, {}), 0);
+});
+
+test("writeAuditDoc writes inside root but rejects escaping/absolute docPath", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-doc-"));
+  const ok = writeAuditDoc(dir, [], { source: "test" }, { docPath: "docs/OUT.md" });
+  assert.ok(fs.existsSync(ok), "safe relative docPath is written");
+  assert.ok(path.resolve(ok).startsWith(path.resolve(dir)), "target stays under root");
+  assert.throws(() => writeAuditDoc(dir, [], {}, { docPath: "../../evil.md" }), /project root/);
+  assert.throws(() => writeAuditDoc(dir, [], {}, { docPath: path.join(dir, "..", "sibling.md") }), /project root/);
+});
+
+test("runAuditReview with no callable reviewers charges nothing and skips the reduce", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-noagents-"));
+  fs.writeFileSync(path.join(dir, "a.mjs"), 'import { help } from "./b.mjs";\nexport function main(){ return help(); }\n');
+  fs.writeFileSync(path.join(dir, "b.mjs"), "export function help(){ return 42; }\n");
+  const model = buildCodebaseModel(dir);
+  const backends = { codex: { companionAvailable: false }, grok: { cli: { available: false } } };
+  const out = await runAuditReview(dir, model, backends, { skipCodex: true, skipGrok: true });
+  assert.equal(out.coverage.budgetSpent, 0, "no agent calls charged when nothing is callable");
+  assert.equal(out.coverage.unitsReviewed, 0);
+  assert.equal(out.coverage.reduceRan, false, "reduce does not run without a reviewer");
+  assert.deepEqual(out.findings, []);
 });
 
 test("buildCodebaseModel scans a fixture (fs fallback, no git) and returns candidates", () => {
