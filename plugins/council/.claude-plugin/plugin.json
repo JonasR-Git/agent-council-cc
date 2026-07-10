@@ -1,8 +1,19 @@
 {
   "name": "council",
   "version": "0.5.0",
-  "description": "Multi-agent council: dual review + deliberate (independent then peer critique) with Codex + Grok + Claude.",
+  "description": "Multi-agent code review for Claude Code: independent review then peer critique across Claude + Codex + Grok, with consensus/verification, a findings ledger, solve, benchmarking, and a live dashboard.",
   "author": {
     "name": "local"
-  }
+  },
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "multi-agent",
+    "codex",
+    "grok",
+    "deliberation",
+    "consensus",
+    "review",
+    "static-analysis"
+  ]
 }

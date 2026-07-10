@@ -2,7 +2,7 @@
   "name": "agent-council-cc",
   "version": "0.5.0",
   "private": true,
-  "description": "Claude Code plugins: Grok bridge + multi-agent council (Codex + Grok)",
+  "description": "Claude Code plugin: multi-agent council code review (Claude + Codex + Grok)",
   "type": "module",
   "engines": {
     "node": ">=18.18"
@@ -10,7 +10,6 @@
   "scripts": {
     "bump": "node scripts/bump-version.mjs",
     "lint": "node scripts/lint.mjs",
-    "test:grok-setup": "node plugins/grok/scripts/grok-companion.mjs setup --json",
     "test:council-setup": "node plugins/council/scripts/council-companion.mjs setup --json",
     "test": "node --test"
   }

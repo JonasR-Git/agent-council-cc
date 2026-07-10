@@ -1,80 +1,91 @@
-# Agent Council for Claude Code
+# Council for Claude Code
 
-Claude Code plugins that wire **Grok Build** and a **multi-agent council** (Codex + Grok + Claude) into a local review workflow.
+A Claude Code plugin that reviews your code with a **multi-agent council** —
+Claude + Codex + Grok each review independently, then critique each other and
+reach consensus. You get fewer false positives, explicit disagreement, and a
+clear "fix now / verify / ignore" decision instead of one model's opinion.
 
-## Plugins
-
-### `grok`
-
-| Command | Purpose |
-|---------|---------|
-| `/grok:setup` | Check Grok CLI + auth |
-| `/grok:review` | Read-only review of the working tree or `--base` diff |
-| `/grok:adversarial-review` | Challenge-style review + focus text |
-| `/grok:rescue` | Hand a task to Grok |
-| `/grok:status` / `result` / `cancel` | Job control |
-
-### `council`
+## What it does
 
 | Command | Purpose |
 |---------|---------|
-| `/council:setup` | Probe Codex companion + Grok + policy file |
-| `/council:deliberate` | 3-way independent review, then peer critique |
-| `/council:solve` | 3-way problem solving: independent plans, scored critique, synthesis, one writer, council review |
-| `/council:review` | Faster dual Codex + Grok review |
-| `/council:adversarial` | Dual adversarial review |
-| `/council:status` / `result` / `cancel` | Council job control (`result --summary` prints only the decision-relevant sections) |
-| `/council:wait` | Block until a background job finishes (watchers get process-exit semantics) |
-| `/council:usage` | Per-kind job stats + per-agent call/failure/timeout counts, with provider quota pointers |
+| `/council:setup` | Check backends (Claude/Codex/Grok) + scaffold `.council.yml` (`--init`) |
+| `/council:deliberate` | 3-way independent review, then peer critique + consensus |
+| `/council:review` | Faster dual review (no peer round) |
+| `/council:adversarial` | Challenge-style review + focus text |
+| `/council:solve` | 3-way problem solving: independent plans → scored critique → one writer → review |
+| `/council:fixloop` | Bounded review → fix → re-review until clean |
+| `/council:watch` | Live dashboard for a running job (per-agent progress, findings, ETA) |
+| `/council:status` · `result` · `wait` · `cancel` | Job control (`result --summary` / `--html`) |
+| `/council:usage` | Provider window limits (5h/weekly) + local token/job stats |
+| `/council:metrics` · `history` | Per-agent durations and cross-run job history |
+| `/council:ledger` · `overview` | Cross-run findings ledger + per-category calibration |
+| `/council:benchmark` | Blind peer-scored model benchmarking over time |
+| `/council:worktree` | Isolated git worktrees for single-writer solve implementations |
+| `/council:doctor` | End-to-end self-test (CLIs, state dir, limits, live agent pings) |
+
+Highlights: verification-first (adversarially refute P0/P1 before surfacing),
+model-agnostic consensus + a findings ledger that recognizes issues across runs,
+a **separated Claude reviewer backend** (`claude_backend: spawn` runs an
+independent read-only `claude -p` so the orchestrating session can judge
+neutrally), configurable `reviewers`, budget guardrails, prompt-injection
+hardening, and cross-platform (Windows/macOS/Linux) with zero runtime deps.
 
 ## Requirements
 
 - Node.js >= 18.18
 - Claude Code with plugin support
-- Codex plugin/CLI, recommended: `codex@openai-codex`
-- Grok Build CLI from xAI with `grok login`
+- Codex plugin or CLI (recommended: `codex@openai-codex`), `codex login`
+- Grok Build CLI from xAI, `grok login`
+- (optional) Claude CLI for the `spawn` reviewer backend
 
-## Install (local marketplace)
+You only need the backends listed in your `reviewers`; drop an agent and it is
+skipped.
+
+## Install
 
 From Claude Code:
 
 ```text
 /plugin marketplace add /path/to/agent-council-cc
-/plugin install grok@agent-council
 /plugin install council@agent-council
 /reload-plugins
 ```
 
-On Windows, the marketplace path can use forward slashes, for example
-`C:/path/to/agent-council-cc`.
-
-## Use only the Grok plugin
-
-The Grok plugin is fully supported as a standalone install. Install only
-`grok@agent-council`; neither the Codex plugin nor the council plugin is required.
-
-```text
-/plugin install grok@agent-council
-/reload-plugins
-```
-
-Run `grok login` before using it. The standalone commands are `/grok:setup`,
-`/grok:review`, `/grok:adversarial-review`, `/grok:rescue`, `/grok:status`,
-`/grok:result`, and `/grok:cancel`. The council plugin is an optional layer on
-top when you want multi-agent deliberation.
+On Windows the marketplace path may use forward slashes, e.g.
+`C:/path/to/agent-council-cc`. Once published to a Git host, users add it with
+`/plugin marketplace add <owner>/<repo>` instead of a local path.
 
 Smoke test without installing:
 
 ```bash
-node plugins/grok/scripts/grok-companion.mjs setup --json
 node plugins/council/scripts/council-companion.mjs setup --json
 ```
 
-## Deliberate Protocol
+## Configure
 
-Round 1 is independent. Claude writes its own JSON findings first, while Codex and Grok produce structured findings through the companion. Round 2 asks agents to critique each other's findings and vote `agree`, `disagree`, or `uncertain`.
+Scaffold a project policy file (safe defaults + your overrides):
 
-Write Claude's R1 JSON to an OS temp path outside the repo. Untracked file bodies are included in review context, so a repo-local scratch file would contaminate Codex/Grok input.
+```text
+/council:setup --init --reviewers claude,codex,grok --claude-backend session
+```
+
+`reviewers` picks who participates. `claude_backend` is `session` (Claude's R1
+comes from the orchestrating session) or `spawn` (an independent
+`claude -p --model <id>`, decoupled so the session judges neutrally). Logins are
+per-CLI: `codex login`, `grok login`, and (for the spawn backend) run `claude`
+once.
+
+## Deliberate protocol
+
+Round 1 is independent: Claude writes its own JSON findings first, while Codex
+and Grok produce structured findings in parallel. Round 2 asks agents to
+critique each other's findings and vote `agree`/`disagree`/`uncertain`, then the
+report merges consensus vs unique with peer votes.
+
+Write Claude's R1 JSON to an OS temp path **outside the repo** — untracked file
+bodies are included in review context, so a repo-local scratch file would
+contaminate Codex/Grok input.
 
 ```text
 # POSIX
@@ -84,114 +95,114 @@ Write Claude's R1 JSON to an OS temp path outside the repo. Untracked file bodie
 /council:deliberate --claude-findings C:\Users\you\AppData\Local\Temp\council-claude-r1.json
 ```
 
-Parallel mode starts Codex/Grok first, then waits for Claude's file:
+With `--claude-backend spawn` you skip that step — the spawned Claude produces
+R1 itself. Parallel mode starts the agents first, then waits for Claude's file:
 
 ```text
 /council:deliberate --claude-findings-wait /tmp/council-claude-r1.json --wait-timeout 600 --background
 ```
 
-R2 critique cost is bounded: only findings in `peer_critique_severities` (default `P0,P1`) are critiqued, critics see per-finding code evidence snippets instead of the full diff, and Grok critiques run at `r2_effort` (default `medium`).
+R2 cost is bounded: only `peer_critique_severities` (default `P0,P1`) are
+critiqued, critics see per-finding code evidence instead of the full diff, and
+Grok critiques run at `r2_effort`.
 
-## Solve Protocol
+## Solve protocol
 
-`/council:solve` turns the council into a problem-solving panel: every agent writes an independent solution plan (`schemas/plan.schema.json`), then each scores the other plans (feasibility/risk/simplicity/completeness, overall 1-10) and lists blockers/improvements. The report ranks the plans; Claude synthesizes the final plan, gets user approval, and exactly ONE writer (`solve_writer` policy) implements it on a branch. `/council:deliberate` then reviews the diff — the writer's own verdict does not count towards approval.
+`/council:solve` turns the council into a problem-solving panel: every agent
+writes an independent plan, then scores the others (feasibility/risk/simplicity/
+completeness, overall 1-10). The report ranks the plans; Claude synthesizes the
+final one, gets approval, and exactly ONE writer (`solve_writer`) implements it
+on a branch. `/council:deliberate` then reviews the diff — the writer's own
+verdict does not count towards approval.
 
 ```text
 /council:solve --background how should we add offline support to the sync engine?
 ```
 
-To include Claude's independent plan from a temp file, use either path style:
+Optional bounded debate (never a live chat): `--debate-rounds 1` gives each
+disputed item's author one rebuttal; `--debate-rounds 2` adds one counter by the
+original critic. Hard caps: 6 items, 2 rounds.
+
+## Live dashboard
 
 ```text
-# POSIX
-/council:solve --claude-plan /tmp/council-claude-plan.json how should we add offline support?
-
-# Windows
-/council:solve --claude-plan C:\Users\you\AppData\Local\Temp\council-claude-plan.json how should we add offline support?
+/council:deliberate --background
+/council:watch            # most recent job
 ```
 
-Optional bounded debate (never a live chat): `--debate-rounds 1` gives each disputed item's author one rebuttal turn; `--debate-rounds 2` adds one counter by the original critic. Hard caps: 6 items, 2 rounds.
+`watch` shows per-agent Round 1 state, R1/R2 progress bars, elapsed + remaining
+estimate, and (on completion) a findings breakdown (raised / shared / disputed,
+severity histogram, must-fix count). In a real terminal it redraws live and is
+ANSI-colored; in the chat it prints a single snapshot (`--once`/`--json`). Tip:
+run it in a separate terminal pane for the smooth live view.
 
-## Typical Flows
+## Typical flows
 
 ```text
 /council:review --background
 /council:status
 /council:result
-```
 
-```text
 /council:adversarial --background look for race conditions and soft-delete mistakes
 ```
 
-```text
-/grok:review --background
-/grok:rescue --write fix the failing unit test with minimal patch
-```
+## State and environment
 
-## State And Environment
-
-Job state is stored per workspace under:
-
-- Council: `~/.claude/agent-council-state/council/<workspace-slug-hash>/`
-- Grok: `~/.claude/agent-council-state/grok/<workspace-slug-hash>/`
-
-Overrides:
+Job state is stored per workspace under
+`~/.claude/agent-council-state/council/<workspace-slug-hash>/`.
 
 | Variable | Meaning |
 |----------|---------|
 | `AGENT_COUNCIL_STATE_DIR` | Council state root |
-| `AGENT_COUNCIL_GROK_STATE_DIR` | Grok state root |
-| `GROK_BIN` / `GROK_PATH` | Path to `grok` binary |
-| `GROK_COMPANION_PATH` | Path to `grok-companion.mjs` |
+| `GROK_BIN` / `GROK_PATH` | Path to the `grok` binary |
+| `GROK_COMPANION_PATH` | Path to a separately-installed `grok-companion.mjs` (optional) |
 | `CODEX_COMPANION_PATH` | Path to `codex-companion.mjs` |
-
-The plugins no longer use `CLAUDE_PLUGIN_DATA` for job state.
+| `CLAUDE_BIN` / `CLAUDE_PATH` | Path to the `claude` binary (spawn backend) |
 
 ## Policy
 
-Copy `.council.example.yml` to `.council.yml` for project defaults. Important keys:
+`/council:setup --init` scaffolds `.council.yml`; `.council.example.yml`
+documents every key. Common ones:
 
 ```yaml
+reviewers: [claude, codex, grok]
+claude_backend: session      # session | spawn
 scope: auto
 agent_timeout_minutes: 30
 require_consensus_for: [auth, concurrency, data-loss, compliance, security]
-skip_paths:
-  - content/blog/**
 peer_critique_severities: [P0, P1]
 r2_effort: medium
-debate_rounds: 0
-debate_resume: false
+verify_findings: false
+budget_guard: 0
 solve_writer: claude
 ```
 
-`debate_resume: true` lets Grok authors defend contested findings inside their own R1 session (context continuity via `--resume`); Codex debate turns stay fresh slim calls because its companion only supports resume-last.
+`skip_paths` applies to git status/diff pathspecs and untracked-file inclusion
+in deliberate/solve context (the cheaper `review`/`adversarial` paths delegate
+context to the companions and do not apply it). Codex reasoning effort comes
+from `~/.codex/config.toml`; the `codex_effort` key / `--codex-effort` flag are
+accepted for compatibility but ignored.
 
-`skip_paths` applies to Git status/diff pathspecs and untracked file body inclusion in the council deliberate/solve context; the cheaper `/council:review` and `/council:adversarial` paths delegate context collection to the codex/grok companions and do not apply `skip_paths`. `agent_timeout_minutes` bounds Codex/Grok subprocesses. `peer_critique_severities: [all]` critiques every finding.
+## Model configuration
 
-Codex reasoning effort comes from `~/.codex/config.toml` (`model_reasoning_effort`). The council `codex_effort` policy key and `--codex-effort` flag are accepted for compatibility but ignored.
-
-## Model Configuration
-
-Prefer per-agent flags:
+Prefer per-agent flags (or the matching `.council.yml` keys):
 
 ```text
-/council:review --codex-model gpt-5.5 --grok-model grok-4.5
-/grok:review --model grok-build
+/council:deliberate --codex-model gpt-5.5 --grok-model grok-4.5 --claude-model claude-opus-4-8
 ```
 
-Grok effort can be passed with `--grok-effort`; Codex effort must be configured in Codex itself.
+Grok effort: `--grok-effort`. Codex effort: configure in Codex itself.
 
 ## Development
 
 ```bash
-npm test
+npm test      # node:test, no npm dependencies
+npm run lint
 ```
 
-The test suite uses Node's built-in `node:test` runner and has no npm dependencies.
-
-Release history is recorded in [CHANGELOG.md](CHANGELOG.md).
+Release history: [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT for this local toolkit. Codex plugin remains Apache-2.0 (OpenAI). Grok CLI is covered by xAI terms.
+MIT (this toolkit). The Codex plugin remains Apache-2.0 (OpenAI); the Grok CLI
+is covered by xAI terms.
