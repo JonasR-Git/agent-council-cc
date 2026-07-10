@@ -82,18 +82,23 @@ export function summarizeFindings(merged) {
   const all = merged?.all;
   if (!Array.isArray(all)) return null;
   const bySeverity = { P0: 0, P1: 0, P2: 0, nit: 0 };
-  const byAgent = { codex: { raised: 0, shared: 0 }, grok: { raised: 0, shared: 0 }, claude: { raised: 0, shared: 0 } };
+  const blank = () => ({ raised: 0, shared: 0, disputed: 0 });
+  const byAgent = { codex: blank(), grok: blank(), claude: blank() };
   let consensus = 0;
   let contested = 0;
   for (const f of all) {
     const sev = f.severity in bySeverity ? f.severity : "nit";
     bySeverity[sev] += 1;
     if (f.consensus) consensus += 1;
-    if (f.contested) contested += 1;
+    // "disputed" = a peer voted disagree on this finding (contested), i.e. it
+    // was pushed back on / partly refuted in Round 2.
+    const disputed = Boolean(f.contested);
+    if (disputed) contested += 1;
     for (const a of f.agents ?? []) {
       if (!byAgent[a]) continue;
       byAgent[a].raised += 1;
       if (f.consensus) byAgent[a].shared += 1;
+      if (disputed) byAgent[a].disputed += 1;
     }
   }
   return { total: all.length, consensus, unique: all.length - consensus, contested, bySeverity, byAgent };
@@ -128,7 +133,6 @@ export function progressBar(done, total, width = 12) {
 
 // --- box helpers (all content uses single-width glyphs, so .length == width) --
 const TOP = `╔${"═".repeat(W)}╗`;
-const MID = `╠${"═".repeat(W)}╣`;
 const SEP = `╟${"─".repeat(W)}╢`;
 const BOT = `╚${"═".repeat(W)}╝`;
 function box(content = "") {
@@ -163,7 +167,7 @@ export function formatDashboard(job, progress, { nowMs, etaMs = null, skipped = 
   let timeMeta = formatDuration(elapsedMs);
   if (!terminal && etaMs && elapsedMs != null) {
     const remaining = etaMs - elapsedMs;
-    timeMeta += remaining > 0 ? ` · ~${formatDuration(remaining)} left` : ` · over median ${formatDuration(etaMs)}`;
+    timeMeta += remaining > 0 ? ` │ ~${formatDuration(remaining)} left` : ` │ over median ${formatDuration(etaMs)}`;
   }
 
   const r1Count = AGENTS.filter((a) => states[a] === "done" || states[a] === "file").length;
@@ -174,21 +178,22 @@ export function formatDashboard(job, progress, { nowMs, etaMs = null, skipped = 
   lines.push(TOP);
   lines.push(boxLR(`COUNCIL ${String(job.kind ?? "review").toUpperCase()}`, job.id));
   lines.push(SEP);
-  lines.push(box(`${job.status}  ·  ${timeMeta}`));
+  lines.push(box(`${job.status}  │  ${timeMeta}`));
   lines.push(box(`phase  ${phase}`));
   lines.push(SEP);
-  lines.push(box(`${col("agent", 10)}${col("round 1", 11)}${col("findings", 11)}shared`));
+  lines.push(box(`${col("agent", 9)}${col("round 1", 10)}${col("raised", 8)}${col("shared", 8)}disputed`));
   for (const agent of AGENTS) {
     const fa = findings?.byAgent?.[agent];
-    const raised = fa ? String(fa.raised) : "·";
-    const shared = fa ? String(fa.shared) : "·";
-    lines.push(box(`${col(agent, 10)}${col(R1_LABEL[states[agent]], 11)}${col(raised, 11)}${shared}`));
+    const raised = fa ? String(fa.raised) : "-";
+    const shared = fa ? String(fa.shared) : "-";
+    const disputed = fa ? String(fa.disputed) : "-";
+    lines.push(box(`${col(agent, 9)}${col(R1_LABEL[states[agent]], 10)}${col(raised, 8)}${col(shared, 8)}${disputed}`));
   }
   lines.push(SEP);
   lines.push(box(`R1  ${progressBar(r1Count, r1Total, 12)} ${r1Count}/${r1Total}    R2  ${progressBar(progress.r2Done, r2Total, 12)} ${progress.r2Done}/${r2Total || "?"}`));
   lines.push(SEP);
   if (findings) {
-    lines.push(box(`${findings.total} findings  ·  ${findings.consensus} consensus  ·  ${findings.unique} unique  ·  ${findings.contested} contested`));
+    lines.push(box(`${findings.total} findings  │  ${findings.consensus} consensus  │  ${findings.unique} unique  │  ${findings.contested} disputed`));
     const sev = Object.entries(findings.bySeverity)
       .filter(([, n]) => n > 0)
       .map(([k, n]) => `${k} ${n}`)

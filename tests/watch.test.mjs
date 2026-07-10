@@ -64,9 +64,9 @@ test("summarizeFindings counts totals, consensus, contested, per-severity, per-a
   assert.equal(f.unique, 2);
   assert.equal(f.contested, 1);
   assert.deepEqual(f.bySeverity, { P0: 0, P1: 2, P2: 1, nit: 1 });
-  assert.deepEqual(f.byAgent.codex, { raised: 2, shared: 2 });
-  assert.deepEqual(f.byAgent.grok, { raised: 3, shared: 2 });
-  assert.deepEqual(f.byAgent.claude, { raised: 2, shared: 1 });
+  assert.deepEqual(f.byAgent.codex, { raised: 2, shared: 2, disputed: 0 });
+  assert.deepEqual(f.byAgent.grok, { raised: 3, shared: 2, disputed: 1 });
+  assert.deepEqual(f.byAgent.claude, { raised: 2, shared: 1, disputed: 0 });
 });
 
 test("summarizeFindings returns null when no merged findings exist yet", () => {
@@ -105,7 +105,8 @@ test("formatDashboard (completed) shows the findings breakdown and a right-align
   assert.equal(out.terminal, true);
   assert.match(out.text, /council-abc/);
   assert.match(out.text, /claude\s+file/, "session Claude shows as file in the table");
-  assert.match(out.text, /4 findings\s+·\s+2 consensus\s+·\s+2 unique\s+·\s+1 contested/);
+  assert.match(out.text, /disputed/, "table has a disputed column");
+  assert.match(out.text, /4 findings\s+│\s+2 consensus\s+│\s+2 unique\s+│\s+1 disputed/);
   assert.match(out.text, /severity\s+P1 2\s+P2 1\s+nit 1/);
   assert.match(out.text, /\/council:result council-abc/);
 
