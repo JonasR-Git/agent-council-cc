@@ -134,6 +134,7 @@ export function runCommandAsync(command, args = [], options = {}) {
     const detached =
       options.detached ??
       (process.platform !== "win32" && options.timeoutMs != null && Number(options.timeoutMs) > 0);
+    const hasInput = options.input != null;
     let child;
     try {
       child = spawn(prepared.command, prepared.args, {
@@ -142,8 +143,17 @@ export function runCommandAsync(command, args = [], options = {}) {
         shell: prepared.shell,
         windowsHide: true,
         detached: Boolean(detached),
-        stdio: ["ignore", "pipe", "pipe"]
+        stdio: [hasInput ? "pipe" : "ignore", "pipe", "pipe"]
       });
+      if (hasInput) {
+        child.stdin?.on("error", () => {});
+        try {
+          child.stdin.write(String(options.input));
+          child.stdin.end();
+        } catch {
+          /* ignore stdin write errors */
+        }
+      }
     } catch (error) {
       resolve({
         command,

@@ -13,6 +13,22 @@ version: 1
 # Default slash mode hint for humans/skills: review | deliberate
 default_mode: deliberate
 
+# Who reviews. Remove an agent to skip it entirely (e.g. [codex, grok] to run
+# without a Claude R1 voice). Explicit --skip-codex/--skip-grok/--skip-claude
+# still force-skip on top of this. Valid: claude, codex, grok.
+reviewers: [claude, codex, grok]
+
+# Claude reviewer backend:
+#   session (default) - Claude's R1 findings come from the orchestrating session
+#                       (the Claude you're talking to writes them first).
+#   spawn             - run an INDEPENDENT `claude -p --model <model>` headless as
+#                       the R1 reviewer, decoupled from the orchestrator so the
+#                       session Claude can judge neutrally in Phase C. Read-only
+#                       (Edit/Write/Bash disallowed). Needs the Claude CLI logged in.
+claude_backend: session
+# Pin the spawned reviewer's model (spawn backend only; null = CLI default).
+# claude_model: claude-opus-4-8
+
 # Review target defaults
 scope: auto
 # base: main

@@ -10,6 +10,7 @@ import {
   runGrokStructured,
   waitForFile
 } from "./agents.mjs";
+import { runClaudeStructured } from "./claude-agent.mjs";
 import { applyDebateOutcomes, renderDebateSection, runDebateRounds } from "./debate.mjs";
 import {
   applyConsensusPolicy,
@@ -258,6 +259,21 @@ export async function runDeliberation(cwd, backends, options = {}) {
     );
   }
 
+  // Claude backend: 'spawn' runs Claude Code headless as an independent reviewer
+  // (pinnable model), so the orchestrating session judges neutrally. 'session'
+  // (default) keeps Claude's R1 as the orchestrator's own findings file.
+  const claudeSpawned = options.claudeBackend === "spawn" && !options.skipClaude;
+  if (claudeSpawned) {
+    r1Jobs.push(
+      runClaudeStructured(
+        cwd,
+        backends,
+        { ...options, maxTurns: options.maxTurnsR1 },
+        buildR1Prompt("claude", context, r1TemplateOpts)
+      )
+    );
+  }
+
   onPhase(resume && (cachedCodex || cachedGrok) ? "r1 (resuming)" : "r1");
   // Emit per-agent completion so a slow/stuck agent (e.g. a codex backend stall)
   // is visible - you can see grok finished while r1 still waits on codex.
@@ -273,7 +289,9 @@ export async function runDeliberation(cwd, backends, options = {}) {
     )
   );
   onPhase("r1-done");
-  const claudeDoc = await loadClaudeDoc(options);
+  // In spawn mode Claude's findings arrive via r1Raw (spawned CLI); in session
+  // mode they come from the orchestrator's findings file.
+  const fileClaudeDoc = claudeSpawned ? null : await loadClaudeDoc(options);
 
   const r1Docs = [];
   const r1Results = [];
@@ -290,18 +308,20 @@ export async function runDeliberation(cwd, backends, options = {}) {
     if (!raw.resumedFromCache && doc.parseOk) writeCachedR1(cwd, context.snapshotId, raw.agent, raw, ctxKey);
   }
   if (options.nowMs) pruneR1Cache(cwd, options.nowMs);
-  if (claudeDoc) {
-    r1Docs.push(claudeDoc);
+  if (fileClaudeDoc) {
+    r1Docs.push(fileClaudeDoc);
     r1Results.push({
       agent: "claude",
       backend: "claude-findings-file",
       status: 0,
-      stdout: JSON.stringify(claudeDoc, null, 2),
-      findings: claudeDoc,
+      stdout: JSON.stringify(fileClaudeDoc, null, 2),
+      findings: fileClaudeDoc,
       model: "claude-session",
       skipped: false
     });
   }
+  // Unified claude doc for R2 peer critique / debate, from whichever source.
+  const claudeDoc = fileClaudeDoc ?? r1Docs.find((d) => d.agent === "claude") ?? null;
 
   const r2Results = [];
   const critiqueStats = [];

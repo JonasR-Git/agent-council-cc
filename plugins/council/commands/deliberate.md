@@ -1,6 +1,6 @@
 ---
 description: 3-agent deliberation - independent reviews then peer critique (Claude + Codex + Grok)
-argument-hint: "[--wait|--background] [--base <ref>] [--codex-model <id>] [--grok-model <id>] [--claude-findings <path>|--claude-findings-wait <path> --wait-timeout <seconds>] [--peer-severities P0,P1] [--debate-rounds 0|1|2] [--debate-resume] [--resume] [focus text]"
+argument-hint: "[--wait|--background] [--base <ref>] [--reviewers claude,codex,grok] [--claude-backend session|spawn] [--claude-model <id>] [--codex-model <id>] [--grok-model <id>] [--claude-findings <path>|--claude-findings-wait <path> --wait-timeout <seconds>] [--peer-severities P0,P1] [--debate-rounds 0|1|2] [--debate-resume] [--resume] [focus text]"
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), Write, AskUserQuestion
 ---
@@ -12,9 +12,21 @@ All three parties **think independently first**, then **evaluate each other**.
 Raw arguments:
 `$ARGUMENTS`
 
+## Who reviews (reviewers + Claude backend)
+
+- **`--reviewers claude,codex,grok`** (or policy `reviewers:`) picks who participates.
+  Drop an agent to skip it (e.g. `--reviewers codex,grok` runs without a Claude R1 voice).
+- **`--claude-backend session`** (default): Claude's R1 findings come from **you, the
+  orchestrating session** — follow Phase A below and write the findings file first.
+- **`--claude-backend spawn`** (with optional `--claude-model`, e.g. `claude-opus-4-8`):
+  the companion runs an **independent** `claude -p` headless as the R1 reviewer, decoupled
+  from you, so you can judge neutrally in Phase C. **In spawn mode, SKIP Phase A** (do not
+  write a `--claude-findings` file) — go straight to Phase B, then Phase C. The spawned
+  reviewer is read-only (Edit/Write/Bash disallowed) and needs the Claude CLI logged in.
+
 ## Protocol (follow exactly)
 
-### Phase A - YOU (Claude) independent review FIRST
+### Phase A - YOU (Claude) independent review FIRST  _(session backend only)_
 
 1. Inspect the review target (working tree or `--base` branch) with git + code tools.
 2. Write structured findings **without** calling Codex/Grok and **without** reading their opinions.
@@ -72,7 +84,9 @@ After the report (or `/council:result`):
 - Review-only during this command.
 - Never skip Phase A (Claude must think alone first).
 - Prefer `--background` for non-trivial diffs; then `/council:status` + `/council:result`.
-- Models: `--codex-model` / `--grok-model` or `.council.yml` / CLI config files.
+- Models: `--codex-model` / `--grok-model` / `--claude-model` or `.council.yml` / CLI config files.
+- Reviewers: `--reviewers` (or policy `reviewers:`) sets who participates; `--claude-backend
+  spawn` decouples the Claude R1 reviewer from you (skip Phase A then). See "Who reviews" above.
 - Cost controls: R2 critiques only cover `peer_critique_severities` (default P0,P1) and run at
   `r2_effort` (Grok). `--debate-rounds 1|2` adds a bounded rebuttal/counter exchange on
   contested items only — no free-running chat. With `--debate-resume` (or policy

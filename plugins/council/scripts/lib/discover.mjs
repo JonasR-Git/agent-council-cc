@@ -110,12 +110,28 @@ export function findGrokBinary() {
   return "grok";
 }
 
+export function findClaudeBinary() {
+  const fromEnv = process.env.CLAUDE_BIN || process.env.CLAUDE_PATH;
+  if (fromEnv && exists(fromEnv)) return fromEnv;
+  const home = os.homedir();
+  const candidates = [
+    path.join(home, ".local", "bin", process.platform === "win32" ? "claude.exe" : "claude"),
+    path.join(home, ".claude", "local", "claude")
+  ];
+  for (const c of candidates) {
+    if (exists(c)) return c;
+  }
+  return "claude";
+}
+
 export function probeBackends(cwd, councilRoot) {
   const codexCompanion = findCodexCompanion();
   const grokCompanion = findGrokCompanion(councilRoot);
   const grokBin = findGrokBinary();
+  const claudeBin = findClaudeBinary();
   const codexCli = binaryAvailable("codex", ["--version"], { cwd });
   const grokCli = binaryAvailable(grokBin, ["--version"], { cwd });
+  const claudeCli = binaryAvailable(claudeBin, ["--version"], { cwd });
   const node = binaryAvailable("node", ["--version"], { cwd });
 
   return {
@@ -130,6 +146,10 @@ export function probeBackends(cwd, councilRoot) {
       companionAvailable: Boolean(grokCompanion),
       bin: grokBin,
       cli: grokCli
+    },
+    claude: {
+      bin: claudeBin,
+      cli: claudeCli
     }
   };
 }

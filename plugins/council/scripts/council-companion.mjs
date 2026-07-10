@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { READONLY_DISALLOWED_TOOLS, runDeliberation } from "./lib/deliberate.mjs";
 import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover.mjs";
-import { loadPolicy, mergeOptionsWithPolicy } from "./lib/policy.mjs";
+import { DEFAULT_POLICY, loadPolicy, mergeOptionsWithPolicy, normalizeReviewers } from "./lib/policy.mjs";
 import { runSolve } from "./lib/solve.mjs";
 import { aggregateBenchmarks, readBenchmarks, runBenchmark } from "./lib/benchmark.mjs";
 import { evaluateBudget, gatherWindowPressure, renderBudgetBreaches } from "./lib/budget.mjs";
@@ -106,34 +106,69 @@ function outputResult(value, asJson) {
 }
 
 async function handleSetup(argv) {
-  const { options } = parseCommandInput(argv, { booleanOptions: ["json"] });
+  const { options } = parseCommandInput(argv, {
+    booleanOptions: ["json", "init", "force"],
+    valueOptions: ["reviewers", "claude-backend", "claude-model", "codex-model", "grok-model", "default-mode"]
+  });
   const cwd = process.cwd();
+
+  if (options.init) {
+    const result = scaffoldPolicyFile(cwd, options);
+    if (options.json) {
+      outputResult(result, true);
+    } else if (result.written) {
+      console.log(`Wrote ${result.path}\n\n${result.contents}`);
+    } else {
+      console.log(`${result.message}\n`);
+    }
+    return;
+  }
+
   const backends = probeBackends(cwd, ROOT_DIR);
   const policy = loadPolicy(cwd);
-  const ready =
-    backends.node.available &&
-    (backends.codex.companionAvailable || backends.codex.cli.available) &&
-    (backends.grok.companionAvailable || backends.grok.cli.available);
+  const reviewers = policy.reviewers ?? DEFAULT_POLICY.reviewers;
+  const wants = (agent) => reviewers.includes(agent);
+  // A reviewer is "reachable" if it participates AND a backend can run it.
+  const claudeBackend = policy.claude_backend ?? "session";
+  const claudeReachable = !wants("claude") || claudeBackend === "session" || backends.claude.cli.available;
+  const codexReachable = !wants("codex") || backends.codex.companionAvailable || backends.codex.cli.available;
+  const grokReachable = !wants("grok") || backends.grok.companionAvailable || backends.grok.cli.available;
+  const ready = backends.node.available && claudeReachable && codexReachable && grokReachable;
 
   const report = {
     ready,
     node: backends.node,
+    reviewers,
+    claude: {
+      backend: claudeBackend,
+      model: policy.claude_model,
+      participates: wants("claude"),
+      // session backend = the orchestrating Claude itself; always "logged in".
+      cli: backends.claude.cli,
+      reachable: claudeReachable
+    },
     codex: {
       companion: backends.codex.companion,
       companionAvailable: backends.codex.companionAvailable,
-      cli: backends.codex.cli
+      cli: backends.codex.cli,
+      participates: wants("codex"),
+      reachable: codexReachable
     },
     grok: {
       companion: backends.grok.companion,
       companionAvailable: backends.grok.companionAvailable,
       bin: backends.grok.bin,
-      cli: backends.grok.cli
+      cli: backends.grok.cli,
+      participates: wants("grok"),
+      reachable: grokReachable
     },
     policy: {
       source: policy._source,
       default_mode: policy.default_mode,
       codex_model: policy.codex_model,
       grok_model: policy.grok_model,
+      claude_backend: claudeBackend,
+      claude_model: policy.claude_model,
       focus: policy.focus,
       agent_timeout_minutes: policy.agent_timeout_minutes
     },
@@ -141,20 +176,23 @@ async function handleSetup(argv) {
     nextSteps: []
   };
 
-  if (!backends.codex.companionAvailable && !backends.codex.cli.available) {
-    report.nextSteps.push("Install Codex plugin: /plugin install codex@openai-codex (and/or `npm i -g @openai/codex`).");
+  if (wants("codex") && !backends.codex.companionAvailable && !backends.codex.cli.available) {
+    report.nextSteps.push("Codex: install the Codex plugin (/plugin install codex@openai-codex) and run `codex login`.");
   }
-  if (!backends.grok.cli.available) {
-    report.nextSteps.push("Install Grok Build CLI (https://x.ai/cli) and run `grok login`.");
+  if (wants("grok") && !backends.grok.cli.available) {
+    report.nextSteps.push("Grok: install the Grok Build CLI (https://x.ai/cli) and run `grok login`.");
   }
-  if (!backends.grok.companionAvailable) {
-    report.nextSteps.push("Install grok plugin from this marketplace: /plugin install grok@agent-council (optional; council can call grok CLI directly).");
+  if (wants("grok") && !backends.grok.companionAvailable) {
+    report.nextSteps.push("Grok: optionally install the grok plugin (/plugin install grok@agent-council); council can also call the grok CLI directly.");
+  }
+  if (wants("claude") && claudeBackend === "spawn" && !backends.claude.cli.available) {
+    report.nextSteps.push("Claude (spawn backend): install the Claude CLI or set CLAUDE_BIN; run `claude` once to log in. Or use claude_backend: session.");
   }
   if (ready) {
     report.nextSteps.push("Try `/council:deliberate` (3-way protocol) or `/council:review --background`.");
   }
   if (!policy._source) {
-    report.nextSteps.push("Optional: copy `.council.example.yml` to repo root as `.council.yml`.");
+    report.nextSteps.push("No .council.yml found - run `/council:setup --init` to scaffold one (or copy `.council.example.yml`).");
   }
 
   if (options.json) {
@@ -162,19 +200,87 @@ async function handleSetup(argv) {
     return;
   }
 
+  const flag = (ok) => (ok ? "ok" : "MISSING");
+  const reviewerLine = (agent, on, detail) =>
+    `  ${agent}: ${reviewers.includes(agent) ? `reviewer [${flag(on)}]` : "not a reviewer"}${detail ? ` - ${detail}` : ""}`;
   const lines = [
     `Council setup: ${ready ? "READY" : "PARTIAL / NOT READY"}`,
-    `  node:  ${backends.node.detail}`,
-    `  codex companion: ${backends.codex.companionAvailable ? backends.codex.companion : "not found"}`,
-    `  codex cli: ${backends.codex.cli.available ? backends.codex.cli.detail : backends.codex.cli.detail}`,
-    `  grok companion: ${backends.grok.companionAvailable ? backends.grok.companion : "not found"}`,
-    `  grok cli: ${backends.grok.cli.available ? backends.grok.cli.detail : backends.grok.cli.detail}`,
+    `  reviewers: ${reviewers.join(", ")}`,
+    `  node: ${backends.node.detail}`,
+    reviewerLine(
+      "claude",
+      claudeReachable,
+      claudeBackend === "session"
+        ? "session backend (orchestrator)"
+        : `spawn backend - ${backends.claude.cli.available ? backends.claude.cli.detail : "CLI not found"}${policy.claude_model ? ` (model ${policy.claude_model})` : ""}`
+    ),
+    reviewerLine(
+      "codex",
+      codexReachable,
+      backends.codex.companionAvailable ? "companion" : backends.codex.cli.available ? backends.codex.cli.detail : "not found"
+    ),
+    reviewerLine(
+      "grok",
+      grokReachable,
+      backends.grok.cli.available ? backends.grok.cli.detail : "not found"
+    ),
     `  policy: ${policy._source ?? "(none - using defaults)"}`,
     `  state: ${report.stateDir}`,
     "Next:"
   ];
   for (const step of report.nextSteps) lines.push(`  - ${step}`);
   console.log(`${lines.join("\n")}\n`);
+}
+
+/**
+ * Scaffold a `.council.yml` in the workspace root from current defaults +
+ * any --reviewers/--claude-backend/--claude-model/--codex-model/--grok-model
+ * /--default-mode overrides. Refuses to clobber an existing file without --force.
+ */
+function scaffoldPolicyFile(cwd, options) {
+  const root = workspaceRoot(cwd);
+  const target = path.join(root, ".council.yml");
+  if (fs.existsSync(target) && !options.force) {
+    return {
+      written: false,
+      path: target,
+      message: `${target} already exists. Re-run with --force to overwrite, or edit it directly.`
+    };
+  }
+
+  const reviewers = normalizeReviewers(options.reviewers ?? DEFAULT_POLICY.reviewers);
+  const claudeBackend = options["claude-backend"] === "spawn" ? "spawn" : "session";
+  const claudeModel = options["claude-model"] ?? "";
+  const codexModel = options["codex-model"] ?? "";
+  const grokModel = options["grok-model"] ?? "";
+  const defaultMode = options["default-mode"] === "review" ? "review" : "deliberate";
+
+  const contents = [
+    "# Council policy - see .council.example.yml for all keys and comments.",
+    "version: 1",
+    `default_mode: ${defaultMode}   # review | deliberate`,
+    "",
+    `# Who reviews. Remove an agent to skip it entirely.`,
+    `reviewers: [${reviewers.join(", ")}]`,
+    "",
+    "# Claude reviewer: 'session' reuses the orchestrating Claude; 'spawn' runs an",
+    "# independent `claude -p --model <model>` so the reviewer is decoupled from the",
+    "# orchestrator (needs the Claude CLI logged in).",
+    `claude_backend: ${claudeBackend}`,
+    `claude_model:${claudeModel ? ` ${claudeModel}` : " null"}   # e.g. claude-opus-4-8 (spawn backend only)`,
+    "",
+    "# Pin external models (leave null to use each CLI's configured default).",
+    `codex_model:${codexModel ? ` ${codexModel}` : " null"}`,
+    `grok_model:${grokModel ? ` ${grokModel}` : " null"}`,
+    "",
+    "agent_timeout_minutes: 30",
+    "verify_findings: false",
+    "budget_guard: 0",
+    ""
+  ].join("\n");
+
+  fs.writeFileSync(target, contents, "utf8");
+  return { written: true, path: target, contents };
 }
 
 function resolveAgentModels(options = {}) {
@@ -536,6 +642,9 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       policyFocus: policy.focus,
       resume: mergedOpts.resume,
       verifyFindings: mergedOpts.verifyFindings,
+      claudeBackend: mergedOpts.claudeBackend,
+      claudeModel: mergedOpts.claudeModel,
+      skipClaude: mergedOpts.skipClaude,
       jobId: job.id,
       nowIso: nowIso(),
       nowMs: Date.now(),
@@ -674,9 +783,12 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
       "claude-plan",
       "claude-plan-wait",
       "budget-guard",
+      "reviewers",
+      "claude-backend",
+      "claude-model",
       "cwd"
     ],
-    booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "debate-resume", "force-budget", "resume", "verify"]
+    booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "skip-claude", "debate-resume", "force-budget", "resume", "verify"]
   });
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const focusText = positionals.join(" ").trim();
@@ -709,6 +821,10 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
     debateResume: options["debate-resume"] ? true : undefined,
     resume: options.resume ? true : undefined,
     verifyFindings: options.verify ? true : undefined,
+    reviewers: options.reviewers ?? undefined,
+    claudeBackend: options["claude-backend"] ?? undefined,
+    claudeModel: options["claude-model"] ?? undefined,
+    skipClaude: options["skip-claude"] ? true : undefined,
     budgetGuard: options["budget-guard"] != null ? Number(options["budget-guard"]) : undefined,
     forceBudget: options["force-budget"] ? true : undefined,
     waitTimeoutMs,
@@ -938,6 +1054,13 @@ async function handleDoctor(argv) {
     detail: backends.codex.companion ?? "not found"
   });
   checks.push({ name: "grok-cli", ok: backends.grok.cli.available, detail: backends.grok.cli.detail });
+  checks.push({
+    name: "claude-cli (optional)",
+    ok: true, // optional: only the spawn backend needs it; session backend always works
+    detail: backends.claude.cli.available
+      ? backends.claude.cli.detail
+      : "not found - spawn backend unavailable, session backend (default) still works"
+  });
 
   // 2. State dir writable
   let stateOk = false;
