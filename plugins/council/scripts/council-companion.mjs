@@ -42,6 +42,7 @@ import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
 import { runAuditReview } from "./lib/audit-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
+import { runAuditFix } from "./lib/audit-fix.mjs";
 import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
@@ -1656,8 +1657,8 @@ async function handleWatch(argv) {
 // team is a later phase.
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path"],
-    booleanOptions: ["json", "write-map", "doc"]
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes"],
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested"]
   });
   const cwd = process.cwd();
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
@@ -1680,18 +1681,7 @@ async function handleAudit(argv) {
   if (positionals[0] === "review") {
     const backends = probeBackends(cwd, ROOT_DIR);
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
-    let budget = 20;
-    if (options.budget != null) {
-      const n = Number(options.budget);
-      if (!Number.isFinite(n) || n < 2) throw new Error("--budget must be a number >= 2");
-      budget = Math.floor(n);
-    }
-    let maxUnits = 12;
-    if (options["max-units"] != null) {
-      const n = Number(options["max-units"]);
-      if (!Number.isFinite(n) || n < 1) throw new Error("--max-units must be a positive number");
-      maxUnits = Math.floor(n);
-    }
+    const { budget, maxUnits } = parseAuditBudgetOptions(options);
     const out = await runAuditReview(cwd, model, backends, {
       ...merged,
       budget,
@@ -1708,6 +1698,51 @@ async function handleAudit(argv) {
       return;
     }
     console.log(renderAuditReviewReport(out));
+    return;
+  }
+
+  // `audit fix` (v3): SAFE auto-fix of verified LOCALIZED findings on an isolated
+  // integration branch, each gated by the project's tests, reverted on failure.
+  // Findings come from --from <json> (a prior review) or a fresh review run.
+  if (positionals[0] === "fix") {
+    const backends = probeBackends(cwd, ROOT_DIR);
+    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    const { budget, maxUnits } = parseAuditBudgetOptions(options);
+    let findings;
+    if (options.from) {
+      // Confine --from to the project root (no absolute/.. escape) the same way
+      // --doc-path is confined: it is read and JSON-parsed, so a stray path could
+      // otherwise slurp an arbitrary file as "findings".
+      const base = workspaceRoot(cwd);
+      const target = path.resolve(base, String(options.from));
+      const rel = path.relative(base, target);
+      if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) throw new Error(`--from must stay within the project root (got: ${options.from})`);
+      const raw = JSON.parse(fs.readFileSync(target, "utf8"));
+      findings = Array.isArray(raw) ? raw : raw.findings ?? raw.all ?? [];
+    } else {
+      if (!options.json) console.error("No --from findings file; running a fresh audit review first…");
+      const rev = await runAuditReview(cwd, model, backends, { ...merged, budget, maxUnits, skipCodex: merged.skipCodex, skipGrok: merged.skipGrok });
+      findings = rev.findings;
+    }
+    let maxFixes;
+    if (options["max-fixes"] != null) {
+      const n = Number(options["max-fixes"]);
+      if (!Number.isFinite(n) || n < 1) throw new Error("--max-fixes must be a positive number");
+      maxFixes = Math.floor(n);
+    }
+    const out = await runAuditFix(cwd, findings, backends, {
+      ...merged,
+      dryRun: options["dry-run"],
+      allowUntested: options["allow-untested"],
+      minSeverity: options["min-severity"] ?? "P2",
+      maxFixes,
+      onProgress: options.json ? undefined : (m) => console.error(m)
+    });
+    if (options.json) {
+      outputResult(out, true);
+      return;
+    }
+    console.log(renderAuditFixReport(out));
     return;
   }
 
@@ -1744,6 +1779,78 @@ function renderAuditReviewReport(out) {
   }
   L.push("");
   L.push("Next (Claude): verify consensus + P0/P1, produce Fix now / Verify / Ignore.");
+  return L.join("\n");
+}
+
+/** Parse + validate the shared --budget / --max-units options for audit review/fix. */
+function parseAuditBudgetOptions(options) {
+  let budget = 20;
+  if (options.budget != null) {
+    const n = Number(options.budget);
+    if (!Number.isFinite(n) || n < 2) throw new Error("--budget must be a number >= 2");
+    budget = Math.floor(n);
+  }
+  let maxUnits = 12;
+  if (options["max-units"] != null) {
+    const n = Number(options["max-units"]);
+    if (!Number.isFinite(n) || n < 1) throw new Error("--max-units must be a positive number");
+    maxUnits = Math.floor(n);
+  }
+  return { budget, maxUnits };
+}
+
+function renderAuditFixReport(out) {
+  const L = [];
+  L.push("# Council Audit — safe auto-fix (v3)");
+  L.push("");
+  if (!out.ok) {
+    L.push(`✗ ${out.error}`);
+    return L.join("\n");
+  }
+  if (out.dryRun) {
+    L.push(`Dry run — ${out.planned.length} file(s) would be fixed${out.gated ? " (test-gated)" : " (UNVERIFIED — no test gate)"}, ${out.rejected.length} finding(s) rejected. No branch created, nothing edited.`);
+    for (const t of out.planned) {
+      L.push(`- **${t.file}** — ${t.findings.length} finding(s): ${t.findings.map((f) => `${f.severity} ${f.title}`).join("; ")}`);
+    }
+    if (out.rejected.length) {
+      L.push("");
+      L.push("## Rejected (never auto-fixed)");
+      for (const r of out.rejected) L.push(`- ${r.finding.severity ?? "?"} ${r.finding.title ?? "(untitled)"}${r.finding.file ? ` · ${r.finding.file}` : ""} — ${r.reason}`);
+    }
+    return L.join("\n");
+  }
+  if (!out.branch) {
+    L.push(out.note ?? "Nothing to fix.");
+    if (out.rejected?.length) {
+      L.push("");
+      for (const r of out.rejected) L.push(`- skipped: ${r.finding.title ?? "(untitled)"} — ${r.reason}`);
+    }
+    return L.join("\n");
+  }
+  const gate = out.gated ? "tests green per commit" : "⚠ UNVERIFIED (no test gate — fixes committed without verification)";
+  L.push(`Integration branch **${out.branch}** (off ${String(out.baseRef).slice(0, 8)}), ${gate}. Base branch never modified${out.returnedToBase ? `; returned to ${out.baseBranch}` : ""}.`);
+  if (out.integration) L.push(out.integration.ok ? "Final full test run: **green**." : "Final full test run: **RED** — ok:false; review the branch before merging, do NOT merge as-is.");
+  if (out.capped) L.push(`⚠ ${out.capped} eligible finding(s) skipped by the --max-fixes cap.`);
+  L.push("");
+  L.push(`## Fixed (${out.fixed.length})`);
+  for (const f of out.fixed) L.push(`- ✓ ${f.finding.severity} ${f.finding.title} · \`${f.file}\` · ${String(f.commit).slice(0, 8)}`);
+  if (out.failed.length) {
+    L.push("");
+    L.push(`## Failed / reverted (${out.failed.length})`);
+    for (const f of out.failed) L.push(`- ✗ ${f.finding.severity} ${f.finding.title} · \`${f.file}\` — ${f.reason}`);
+  }
+  if (out.skipped.length) {
+    L.push("");
+    L.push(`## Skipped (${out.skipped.length})`);
+    for (const s of out.skipped) L.push(`- – ${s.finding.title} · \`${s.file}\` — ${s.reason}`);
+  }
+  if (out.rejected.length) {
+    L.push("");
+    L.push(`## Rejected — never eligible (${out.rejected.length})`);
+    for (const r of out.rejected) L.push(`- ${r.finding.severity ?? "?"} ${r.finding.title ?? "(untitled)"}${r.finding.file ? ` · ${r.finding.file}` : ""} — ${r.reason}`);
+  }
+  L.push("");
+  L.push(`Review: \`git checkout ${out.branch}\` → inspect the per-fix commits → merge or discard. Nothing was auto-merged.`);
   return L.join("\n");
 }
 

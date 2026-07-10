@@ -1,6 +1,6 @@
 ---
-description: Whole-project audit — static candidates (SSOT/duplication, complexity, dead code, smells) + optional deep agent review of hotspots
-argument-hint: "[review] [--areas dir1,dir2] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--doc-path <file>] [--write-map] [--json]"
+description: Whole-project audit — static candidates + deep agent review of hotspots + safe test-gated auto-fix on an isolated branch
+argument-hint: "[review|fix] [--areas dir1,dir2] [--budget <n>] [--max-units <n>] [--doc] [--from <json>] [--dry-run] [--allow-untested] [--json]"
 allowed-tools: Bash(node:*)
 ---
 
@@ -15,6 +15,21 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" audit $ARGUMENTS
 - **`review`** — deep agent review (Codex + Grok) of the top `--max-units` hotspot
   modules, bounded by `--budget <n>` agent calls (default 20), plus a global
   SSOT/architecture reduce over the map. Findings are candidates; you synthesize.
+- **`fix`** — **safe auto-fix (v3)**. Fixes ONLY **localized** findings with an
+  explicit scope (fail-closed), one writer per file, on an isolated
+  `council/audit-fix-<sha>` branch. Each fix must touch only its target file (else
+  reverted) and keep the project's tests green (else reverted); every kept fix is
+  its own single-file commit. Cross-cutting / SSOT findings and protected paths
+  (`.git`, `node_modules`, build output, **`.env`/secrets/`.github` CI/Dockerfile**,
+  lockfiles) are **never** auto-patched. A **clean working tree is required** (no
+  `--allow-dirty`: the rollback would destroy uncommitted work), a repo-scoped lock
+  forbids concurrent runs, and the base branch is untouched — nothing is auto-merged;
+  you review the branch. A RED final integration run reports `ok:false`. Findings
+  come from `--from <json>` (a prior `review --json`, confined to the project root)
+  or a fresh review. `--dry-run` previews the plan without editing; `--min-severity
+  <P0|P1|P2>` sets the gate (default P2); `--max-fixes <n>` caps the number of fixes
+  (default 50); `--allow-untested` fixes without a test gate (**not recommended** —
+  commits are then flagged unverified).
 - `--areas a,b` limits the scan to those path prefixes; `--churn-days <n>` sets the
   git-churn window (default 90).
 - `--doc` writes findings as **proposals** to `docs/AUDIT.md` (cross-cutting items
@@ -33,10 +48,10 @@ Present the report, then add a short **Claude synthesis**:
 2. Which duplicated blocks are real SSOT breaks worth consolidating (vs incidental).
 3. Which dead-export / no-test candidates need verification before acting.
 
-Do not implement fixes to reviewed code here — this command never auto-edits the
-code it audits. Its only writes are the opt-in artifacts `--write-map`
-(`docs/codebase-map.json`) and `--doc` (`docs/AUDIT.md`, or `--doc-path`), both
-confined to the project root. Under `review`, the Codex/Grok reviewers are
-prompted read-only but run as external CLIs whose sandboxing this command cannot
-itself guarantee. See `docs/audit-design.md` for the deeper-review and safe
-`--fix` phases.
+`audit` (static) and `audit review` never auto-edit code — their only writes are the
+opt-in artifacts `--write-map` (`docs/codebase-map.json`) and `--doc`
+(`docs/AUDIT.md`, or `--doc-path`), confined to the project root. Under `review`,
+the Codex/Grok reviewers are prompted read-only but run as external CLIs whose
+sandboxing this command cannot itself guarantee. Only `audit fix` writes code, and
+only on an isolated branch under the safety rules above. See `docs/audit-design.md`
+for the design and the remaining `--endless` phase.
