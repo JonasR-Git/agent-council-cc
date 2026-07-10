@@ -35,6 +35,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
+import { formatDashboard, summarizeProgress } from "./lib/watch.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
@@ -62,6 +63,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs review|adversarial|deliberate [flags] [focus text]",
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
+      "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
       "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
@@ -1573,6 +1575,79 @@ async function handleWait(argv) {
   if (!finished) process.exitCode = 1;
 }
 
+function medianWallClockForKind(cwd, kind) {
+  const durations = readMetrics(cwd)
+    .filter((e) => e.kind === kind && Number.isFinite(Number(e.wallClockMs)))
+    .map((e) => Number(e.wallClockMs))
+    .sort((a, b) => a - b);
+  if (!durations.length) return null;
+  const mid = Math.floor(durations.length / 2);
+  return durations.length % 2 ? durations[mid] : Math.round((durations[mid - 1] + durations[mid]) / 2);
+}
+
+function watchSnapshot(cwd, root, job) {
+  let logText = "";
+  try {
+    if (job.logFile) logText = fs.readFileSync(job.logFile, "utf8");
+  } catch {
+    /* log may not exist yet */
+  }
+  const progress = summarizeProgress(logText);
+  const merged = mergeOptionsWithPolicy(job.request ?? {}, loadPolicy(cwd));
+  const skipped = [
+    merged.skipCodex ? "codex" : null,
+    merged.skipGrok ? "grok" : null,
+    merged.skipClaude ? "claude" : null
+  ].filter(Boolean);
+  const etaMs = medianWallClockForKind(cwd, job.kind);
+  return formatDashboard(job, progress, { nowMs: Date.now(), etaMs, skipped });
+}
+
+/**
+ * Live dashboard for a running job. Redraws every interval until the job
+ * finishes (a real terminal shows it as an updating dashboard). --once/--json
+ * print a single snapshot (useful inside captured/non-TTY output).
+ */
+async function handleWatch(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["interval", "timeout"],
+    booleanOptions: ["json", "once"]
+  });
+  const cwd = process.cwd();
+  const root = workspaceRoot(cwd);
+  const jobId = positionals[0] ?? listJobs(root)[0]?.id;
+  if (!jobId) throw new Error("No council jobs found.");
+  let job = readJobFile(root, jobId);
+  if (!job) throw new Error(`Job not found: ${jobId}`);
+
+  if (options.json) {
+    const snap = watchSnapshot(cwd, root, job);
+    outputResult({ jobId: job.id, status: job.status, dashboard: snap.text, terminal: snap.terminal }, true);
+    return;
+  }
+
+  const intervalMs = secondsToMs(options.interval, "--interval") ?? 2000;
+  const timeoutMs = secondsToMs(options.timeout, "--timeout") ?? 3_600_000;
+  const deadline = Date.now() + timeoutMs;
+
+  // Single snapshot (no live redraw) for --once or non-TTY stdout.
+  if (options.once || !process.stdout.isTTY) {
+    const snap = watchSnapshot(cwd, root, job);
+    console.log(snap.text);
+    if (!snap.terminal) console.log("\n(snapshot; re-run or use a TTY for a live view)");
+    return;
+  }
+
+  // Live redraw loop for an interactive terminal.
+  for (;;) {
+    job = readJobFile(root, jobId) ?? job;
+    const snap = watchSnapshot(cwd, root, job);
+    process.stdout.write(`\x1b[2J\x1b[H${snap.text}\n`);
+    if (snap.terminal || Date.now() >= deadline) break;
+    await delay(intervalMs);
+  }
+}
+
 async function handleUsage(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["days"],
@@ -1710,6 +1785,9 @@ async function main() {
         break;
       case "wait":
         await handleWait(rest);
+        break;
+      case "watch":
+        await handleWatch(rest);
         break;
       case "usage":
         await handleUsage(rest);
