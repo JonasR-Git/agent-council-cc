@@ -161,6 +161,7 @@ export function runCommandAsync(command, args = [], options = {}) {
     }
 
     const maxBuffer = options.maxBuffer ?? DEFAULT_MAX_BUFFER;
+    const startedAt = Date.now();
     let stdout = "";
     let stderr = "";
     let capturedBytes = 0;
@@ -217,6 +218,7 @@ export function runCommandAsync(command, args = [], options = {}) {
         pid: child.pid ?? null,
         timedOut,
         truncated,
+        durationMs: Date.now() - startedAt,
         ...payload
       });
     }

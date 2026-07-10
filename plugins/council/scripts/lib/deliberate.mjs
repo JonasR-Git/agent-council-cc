@@ -149,11 +149,13 @@ function r2Options(options) {
   return {
     ...options,
     maxTurns: options.maxTurnsR2,
-    grokEffort: options.r2Effort ?? options.grokEffort
+    grokEffort: options.r2Effort ?? options.grokEffort,
+    // Capture grok critic sessions so debate counters can resume them.
+    captureGrokSession: Boolean(options.debateRounds >= 2 && options.debateResume)
   };
 }
 
-function buildDebateEntries(merged, options, sessions = {}) {
+function buildDebateEntries(merged, options, sessions = {}, criticSessions = {}) {
   const skipped = new Set(
     [options.skipCodex ? "codex" : null, options.skipGrok ? "grok" : null].filter(Boolean)
   );
@@ -171,6 +173,9 @@ function buildDebateEntries(merged, options, sessions = {}) {
         author,
         critic: critic ?? null,
         authorSessionId: sessions[author] ?? null,
+        // The critic critiqued this author, so the relevant grok session is the
+        // one keyed by the author it was about.
+        criticSessionId: critic === "grok" ? criticSessions[author] ?? null : null,
         payload: {
           title: item.title,
           severity: item.severity,
@@ -189,6 +194,8 @@ function buildDebateEntries(merged, options, sessions = {}) {
  * Full deliberation: R1 independent (codex+grok [+claude file]) then R2 cross-critique.
  */
 export async function runDeliberation(cwd, backends, options = {}) {
+  const onPhase = typeof options.onPhase === "function" ? options.onPhase : () => {};
+  onPhase("collecting-context");
   const target = resolveReviewTarget(cwd, { base: options.base, scope: options.scope });
   const context = collectReviewContext(cwd, target, { skipPaths: options.skipPaths ?? [] });
 
@@ -227,7 +234,9 @@ export async function runDeliberation(cwd, backends, options = {}) {
     r1Jobs.push(Promise.resolve({ agent: "grok", skipped: true, reason: "skip", stdout: "" }));
   }
 
+  onPhase("r1");
   const r1Raw = await Promise.all(r1Jobs);
+  onPhase("r1-done");
   const claudeDoc = await loadClaudeDoc(options);
 
   const r1Docs = [];
@@ -318,6 +327,7 @@ export async function runDeliberation(cwd, backends, options = {}) {
     }
 
     if (peerJobs.length) {
+      onPhase(`r2 (${peerJobs.length} critiques)`);
       const peerResults = await Promise.all(peerJobs);
       r2Results.push(
         ...peerResults.map((result) => ({
@@ -376,9 +386,15 @@ export async function runDeliberation(cwd, backends, options = {}) {
 
   let debates = [];
   if ((options.debateRounds ?? 0) > 0) {
+    onPhase("debate");
     const grokR1 = r1Raw.find((r) => r.agent === "grok" && !r.skipped);
     const sessions = { grok: grokR1?.sessionId ?? null };
-    const entries = buildDebateEntries(merged, options, sessions);
+    // grok critic sessions keyed by the author they critiqued (aboutAgent).
+    const criticSessions = {};
+    for (const r of r2Results) {
+      if (r.agent === "grok" && r.sessionId && r.aboutAgent) criticSessions[r.aboutAgent] = r.sessionId;
+    }
+    const entries = buildDebateEntries(merged, options, sessions, criticSessions);
     debates = await runDebateRounds(cwd, backends, options, entries);
     merged = applyDebateOutcomes(merged, debates);
   }

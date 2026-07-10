@@ -13,6 +13,7 @@ import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover
 import { loadPolicy, mergeOptionsWithPolicy } from "./lib/policy.mjs";
 import { runSolve } from "./lib/solve.mjs";
 import { evaluateBudget, gatherWindowPressure, renderBudgetBreaches } from "./lib/budget.mjs";
+import { aggregateMetrics, readMetrics, recordJobMetrics, renderMetrics } from "./lib/metrics.mjs";
 import {
   collectAllTokenUsage,
   collectCodexRateLimits,
@@ -48,7 +49,9 @@ function printUsage() {
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
-      "  node scripts/council-companion.mjs doctor [--json]",
+      "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
+      "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
+      "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>]",
       "  node scripts/council-companion.mjs result [job-id] [--summary] [--json]",
       "",
       "Flags:",
@@ -352,6 +355,19 @@ function renderCouncilReport(job, results) {
   return lines.join("\n");
 }
 
+function makePhaseReporter(root, job) {
+  return (phase) => {
+    try {
+      job.phase = phase;
+      job.updatedAt = nowIso();
+      upsertJob(root, job);
+      appendLogLine(job.logFile, `Phase: ${phase}`);
+    } catch {
+      /* progress reporting must never break a run */
+    }
+  };
+}
+
 function jobTitle(kind) {
   if (kind === "solve") return "Council Solve";
   if (kind === "deliberate") return "Council Deliberation";
@@ -456,7 +472,8 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
     appendLogLine(job.logFile, "Solve protocol: independent plans -> plan critique -> ranking");
     const solveRun = await runSolve(cwd, backends, {
       ...mergedOpts,
-      policyFocus: policy.focus
+      policyFocus: policy.focus,
+      onPhase: makePhaseReporter(root, job)
     });
     const r1Failed = solveRun.r1.some((r) => !r.skipped && r.status !== 0);
     const allSkipped = solveRun.r1.every((r) => r.skipped && r.agent !== "claude");
@@ -485,6 +502,7 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       pid: null
     };
     upsertJob(root, finished);
+    recordJobMetrics(cwd, finished);
     appendLogLine(job.logFile, `Solve report stored (${solveRun.report.length} chars)`);
     return finished;
   }
@@ -498,7 +516,8 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       claudeFindingsPath: mergedOpts.claudeFindingsPath,
       claudeFindingsWaitPath: mergedOpts.claudeFindingsWaitPath,
       waitTimeoutMs: mergedOpts.waitTimeoutMs,
-      policyFocus: policy.focus
+      policyFocus: policy.focus,
+      onPhase: makePhaseReporter(root, job)
     });
     const r1Failed = deliberation.r1.some((r) => !r.skipped && r.status !== 0);
     const allSkipped = deliberation.r1.every((r) => r.skipped && r.agent !== "claude");
@@ -535,6 +554,7 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       pid: null
     };
     upsertJob(root, finished);
+    recordJobMetrics(cwd, finished);
     appendLogLine(job.logFile, `Deliberation stored (${deliberation.report.length} chars)`);
     return finished;
   }
@@ -584,6 +604,7 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
     pid: null
   };
   upsertJob(root, finished);
+  recordJobMetrics(cwd, finished);
   appendLogLine(job.logFile, `Stored report (${report.length} chars)`);
   return finished;
   }
@@ -798,7 +819,7 @@ function handleStatus(argv) {
     outputResult(
       options.json
         ? { job }
-        : `Job ${job.id}\n  status: ${job.status}\n  title:  ${job.title}\n  summary:${job.summary}\n  updated:${job.updatedAt}\n`,
+        : `Job ${job.id}\n  status: ${job.status}\n  phase:  ${job.phase ?? "-"}\n  title:  ${job.title}\n  summary:${job.summary}\n  updated:${job.updatedAt}\n`,
       options.json
     );
     return;
@@ -993,10 +1014,24 @@ async function runGrokPing(cwd, backends, prompt) {
   }
 }
 
+function handleMetrics(argv) {
+  const { options } = parseCommandInput(argv, { valueOptions: ["days"], booleanOptions: ["json"] });
+  const cwd = process.cwd();
+  const days = options.days != null ? Number(options.days) : 30;
+  if (!Number.isFinite(days) || days <= 0) throw new Error("--days must be a positive number");
+  const entries = readMetrics(cwd, Date.now() - days * 86_400_000);
+  const agg = aggregateMetrics(entries);
+  if (options.json) {
+    outputResult({ days, ...agg }, true);
+    return;
+  }
+  console.log(`${renderMetrics(agg, days)}\n`);
+}
+
 async function handleWait(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["timeout", "interval"],
-    booleanOptions: ["json"]
+    booleanOptions: ["json", "follow"]
   });
   const cwd = process.cwd();
   const root = workspaceRoot(cwd);
@@ -1008,7 +1043,12 @@ async function handleWait(argv) {
 
   let job = readJobFile(root, jobId);
   if (!job) throw new Error(`Job not found: ${jobId}`);
+  let lastPhase = null;
   while ((job.status === "running" || job.status === "queued") && Date.now() < deadline) {
+    if (options.follow && !options.json && job.phase && job.phase !== lastPhase) {
+      console.error(`[${job.id}] ${job.phase}`);
+      lastPhase = job.phase;
+    }
     await delay(intervalMs);
     job = readJobFile(root, jobId) ?? job;
   }
@@ -1165,6 +1205,9 @@ async function main() {
         break;
       case "doctor":
         await handleDoctor(rest);
+        break;
+      case "metrics":
+        handleMetrics(rest);
         break;
       case "cancel":
         handleCancel(rest);

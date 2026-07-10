@@ -6,6 +6,12 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
+import { findGrokBinary } from "./discover.mjs";
+import { runCommandAsync } from "./process.mjs";
+
+export const READONLY_DISALLOWED_TOOLS =
+  "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal";
+
 /**
  * A per-run token that fences untrusted content in prompts. Hostile repo text
  * cannot forge the closing marker because it cannot predict the nonce.
@@ -13,12 +19,6 @@ import { fileURLToPath } from "node:url";
 export function makeFenceNonce() {
   return randomBytes(6).toString("hex").toUpperCase();
 }
-
-import { findGrokBinary } from "./discover.mjs";
-import { runCommandAsync } from "./process.mjs";
-
-export const READONLY_DISALLOWED_TOOLS =
-  "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal";
 
 const PROMPTS_DIR = path.resolve(fileURLToPath(new URL("../../prompts", import.meta.url)));
 
@@ -136,6 +136,7 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
       stderr: result.stderr,
       timedOut: Boolean(result.timedOut),
       truncated: Boolean(result.truncated),
+      durationMs: result.durationMs ?? null,
       sessionId,
       model: retriedWithoutOverrides ? "(CLI default after rejected override)" : options.grokModel ?? "(default)",
       command: `${bin} --prompt-file ...`
@@ -197,6 +198,7 @@ export async function runCodexStructured(cwd, backends, options, prompt, label) 
         stderr: fb.stderr,
         timedOut: Boolean(fb.timedOut),
         truncated: Boolean(fb.truncated),
+        durationMs: fb.durationMs ?? null,
         model: options.codexModel ?? "(default)",
         command: `node ... adversarial-review`
       };
@@ -209,6 +211,7 @@ export async function runCodexStructured(cwd, backends, options, prompt, label) 
       stderr: result.stderr,
       timedOut: Boolean(result.timedOut),
       truncated: Boolean(result.truncated),
+      durationMs: result.durationMs ?? null,
       model: options.codexModel ?? "(default)",
       command: `node ... task --prompt-file`
     };

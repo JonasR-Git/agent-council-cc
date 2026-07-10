@@ -156,11 +156,16 @@ export async function runDebateRounds(cwd, backends, options, entries) {
     const counters = await Promise.all(
       defended.map(async (entry) => {
         const rebuttal = rebuttals.find((r) => r.id === entry.id);
+        // Grok critics resume their own R2 critique session when debate_resume
+        // is on, so counters carry the critic's original reasoning context.
+        const resume = Boolean(
+          options.debateResume && entry.critic === "grok" && entry.criticSessionId
+        );
         const res = await runAgentPrompt(
           entry.critic,
           cwd,
           backends,
-          opts,
+          resume ? { ...opts, resumeSessionId: entry.criticSessionId } : opts,
           buildCounterPrompt(entry, rebuttal),
           `debate-counter-${entry.id}`
         );
@@ -170,6 +175,7 @@ export async function runDebateRounds(cwd, backends, options, entries) {
           ...parsed,
           round: 2,
           role: "counter",
+          resumedSession: resume,
           skipped: Boolean(res.skipped),
           artifactRound: `debate-${entry.id}`
         };
