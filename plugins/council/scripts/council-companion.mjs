@@ -26,7 +26,7 @@ import { runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
-import { collectVerdicts, evaluateApproval } from "./lib/verdicts.mjs";
+import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
 import {
   appendLogLine,
   archiveJobResults,
@@ -1139,33 +1139,28 @@ function handleFixloopStatus(argv) {
   const job = resolveJob(process.cwd(), positionals[0]);
   if (!job) throw new Error("No council jobs found.");
   if (job.kind !== "deliberate") throw new Error(`fixloop-status needs a deliberate job (got ${job.kind}).`);
+  let needed = options.needed != null ? Math.floor(Number(options.needed)) : 2;
+  if (!Number.isFinite(needed) || needed < 1) needed = 1;
   const verdicts = job.deliberation?.verdicts ?? [];
-  const approval = evaluateApproval(verdicts, {
-    writer: options.writer ?? null,
-    needed: options.needed != null ? Number(options.needed) : 2
-  });
+  const approval = evaluateApproval(verdicts, { writer: options.writer ?? null, needed });
   const merged = job.deliberation?.merged ?? { all: [] };
-  // Actionable = consensus OR needs-consensus-policy OR P0/P1, not conceded/ignored.
-  const actionable = (merged.all ?? [])
-    .filter((f) => {
-      const sev = String(f.severity);
-      const debateConceded = f.debate?.stance === "concede";
-      return !debateConceded && (f.consensus || f.needsConsensus || sev === "P0" || sev === "P1");
-    })
-    .map((f) => ({
-      severity: f.severity,
-      category: f.category,
-      title: f.title,
-      file: f.file ?? null,
-      line: f.line ?? null,
-      consensus: Boolean(f.consensus),
-      agents: f.agents ?? []
-    }));
+  const actionable = selectActionable(merged, { anyBlocker: approval.blockers.length > 0 });
+  // A council with fewer voters than needed, or a non-clean finish, cannot be
+  // trusted to approve - fail closed with an incomplete marker.
+  const incomplete = job.status !== "completed" || approval.voters.length < needed;
+  const approved = approval.approved && !incomplete;
+  // Not approved but nothing to fix (all findings are P2/nit, or a partial run
+  // yielded none) - the loop must escalate to a human, not spin.
+  const stuck = !approved && actionable.length === 0;
   const payload = {
     jobId: job.id,
     status: job.status,
     verdicts,
     ...approval,
+    approved,
+    incomplete,
+    stuck,
+    recommendation: approved ? "stop-approved" : stuck ? "stop-escalate-to-human" : "fix-and-rereview",
     actionableCount: actionable.length,
     actionable
   };
@@ -1173,11 +1168,17 @@ function handleFixloopStatus(argv) {
     outputResult(payload, true);
     return;
   }
+  const decision =
+    payload.recommendation === "stop-approved"
+      ? "APPROVED - stop the loop"
+      : payload.recommendation === "stop-escalate-to-human"
+        ? "STUCK (not approved, nothing actionable) - escalate to a human"
+        : "NOT approved - fix actionable findings and re-review";
   const lines = [
-    `Fixloop status for ${job.id}:`,
+    `Fixloop status for ${job.id}${incomplete ? " (INCOMPLETE council)" : ""}:`,
     `  verdicts: ${verdicts.map((v) => `${v.agent}=${v.verdict}`).join(", ") || "(none)"}`,
-    `  approvals: ${approval.approvals.join("+") || "none"} of ${approval.needed} needed${approval.excludedWriter ? ` (writer ${approval.excludedWriter} excluded)` : ""}`,
-    `  decision: ${approval.approved ? "APPROVED - stop the loop" : "NOT approved - fix actionable findings and re-review"}`,
+    `  approvals: ${approval.approvals.join("+") || "none"} of ${needed} needed${approval.excludedWriter ? ` (writer ${approval.excludedWriter} excluded)` : ""}`,
+    `  decision: ${decision}`,
     `  actionable findings: ${actionable.length}`
   ];
   for (const f of actionable.slice(0, 20)) {

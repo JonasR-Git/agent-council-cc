@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { collectVerdicts, evaluateApproval } from "../plugins/council/scripts/lib/verdicts.mjs";
+import { collectVerdicts, evaluateApproval, selectActionable } from "../plugins/council/scripts/lib/verdicts.mjs";
 
 test("evaluateApproval counts non-writer approvals against the threshold", () => {
   const verdicts = [
@@ -40,6 +40,41 @@ test("block and unknown verdicts are handled", () => {
   assert.deepEqual(r.approvals, ["grok"]);
   assert.deepEqual(r.blockers, ["codex"]);
   assert.equal(r.approved, true);
+});
+
+test("selectActionable: consensus and P0 always in; lone P1 only when someone blocked", () => {
+  const merged = {
+    all: [
+      { severity: "P1", title: "consensus issue", consensus: true, agents: ["codex", "grok"] },
+      { severity: "P0", title: "lone p0", consensus: false, agents: ["grok"] },
+      { severity: "P1", title: "lone p1", consensus: false, agents: ["grok"] },
+      { severity: "P2", title: "policy item", consensus: false, needsConsensus: true, agents: ["grok"] },
+      { severity: "P1", title: "conceded", consensus: true, agents: ["codex", "grok"], debate: { stance: "concede" } },
+      { severity: "nit", title: "a nit", consensus: false, agents: ["grok"] }
+    ]
+  };
+  const noBlock = selectActionable(merged, { anyBlocker: false }).map((f) => f.title);
+  assert.ok(noBlock.includes("consensus issue"));
+  assert.ok(noBlock.includes("lone p0"));
+  assert.ok(noBlock.includes("policy item"));
+  assert.ok(!noBlock.includes("lone p1"), "lone P1 excluded when nobody blocked");
+  assert.ok(!noBlock.includes("conceded"));
+  assert.ok(!noBlock.includes("a nit"));
+
+  const withBlock = selectActionable(merged, { anyBlocker: true }).map((f) => f.title);
+  assert.ok(withBlock.includes("lone p1"), "lone P1 included when an agent blocked");
+});
+
+test("selectActionable never returns nits, even consensus nits", () => {
+  const merged = {
+    all: [
+      { severity: "nit", title: "consensus nit", consensus: true, agents: ["codex", "grok"] },
+      { severity: "P2", title: "consensus p2", consensus: true, agents: ["codex", "grok"] }
+    ]
+  };
+  const titles = selectActionable(merged, {}).map((f) => f.title);
+  assert.ok(!titles.includes("consensus nit"), "consensus nit is not actionable");
+  assert.ok(titles.includes("consensus p2"), "consensus P2 is actionable");
 });
 
 test("collectVerdicts reads verdict from findings docs and skips absent/skipped", () => {

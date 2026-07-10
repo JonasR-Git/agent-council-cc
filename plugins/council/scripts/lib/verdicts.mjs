@@ -26,6 +26,36 @@ export function evaluateApproval(verdicts, opts = {}) {
   };
 }
 
+/**
+ * The findings a fix loop must address before re-review: consensus, policy-
+ * required-consensus, and any P0. Single-agent P1s are included only when an
+ * agent actually blocked (else a lone shaky P1 churns the loop forever).
+ * Conceded/ignored items are dropped.
+ */
+export function selectActionable(merged, opts = {}) {
+  const anyBlocker = Boolean(opts.anyBlocker);
+  return (merged?.all ?? [])
+    .filter((f) => {
+      if (f.debate?.stance === "concede" || f.ledgerStatus === "ignored") return false;
+      const sev = String(f.severity);
+      if (sev === "nit") return false; // nits never block a merge
+      if (f.needsConsensus) return true; // policy-required consensus category
+      if (sev === "P0") return true;
+      if (f.consensus && (sev === "P1" || sev === "P2")) return true; // agreed real issues
+      if (sev === "P1") return anyBlocker; // lone P1 only if someone blocked
+      return false;
+    })
+    .map((f) => ({
+      severity: f.severity,
+      category: f.category,
+      title: f.title,
+      file: f.file ?? null,
+      line: f.line ?? null,
+      consensus: Boolean(f.consensus),
+      agents: f.agents ?? []
+    }));
+}
+
 /** Collect {agent, verdict} pairs from R1 result docs (skips absent verdicts). */
 export function collectVerdicts(r1Results = []) {
   const out = [];
