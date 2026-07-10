@@ -38,6 +38,46 @@ function writeTempPrompt(content) {
   return file;
 }
 
+/**
+ * Write `content` to a temp prompt file, run `fn(file)`, and always unlink it.
+ * `dir` defaults to the OS temp dir; pass a state dir for prompts that must live
+ * alongside a run. Returns whatever `fn` returns.
+ */
+export async function withTempPrompt(content, fn, { dir } = {}) {
+  const base = dir ?? os.tmpdir();
+  fs.mkdirSync(base, { recursive: true });
+  const file = path.join(base, `council-prompt-${Date.now()}-${Math.random().toString(16).slice(2)}.md`);
+  fs.writeFileSync(file, content, "utf8");
+  try {
+    return await fn(file);
+  } finally {
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Map a raw runCommandAsync result to the canonical agent-result shape. `extra`
+ * carries per-caller fields (model, command, sessionId) and can override base
+ * fields (e.g. a post-processed stdout).
+ */
+export function buildAgentResult(agent, backend, result, extra = {}) {
+  return {
+    agent,
+    backend,
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    timedOut: Boolean(result.timedOut),
+    truncated: Boolean(result.truncated),
+    durationMs: result.durationMs ?? null,
+    ...extra
+  };
+}
+
 export async function waitForFile(waitPath, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   // Return only once the file size is non-zero and stable across two polls —
@@ -128,19 +168,17 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
         sessionId = envelope.sessionId;
       }
     }
-    return {
-      agent: "grok",
-      backend: retriedWithoutOverrides ? "grok-cli (model/effort overrides rejected, CLI defaults used)" : "grok-cli",
-      status: result.status,
-      stdout,
-      stderr: result.stderr,
-      timedOut: Boolean(result.timedOut),
-      truncated: Boolean(result.truncated),
-      durationMs: result.durationMs ?? null,
-      sessionId,
-      model: retriedWithoutOverrides ? "(CLI default after rejected override)" : options.grokModel ?? "(default)",
-      command: `${bin} --prompt-file ...`
-    };
+    return buildAgentResult(
+      "grok",
+      retriedWithoutOverrides ? "grok-cli (model/effort overrides rejected, CLI defaults used)" : "grok-cli",
+      result,
+      {
+        stdout,
+        sessionId,
+        model: retriedWithoutOverrides ? "(CLI default after rejected override)" : options.grokModel ?? "(default)",
+        command: `${bin} --prompt-file ...`
+      }
+    );
   } finally {
     try {
       fs.unlinkSync(promptFile);
@@ -190,31 +228,15 @@ export async function runCodexStructured(cwd, backends, options, prompt, label) 
         cwd,
         timeoutMs: options.agentTimeoutMs
       });
-      return {
-        agent: "codex",
-        backend: "codex-companion-adversarial-fallback",
-        status: fb.status,
-        stdout: fb.stdout,
-        stderr: fb.stderr,
-        timedOut: Boolean(fb.timedOut),
-        truncated: Boolean(fb.truncated),
-        durationMs: fb.durationMs ?? null,
+      return buildAgentResult("codex", "codex-companion-adversarial-fallback", fb, {
         model: options.codexModel ?? "(default)",
         command: `node ... adversarial-review`
-      };
+      });
     }
-    return {
-      agent: "codex",
-      backend: "codex-companion-task",
-      status: result.status,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      timedOut: Boolean(result.timedOut),
-      truncated: Boolean(result.truncated),
-      durationMs: result.durationMs ?? null,
+    return buildAgentResult("codex", "codex-companion-task", result, {
       model: options.codexModel ?? "(default)",
       command: `node ... task --prompt-file`
-    };
+    });
   } finally {
     try {
       fs.unlinkSync(promptFile);

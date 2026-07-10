@@ -1,7 +1,8 @@
-import fs from "node:fs";
 import path from "node:path";
 
+import { appendJsonlCapped, readJsonl } from "./jsonl.mjs";
 import { resolveStateDir } from "./state.mjs";
+import { median } from "./stats.mjs";
 
 /**
  * Persisted per-job metrics history: one JSONL line per finished job, appended
@@ -34,54 +35,20 @@ export function recordJobMetrics(cwd, job) {
     agents
   };
   try {
-    const file = metricsFile(cwd);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.appendFileSync(file, `${JSON.stringify(entry)}\n`, "utf8");
-    trimMetrics(file);
+    appendJsonlCapped(metricsFile(cwd), entry, MAX_METRICS_LINES);
   } catch {
     /* metrics are best-effort; never break a run */
   }
   return entry;
 }
 
-function trimMetrics(file) {
-  try {
-    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
-    if (lines.length > MAX_METRICS_LINES) {
-      fs.writeFileSync(file, `${lines.slice(-MAX_METRICS_LINES).join("\n")}\n`, "utf8");
-    }
-  } catch {
-    /* ignore */
-  }
-}
-
 export function readMetrics(cwd, sinceMs = 0) {
-  const file = metricsFile(cwd);
-  let text;
-  try {
-    text = fs.readFileSync(file, "utf8");
-  } catch {
-    return [];
-  }
   const entries = [];
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      const at = Date.parse(entry.finishedAt ?? entry.createdAt ?? "");
-      if (!sinceMs || (Number.isFinite(at) && at >= sinceMs)) entries.push(entry);
-    } catch {
-      /* skip corrupt line */
-    }
+  for (const entry of readJsonl(metricsFile(cwd))) {
+    const at = Date.parse(entry.finishedAt ?? entry.createdAt ?? "");
+    if (!sinceMs || (Number.isFinite(at) && at >= sinceMs)) entries.push(entry);
   }
   return entries;
-}
-
-function median(values) {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
 }
 
 export function aggregateMetrics(entries) {
