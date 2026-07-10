@@ -100,6 +100,53 @@ export function writeFileAtomic(file, data) {
   }
 }
 
+function sleepSync(ms) {
+  // Dependency-free synchronous sleep for the lock retry loop.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Run `fn` while holding a cross-process advisory lock (an atomically-created
+ * lock directory). Serializes read-modify-write on a shared file across
+ * concurrently-finishing council jobs. A stale lock (older than `staleMs`, e.g.
+ * from a crashed process) is stolen; if the lock can't be taken within
+ * `timeoutMs`, `fn` runs anyway (best-effort - never block a run on the lock).
+ */
+export function withFileLock(lockPath, fn, { timeoutMs = 5000, staleMs = 30_000 } = {}) {
+  const start = Date.now();
+  let held = false;
+  for (;;) {
+    try {
+      fs.mkdirSync(lockPath); // atomic: throws EEXIST if another holder exists
+      held = true;
+      break;
+    } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ (error).code !== "EEXIST") break; // unexpected -> proceed unlocked
+      try {
+        if (Date.now() - fs.statSync(lockPath).mtimeMs > staleMs) {
+          fs.rmSync(lockPath, { recursive: true, force: true });
+          continue; // stole a stale lock; retry immediately
+        }
+      } catch {
+        continue; // lock vanished between mkdir and stat; retry
+      }
+      if (Date.now() - start > timeoutMs) break; // give up waiting -> proceed unlocked
+      sleepSync(25);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (held) {
+      try {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 export function generateJobId(prefix = "council") {
   return `${prefix}-${randomBytes(4).toString("hex")}`;
 }

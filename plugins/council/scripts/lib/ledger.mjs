@@ -1,7 +1,7 @@
 import path from "node:path";
 
 import { readJsonl, writeJsonlCapped } from "./jsonl.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { resolveStateDir, withFileLock } from "./state.mjs";
 import { hashLite } from "./util.mjs";
 
 /**
@@ -53,32 +53,40 @@ function writeLedger(cwd, map) {
   writeJsonlCapped(ledgerFile(cwd), [...map.values()], MAX_LEDGER_ENTRIES);
 }
 
+function ledgerLockPath(cwd) {
+  return `${ledgerFile(cwd)}.lock`;
+}
+
 /**
  * Merge freshly-computed entries into the on-disk ledger just before writing,
  * so a concurrent finish is not lost. Newer lastSeen / higher timesSeen wins;
  * an explicit non-open status is preserved.
  */
 function mergeAndWriteLedger(cwd, map) {
-  const disk = readLedger(cwd);
-  for (const [fp, entry] of map) {
-    const other = disk.get(fp);
-    if (!other) {
-      disk.set(fp, entry);
-      continue;
+  // Serialize the read-merge-write across processes so two jobs finishing at
+  // once can't lose each other's fingerprints.
+  withFileLock(ledgerLockPath(cwd), () => {
+    const disk = readLedger(cwd);
+    for (const [fp, entry] of map) {
+      const other = disk.get(fp);
+      if (!other) {
+        disk.set(fp, entry);
+        continue;
+      }
+      disk.set(fp, {
+        ...entry,
+        timesSeen: Math.max(entry.timesSeen ?? 0, other.timesSeen ?? 0),
+        consensusSeen: Math.max(entry.consensusSeen ?? 0, other.consensusSeen ?? 0),
+        category: entry.category ?? other.category ?? "other",
+        firstSeen: [entry.firstSeen, other.firstSeen].filter(Boolean).sort()[0] ?? entry.firstSeen,
+        firstJobId: (entry.firstSeen ?? "") <= (other.firstSeen ?? "") ? entry.firstJobId : other.firstJobId,
+        lastSeen: (entry.lastSeen ?? "") >= (other.lastSeen ?? "") ? entry.lastSeen : other.lastSeen,
+        lastJobId: (entry.lastSeen ?? "") >= (other.lastSeen ?? "") ? entry.lastJobId : other.lastJobId,
+        status: other.status !== "open" ? other.status : entry.status
+      });
     }
-    disk.set(fp, {
-      ...entry,
-      timesSeen: Math.max(entry.timesSeen ?? 0, other.timesSeen ?? 0),
-      consensusSeen: Math.max(entry.consensusSeen ?? 0, other.consensusSeen ?? 0),
-      category: entry.category ?? other.category ?? "other",
-      firstSeen: [entry.firstSeen, other.firstSeen].filter(Boolean).sort()[0] ?? entry.firstSeen,
-      firstJobId: (entry.firstSeen ?? "") <= (other.firstSeen ?? "") ? entry.firstJobId : other.firstJobId,
-      lastSeen: (entry.lastSeen ?? "") >= (other.lastSeen ?? "") ? entry.lastSeen : other.lastSeen,
-      lastJobId: (entry.lastSeen ?? "") >= (other.lastSeen ?? "") ? entry.lastJobId : other.lastJobId,
-      status: other.status !== "open" ? other.status : entry.status
-    });
-  }
-  writeLedger(cwd, disk);
+    writeLedger(cwd, disk);
+  });
 }
 
 /**
@@ -131,12 +139,16 @@ export function recordAndAnnotate(cwd, jobId, merged, nowIso) {
 
 /** Explicitly set a ledger entry's status (fixed | ignored | open). */
 export function resolveLedgerEntry(cwd, fingerprint, status, nowIso) {
-  const map = readLedger(cwd);
-  const entry = map.get(fingerprint);
-  if (!entry) return false;
-  map.set(fingerprint, { ...entry, status, resolvedAt: nowIso });
-  writeLedger(cwd, map);
-  return true;
+  // Under the same lock as recordAndAnnotate so a concurrent finish can't clobber
+  // the status we just set (and vice versa).
+  return withFileLock(ledgerLockPath(cwd), () => {
+    const map = readLedger(cwd);
+    const entry = map.get(fingerprint);
+    if (!entry) return false;
+    map.set(fingerprint, { ...entry, status, resolvedAt: nowIso });
+    writeLedger(cwd, map);
+    return true;
+  });
 }
 
 export function readLedgerEntries(cwd) {

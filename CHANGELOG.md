@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Verification never lets a finding's own author refute it: when no independent peer verifier is available (the peer is skipped), the finding is left as-is instead of being self-verified and demoted.
 - Agent `scope` overrides (`localized`/`cross-cutting`) now survive normalization and merging, so an explicit agent scope actually beats the heuristic (previously the field was dropped before `classifyScope` ran). A finding with a file but a null line is no longer misclassified as a precise/localized location.
 - Fuzzy-merging findings no longer discards a known line number when a higher-severity duplicate has none.
+- The cross-run findings ledger is now updated under a cross-process advisory lock (`withFileLock`), so two council jobs finishing at once no longer lose each other's fingerprints, and an explicit `fixed`/`ignored` status can't be clobbered by a concurrent finish.
+- The R1 resume cache no longer carries a grok session id across processes: a resumed run's debate falls back to fresh calls instead of trying to resume a prior process's expired session.
 
 ### Housekeeping
 
