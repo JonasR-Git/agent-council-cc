@@ -541,7 +541,11 @@ function formatMergedItem(f) {
       ? `seen ${f.timesSeen}x${f.ledgerStatus && f.ledgerStatus !== "open" && f.ledgerStatus !== "new" ? ` · was ${f.ledgerStatus}` : ""}`
       : null;
   const scope = f.scope === "cross-cutting" ? "cross-cutting→document" : f.scope === "localized" ? "localized→fixable" : null;
-  const verified = f.verified && !f.verified.refuted ? "verified" : null;
+  const verified = f.verified
+    ? f.verified.refuted
+      ? `disputed by ${f.verified.by}`
+      : "verified"
+    : null;
   const flags = [
     f.contested ? "contested" : null,
     f.fromPeerMissed ? "peer-missed" : null,

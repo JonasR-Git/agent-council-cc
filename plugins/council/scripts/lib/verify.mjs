@@ -61,6 +61,8 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
   const jobs = targets.map(async (finding) => {
     const agent = verifierFor(finding, options);
     if (!agent) return { finding, verdict: null };
+    const evidence = buildEvidence(repoRoot, [{ id: finding.ids?.[0], file: finding.file, line: finding.line }], "");
+    const hadEvidence = Boolean(evidence) && evidence !== "(no file evidence available)";
     const prompt = interpolate(loadPrompt("r2-verify"), {
       AGENT: agent,
       FINDING_JSON: JSON.stringify(
@@ -69,28 +71,49 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
         2
       ),
       NONCE: makeFenceNonce(),
-      EVIDENCE: buildEvidence(repoRoot, [{ id: finding.ids?.[0], file: finding.file, line: finding.line }], "")
+      EVIDENCE: evidence
     });
     const res = await runVerifier(agent, cwd, backends, verifyOpts, prompt);
-    return { finding, agent, verdict: res.skipped ? null : parseRefutation(res.stdout) };
+    // Trust a refutation only from a clean run (not skipped/timed-out/failed/empty).
+    const trustworthy = !res.skipped && !res.timedOut && res.status === 0 && Boolean(String(res.stdout ?? "").trim());
+    const verdict = trustworthy ? parseRefutation(res.stdout) : null;
+    return { finding, agent, verdict, hadEvidence };
   });
   const results = await Promise.all(jobs);
-
   const refutedKeys = new Map();
   for (const r of results) {
     if (!r.verdict) continue;
-    refutedKeys.set(r.finding, { by: r.agent, refuted: r.verdict.refuted, reason: r.verdict.reason });
+    // Demote (hide a unique finding) only when the refutation is evidence-based;
+    // default-refute with no evidence is unreliable, so annotate but keep it.
+    refutedKeys.set(r.finding, {
+      by: r.agent,
+      refuted: r.verdict.refuted,
+      reason: r.verdict.reason,
+      demotable: r.hadEvidence
+    });
   }
+  return partitionByRefutation(merged, refutedKeys, targets.length);
+}
 
+/**
+ * Split findings by refutation, protecting consensus. A consensus finding (>=2
+ * agents raised it) is NEVER hidden by a single refuter - it stays in the main
+ * list, annotated as disputed. Only single-agent findings that an independent
+ * verifier could not support are moved to the low-confidence bucket. Pure and
+ * testable; `refutations` maps finding -> {by, refuted, reason}.
+ */
+export function partitionByRefutation(merged, refutations, verifiedCount = 0) {
   const kept = [];
   const refuted = [];
   for (const f of merged.all ?? []) {
-    const v = refutedKeys.get(f);
+    const v = refutations.get(f);
     const annotated = v ? { ...f, verified: v } : f;
-    if (v?.refuted) refuted.push(annotated);
+    // Demote only a refuted, single-agent finding whose refutation was
+    // evidence-based (demotable !== false). Consensus stays (annotated disputed);
+    // an evidence-less refutation annotates but never hides a finding.
+    if (v?.refuted && v.demotable !== false && !f.consensus) refuted.push(annotated);
     else kept.push(annotated);
   }
-
   return {
     merged: {
       ...merged,
@@ -100,6 +123,6 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
       refuted
     },
     refutedCount: refuted.length,
-    verifiedCount: targets.length
+    verifiedCount
   };
 }

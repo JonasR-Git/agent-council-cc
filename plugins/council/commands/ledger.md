@@ -1,6 +1,6 @@
 ---
 description: Show and resolve the cross-run findings ledger (recognize known findings over time)
-argument-hint: "[--status open|fixed|ignored] [--resolve <fingerprint> fixed|ignored|open]"
+argument-hint: "[--status open|fixed|dismissed|ignored] [--resolve <fingerprint> fixed|dismissed|ignored|open]"
 allowed-tools: Bash(node:*)
 ---
 
@@ -13,6 +13,7 @@ show which findings were seen before and how many times. The report annotates ea
 finding with `seenBefore` / `timesSeen`.
 
 - `ledger` lists tracked findings (most-recurring first) with status + fingerprint.
-- `--status open|fixed|ignored` filters.
-- `--resolve <fingerprint> fixed` marks a finding resolved (absence alone never
-  auto-marks fixed, because reviews have varying scopes).
+- `--status open|fixed|dismissed|ignored` filters.
+- `--resolve <fingerprint> fixed|dismissed|ignored` marks the outcome (absence alone
+  never auto-marks fixed, because reviews have varying scopes). `dismissed` = a false
+  positive; it feeds the per-category calibration shown by `/council:overview`.
