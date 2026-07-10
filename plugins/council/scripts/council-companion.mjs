@@ -1220,7 +1220,13 @@ function handleFixloopStatus(argv) {
   const actionable = selectActionable(merged, { anyBlocker: approval.blockers.length > 0 });
   // A council with fewer voters than needed, or a non-clean finish, cannot be
   // trusted to approve - fail closed with an incomplete marker.
-  const incomplete = job.status !== "completed" || approval.voters.length < needed;
+  // Incomplete means the PEER council can't be trusted: a genuinely failed/
+  // unfinished job, or too few non-writer voters (a peer that timed out or
+  // parse-failed has no verdict, so it is already missing from voters). A
+  // writer-only parse glitch (completed_with_errors) must NOT block a clean
+  // peer approval - the writer is excluded from approval anyway.
+  const jobFailed = job.status === "failed" || job.status === "running" || job.status === "queued";
+  const incomplete = jobFailed || approval.voters.length < needed;
   const approved = approval.approved && !incomplete;
   // Not approved but nothing to fix (all findings are P2/nit, or a partial run
   // yielded none) - the loop must escalate to a human, not spin.

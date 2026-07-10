@@ -198,16 +198,22 @@ export async function runBenchmark(cwd, backends, options = {}) {
     } catch {
       /* new file */
     }
-    // judge-only SUPERSEDES the answer-phase record for the same task (it is the
-    // same logical run, now with fair/complete judging) - never double-count.
+    // judge-only SUPERSEDES only the MOST RECENT same-task record (the answer
+    // phase of THIS run) - it must not wipe earlier chronological runs of the
+    // same task, which are the longitudinal history --stats tracks.
     if (options.judgeOnly) {
-      lines = lines.filter((l) => {
+      let lastIdx = -1;
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
         try {
-          return JSON.parse(l).taskHash !== taskHash;
+          if (JSON.parse(lines[i]).taskHash === taskHash) {
+            lastIdx = i;
+            break;
+          }
         } catch {
-          return true;
+          /* skip */
         }
-      });
+      }
+      if (lastIdx >= 0) lines.splice(lastIdx, 1);
     }
     lines.push(JSON.stringify(record));
     if (lines.length > MAX_BENCHMARK_RECORDS) lines = lines.slice(-MAX_BENCHMARK_RECORDS);

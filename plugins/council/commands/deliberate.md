@@ -78,4 +78,6 @@ After the report (or `/council:result`):
   contested items only — no free-running chat. With `--debate-resume` (or policy
   `debate_resume: true`) Grok authors defend inside their own R1 session.
 - `--resume`: reuse cached successful R1 outputs for the same diff snapshot and only
-  re-run the agents that failed/timed out last time (e.g. after a codex timeout).
+  re-run the agents that failed/timed out last time (e.g. after a codex timeout). A
+  resumed Grok R1 keeps its session id only if the original run used `--debate-resume`
+  (you cannot resume a session that was never opened).
