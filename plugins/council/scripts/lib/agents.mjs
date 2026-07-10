@@ -32,7 +32,7 @@ export function interpolate(template, values) {
   );
 }
 
-export function writeTempPrompt(content) {
+function writeTempPrompt(content) {
   const file = path.join(os.tmpdir(), `council-prompt-${Date.now()}-${Math.random().toString(16).slice(2)}.md`);
   fs.writeFileSync(file, content, "utf8");
   return file;

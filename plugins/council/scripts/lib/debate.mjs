@@ -15,7 +15,7 @@ export function normalizeStance(value) {
   return "defend";
 }
 
-export function parseDebateRebuttal(stdout, agent, id) {
+function parseDebateRebuttal(stdout, agent, id) {
   const doc = extractJsonObject(stdout);
   const checked = validate(SCHEMAS.debateRebuttal, doc);
   if (!checked.valid) {
@@ -40,7 +40,7 @@ export function parseDebateRebuttal(stdout, agent, id) {
   };
 }
 
-export function parseDebateCounter(stdout, agent, id) {
+function parseDebateCounter(stdout, agent, id) {
   const doc = extractJsonObject(stdout);
   const checked = validate(SCHEMAS.debateCounter, doc);
   if (!checked.valid) {

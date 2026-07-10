@@ -42,7 +42,7 @@ export function resolveJobsDir(cwd) {
   return path.join(resolveStateDir(cwd), "jobs");
 }
 
-export function resolveStateRoot() {
+function resolveStateRoot() {
   return process.env[STATE_ROOT_ENV] || FALLBACK_STATE_ROOT_DIR;
 }
 

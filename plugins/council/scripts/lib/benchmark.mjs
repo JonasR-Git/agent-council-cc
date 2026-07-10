@@ -13,7 +13,7 @@ import {
 import { extractJsonObject } from "./findings.mjs";
 import { resolveStateDir } from "./state.mjs";
 
-export function benchmarkFile(cwd) {
+function benchmarkFile(cwd) {
   return path.join(resolveStateDir(cwd), "benchmarks.jsonl");
 }
 

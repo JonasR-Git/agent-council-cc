@@ -7,7 +7,7 @@ import { resolveStateDir, writeFileAtomic } from "./state.mjs";
  * A cross-run findings ledger: fingerprints each merged finding so later runs
  * can recognize "already flagged" issues and track fixed/open status.
  */
-export function ledgerFile(cwd) {
+function ledgerFile(cwd) {
   return path.join(resolveStateDir(cwd), "ledger.jsonl");
 }
 
