@@ -35,7 +35,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
-import { formatDashboard, summarizeProgress } from "./lib/watch.mjs";
+import { formatDashboard, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
@@ -1609,12 +1609,15 @@ function watchSnapshot(cwd, root, job) {
     claudeBackend = merged.claudeBackend;
   }
   const etaMs = medianWallClockForKind(cwd, job.kind);
+  // Findings only exist once the merge phase ran (terminal jobs); null otherwise.
+  const findings = summarizeFindings(job.deliberation?.merged);
   return formatDashboard(job, progress, {
     nowMs: Date.now(),
     etaMs,
     skipped,
     claudeBackend,
-    jobPhase: job.phase
+    jobPhase: job.phase,
+    findings
   });
 }
 
