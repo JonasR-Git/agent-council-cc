@@ -243,6 +243,8 @@ async function loadClaudePlan(options) {
  * Synthesis and implementation stay with the orchestrator (Claude).
  */
 export async function runSolve(cwd, backends, options = {}) {
+  const onPhase = typeof options.onPhase === "function" ? options.onPhase : () => {};
+  onPhase("collecting-context");
   const problem = options.problemFile
     ? fs.readFileSync(options.problemFile, "utf8")
     : String(options.focusText ?? "");
@@ -272,7 +274,9 @@ export async function runSolve(cwd, backends, options = {}) {
     r1Jobs.push(Promise.resolve({ agent: "grok", skipped: true, reason: "skip", stdout: "" }));
   }
 
+  onPhase("plans");
   const r1Raw = await Promise.all(r1Jobs);
+  onPhase("plans-done");
   const claudePlan = await loadClaudePlan(options);
 
   const plans = [];
@@ -296,7 +300,9 @@ export async function runSolve(cwd, backends, options = {}) {
   const r2Opts = {
     ...options,
     maxTurns: options.maxTurnsR2,
-    grokEffort: options.r2Effort ?? options.grokEffort
+    grokEffort: options.r2Effort ?? options.grokEffort,
+    // Capture grok critic sessions so debate counters can resume them.
+    captureGrokSession: Boolean(options.debateRounds >= 2 && options.debateResume)
   };
   const critiqueJobs = [];
   for (const plan of parsedPlans) {
@@ -318,6 +324,7 @@ export async function runSolve(cwd, backends, options = {}) {
       );
     }
   }
+  onPhase(`critique (${critiqueJobs.length})`);
   const r2Results = await Promise.all(critiqueJobs);
   const critiques = r2Results.map((r) => r.critique).filter(Boolean);
 
@@ -325,21 +332,28 @@ export async function runSolve(cwd, backends, options = {}) {
 
   let debates = [];
   if ((options.debateRounds ?? 0) > 0) {
+    onPhase("debate");
     const skipped = new Set(
       [options.skipCodex ? "codex" : null, options.skipGrok ? "grok" : null, "claude"].filter(Boolean)
     );
+    const grokR1 = r1Raw.find((raw) => raw.agent === "grok" && !raw.skipped);
+    // grok critic sessions keyed by the plan author they critiqued.
+    const criticSessions = {};
+    for (const r of r2Results) {
+      if (r.agent === "grok" && r.sessionId && r.aboutAgent) criticSessions[r.aboutAgent] = r.sessionId;
+    }
     const entries = ranking
       .filter((r) => r.blockers.length && !skipped.has(r.agent))
       .map((r) => {
         const plan = parsedPlans.find((p) => p.agent === r.agent);
         if (!plan || plan.confidence < 0.7) return null;
         const critic = r.blockers.map((b) => b.from).find((from) => from !== r.agent && !skipped.has(from));
-        const grokR1 = r1Raw.find((raw) => raw.agent === "grok" && !raw.skipped);
         return {
           id: `plan-${r.agent}`,
           author: r.agent,
           critic: critic ?? null,
           authorSessionId: r.agent === "grok" ? grokR1?.sessionId ?? null : null,
+          criticSessionId: critic === "grok" ? criticSessions[r.agent] ?? null : null,
           payload: {
             title: `Plan by ${r.agent}`,
             summary: plan.summary,

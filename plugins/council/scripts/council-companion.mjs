@@ -47,11 +47,10 @@ function printUsage() {
       "  node scripts/council-companion.mjs setup [--json]",
       "  node scripts/council-companion.mjs review|adversarial|deliberate [flags] [focus text]",
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
-      "  node scripts/council-companion.mjs wait [job-id] [--timeout <s>] [--interval <s>]",
+      "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
       "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
-      "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>]",
       "  node scripts/council-companion.mjs result [job-id] [--summary] [--json]",
       "",
       "Flags:",
@@ -222,6 +221,7 @@ async function runCodexReview(cwd, backends, options, adversarial, focusText) {
     stderr: result.stderr,
     timedOut: Boolean(result.timedOut),
     truncated: Boolean(result.truncated),
+    durationMs: result.durationMs ?? null,
     command: `node ${args.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`
   };
 }
@@ -252,6 +252,7 @@ async function runGrokReview(cwd, backends, options, adversarial, focusText) {
       stderr: result.stderr,
       timedOut: Boolean(result.timedOut),
       truncated: Boolean(result.truncated),
+      durationMs: result.durationMs ?? null,
       command: `node ${args.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`
     };
   }
@@ -307,6 +308,7 @@ async function runGrokReview(cwd, backends, options, adversarial, focusText) {
     stderr: result.stderr,
     timedOut: Boolean(result.timedOut),
     truncated: Boolean(result.truncated),
+    durationMs: result.durationMs ?? null,
     command: `${bin} ${args.filter((a) => a !== promptFile).join(" ")}`
   };
 }
@@ -463,6 +465,7 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       pid: null
     };
     upsertJob(root, failed);
+    recordJobMetrics(cwd, failed);
     appendLogLine(job.logFile, `Failed: ${message}`);
     throw error;
   }
@@ -835,7 +838,9 @@ function handleStatus(argv) {
   }
   console.log("Council jobs (newest first):");
   for (const job of jobs.slice(0, options.all ? 50 : 10)) {
-    console.log(`  ${job.id}  ${String(job.status).padEnd(22)}  ${job.title} - ${job.summary ?? ""}`);
+    const active = job.status === "running" || job.status === "queued";
+    const phaseTag = active && job.phase && job.phase !== "running" ? ` [${job.phase}]` : "";
+    console.log(`  ${job.id}  ${String(job.status).padEnd(22)}${phaseTag}  ${job.title} - ${job.summary ?? ""}`);
   }
   console.log("");
 }

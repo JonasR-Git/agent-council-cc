@@ -23,14 +23,14 @@ export function recordJobMetrics(cwd, job) {
       durationMs: Number.isFinite(Number(r.durationMs)) ? Number(r.durationMs) : null,
       timedOut: Boolean(r.timedOut)
     }));
+  const wallClockMs = Date.parse(job.finishedAt ?? "") - Date.parse(job.createdAt ?? "");
   const entry = {
     id: job.id,
     kind: job.kind,
     status: job.status,
     finishedAt: job.finishedAt ?? null,
     createdAt: job.createdAt ?? null,
-    wallClockMs:
-      Date.parse(job.finishedAt ?? "") - Date.parse(job.createdAt ?? "") || null,
+    wallClockMs: Number.isFinite(wallClockMs) ? wallClockMs : null,
     agents
   };
   try {
