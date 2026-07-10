@@ -259,7 +259,19 @@ export async function runDeliberation(cwd, backends, options = {}) {
   }
 
   onPhase(resume && (cachedCodex || cachedGrok) ? "r1 (resuming)" : "r1");
-  const r1Raw = await Promise.all(r1Jobs);
+  // Emit per-agent completion so a slow/stuck agent (e.g. a codex backend stall)
+  // is visible - you can see grok finished while r1 still waits on codex.
+  let r1Done = 0;
+  const r1Expected = r1Jobs.length;
+  const r1Raw = await Promise.all(
+    r1Jobs.map((job) =>
+      Promise.resolve(job).then((r) => {
+        r1Done += 1;
+        if (r && !r.skipped) onPhase(`r1: ${r.agent} done (${r1Done}/${r1Expected})`);
+        return r;
+      })
+    )
+  );
   onPhase("r1-done");
   const claudeDoc = await loadClaudeDoc(options);
 
@@ -356,7 +368,16 @@ export async function runDeliberation(cwd, backends, options = {}) {
 
     if (peerJobs.length) {
       onPhase(`r2 (${peerJobs.length} critiques)`);
-      const peerResults = await Promise.all(peerJobs);
+      let r2Done = 0;
+      const peerResults = await Promise.all(
+        peerJobs.map((job) =>
+          Promise.resolve(job).then((r) => {
+            r2Done += 1;
+            if (r && !r.skipped) onPhase(`r2: ${r.agent}->${r.aboutAgent} done (${r2Done}/${peerJobs.length})`);
+            return r;
+          })
+        )
+      );
       r2Results.push(
         ...peerResults.map((result) => ({
           ...result,

@@ -275,7 +275,16 @@ export async function runSolve(cwd, backends, options = {}) {
   }
 
   onPhase("plans");
-  const r1Raw = await Promise.all(r1Jobs);
+  let plansDone = 0;
+  const r1Raw = await Promise.all(
+    r1Jobs.map((job) =>
+      Promise.resolve(job).then((r) => {
+        plansDone += 1;
+        if (r && !r.skipped) onPhase(`plans: ${r.agent} done (${plansDone}/${r1Jobs.length})`);
+        return r;
+      })
+    )
+  );
   onPhase("plans-done");
   const claudePlan = await loadClaudePlan(options);
 
