@@ -25,6 +25,8 @@ import {
 import { collectReviewContext, resolveReviewTarget } from "./git-context.mjs";
 import { recordAndAnnotate } from "./ledger.mjs";
 import { pruneR1Cache, readCachedR1, resumeContextKey, writeCachedR1 } from "./resume.mjs";
+import { annotateScopes } from "./scope.mjs";
+import { verifyFindings } from "./verify.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 
 export { READONLY_DISALLOWED_TOOLS, runCodexStructured, runGrokStructured };
@@ -409,6 +411,21 @@ export async function runDeliberation(cwd, backends, options = {}) {
   }
 
   merged = applyConsensusPolicy(merged, options.requireConsensusFor ?? []);
+
+  // Verification-first: adversarially refute P0/P1 (+ consensus) findings before
+  // they are surfaced. Reuses the R2 agent runners at low effort with per-finding
+  // evidence only - refuted findings move to a low-confidence bucket. Opt-in.
+  let verification = null;
+  if (options.verifyFindings) {
+    onPhase("verify");
+    const vr = await verifyFindings(cwd, backends, options, merged, buildEvidence, context.repoRoot);
+    merged = vr.merged;
+    verification = { verifiedCount: vr.verifiedCount, refutedCount: vr.refutedCount };
+  }
+
+  // Classify each finding localized vs cross-cutting -> preferred deliverable.
+  merged = annotateScopes(merged);
+
   if (options.ledger !== false) {
     merged = recordAndAnnotate(cwd, options.jobId ?? "unknown", merged, options.nowIso ?? new Date().toISOString());
   }
@@ -466,6 +483,7 @@ export async function runDeliberation(cwd, backends, options = {}) {
     r2: r2Results,
     merged,
     debates,
+    verification,
     claudeIncluded: Boolean(claudeDoc),
     report,
     sections

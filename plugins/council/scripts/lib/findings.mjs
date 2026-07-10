@@ -507,6 +507,16 @@ export function renderMergedMarkdown(merged, options = {}) {
     lines.push("");
   }
 
+  if (merged.refuted?.length) {
+    lines.push("### Refuted / low-confidence (survived neither verification)");
+    lines.push("These P0/P1 findings were refuted in the adversarial verification pass — treat as low-confidence.");
+    for (const f of merged.refuted) {
+      lines.push(formatMergedItem(f));
+      if (f.verified?.reason) lines.push(`  _refuted by ${f.verified.by}: ${f.verified.reason}_`);
+    }
+    lines.push("");
+  }
+
   if (options.includeVotes && merged.votes?.length) {
     lines.push("### Peer votes (round 2)");
     for (const v of merged.votes) {
@@ -530,7 +540,16 @@ function formatMergedItem(f) {
     f.seenBefore && f.timesSeen > 1
       ? `seen ${f.timesSeen}x${f.ledgerStatus && f.ledgerStatus !== "open" && f.ledgerStatus !== "new" ? ` · was ${f.ledgerStatus}` : ""}`
       : null;
-  const flags = [f.contested ? "contested" : null, f.fromPeerMissed ? "peer-missed" : null, ledger, voters]
+  const scope = f.scope === "cross-cutting" ? "cross-cutting→document" : f.scope === "localized" ? "localized→fixable" : null;
+  const verified = f.verified && !f.verified.refuted ? "verified" : null;
+  const flags = [
+    f.contested ? "contested" : null,
+    f.fromPeerMissed ? "peer-missed" : null,
+    verified,
+    scope,
+    ledger,
+    voters
+  ]
     .filter(Boolean)
     .join(" · ");
   return [

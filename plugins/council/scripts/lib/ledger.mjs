@@ -89,6 +89,8 @@ function mergeAndWriteLedger(cwd, map) {
     disk.set(fp, {
       ...entry,
       timesSeen: Math.max(entry.timesSeen ?? 0, other.timesSeen ?? 0),
+      consensusSeen: Math.max(entry.consensusSeen ?? 0, other.consensusSeen ?? 0),
+      category: entry.category ?? other.category ?? "other",
       firstSeen: [entry.firstSeen, other.firstSeen].filter(Boolean).sort()[0] ?? entry.firstSeen,
       firstJobId: (entry.firstSeen ?? "") <= (other.firstSeen ?? "") ? entry.firstJobId : other.firstJobId,
       lastSeen: (entry.lastSeen ?? "") >= (other.lastSeen ?? "") ? entry.lastSeen : other.lastSeen,
@@ -115,13 +117,18 @@ export function recordAndAnnotate(cwd, jobId, merged, nowIso) {
       const fingerprint = fingerprintFinding(item);
       const prior = map.get(fingerprint);
       const timesSeen = (prior?.timesSeen ?? 0) + 1;
+      // A resolved outcome (fixed/dismissed/ignored) is durable; only 'open'
+      // entries reopen. Category + consensus count are tracked model-agnostically.
+      const resolved = prior?.status && prior.status !== "open";
       map.set(fingerprint, {
         fingerprint,
         title: item.title,
         file: item.file ?? null,
+        category: item.category ?? prior?.category ?? "other",
         severity: item.severity,
-        status: prior?.status === "ignored" ? "ignored" : "open",
+        status: resolved ? prior.status : "open",
         timesSeen,
+        consensusSeen: (prior?.consensusSeen ?? 0) + (item.consensus ? 1 : 0),
         firstJobId: prior?.firstJobId ?? jobId,
         firstSeen: prior?.firstSeen ?? nowIso,
         lastJobId: jobId,

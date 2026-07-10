@@ -81,3 +81,10 @@ After the report (or `/council:result`):
   re-run the agents that failed/timed out last time (e.g. after a codex timeout). A
   resumed Grok R1 keeps its session id only if the original run used `--debate-resume`
   (you cannot resume a session that was never opened).
+- `--verify` (or policy `verify_findings: true`): before surfacing them, adversarially
+  refute each P0/P1 (+ consensus) finding — the agent that did NOT raise it tries to
+  disprove it, seeing only that finding + its local code. Refuted findings move to a
+  "low-confidence" section. Fewer, righter. Reuses the R2 round (small context, low
+  effort) so it does not blow up tokens.
+- Findings are tagged `localized→fixable` (a concrete fix diff is right) or
+  `cross-cutting→document` (a documented approach beats an auto-patch).

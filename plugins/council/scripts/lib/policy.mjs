@@ -24,7 +24,8 @@ export const DEFAULT_POLICY = {
   debate_rounds: 0,
   debate_resume: false,
   solve_writer: "claude",
-  budget_guard: 0
+  budget_guard: 0,
+  verify_findings: false
 };
 
 /**
@@ -201,6 +202,7 @@ export function mergeOptionsWithPolicy(options, policy) {
     budgetGuard: clampPercent(options.budgetGuard ?? policy.budget_guard ?? 0),
     forceBudget: options.forceBudget ?? false,
     resume: options.resume ?? false,
+    verifyFindings: options.verifyFindings ?? policy.verify_findings === true,
     policySource: policy._source
   };
 }

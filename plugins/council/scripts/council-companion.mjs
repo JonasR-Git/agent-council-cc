@@ -27,6 +27,7 @@ import { runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
+import { renderOverview } from "./lib/overview.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
@@ -61,7 +62,8 @@ function printUsage() {
       "  node scripts/council-companion.mjs fixloop-status [job-id] [--writer <agent>] [--needed <n>] [--json]",
       "  node scripts/council-companion.mjs benchmark [--task-file <path>] [--claude-answer <path>] [--category <c>] [task text]",
       "  node scripts/council-companion.mjs benchmark --stats [--json]",
-      "  node scripts/council-companion.mjs ledger [--status open|fixed|ignored] [--resolve <fp> fixed|ignored]",
+      "  node scripts/council-companion.mjs ledger [--status ...] [--resolve <fp> fixed|dismissed|ignored]",
+      "  node scripts/council-companion.mjs overview [--limit <n>] [--json]",
       "  node scripts/council-companion.mjs result [job-id] [--summary|--html] [--json]",
       "  node scripts/council-companion.mjs worktree add|remove|list <slug> [--base <ref>] [--force]",
       "",
@@ -533,6 +535,7 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       waitTimeoutMs: mergedOpts.waitTimeoutMs,
       policyFocus: policy.focus,
       resume: mergedOpts.resume,
+      verifyFindings: mergedOpts.verifyFindings,
       jobId: job.id,
       nowIso: nowIso(),
       nowMs: Date.now(),
@@ -673,7 +676,7 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
       "budget-guard",
       "cwd"
     ],
-    booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "debate-resume", "force-budget", "resume"]
+    booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "debate-resume", "force-budget", "resume", "verify"]
   });
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const focusText = positionals.join(" ").trim();
@@ -705,6 +708,7 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
     debateRounds: options["debate-rounds"] != null ? Number(options["debate-rounds"]) : undefined,
     debateResume: options["debate-resume"] ? true : undefined,
     resume: options.resume ? true : undefined,
+    verifyFindings: options.verify ? true : undefined,
     budgetGuard: options["budget-guard"] != null ? Number(options["budget-guard"]) : undefined,
     forceBudget: options["force-budget"] ? true : undefined,
     waitTimeoutMs,
@@ -1120,6 +1124,19 @@ function handleHistory(argv) {
   console.log(`${lines.join("\n")}\n`);
 }
 
+function handleOverview(argv) {
+  const { options } = parseCommandInput(argv, { valueOptions: ["limit"], booleanOptions: ["json"] });
+  const cwd = process.cwd();
+  const { text, overview, recurring } = renderOverview(cwd, {
+    limit: options.limit != null ? Number(options.limit) : 10
+  });
+  if (options.json) {
+    outputResult({ overview, recurring }, true);
+    return;
+  }
+  console.log(`${text}\n`);
+}
+
 function handleLedger(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["resolve", "status"],
@@ -1128,8 +1145,8 @@ function handleLedger(argv) {
   const cwd = process.cwd();
   if (options.resolve) {
     const status = positionals[0] ?? "fixed";
-    if (!["fixed", "ignored", "open"].includes(status)) {
-      throw new Error("resolve status must be fixed | ignored | open");
+    if (!["fixed", "dismissed", "ignored", "open"].includes(status)) {
+      throw new Error("resolve status must be fixed | dismissed | ignored | open");
     }
     const ok = resolveLedgerEntry(cwd, options.resolve, status, nowIso());
     outputResult(options.json ? { fingerprint: options.resolve, status, updated: ok } : `${ok ? "Updated" : "Not found"}: ${options.resolve} -> ${status}\n`, options.json);
@@ -1538,6 +1555,9 @@ async function main() {
         break;
       case "ledger":
         handleLedger(rest);
+        break;
+      case "overview":
+        handleOverview(rest);
         break;
       case "cancel":
         handleCancel(rest);

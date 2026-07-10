@@ -56,6 +56,10 @@ debate_resume: false
 # /council:solve - who implements the synthesized plan (exactly one writer)
 solve_writer: claude
 
+# Verification-first: adversarially refute each P0/P1 (+ consensus) finding before
+# showing it (reuses the R2 round, small context, low effort). Fewer, righter.
+verify_findings: false
+
 # Budget guard: refuse to start deliberate/solve (the expensive multi-agent modes;
 # review/adversarial are not gated) when any provider's most-pressed window (5h or
 # weekly) is at/above this percent. Fails CLOSED if limits cannot be read. 0 = off.
