@@ -4,19 +4,10 @@
     "name": "local"
   },
   "metadata": {
-    "description": "Grok + multi-agent council reviews for Claude Code (Codex + Grok + Claude).",
+    "description": "Multi-agent council code review for Claude Code: independent review then peer critique across Claude + Codex + Grok.",
     "version": "0.5.0"
   },
   "plugins": [
-    {
-      "name": "grok",
-      "description": "Use Grok Build from Claude Code for code reviews or to delegate tasks.",
-      "version": "0.5.0",
-      "author": {
-        "name": "local"
-      },
-      "source": "./plugins/grok"
-    },
     {
       "name": "council",
       "description": "Multi-agent council: dual review + deliberate protocol (Claude + Codex + Grok).",

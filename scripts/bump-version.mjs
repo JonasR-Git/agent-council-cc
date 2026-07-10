@@ -16,8 +16,7 @@ if (!version || !SEMVER.test(version)) {
   const files = {
     package: "package.json",
     marketplace: ".claude-plugin/marketplace.json",
-    council: "plugins/council/.claude-plugin/plugin.json",
-    grok: "plugins/grok/.claude-plugin/plugin.json"
+    council: "plugins/council/.claude-plugin/plugin.json"
   };
   const read = (name) => JSON.parse(fs.readFileSync(path.join(ROOT, name), "utf8"));
   const write = (name, value) =>
@@ -26,22 +25,18 @@ if (!version || !SEMVER.test(version)) {
   const pkg = read(files.package);
   const marketplace = read(files.marketplace);
   const council = read(files.council);
-  const grok = read(files.grok);
-  if (!Array.isArray(marketplace.plugins) || marketplace.plugins.length !== 2) {
-    throw new Error("marketplace.json must contain exactly two plugin entries");
+  if (!Array.isArray(marketplace.plugins) || marketplace.plugins.length !== 1) {
+    throw new Error("marketplace.json must contain exactly one plugin entry");
   }
 
   pkg.version = version;
   marketplace.metadata.version = version;
   marketplace.plugins[0].version = version;
-  marketplace.plugins[1].version = version;
   council.version = version;
-  grok.version = version;
 
   write(files.package, pkg);
   write(files.marketplace, marketplace);
   write(files.council, council);
-  write(files.grok, grok);
-  console.log(`Updated 6 version fields to ${version}:`);
+  console.log(`Updated 4 version fields to ${version}:`);
   for (const file of Object.values(files)) console.log(`- ${file}`);
 }

@@ -4,7 +4,7 @@
  * A fence only closes on a run of the SAME character at least as long as the
  * opener, so we pick a delimiter (backtick or tilde) one character longer than
  * the longest run of that character in the body — the body can never terminate
- * its own wrapper. Kept byte-identical between the council and grok plugins
+ * its own wrapper. Self-contained (no cross-plugin imports)
  * (guarded by tests/libsync.test.mjs).
  */
 

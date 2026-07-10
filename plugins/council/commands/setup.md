@@ -16,7 +16,7 @@ Presents readiness per reviewer:
 - **claude** - `session` backend is always reachable (it's the orchestrating you);
   `spawn` backend needs the Claude CLI logged in.
 - **codex** - via the Codex plugin companion or the `codex` CLI (`codex login`).
-- **grok** - via the `grok` CLI (`grok login`) and optionally the grok plugin.
+- **grok** - via the `grok` CLI (`grok login`).
 
 Only agents listed in `reviewers` are required for READY. Present the report and call
 out any missing backend with its suggested next step.

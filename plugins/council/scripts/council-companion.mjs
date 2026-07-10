@@ -202,9 +202,6 @@ async function handleSetup(argv) {
   if (wants("grok") && !backends.grok.cli.available) {
     report.nextSteps.push("Grok: install the Grok Build CLI (https://x.ai/cli) and run `grok login`.");
   }
-  if (wants("grok") && !backends.grok.companionAvailable) {
-    report.nextSteps.push("Grok: optionally install the grok plugin (/plugin install grok@agent-council); council can also call the grok CLI directly.");
-  }
   if (wants("claude") && claudeBackend === "spawn" && !backends.claude.cli.available) {
     report.nextSteps.push("Claude (spawn backend): install the Claude CLI or set CLAUDE_BIN; run `claude` once to log in. Or use claude_backend: session.");
   }

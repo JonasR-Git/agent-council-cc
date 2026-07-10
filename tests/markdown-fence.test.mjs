@@ -11,7 +11,6 @@ import {
   closeDanglingFence,
   wrapMarkdownFence
 } from "../plugins/council/scripts/lib/markdown-fence.mjs";
-import { collectReviewContext as grokCollect, resolveReviewTarget as grokTarget } from "../plugins/grok/scripts/lib/git.mjs";
 
 test("wrapMarkdownFence: fence length table", () => {
   assert.equal(wrapMarkdownFence(""), "```\n\n```");
@@ -82,16 +81,6 @@ test("council review context: file containing ``` cannot break section structure
     sectionIsOutsideFences(context.content, "## new file: second.txt"),
     "second file heading must not be swallowed by the first file's fences"
   );
-  fs.rmSync(dir, { recursive: true, force: true });
-});
-
-test("grok review context: same fence safety", () => {
-  const dir = makeRepo({
-    "tricky.md": "```\nfence\n```\n",
-    "after.txt": "AFTER-CONTENT"
-  });
-  const context = grokCollect(dir, grokTarget(dir, {}));
-  assert.ok(sectionIsOutsideFences(context.content, "## new file: after.txt"));
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
