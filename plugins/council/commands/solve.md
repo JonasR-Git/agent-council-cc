@@ -47,8 +47,15 @@ Do NOT read their plans first. The companion picks your file up automatically.
 ### Phase 4 - implementation: exactly ONE writer
 
 - Writer per `.council.yml` `solve_writer: claude|codex|grok` (default claude) or user choice.
-- Always on a dedicated branch (e.g. `council-solve/<slug>`).
-- codex -> codex plugin task (write mode); grok -> `/grok:rescue --write`; claude -> implement directly.
+- **Isolate the writer in a git worktree** so the main tree stays usable and the
+  one-writer rule is enforced by construction:
+  ```bash
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" worktree add <slug>
+  # -> creates branch council-solve/<slug> + a sibling worktree dir; work there
+  # ... implement + commit inside the worktree ...
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" worktree remove <slug>
+  ```
+- codex -> codex plugin task (write mode) with `--cwd <worktree>`; grok -> `/grok:rescue --write`; claude -> implement in the worktree.
 
 ### Phase 5 - council review of the result
 

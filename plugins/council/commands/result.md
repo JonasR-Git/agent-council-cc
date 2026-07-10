@@ -12,4 +12,8 @@ Prefer `--summary` when you only need the decision-relevant parts (merged findin
 ranking / debate outcomes) - it skips the raw R1/R2 bodies and saves tokens. Full
 agent output stays available without `--summary` and in the job's artifact files.
 
+`--html` writes a self-contained, styled HTML report (sortable findings table with
+severity colours + consensus badges, verdicts, solve ranking, collapsed full report)
+to the job's artifacts dir and prints its path — open it in a browser or share it.
+
 Present the report, then add a brief Claude synthesis (consensus vs unique P0 findings). Do not re-run the review.

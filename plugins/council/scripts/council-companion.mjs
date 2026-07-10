@@ -27,6 +27,8 @@ import { runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
+import { writeJobHtml } from "./lib/html-report.mjs";
+import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
 import {
   appendLogLine,
@@ -60,7 +62,8 @@ function printUsage() {
       "  node scripts/council-companion.mjs benchmark [--task-file <path>] [--claude-answer <path>] [--category <c>] [task text]",
       "  node scripts/council-companion.mjs benchmark --stats [--json]",
       "  node scripts/council-companion.mjs ledger [--status open|fixed|ignored] [--resolve <fp> fixed|ignored]",
-      "  node scripts/council-companion.mjs result [job-id] [--summary] [--json]",
+      "  node scripts/council-companion.mjs result [job-id] [--summary|--html] [--json]",
+      "  node scripts/council-companion.mjs worktree add|remove|list <slug> [--base <ref>] [--force]",
       "",
       "Flags:",
       "  --wait|--background  --base <ref>  --scope auto|working-tree|branch",
@@ -872,14 +875,20 @@ function handleStatus(argv) {
 }
 
 function handleResult(argv) {
-  const { options, positionals } = parseCommandInput(argv, { booleanOptions: ["json", "summary"] });
-  const job = resolveJob(process.cwd(), positionals[0]);
+  const { options, positionals } = parseCommandInput(argv, { booleanOptions: ["json", "summary", "html"] });
+  const cwd = process.cwd();
+  const job = resolveJob(cwd, positionals[0]);
   if (!job) throw new Error("No council jobs found.");
   if (job.status === "running" || job.status === "queued") {
     outputResult(
       options.json ? { job, pending: true } : `Job ${job.id} is still ${job.status}.\n`,
       options.json
     );
+    return;
+  }
+  if (options.html) {
+    const file = writeJobHtml(cwd, job);
+    outputResult(options.json ? { jobId: job.id, html: file } : `HTML report written: ${file}\n`, options.json);
     return;
   }
   if (options.summary) {
@@ -1143,6 +1152,50 @@ function handleLedger(argv) {
     lines.push(`            fp=${e.fingerprint}`);
   }
   console.log(`${lines.join("\n")}\n`);
+}
+
+function handleWorktree(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["base"],
+    booleanOptions: ["json", "force"]
+  });
+  const cwd = process.cwd();
+  const action = positionals[0];
+  const slug = positionals[1];
+
+  if (action === "add") {
+    if (!slug) throw new Error("Usage: worktree add <slug> [--base <ref>]");
+    const res = addWorktree(cwd, slug, options.base);
+    if (!res.ok) throw new Error(res.error);
+    outputResult(
+      options.json ? res : `Worktree ready: ${res.dir}\n  branch: ${res.branch}\n  cd there, implement, commit; then: worktree remove ${slug}\n`,
+      options.json
+    );
+    return;
+  }
+  if (action === "remove") {
+    if (!slug) throw new Error("Usage: worktree remove <slug> [--force]");
+    const res = removeWorktree(cwd, slug, { force: Boolean(options.force) });
+    if (!res.ok) throw new Error(res.error);
+    outputResult(options.json ? res : `Removed worktree for ${slug} (branch ${res.branch} kept).\n`, options.json);
+    return;
+  }
+  if (action === "list" || !action) {
+    const entries = listWorktrees(cwd);
+    if (options.json) {
+      outputResult({ worktrees: entries }, true);
+      return;
+    }
+    if (!entries.length) {
+      console.log("No council-solve worktrees.\n");
+      return;
+    }
+    console.log("Council-solve worktrees:");
+    for (const e of entries) console.log(`  ${e.branch}  ${e.path}`);
+    console.log("");
+    return;
+  }
+  throw new Error(`Unknown worktree action: ${action} (use add|remove|list)`);
 }
 
 async function handleBenchmark(argv) {
@@ -1479,6 +1532,9 @@ async function main() {
         break;
       case "benchmark":
         await handleBenchmark(rest);
+        break;
+      case "worktree":
+        handleWorktree(rest);
         break;
       case "ledger":
         handleLedger(rest);
