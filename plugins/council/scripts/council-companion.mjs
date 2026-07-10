@@ -208,7 +208,7 @@ async function handleSetup(argv) {
     report.nextSteps.push("Try `/council:deliberate` (3-way protocol) or `/council:review --background`.");
   }
   if (!policy._source) {
-    report.nextSteps.push("No .council.yml found - run `/council:setup --init` to scaffold one (or copy `.council.example.yml`).");
+    report.nextSteps.push("No .council.yml found - run `/council:setup --init` to scaffold one.");
   }
 
   if (options.json) {
@@ -274,7 +274,7 @@ function scaffoldPolicyFile(cwd, options) {
   const defaultMode = options["default-mode"] === "review" ? "review" : "deliberate";
 
   const contents = [
-    "# Council policy - see .council.example.yml for all keys and comments.",
+    "# Council policy. Unknown keys are ignored; re-run /council:setup --init to regenerate.",
     "version: 1",
     `default_mode: ${defaultMode}   # review | deliberate`,
     "",

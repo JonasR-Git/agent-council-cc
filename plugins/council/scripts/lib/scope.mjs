@@ -12,7 +12,9 @@ export function classifyScope(finding) {
   const explicit = String(finding?.scope ?? "").toLowerCase();
   if (explicit === "localized" || explicit === "cross-cutting") return explicit;
 
-  const hasPreciseLocation = Boolean(finding?.file) && Number.isFinite(Number(finding?.line));
+  // Number(null) is 0 (finite), so guard against a null line explicitly -
+  // a finding with a file but no line is NOT a precise location.
+  const hasPreciseLocation = Boolean(finding?.file) && finding?.line != null && Number.isFinite(Number(finding.line));
   const text = `${finding?.title ?? ""} ${finding?.detail ?? ""}`;
   const soundsCrossCutting = CROSS_CUTTING_HINTS.test(text);
 

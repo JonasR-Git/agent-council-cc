@@ -21,23 +21,44 @@ export function parseRefutation(stdout) {
   return { refuted: Boolean(doc.refuted), reason: String(doc.reason ?? "").trim() };
 }
 
-function verifierFor(finding, options) {
+// Cap concurrent verifier spawns. Unlike R1/R2 (2-4 jobs), verify scales with
+// the finding count, so a large diff could otherwise fire dozens of CLI
+// subprocesses at once and exhaust process/API limits.
+const VERIFY_CONCURRENCY = 4;
+
+export function verifierFor(finding, options) {
   const skip = new Set([options.skipCodex ? "codex" : null, options.skipGrok ? "grok" : null].filter(Boolean));
   const raisedBy = new Set(finding.agents ?? []);
-  // Prefer an agent that did not raise it (independent check); fall back to any
-  // available non-claude agent (claude is the orchestrator here).
+  // ONLY an agent that did not raise the finding may verify it. If no such
+  // independent agent is available (peers skipped), do not verify at all - a
+  // finding must never be demoted by its own author.
   for (const candidate of ["grok", "codex"]) {
     if (!skip.has(candidate) && !raisedBy.has(candidate)) return candidate;
-  }
-  for (const candidate of ["grok", "codex"]) {
-    if (!skip.has(candidate)) return candidate;
   }
   return null;
 }
 
-function shouldVerify(finding, severities) {
+export function shouldVerify(finding, severities) {
   const allowed = new Set(severities ?? ["P0", "P1"]);
-  return allowed.has(finding.severity) || finding.consensus;
+  // Consensus findings are protected (partitionByRefutation never demotes them),
+  // so verifying them is wasted spawns - only check demotable single-agent
+  // findings of the target severities.
+  return allowed.has(finding.severity) && !finding.consensus;
+}
+
+/** Run fn over items with at most `limit` in flight; preserves input order. */
+async function mapWithLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const idx = next++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  }
+  const workers = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workers }, worker));
+  return results;
 }
 
 async function runVerifier(agent, cwd, backends, options, prompt) {
@@ -58,7 +79,7 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
     grokEffort: options.r2Effort ?? options.grokEffort
   };
   const targets = (merged.all ?? []).filter((f) => shouldVerify(f, severities));
-  const jobs = targets.map(async (finding) => {
+  const results = await mapWithLimit(targets, options.verifyConcurrency ?? VERIFY_CONCURRENCY, async (finding) => {
     const agent = verifierFor(finding, options);
     if (!agent) return { finding, verdict: null };
     const evidence = buildEvidence(repoRoot, [{ id: finding.ids?.[0], file: finding.file, line: finding.line }], "");
@@ -79,7 +100,6 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
     const verdict = trustworthy ? parseRefutation(res.stdout) : null;
     return { finding, agent, verdict, hadEvidence };
   });
-  const results = await Promise.all(jobs);
   const refutedKeys = new Map();
   for (const r of results) {
     if (!r.verdict) continue;

@@ -105,7 +105,10 @@ function normalizeFindingsDoc(doc, agentFallback = "unknown") {
     file: f?.file != null ? String(f.file) : null,
     line: Number.isFinite(Number(f?.line)) ? Number(f.line) : null,
     confidence: Number.isFinite(Number(f?.confidence)) ? Number(f.confidence) : 0.6,
-    agent
+    agent,
+    // Honor an explicit agent scope override ("localized"/"cross-cutting");
+    // anything else stays undefined so annotateScopes falls back to heuristics.
+    scope: f?.scope === "localized" || f?.scope === "cross-cutting" ? f.scope : undefined
   }));
 
   const VALID_VERDICTS = new Set(["approve", "approve_with_nits", "request_changes", "block"]);
@@ -276,12 +279,16 @@ function mergeBucketInto(target, source) {
   target.confidences.push(...source.confidences);
   if (target.line == null && source.line != null) target.line = source.line;
   if (!target.file && source.file) target.file = source.file;
+  if (!target.scope && source.scope) target.scope = source.scope;
   if (SEVERITY_RANK[source.severity] < SEVERITY_RANK[target.severity]) {
     target.severity = source.severity;
     target.category = source.category;
     target.title = source.title;
     target.detail = source.detail;
-    target.line = source.line;
+    // Prefer the higher-severity description, but never discard a known
+    // location: only adopt source's line/file when it actually has one.
+    if (source.line != null) target.line = source.line;
+    if (source.file) target.file = source.file;
   }
   return target;
 }
@@ -332,6 +339,7 @@ export function mergeFindings(docs) {
           severity: f.severity,
           category: f.category,
           detail: f.detail,
+          scope: f.scope,
           agents: [doc.agent],
           ids: [f.id],
           confidences: [f.confidence]
@@ -345,6 +353,7 @@ export function mergeFindings(docs) {
           severity: f.severity,
           category: f.category,
           detail: f.detail,
+          scope: f.scope,
           agents: [doc.agent],
           ids: [f.id],
           confidences: [f.confidence]

@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `result --html`: self-contained styled HTML report (sortable severity-coloured findings table with consensus/policy/contested/seen badges, verdict chips, solve ranking, collapsed full report) written to the job's artifacts dir. All fields HTML-escaped; light/dark aware.
 - `worktree add|remove|list`: isolated git worktrees for single-writer `/council:solve` implementations (branch `council-solve/<slug>`). Idempotent add, re-attaches a kept branch after remove (fixloop-safe), and refuses to remove a worktree with uncommitted changes unless `--force`.
 
+### Fixed
+
+- Verification (`--verify`) no longer fires an unbounded number of concurrent agent subprocesses: it runs through a bounded pool (`VERIFY_CONCURRENCY`, default 4) and no longer wastes spawns verifying consensus findings (which are protected and never demoted).
+- Verification never lets a finding's own author refute it: when no independent peer verifier is available (the peer is skipped), the finding is left as-is instead of being self-verified and demoted.
+- Agent `scope` overrides (`localized`/`cross-cutting`) now survive normalization and merging, so an explicit agent scope actually beats the heuristic (previously the field was dropped before `classifyScope` ran). A finding with a file but a null line is no longer misclassified as a precise/localized location.
+- Fuzzy-merging findings no longer discards a known line number when a higher-severity duplicate has none.
+
+### Housekeeping
+
+- Removed dead code (`clearR1Cache`), narrowed the lib API surface (9 internal-only helpers un-exported), untracked the runtime `.claude/scheduled_tasks.lock`, and dropped a dev-only upstream memo. Docs/runtime now point at `/council:setup --init` instead of copying the repo-only `.council.example.yml`.
+
 ## [0.5.0]
 
 ### Added
