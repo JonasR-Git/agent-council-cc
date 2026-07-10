@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { interpolate, makeFenceNonce, runCodexStructured, runGrokStructured, runStructuredWithRetry } from "./agents.mjs";
 import { mergeFindings, parseAgentFindings } from "./findings.mjs";
-import { recordAndAnnotate } from "./ledger.mjs";
+import { fingerprintFinding, recordAndAnnotate } from "./ledger.mjs";
 import { annotateScopes } from "./scope.mjs";
 import { nowIso, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
@@ -267,7 +267,16 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
   // the first pass pass skipReduce to spend their budget on fresh unit coverage.
   const reduce = options.skipReduce ? { all: [], consensus: [], unique: [], ran: false } : await globalReduce(cwd, backends, options, model, budget);
 
-  const allFindings = [...results.flatMap((r) => r.merged.all), ...reduce.all];
+  // Per-unit merges + the global reduce can each surface the same issue; dedupe by
+  // ledger fingerprint before annotating/recording so one finding isn't counted (or
+  // ledger-incremented) twice in a single run.
+  const seenFp = new Set();
+  const allFindings = [...results.flatMap((r) => r.merged.all), ...reduce.all].filter((f) => {
+    const k = fingerprintFinding(f);
+    if (seenFp.has(k)) return false;
+    seenFp.add(k);
+    return true;
+  });
   let scoped = annotateScopes({ all: allFindings, consensus: [], unique: [] });
   // Persist findings to the cross-run ledger (unless opted out) so re-runs recognize
   // "already flagged" issues (seenBefore/timesSeen) and `audit fix` can later resolve

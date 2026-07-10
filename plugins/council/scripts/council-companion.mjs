@@ -59,7 +59,8 @@ import {
   readJobFile,
   resolveStateDir,
   upsertJob,
-  workspaceRoot
+  workspaceRoot,
+  writeFileAtomic
 } from "./lib/state.mjs";
 
 const ROOT_DIR = councilPluginRoot();
@@ -700,6 +701,10 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
         merged: deliberation.merged,
         debates: deliberation.debates ?? [],
         verdicts: collectVerdicts(deliberation.r1),
+        // Keep the metrics/dashboard inputs on the slimmed job: without these,
+        // recordJobMetrics records verify:null / parseFailures:null for real runs.
+        verification: deliberation.verification ?? null,
+        parseFailures: deliberation.parseFailures ?? null,
         claudeIncluded: deliberation.claudeIncluded
       },
       report: deliberation.report,
@@ -1625,8 +1630,7 @@ function renderWatchMarkdown(cwd, job, ctx) {
     prior
   });
   try {
-    fs.mkdirSync(path.dirname(snapFile), { recursive: true });
-    fs.writeFileSync(snapFile, `${JSON.stringify(out.snapshot)}\n`, "utf8");
+    writeFileAtomic(snapFile, `${JSON.stringify(out.snapshot)}\n`);
   } catch {
     /* delta persistence is best-effort */
   }

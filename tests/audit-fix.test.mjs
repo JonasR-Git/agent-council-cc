@@ -178,6 +178,19 @@ test("runAuditFix resolves each committed fix in the ledger, but not on a red in
   assert.equal(resolved2.length, 0);
 });
 
+test("runAuditFix does NOT resolve the ledger for unverified (--allow-untested) fixes", async () => {
+  const git = fakeGit();
+  const resolved = [];
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix" })], {}, { allowUntested: true }, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    resolveLedger: (fp, s) => (resolved.push([fp, s]), true)
+  }));
+  assert.equal(out.fixed.length, 1);
+  assert.equal(out.fixed[0].verified, false);
+  assert.equal(out.ledgerResolved, 0, "an unverified fix must not suppress re-detection");
+  assert.equal(resolved.length, 0);
+});
+
 test("runAuditFix reverts + rejects an out-of-scope edit; never commits", async () => {
   const git = fakeGit();
   const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix" })], {}, {}, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs", "sneaky.mjs"]) }));

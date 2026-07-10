@@ -428,11 +428,13 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     if (gated && fixed.length) integration = await runTests();
     const integrationFailed = integration ? !integration.ok : false;
 
-    // Only resolve the ledger when the run succeeded as a whole — a red integration
-    // means the branch may be discarded, so marking the findings 'fixed' would lie.
+    // Resolve to 'fixed' only for VERIFIED fixes on a test-gated, green run: an
+    // unverified (--allow-untested) or ungated fix must not suppress re-detection,
+    // and a red final integration means the branch may be discarded.
     let ledgerResolved = 0;
-    if (!integrationFailed) {
+    if (gated && !integrationFailed) {
       for (const f of fixed) {
+        if (!f.verified) continue;
         try {
           if (resolveLedger(fingerprintFinding(f.finding), "fixed")) ledgerResolved += 1;
         } catch {

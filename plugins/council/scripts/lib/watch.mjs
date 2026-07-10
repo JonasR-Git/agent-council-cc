@@ -227,9 +227,20 @@ const R1_EMOJI = { done: "🟢", running: "🟡", pending: "⚪", skipped: "⚫"
 const SEV_SQUARE = { P0: "🟥", P1: "🟧", P2: "🟨", nit: "⬜" };
 const VERDICT_BADGE = { approve: "✅", approve_with_nits: "👍", request_changes: "🟠", block: "⛔" };
 
-// Flatten newlines + cap length: finding titles/files come from external Codex/Grok
-// output, so they must not break the markdown table/list or inject rows.
-const flat = (s, max = 120) => String(s ?? "").replace(/[\r\n]+/g, " ").replace(/\|/g, "/").slice(0, max);
+// Neutralize untrusted text before it enters the chat markdown. Finding titles/
+// files/branch come from external Codex/Grok output, so beyond flattening rows we
+// must stop markdown injection: backticks (code-span breakout), [] (phishing
+// links), pipes (table rows), and control/bidi chars. Cosmetic emphasis (*/_) is
+// left as-is.
+const flat = (s, max = 120) =>
+  String(s ?? "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[|`]/g, "'")
+    .replace(/[[\]]/g, "")
+    .slice(0, max)
+    .trim();
 
 /**
  * Decision-relevant extras from a finished deliberation (null while running / for
@@ -259,7 +270,7 @@ export function summarizeCouncilExtras(deliberation) {
   const localized = all.filter((f) => f.scope === "localized").length;
   const crossCutting = all.filter((f) => f.scope === "cross-cutting").length;
   const scope = localized || crossCutting ? { localized, crossCutting } : null;
-  const context = deliberation.context ? { branch: deliberation.context.branch, target: flat(deliberation.context.target?.label, 60) } : null;
+  const context = deliberation.context ? { branch: flat(deliberation.context.branch, 60), target: flat(deliberation.context.target?.label, 60) } : null;
   return { verdicts, topFindings, ledger, verify, scope, context };
 }
 

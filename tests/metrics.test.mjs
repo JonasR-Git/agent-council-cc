@@ -79,7 +79,7 @@ test("aggregateMetrics summarizes review quality, per-agent retries, and phase a
       kind: "deliberate",
       wallClockMs: 300000,
       agents: [{ agent: "codex", status: 0, retryAttempts: 2 }, { agent: "grok", status: 0, retryAttempts: 1 }],
-      review: { findings: 6, mustFix: 2, consensus: 3, contested: 1, parseFailures: 1 },
+      review: { findings: 6, mustFix: 2, consensus: 3, contested: 1, parseFailures: 1, verify: { verified: 3, refuted: 1 } },
       phases: { r1: 4000, r2: 2000 }
     },
     {
@@ -94,8 +94,10 @@ test("aggregateMetrics summarizes review quality, per-agent retries, and phase a
   assert.equal(agg.review.runs, 2);
   assert.equal(agg.review.avgFindings, 5);
   assert.equal(agg.review.avgMustFix, 1);
-  assert.equal(agg.review.consensus, 4);
-  assert.equal(agg.review.parseFailures, 1);
+  assert.equal(agg.review.totals.consensus, 4);
+  assert.equal(agg.review.totals.parseFailures, 1);
+  assert.equal(agg.review.totals.verified, 3, "verify counts aggregated");
+  assert.equal(agg.review.totals.refuted, 1);
   assert.equal(agg.agents.codex.retries, 1, "one retry across codex calls (attempts 2 -> +1)");
   assert.equal(agg.agents.grok.retries, 0);
   assert.equal(agg.phases.r1, 3000);
@@ -149,7 +151,11 @@ test("recordAuditMetrics records a synchronous audit run under an audit-* kind",
     assert.equal(entries[0].kind, "audit-fix");
     assert.equal(entries[0].audit.fixed, 3);
     assert.equal(entries[0].audit.ledgerResolved, 3);
-    assert.equal(aggregateMetrics(entries).kinds["audit-fix"].jobs, 1);
+    const agg = aggregateMetrics(entries);
+    assert.equal(agg.kinds["audit-fix"].jobs, 1);
+    assert.equal(agg.audit["audit-fix"].runs, 1, "audit outcomes are aggregated, not discarded");
+    assert.equal(agg.audit["audit-fix"].sums.fixed, 3);
+    assert.equal(agg.audit["audit-fix"].sums.ledgerResolved, 3);
   } finally {
     if (previous === undefined) delete process.env.AGENT_COUNCIL_STATE_DIR;
     else process.env.AGENT_COUNCIL_STATE_DIR = previous;

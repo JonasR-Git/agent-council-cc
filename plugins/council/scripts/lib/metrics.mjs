@@ -121,11 +121,17 @@ const avg = (arr) => (arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / a
 export function aggregateMetrics(entries) {
   const byKind = {};
   const byAgent = {};
-  const review = { runs: 0, findings: [], mustFix: [], consensus: 0, contested: 0, parseFailures: 0 };
+  const review = { runs: 0, findings: [], mustFix: [], consensus: 0, contested: 0, parseFailures: 0, verified: 0, refuted: 0 };
   const phaseMs = {};
+  const audit = {};
   for (const entry of entries) {
     for (const [p, ms] of Object.entries(entry.phases ?? {})) {
       if (Number.isFinite(Number(ms))) (phaseMs[p] = phaseMs[p] ?? []).push(Number(ms));
+    }
+    if (entry.audit) {
+      const a = (audit[entry.kind] = audit[entry.kind] ?? { runs: 0, sums: {} });
+      a.runs += 1;
+      for (const [k, v] of Object.entries(entry.audit)) if (Number.isFinite(Number(v))) a.sums[k] = (a.sums[k] ?? 0) + Number(v);
     }
     const kind = (byKind[entry.kind] = byKind[entry.kind] ?? { jobs: 0, wallClockMs: [] });
     kind.jobs += 1;
@@ -145,6 +151,8 @@ export function aggregateMetrics(entries) {
       review.consensus += entry.review.consensus ?? 0;
       review.contested += entry.review.contested ?? 0;
       review.parseFailures += entry.review.parseFailures ?? 0;
+      review.verified += entry.review.verify?.verified ?? 0;
+      review.refuted += entry.review.verify?.refuted ?? 0;
     }
   }
   const kinds = Object.fromEntries(Object.entries(byKind).map(([k, v]) => [k, { jobs: v.jobs, avgWallClockMs: avg(v.wallClockMs) }]));
@@ -159,8 +167,17 @@ export function aggregateMetrics(entries) {
     jobs: entries.length,
     kinds,
     agents,
-    review: review.runs ? { runs: review.runs, avgFindings: avg(review.findings), avgMustFix: avg(review.mustFix), consensus: review.consensus, contested: review.contested, parseFailures: review.parseFailures } : null,
-    phases
+    review: review.runs
+      ? {
+          runs: review.runs,
+          avgFindings: avg(review.findings),
+          avgMustFix: avg(review.mustFix),
+          // These are lifetime totals across `runs`, not per-run averages.
+          totals: { consensus: review.consensus, contested: review.contested, parseFailures: review.parseFailures, verified: review.verified, refuted: review.refuted }
+        }
+      : null,
+    phases,
+    audit: Object.keys(audit).length ? audit : null
   };
 }
 
@@ -179,11 +196,21 @@ export function renderMetrics(agg, days) {
   }
   if (agg.review) {
     const r = agg.review;
+    const t = r.totals;
+    const holdup = t.verified + t.refuted > 0 ? ` verify hold-up=${Math.round((100 * t.verified) / (t.verified + t.refuted))}%` : "";
     lines.push("Review quality:");
-    lines.push(`  runs=${r.runs}  avg findings=${r.avgFindings ?? "-"}  avg must-fix=${r.avgMustFix ?? "-"}  consensus=${r.consensus}  contested=${r.contested}  parse-failures=${r.parseFailures}`);
+    lines.push(`  runs=${r.runs}  per-run avg: findings=${r.avgFindings ?? "-"} must-fix=${r.avgMustFix ?? "-"}`);
+    lines.push(`  totals (across ${r.runs}): consensus=${t.consensus}  contested=${t.contested}  parse-failures=${t.parseFailures}${holdup}`);
   }
   if (agg.phases) {
     lines.push(`Per phase (avg): ${Object.entries(agg.phases).map(([p, ms]) => `${p}=${min(ms)}`).join("  ")}`);
+  }
+  if (agg.audit) {
+    lines.push("Audit runs:");
+    for (const [kind, v] of Object.entries(agg.audit)) {
+      const fields = Object.entries(v.sums).map(([k, s]) => `${k}=${s}`).join("  ");
+      lines.push(`  ${kind.padEnd(14)} runs=${v.runs}  ${fields}`);
+    }
   }
   return lines.join("\n");
 }

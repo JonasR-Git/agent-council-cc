@@ -100,6 +100,23 @@ test("summarizeCouncilExtras extracts verdicts, top must-fix, ledger split, veri
   assert.equal(summarizeCouncilExtras(null), null);
 });
 
+test("formatDashboardMarkdown neutralizes markdown injection in untrusted finding titles/files", () => {
+  const delib = {
+    verdicts: [],
+    merged: { all: [{ severity: "P1", title: "evil `code` [link](http://x) | row", file: "a`b|c.mjs", scope: "localized", consensus: false }] },
+    context: { branch: "m`a|in", target: { label: "t" } }
+  };
+  const { markdown } = formatDashboardMarkdown(
+    { id: "c", kind: "deliberate", status: "completed", createdAt: "2026-07-10T00:00:00Z", finishedAt: "2026-07-10T00:01:00Z" },
+    summarizeProgress(""),
+    { nowMs: Date.parse("2026-07-10T00:01:00Z"), findings: summarizeFindings(delib.merged), extras: summarizeCouncilExtras(delib) }
+  );
+  assert.match(markdown, /evil 'code' link\(http/, "backticks -> ', brackets removed in the title");
+  assert.doesNotMatch(markdown, /\[link\]/, "no link syntax survives");
+  assert.doesNotMatch(markdown, /`code`/, "no title backtick survives (would break code spans)");
+  assert.doesNotMatch(markdown, /m`a/, "branch is sanitized too");
+});
+
 test("summarizeCouncilExtras also reads the persisted verdicts[] array shape", () => {
   const persisted = { verdicts: [{ agent: "codex", verdict: "block" }, { agent: "grok", verdict: "approve" }], merged: { all: [] } };
   assert.deepEqual(summarizeCouncilExtras(persisted).verdicts, { codex: "block", grok: "approve" });
