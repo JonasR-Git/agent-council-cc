@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Grok + multi-agent council reviews for Claude Code (Codex + Grok + Claude).",
-    "version": "0.4.0"
+    "version": "0.5.0"
   },
   "plugins": [
     {
       "name": "grok",
       "description": "Use Grok Build from Claude Code for code reviews or to delegate tasks.",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "author": {
         "name": "local"
       },
@@ -20,7 +20,7 @@
     {
       "name": "council",
       "description": "Multi-agent council: dual review + deliberate protocol (Claude + Codex + Grok).",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "author": {
         "name": "local"
       },

@@ -18,15 +18,27 @@ test("evaluateBudget flags only windows at/above threshold", () => {
   assert.equal(breaches[0].percent, 92);
 });
 
-test("evaluateBudget ignores skipped agents and missing data", () => {
+test("evaluateBudget ignores skipped agents and reports unreadable data", () => {
   const partial = { claude: { usedPercent: 95, window: "weekly" }, codex: null, grok: null };
-  const skipped = evaluateBudget(partial, 80, ["claude"]);
+  const skipped = evaluateBudget(partial, 80, ["claude", "codex", "grok"]);
   assert.equal(skipped.breaches.length, 0);
   assert.equal(skipped.checked, 0);
+  assert.deepEqual(skipped.unreadable, []);
 
   const included = evaluateBudget(partial, 80, []);
   assert.equal(included.breaches.length, 1);
   assert.equal(included.checked, 1);
+  // codex + grok have no data -> unreadable -> caller fails closed.
+  assert.deepEqual(included.unreadable.sort(), ["codex", "grok"]);
+});
+
+test("evaluateBudget: a readable-but-under provider with an unreadable peer still flags unreadable", () => {
+  const mixed = { claude: null, codex: { usedPercent: 10, window: "5h" }, grok: { usedPercent: 5, window: "weekly" } };
+  const r = evaluateBudget(mixed, 80, []);
+  assert.equal(r.breaches.length, 0);
+  assert.deepEqual(r.unreadable, ["claude"]);
+  // companion blocks on (breaches || unreadable.length || !checked)
+  assert.equal(r.breaches.length || r.unreadable.length || !r.checked ? true : false, true);
 });
 
 test("threshold boundary is inclusive", () => {

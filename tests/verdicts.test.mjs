@@ -77,6 +77,13 @@ test("selectActionable never returns nits, even consensus nits", () => {
   assert.ok(titles.includes("consensus p2"), "consensus P2 is actionable");
 });
 
+test("evaluateApproval: incomplete detection is the caller's job; approval math is exact", () => {
+  // Only one non-writer voter but needed=2 -> not approved (caller also sets incomplete).
+  const r = evaluateApproval([{ agent: "grok", verdict: "approve" }], { writer: "claude", needed: 2 });
+  assert.equal(r.voters.length, 1);
+  assert.equal(r.approved, false);
+});
+
 test("collectVerdicts reads verdict from findings docs and skips absent/skipped", () => {
   const r1 = [
     { agent: "codex", findings: { verdict: "approve" } },

@@ -46,7 +46,13 @@ export function writeCachedR1(cwd, snapshotId, agent, raw, contextKey) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(
       path.join(dir, `${agent}.json`),
-      JSON.stringify({ agent, stdout: raw.stdout, model: raw.model ?? null, backend: raw.backend ?? null }),
+      JSON.stringify({
+        agent,
+        stdout: raw.stdout,
+        model: raw.model ?? null,
+        backend: raw.backend ?? null,
+        sessionId: raw.sessionId ?? null
+      }),
       "utf8"
     );
     return true;
@@ -67,6 +73,7 @@ export function readCachedR1(cwd, snapshotId, agent, contextKey) {
         stdout: parsed.stdout,
         stderr: "",
         model: parsed.model ?? "(cached)",
+        sessionId: parsed.sessionId ?? null,
         timedOut: false,
         truncated: false,
         durationMs: 0,

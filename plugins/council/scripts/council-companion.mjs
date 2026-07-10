@@ -717,15 +717,26 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
   if ((deliberate || solve) && guardPolicy.budgetGuard > 0 && !guardPolicy.forceBudget) {
     const pressure = await gatherWindowPressure();
     const skipAgents = [request.skipCodex ? "codex" : null, request.skipGrok ? "grok" : null].filter(Boolean);
-    const { breaches, checked } = evaluateBudget(pressure, guardPolicy.budgetGuard, skipAgents);
-    if (breaches.length || !checked) {
+    const { breaches, checked, unreadable } = evaluateBudget(pressure, guardPolicy.budgetGuard, skipAgents);
+    // Fail closed if ANY participating provider's limits are unreadable - a guard
+    // that only checks the readable providers would silently under-protect.
+    if (breaches.length || unreadable.length || !checked) {
       const reason = breaches.length
         ? `the following provider windows are at or above the threshold:\n${renderBudgetBreaches(breaches)}`
-        : "no provider window data could be read (limits unavailable) - failing closed.";
+        : unreadable.length
+          ? `limits could not be read for: ${unreadable.join(", ")} - failing closed.`
+          : "no provider window data could be read (limits unavailable) - failing closed.";
       const msg = `Budget guard (${guardPolicy.budgetGuard}%): ${reason}\nRe-run with --force-budget to override.`;
       if (options.json) {
         outputResult(
-          { budgetBlocked: true, threshold: guardPolicy.budgetGuard, breaches, checked, reason: breaches.length ? "over-threshold" : "no-data" },
+          {
+            budgetBlocked: true,
+            threshold: guardPolicy.budgetGuard,
+            breaches,
+            checked,
+            unreadable,
+            reason: breaches.length ? "over-threshold" : "unreadable-limits"
+          },
           true
         );
       } else {
@@ -1214,6 +1225,14 @@ function handleFixloopStatus(argv) {
   // Not approved but nothing to fix (all findings are P2/nit, or a partial run
   // yielded none) - the loop must escalate to a human, not spin.
   const stuck = !approved && actionable.length === 0;
+  // An incomplete council (an agent timed out / parse-failed, or too few voters)
+  // must never drive another fix round - its verdict cannot be trusted even if it
+  // surfaced findings. Escalate regardless of actionable count.
+  const recommendation = approved
+    ? "stop-approved"
+    : incomplete || stuck
+      ? "stop-escalate-to-human"
+      : "fix-and-rereview";
   const payload = {
     jobId: job.id,
     status: job.status,
@@ -1222,7 +1241,7 @@ function handleFixloopStatus(argv) {
     approved,
     incomplete,
     stuck,
-    recommendation: approved ? "stop-approved" : stuck ? "stop-escalate-to-human" : "fix-and-rereview",
+    recommendation,
     actionableCount: actionable.length,
     actionable
   };
@@ -1234,7 +1253,9 @@ function handleFixloopStatus(argv) {
     payload.recommendation === "stop-approved"
       ? "APPROVED - stop the loop"
       : payload.recommendation === "stop-escalate-to-human"
-        ? "STUCK (not approved, nothing actionable) - escalate to a human"
+        ? incomplete
+          ? "INCOMPLETE council (untrusted verdict) - escalate to a human"
+          : "STUCK (not approved, nothing actionable) - escalate to a human"
         : "NOT approved - fix actionable findings and re-review";
   const lines = [
     `Fixloop status for ${job.id}${incomplete ? " (INCOMPLETE council)" : ""}:`,

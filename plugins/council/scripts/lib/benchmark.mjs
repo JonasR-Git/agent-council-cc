@@ -186,17 +186,32 @@ export async function runBenchmark(cwd, backends, options = {}) {
     taskHash,
     date: options.nowIso ?? new Date().toISOString(),
     category: options.category ?? null,
+    judgeOnly: Boolean(options.judgeOnly),
     ranking: ranking.map((r) => ({ agent: r.agent, avgScore: r.avgScore, votes: r.votes }))
   };
   try {
     const file = benchmarkFile(cwd);
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.appendFileSync(file, `${JSON.stringify(record)}\n`, "utf8");
-    // Cap growth, consistent with metrics.jsonl / the ledger.
-    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
-    if (lines.length > MAX_BENCHMARK_RECORDS) {
-      fs.writeFileSync(file, `${lines.slice(-MAX_BENCHMARK_RECORDS).join("\n")}\n`, "utf8");
+    let lines = [];
+    try {
+      lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    } catch {
+      /* new file */
     }
+    // judge-only SUPERSEDES the answer-phase record for the same task (it is the
+    // same logical run, now with fair/complete judging) - never double-count.
+    if (options.judgeOnly) {
+      lines = lines.filter((l) => {
+        try {
+          return JSON.parse(l).taskHash !== taskHash;
+        } catch {
+          return true;
+        }
+      });
+    }
+    lines.push(JSON.stringify(record));
+    if (lines.length > MAX_BENCHMARK_RECORDS) lines = lines.slice(-MAX_BENCHMARK_RECORDS);
+    fs.writeFileSync(file, `${lines.join("\n")}\n`, "utf8");
   } catch {
     /* best effort */
   }

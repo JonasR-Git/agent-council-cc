@@ -38,10 +38,14 @@ export async function gatherWindowPressure(homeDir = os.homedir()) {
 export function evaluateBudget(pressure, thresholdPercent, skipAgents = []) {
   const skip = new Set(skipAgents);
   const breaches = [];
+  const unreadable = [];
   let checked = 0;
   for (const [agent, window] of Object.entries(pressure)) {
     if (skip.has(agent)) continue;
-    if (!window || !Number.isFinite(Number(window.usedPercent))) continue;
+    if (!window || !Number.isFinite(Number(window.usedPercent))) {
+      unreadable.push(agent);
+      continue;
+    }
     checked += 1;
     if (Number(window.usedPercent) >= thresholdPercent) {
       breaches.push({
@@ -52,7 +56,7 @@ export function evaluateBudget(pressure, thresholdPercent, skipAgents = []) {
       });
     }
   }
-  return { breaches, checked };
+  return { breaches, checked, unreadable };
 }
 
 export function renderBudgetBreaches(breaches) {
