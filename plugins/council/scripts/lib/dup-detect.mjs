@@ -31,16 +31,17 @@ export function findDuplicateClusters(files, { minLines = 6 } = {}) {
   const K = Math.max(2, minLines);
   const perFile = files.map((f) => ({ id: f.id, norm: normalizeLines(f.text) }));
 
-  // 1. count every K-line window's content across all files
+  // 1. count every K-line window's content across all files, caching each
+  //    window's hash so the block-merge pass doesn't re-hash.
   const winCount = new Map();
-  const windows = [];
+  const winHash = perFile.map(() => []);
   for (let fi = 0; fi < perFile.length; fi += 1) {
     const norm = perFile[fi].norm;
     for (let i = 0; i + K <= norm.length; i += 1) {
       const content = norm.slice(i, i + K).map((l) => l.s).join("\n");
       const h = hashLite(content);
+      winHash[fi][i] = h;
       winCount.set(h, (winCount.get(h) ?? 0) + 1);
-      windows.push({ fi, i, h });
     }
   }
 
@@ -48,12 +49,9 @@ export function findDuplicateClusters(files, { minLines = 6 } = {}) {
   const blocks = [];
   for (let fi = 0; fi < perFile.length; fi += 1) {
     const norm = perFile[fi].norm;
+    const dup = (start) => (winCount.get(winHash[fi][start]) ?? 0) >= 2;
     let i = 0;
     while (i + K <= norm.length) {
-      const dup = (start) => {
-        const content = norm.slice(start, start + K).map((l) => l.s).join("\n");
-        return (winCount.get(hashLite(content)) ?? 0) >= 2;
-      };
       if (!dup(i)) {
         i += 1;
         continue;
