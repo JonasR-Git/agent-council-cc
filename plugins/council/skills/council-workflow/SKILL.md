@@ -54,7 +54,7 @@ Phase 5: /council:deliberate on the diff; writer's verdict does not count
 
 ## Policy
 
-Repo file `.council.yml` (see marketplace `.council.example.yml`): models, focus, consensus categories, skip paths, `agent_timeout_minutes`, `peer_critique_severities`, `r2_effort`, `debate_rounds`, `solve_writer`.
+Repo file `.council.yml` (scaffold with `/council:setup --init`): models, focus, consensus categories, skip paths, `agent_timeout_minutes`, `peer_critique_severities`, `r2_effort`, `debate_rounds`, `solve_writer`, `reviewers`, `claude_backend`.
 
 ## Models
 
