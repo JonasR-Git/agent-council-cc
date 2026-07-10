@@ -26,6 +26,7 @@ import { runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
+import { collectVerdicts, evaluateApproval } from "./lib/verdicts.mjs";
 import {
   appendLogLine,
   archiveJobResults,
@@ -54,6 +55,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
       "  node scripts/council-companion.mjs history [--kind <k>] [--since <days>] [--global] [--json]",
+      "  node scripts/council-companion.mjs fixloop-status [job-id] [--writer <agent>] [--needed <n>] [--json]",
       "  node scripts/council-companion.mjs ledger [--status open|fixed|ignored] [--resolve <fp> fixed|ignored]",
       "  node scripts/council-companion.mjs result [job-id] [--summary] [--json]",
       "",
@@ -555,6 +557,7 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
         context: deliberation.context,
         merged: deliberation.merged,
         debates: deliberation.debates ?? [],
+        verdicts: collectVerdicts(deliberation.r1),
         claudeIncluded: deliberation.claudeIncluded
       },
       report: deliberation.report,
@@ -1128,6 +1131,61 @@ function handleLedger(argv) {
   console.log(`${lines.join("\n")}\n`);
 }
 
+function handleFixloopStatus(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["writer", "needed"],
+    booleanOptions: ["json"]
+  });
+  const job = resolveJob(process.cwd(), positionals[0]);
+  if (!job) throw new Error("No council jobs found.");
+  if (job.kind !== "deliberate") throw new Error(`fixloop-status needs a deliberate job (got ${job.kind}).`);
+  const verdicts = job.deliberation?.verdicts ?? [];
+  const approval = evaluateApproval(verdicts, {
+    writer: options.writer ?? null,
+    needed: options.needed != null ? Number(options.needed) : 2
+  });
+  const merged = job.deliberation?.merged ?? { all: [] };
+  // Actionable = consensus OR needs-consensus-policy OR P0/P1, not conceded/ignored.
+  const actionable = (merged.all ?? [])
+    .filter((f) => {
+      const sev = String(f.severity);
+      const debateConceded = f.debate?.stance === "concede";
+      return !debateConceded && (f.consensus || f.needsConsensus || sev === "P0" || sev === "P1");
+    })
+    .map((f) => ({
+      severity: f.severity,
+      category: f.category,
+      title: f.title,
+      file: f.file ?? null,
+      line: f.line ?? null,
+      consensus: Boolean(f.consensus),
+      agents: f.agents ?? []
+    }));
+  const payload = {
+    jobId: job.id,
+    status: job.status,
+    verdicts,
+    ...approval,
+    actionableCount: actionable.length,
+    actionable
+  };
+  if (options.json) {
+    outputResult(payload, true);
+    return;
+  }
+  const lines = [
+    `Fixloop status for ${job.id}:`,
+    `  verdicts: ${verdicts.map((v) => `${v.agent}=${v.verdict}`).join(", ") || "(none)"}`,
+    `  approvals: ${approval.approvals.join("+") || "none"} of ${approval.needed} needed${approval.excludedWriter ? ` (writer ${approval.excludedWriter} excluded)` : ""}`,
+    `  decision: ${approval.approved ? "APPROVED - stop the loop" : "NOT approved - fix actionable findings and re-review"}`,
+    `  actionable findings: ${actionable.length}`
+  ];
+  for (const f of actionable.slice(0, 20)) {
+    lines.push(`    - ${f.severity} [${f.agents.join("+")}] ${f.title}${f.file ? ` (${f.file}${f.line != null ? `:${f.line}` : ""})` : ""}`);
+  }
+  console.log(`${lines.join("\n")}\n`);
+}
+
 function handleMetrics(argv) {
   const { options } = parseCommandInput(argv, { valueOptions: ["days"], booleanOptions: ["json"] });
   const cwd = process.cwd();
@@ -1325,6 +1383,9 @@ async function main() {
         break;
       case "history":
         handleHistory(rest);
+        break;
+      case "fixloop-status":
+        handleFixloopStatus(rest);
         break;
       case "ledger":
         handleLedger(rest);
