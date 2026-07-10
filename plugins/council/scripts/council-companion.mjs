@@ -12,6 +12,7 @@ import { READONLY_DISALLOWED_TOOLS, runDeliberation } from "./lib/deliberate.mjs
 import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover.mjs";
 import { loadPolicy, mergeOptionsWithPolicy } from "./lib/policy.mjs";
 import { runSolve } from "./lib/solve.mjs";
+import { aggregateBenchmarks, readBenchmarks, runBenchmark } from "./lib/benchmark.mjs";
 import { evaluateBudget, gatherWindowPressure, renderBudgetBreaches } from "./lib/budget.mjs";
 import { aggregateMetrics, readMetrics, recordJobMetrics, renderMetrics } from "./lib/metrics.mjs";
 import {
@@ -56,6 +57,8 @@ function printUsage() {
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
       "  node scripts/council-companion.mjs history [--kind <k>] [--since <days>] [--global] [--json]",
       "  node scripts/council-companion.mjs fixloop-status [job-id] [--writer <agent>] [--needed <n>] [--json]",
+      "  node scripts/council-companion.mjs benchmark [--task-file <path>] [--claude-answer <path>] [--category <c>] [task text]",
+      "  node scripts/council-companion.mjs benchmark --stats [--json]",
       "  node scripts/council-companion.mjs ledger [--status open|fixed|ignored] [--resolve <fp> fixed|ignored]",
       "  node scripts/council-companion.mjs result [job-id] [--summary] [--json]",
       "",
@@ -1131,6 +1134,50 @@ function handleLedger(argv) {
   console.log(`${lines.join("\n")}\n`);
 }
 
+async function handleBenchmark(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["task-file", "claude-answer", "category", "codex-model", "grok-model", "grok-effort", "cwd"],
+    booleanOptions: ["json", "stats", "skip-codex", "skip-grok"]
+  });
+  const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
+
+  if (options.stats) {
+    const agg = aggregateBenchmarks(readBenchmarks(cwd));
+    if (options.json) {
+      outputResult(agg, true);
+      return;
+    }
+    const lines = [`Benchmark stats (${agg.runs} runs):`];
+    for (const [agent, v] of Object.entries(agg.agents)) {
+      lines.push(`  ${agent.padEnd(10)} runs=${v.runs}  wins=${v.wins}  avg=${v.avgScore == null ? "-" : `${v.avgScore}/10`}`);
+    }
+    console.log(`${lines.join("\n")}\n`);
+    return;
+  }
+
+  const backends = probeBackends(cwd, ROOT_DIR);
+  const policy = loadPolicy(cwd);
+  const mergedOpts = mergeOptionsWithPolicy(
+    {
+      focusText: positionals.join(" ").trim(),
+      codexModel: options["codex-model"],
+      grokModel: options["grok-model"],
+      grokEffort: options["grok-effort"],
+      skipCodex: Boolean(options["skip-codex"]),
+      skipGrok: Boolean(options["skip-grok"])
+    },
+    policy
+  );
+  const result = await runBenchmark(cwd, backends, {
+    ...mergedOpts,
+    taskFile: options["task-file"] ? path.resolve(cwd, options["task-file"]) : null,
+    claudeAnswer: options["claude-answer"] ? path.resolve(cwd, options["claude-answer"]) : null,
+    category: options.category ?? null,
+    nowIso: nowIso()
+  });
+  outputResult(options.json ? { taskHash: result.taskHash, ranking: result.ranking } : result.report, options.json);
+}
+
 function handleFixloopStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["writer", "needed"],
@@ -1387,6 +1434,9 @@ async function main() {
         break;
       case "fixloop-status":
         handleFixloopStatus(rest);
+        break;
+      case "benchmark":
+        await handleBenchmark(rest);
         break;
       case "ledger":
         handleLedger(rest);
