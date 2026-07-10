@@ -9,8 +9,35 @@ import {
   readJobFile,
   resolveJobsDir,
   upsertJob,
+  withFileLock,
   writeFileAtomic
 } from "../plugins/council/scripts/lib/state.mjs";
+
+test("withFileLock runs fn, returns its value, and releases the lock", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-lock-"));
+  const lock = path.join(dir, "x.lock");
+  const result = withFileLock(lock, () => {
+    assert.equal(fs.existsSync(lock), true, "lock is held inside fn");
+    return 42;
+  });
+  assert.equal(result, 42);
+  assert.equal(fs.existsSync(lock), false, "lock released after fn");
+  // reacquire works
+  assert.equal(withFileLock(lock, () => "again"), "again");
+});
+
+test("withFileLock steals a stale lock and always releases even if fn throws", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-lock-"));
+  const lock = path.join(dir, "y.lock");
+  fs.mkdirSync(lock); // pre-existing (stale) lock
+  const ran = withFileLock(lock, () => "stolen", { staleMs: 0 });
+  assert.equal(ran, "stolen", "a stale lock is stolen so fn still runs");
+
+  assert.throws(() => withFileLock(lock, () => {
+    throw new Error("boom");
+  }));
+  assert.equal(fs.existsSync(lock), false, "lock released even when fn throws");
+});
 
 function makeJob(id, patch = {}) {
   return {

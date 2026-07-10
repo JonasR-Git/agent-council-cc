@@ -45,7 +45,7 @@ async function withState(fn) {
   }
 }
 
-test("R1 resume cache round-trips the grok sessionId (debate_resume after --resume)", async () => {
+test("R1 resume cache does NOT carry a grok sessionId across processes", async () => {
   await withState((cwd) => {
     const snap = "snap+1234";
     writeCachedR1(cwd, snap, "grok", {
@@ -55,7 +55,10 @@ test("R1 resume cache round-trips the grok sessionId (debate_resume after --resu
       sessionId: "sess-abc-123"
     });
     const cached = readCachedR1(cwd, snap, "grok");
-    assert.equal(cached.sessionId, "sess-abc-123");
+    // A grok session id is only valid in the process that opened it; a resumed
+    // run must not seed the debate with a prior process's (expired) session.
+    assert.equal(cached.sessionId, null);
+    assert.equal(cached.stdout, '{"findings":[]}', "the cached R1 output still round-trips");
   });
 });
 

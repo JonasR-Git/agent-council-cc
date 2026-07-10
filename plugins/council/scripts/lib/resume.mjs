@@ -46,12 +46,14 @@ export function writeCachedR1(cwd, snapshotId, agent, raw, contextKey) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(
       path.join(dir, `${agent}.json`),
+      // Note: sessionId is intentionally NOT cached - a grok session id is only
+      // valid within the process that opened it, so a resumed run must never
+      // reuse a prior process's (expired) session for debate.
       JSON.stringify({
         agent,
         stdout: raw.stdout,
         model: raw.model ?? null,
-        backend: raw.backend ?? null,
-        sessionId: raw.sessionId ?? null
+        backend: raw.backend ?? null
       }),
       "utf8"
     );
@@ -73,7 +75,9 @@ export function readCachedR1(cwd, snapshotId, agent, contextKey) {
         stdout: parsed.stdout,
         stderr: "",
         model: parsed.model ?? "(cached)",
-        sessionId: parsed.sessionId ?? null,
+        // A cross-process grok session is never valid; force null so the debate
+        // seeder falls back to fresh slim calls instead of a stale resume.
+        sessionId: null,
         timedOut: false,
         truncated: false,
         durationMs: 0,
