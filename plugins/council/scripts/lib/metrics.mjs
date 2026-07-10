@@ -7,7 +7,7 @@ import { resolveStateDir } from "./state.mjs";
  * Persisted per-job metrics history: one JSONL line per finished job, appended
  * under the workspace state dir. Aggregated by the `metrics` subcommand.
  */
-export function metricsFile(cwd) {
+function metricsFile(cwd) {
   return path.join(resolveStateDir(cwd), "metrics.jsonl");
 }
 

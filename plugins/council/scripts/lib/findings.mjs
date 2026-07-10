@@ -77,7 +77,7 @@ function normalizeSeverity(value) {
   return "P2";
 }
 
-export function normalizeFindingsDoc(doc, agentFallback = "unknown") {
+function normalizeFindingsDoc(doc, agentFallback = "unknown") {
   const validShape = isObject(doc) && (Array.isArray(doc.findings) || Array.isArray(doc.votes));
   if (!validShape) {
     return {

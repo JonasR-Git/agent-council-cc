@@ -29,7 +29,7 @@ function newestMatching(dir, predicate) {
  * Find codex-companion.mjs from the installed OpenAI Codex Claude plugin cache,
  * marketplace checkout, or CODEX_COMPANION_PATH.
  */
-export function findCodexCompanion() {
+function findCodexCompanion() {
   if (process.env.CODEX_COMPANION_PATH && exists(process.env.CODEX_COMPANION_PATH)) {
     return process.env.CODEX_COMPANION_PATH;
   }
@@ -67,7 +67,7 @@ export function findCodexCompanion() {
  * Find grok-companion.mjs from sibling plugin in this marketplace source tree,
  * installed cache, or GROK_COMPANION_PATH.
  */
-export function findGrokCompanion(fromCouncilRoot) {
+function findGrokCompanion(fromCouncilRoot) {
   if (process.env.GROK_COMPANION_PATH && exists(process.env.GROK_COMPANION_PATH)) {
     return process.env.GROK_COMPANION_PATH;
   }

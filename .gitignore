@@ -7,3 +7,7 @@ node_modules/
 .council-*.json
 .agents/
 .codex/
+
+# runtime state (not source)
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json

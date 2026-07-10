@@ -86,14 +86,6 @@ export function readCachedR1(cwd, snapshotId, agent, contextKey) {
   return null;
 }
 
-export function clearR1Cache(cwd, snapshotId) {
-  try {
-    fs.rmSync(r1CacheDir(cwd, snapshotId), { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
-}
-
 const CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const CACHE_MAX_SNAPSHOTS = 50;
 
