@@ -499,16 +499,29 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
     });
     const r1Failed = deliberation.r1.some((r) => !r.skipped && r.status !== 0);
     const allSkipped = deliberation.r1.every((r) => r.skipped && r.agent !== "claude");
+    // Agents can exit 0 with unparsable JSON - that must not look like success.
+    const r1ParseFailures = deliberation.r1.filter(
+      (r) => !r.skipped && r.findings && r.findings.parseOk === false
+    ).length;
     const finished = {
       ...job,
-      status: allSkipped ? "failed" : r1Failed ? "completed_with_errors" : "completed",
+      status: allSkipped
+        ? "failed"
+        : r1Failed || r1ParseFailures
+          ? "completed_with_errors"
+          : "completed",
       phase: "done",
       exitCode: allSkipped ? 1 : 0,
       stateVersion: 2,
-      results: archiveJobResults(root, job.id, [...deliberation.r1, ...deliberation.r2]),
+      results: archiveJobResults(root, job.id, [
+        ...deliberation.r1,
+        ...deliberation.r2,
+        ...(deliberation.debates ?? [])
+      ]),
       deliberation: {
         context: deliberation.context,
         merged: deliberation.merged,
+        debates: deliberation.debates ?? [],
         claudeIncluded: deliberation.claudeIncluded
       },
       report: deliberation.report,
@@ -533,19 +546,24 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
   const anyFailed = results.some((r) => !r.skipped && r.status !== 0);
   const allSkipped = results.every((r) => r.skipped);
   const report = renderCouncilReport(job, results);
+  const reviewSection = results
+    .map((r) =>
+      r.skipped
+        ? `## ${r.agent}\n_Skipped:_ ${r.reason}`
+        : `## ${r.agent} (${r.backend ?? "?"} - exit ${formatExit(r)})\n${String(r.stdout ?? "")
+            .split(/\r?\n/)
+            .slice(0, 40)
+            .join("\n")}`
+    )
+    .join("\n\n");
+  const REVIEW_SECTION_MAX_CHARS = 12_000;
   const sections = {
     header: `Kind: ${kind} - ${summary}`,
     merged: null,
-    review: results
-      .map((r) =>
-        r.skipped
-          ? `## ${r.agent}\n_Skipped:_ ${r.reason}`
-          : `## ${r.agent} (${r.backend ?? "?"} - exit ${formatExit(r)})\n${String(r.stdout ?? "")
-              .split(/\r?\n/)
-              .slice(0, 40)
-              .join("\n")}`
-      )
-      .join("\n\n")
+    review:
+      reviewSection.length > REVIEW_SECTION_MAX_CHARS
+        ? `${reviewSection.slice(0, REVIEW_SECTION_MAX_CHARS)}\n[... summary truncated - use result without --summary for the full report ...]`
+        : reviewSection
   };
 
   const finished = {

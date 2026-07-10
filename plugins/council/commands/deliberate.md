@@ -1,6 +1,6 @@
 ---
 description: 3-agent deliberation - independent reviews then peer critique (Claude + Codex + Grok)
-argument-hint: "[--wait|--background] [--base <ref>] [--codex-model <id>] [--grok-model <id>] [--claude-findings <path>|--claude-findings-wait <path> --wait-timeout <seconds>] [--peer-severities P0,P1] [--debate-rounds 0|1|2] [focus text]"
+argument-hint: "[--wait|--background] [--base <ref>] [--codex-model <id>] [--grok-model <id>] [--claude-findings <path>|--claude-findings-wait <path> --wait-timeout <seconds>] [--peer-severities P0,P1] [--debate-rounds 0|1|2] [--debate-resume] [focus text]"
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), Write, AskUserQuestion
 ---
@@ -75,4 +75,5 @@ After the report (or `/council:result`):
 - Models: `--codex-model` / `--grok-model` or `.council.yml` / CLI config files.
 - Cost controls: R2 critiques only cover `peer_critique_severities` (default P0,P1) and run at
   `r2_effort` (Grok). `--debate-rounds 1|2` adds a bounded rebuttal/counter exchange on
-  contested items only — no free-running chat.
+  contested items only — no free-running chat. With `--debate-resume` (or policy
+  `debate_resume: true`) Grok authors defend inside their own R1 session.

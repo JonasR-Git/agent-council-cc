@@ -354,6 +354,7 @@ export async function runSolve(cwd, backends, options = {}) {
   const sections = {
     header: `Problem: ${problem.trim().split(/\r?\n/)[0]}`,
     ranking: renderRankingSection(ranking),
+    debate: debates.length ? renderSolveDebates(debates) : null,
     synthesis: SYNTHESIS_INSTRUCTIONS
   };
 
@@ -378,6 +379,21 @@ const SYNTHESIS_INSTRUCTIONS = [
   "3. Present the final plan to the user for approval BEFORE implementing.",
   "4. Implementation: exactly ONE writer (policy solve_writer) on a dedicated branch; then /council:deliberate on the diff. The writer's own verdict does not count towards approval."
 ].join("\n");
+
+export function renderSolveDebates(debates) {
+  const lines = ["## Debate (bounded, blockers only)"];
+  for (const d of debates.filter((d) => d.round === 1)) {
+    lines.push(
+      `- **${d.id}** ${d.agent}${d.resumedSession ? " (resumed own R1 session)" : ""} -> **${d.stance}**: ${d.note || "(no note)"}`
+    );
+  }
+  for (const d of debates.filter((d) => d.round === 2)) {
+    lines.push(
+      `  - counter by ${d.agent}: ${d.upheld ? "upholds blocker" : "withdraws blocker"} - ${d.note || "(no note)"}`
+    );
+  }
+  return lines.join("\n");
+}
 
 function renderRankingSection(ranking) {
   const lines = ["## Ranking (avg peer overall)"];
@@ -494,13 +510,7 @@ function renderSolveReport({ problem, options, r1Results, r2Results, plans, crit
   }
 
   if (debates?.length) {
-    lines.push("## Debate (bounded, blockers only)");
-    for (const d of debates.filter((d) => d.round === 1)) {
-      lines.push(`- **${d.id}** ${d.agent} -> **${d.stance}**: ${d.note || "(no note)"}`);
-    }
-    for (const d of debates.filter((d) => d.round === 2)) {
-      lines.push(`  - counter by ${d.agent}: ${d.upheld ? "upholds blocker" : "withdraws blocker"} - ${d.note || "(no note)"}`);
-    }
+    lines.push(renderSolveDebates(debates));
     lines.push("");
   }
 

@@ -33,3 +33,6 @@ require_consensus_for:
 max_turns_r1: 40
 max_turns_r2: 25
 deliberate_peer: true
+
+# xhigh reviews of large diffs regularly exceed 30min (observed: codex timeout in acceptance run)
+agent_timeout_minutes: 45

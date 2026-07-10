@@ -103,10 +103,12 @@ export function normalizeFindingsDoc(doc, agentFallback = "unknown") {
     agent
   }));
 
+  const VALID_VERDICTS = new Set(["approve", "approve_with_nits", "request_changes", "block"]);
+  const verdict = String(doc.verdict ?? "").toLowerCase().trim();
   return {
     agent,
     summary: String(doc.summary ?? "").trim(),
-    verdict: String(doc.verdict ?? "request_changes"),
+    verdict: VALID_VERDICTS.has(verdict) ? verdict : "request_changes",
     findings: normalized,
     parseOk: true
   };
@@ -158,6 +160,9 @@ export function parseCritiqueVotes(stdout, agent, aboutAgent) {
 
   const shell = { ...doc };
   if (Array.isArray(shell.votes)) shell.votes = [];
+  // missed is optional bonus content and re-validated downstream as its own
+  // findings doc - a bad missed item must never reject the votes.
+  if (Array.isArray(shell.missed)) shell.missed = [];
   const documentCheck = validate(SCHEMAS.critiqueVotes, shell);
   if (!documentCheck.valid) {
     return {

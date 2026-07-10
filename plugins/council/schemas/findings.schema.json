@@ -15,7 +15,7 @@
     },
     "verdict": {
       "type": "string",
-      "enum": ["approve", "approve_with_nits", "request_changes", "block"]
+      "description": "approve|approve_with_nits|request_changes|block - unknown values normalize to request_changes"
     },
     "findings": {
       "type": "array",
@@ -27,25 +27,13 @@
           "severity": { "type": "string", "description": "P0|P1|P2|nit - unknown values normalize to P2" },
           "category": {
             "type": "string",
-            "enum": [
-              "bug",
-              "security",
-              "concurrency",
-              "data-loss",
-              "auth",
-              "compliance",
-              "performance",
-              "design",
-              "test",
-              "dx",
-              "other"
-            ]
+            "description": "bug|security|concurrency|data-loss|auth|compliance|performance|design|test|dx|other - free-form tolerated"
           },
           "title": { "type": "string" },
           "detail": { "type": "string" },
           "file": { "type": ["string", "null"] },
-          "line": { "type": ["integer", "null"] },
-          "confidence": { "type": "number", "description": "0..1, defaulted by the harness" }
+          "line": { "description": "integer preferred; numeric strings are coerced by the harness" },
+          "confidence": { "description": "0..1 number preferred; coerced/defaulted by the harness" }
         }
       }
     }

@@ -1,6 +1,6 @@
 ---
 description: 3-agent problem solving - independent plans, cross-critique with scores, synthesis, single-writer implementation, council review
-argument-hint: "[--wait|--background] [--codex-model <id>] [--grok-model <id>] [--debate-rounds 0|1|2] [problem text]"
+argument-hint: "[--wait|--background] [--codex-model <id>] [--grok-model <id>] [--debate-rounds 0|1|2] [--debate-resume] [problem text]"
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), Write, Edit, AskUserQuestion
 ---
