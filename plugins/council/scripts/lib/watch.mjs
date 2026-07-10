@@ -259,7 +259,8 @@ export function summarizeCouncilExtras(deliberation) {
   const localized = all.filter((f) => f.scope === "localized").length;
   const crossCutting = all.filter((f) => f.scope === "cross-cutting").length;
   const scope = localized || crossCutting ? { localized, crossCutting } : null;
-  return { verdicts, topFindings, ledger, verify, scope };
+  const context = deliberation.context ? { branch: deliberation.context.branch, target: flat(deliberation.context.target?.label, 60) } : null;
+  return { verdicts, topFindings, ledger, verify, scope, context };
 }
 
 export function formatDashboardMarkdown(job, progress, { nowMs, etaMs = null, skipped = [], claudeBackend = "session", jobPhase = null, findings = null, extras = null, prior = null } = {}) {
@@ -284,14 +285,15 @@ export function formatDashboardMarkdown(job, progress, { nowMs, etaMs = null, sk
 
   const L = [];
   L.push(`### ${STATUS_EMOJI[job.status] ?? "⚪"} Council ${String(job.kind ?? "review")} · \`${job.id}\``);
+  if (extras?.context?.target) L.push(`_reviewing ${extras.context.target}${extras.context.branch ? ` · \`${extras.context.branch}\`` : ""}_`);
   L.push(`**${job.status}** · ${timeMeta} · phase \`${phase}\``);
   L.push("");
-  let bars = `R1 \`${progressBar(r1Count, r1Total, 12)}\` ${r1Count}/${r1Total}`;
-  if (hasR2) bars += ` · R2 \`${progressBar(progress.r2Done, r2Total, 12)}\` ${progress.r2Done}/${r2Total || "?"}`;
+  let bars = `**Round 1** (independent) \`${progressBar(r1Count, r1Total, 12)}\` ${r1Count}/${r1Total}`;
+  if (hasR2) bars += ` · **Round 2** (peer critique) \`${progressBar(progress.r2Done, r2Total, 12)}\` ${progress.r2Done}/${r2Total || "?"}`;
   L.push(bars);
   L.push("");
-  L.push("| Agent | R1 | verdict | raised | shared | disputed |");
-  L.push("|---|---|---|--:|--:|--:|");
+  L.push("| Reviewer | Verdict | Raised | Consensus | Contested |");
+  L.push("|---|---|--:|--:|--:|");
   for (const agent of AGENTS) {
     const fa = findings?.byAgent?.[agent];
     const liveRaised = progress.raisedByAgent?.[agent];
@@ -300,15 +302,17 @@ export function formatDashboardMarkdown(job, progress, { nowMs, etaMs = null, sk
     const disputed = fa ? fa.disputed : "–";
     const v = extras?.verdicts?.[agent];
     const verdict = v ? `${VERDICT_BADGE[v] ?? ""} ${v.replace(/_/g, " ")}`.trim() : "–";
-    L.push(`| ${agent} | ${R1_EMOJI[states[agent]] ?? "⚪"} ${states[agent]} | ${verdict} | ${raised} | ${shared} | ${disputed} |`);
+    L.push(`| ${R1_EMOJI[states[agent]] ?? "⚪"} ${agent} | ${verdict} | ${raised} | ${shared} | ${disputed} |`);
   }
   L.push("");
+  L.push("_Raised = findings this reviewer flagged · Consensus = also flagged by a peer · Contested = a peer disagreed_");
+  L.push("");
   if (findings) {
-    L.push(`**${findings.total} findings** · 🤝 ${findings.consensus} consensus · ${findings.unique} unique · ⚔️ ${findings.contested} disputed`);
-    const sev = ["P0", "P1", "P2", "nit"].filter((k) => findings.bySeverity[k]).map((k) => `${SEV_SQUARE[k]} ${k} ${findings.bySeverity[k]}`).join(" · ");
-    if (sev) L.push(sev);
     const mustFix = findings.bySeverity.P0 + findings.bySeverity.P1;
-    if (mustFix) L.push(`must-fix: **${mustFix}** (P0/P1)`);
+    L.push(`**Findings — ${findings.total} total**`);
+    const sev = ["P0", "P1", "P2", "nit"].filter((k) => findings.bySeverity[k]).map((k) => `${SEV_SQUARE[k]} ${k} ${findings.bySeverity[k]}`).join(" · ");
+    if (sev) L.push(`by severity: ${sev} → **${mustFix} must-fix** (P0+P1)`);
+    L.push(`agreement: 🤝 ${findings.consensus} consensus (≥2 reviewers) · 🔍 ${findings.unique} unique (one reviewer — verify first) · ⚔️ ${findings.contested} contested`);
   } else if (terminal) {
     L.push("_findings: see `/council:status --result` for the full report_");
   } else {
@@ -316,14 +320,14 @@ export function formatDashboardMarkdown(job, progress, { nowMs, etaMs = null, sk
   }
 
   if (extras) {
-    if (extras.ledger) L.push(`♻️ ${extras.ledger.recurring} recurring · 🆕 ${extras.ledger.fresh} new (cross-run)`);
-    if (extras.verify) L.push(`🔬 verified ${extras.verify.verified} · refuted ${extras.verify.refuted}`);
-    if (extras.scope) L.push(`🎯 ${extras.scope.localized} fixable now · 📄 ${extras.scope.crossCutting} documented migration${extras.scope.crossCutting === 1 ? "" : "s"}`);
+    if (extras.ledger) L.push(`history: ♻️ ${extras.ledger.recurring} recurring (seen in earlier runs) · 🆕 ${extras.ledger.fresh} new this run`);
+    if (extras.verify) L.push(`verified: 🔬 ${extras.verify.verified} held up · ${extras.verify.refuted} refuted under adversarial check`);
+    if (extras.scope) L.push(`action: 🎯 ${extras.scope.localized} fixable in place · 📄 ${extras.scope.crossCutting} cross-cutting (needs a migration)`);
     if (extras.topFindings?.length) {
       L.push("");
-      L.push("**Top must-fix**");
+      L.push("**Top issues to fix first**");
       for (const f of extras.topFindings) {
-        L.push(`- ${SEV_SQUARE[f.severity] ?? ""} ${f.severity} · ${f.title}${f.file ? ` · \`${f.file}${f.line ? `:${f.line}` : ""}\`` : ""}${f.consensus ? " · 🤝" : ""}`);
+        L.push(`- ${SEV_SQUARE[f.severity] ?? ""} **${f.severity}** ${f.title}${f.file ? ` — \`${f.file}${f.line ? `:${f.line}` : ""}\`` : ""}${f.consensus ? " · 🤝 consensus" : ""}`);
       }
     }
   }

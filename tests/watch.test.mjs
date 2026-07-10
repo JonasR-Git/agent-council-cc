@@ -54,10 +54,11 @@ test("formatDashboardMarkdown renders a table, bars, status emoji, and severity 
   const job = { id: "council-abc123", kind: "deliberate", status: "completed", createdAt: "2026-07-10T00:00:00Z", finishedAt: "2026-07-10T00:05:00Z" };
   const { markdown, snapshot } = formatDashboardMarkdown(job, summarizeProgress(LOG), { nowMs: Date.parse("2026-07-10T00:05:00Z"), findings: summarizeFindings(MERGED) });
   assert.match(markdown, /🟢 Council deliberate/, "status emoji for completed");
-  assert.match(markdown, /\| Agent \| R1 \| verdict \| raised \| shared \| disputed \|/, "a real markdown table");
+  assert.match(markdown, /\| Reviewer \| Verdict \| Raised \| Consensus \| Contested \|/, "a clearly-labelled table");
+  assert.match(markdown, /Raised = findings this reviewer flagged/, "column legend");
   assert.match(markdown, /🟥 P0|🟧 P1/, "severity squares");
   assert.match(markdown, /🤝 2 consensus/, "consensus badge");
-  assert.match(markdown, /must-fix: \*\*2\*\* \(P0\/P1\)/);
+  assert.match(markdown, /\*\*2 must-fix\*\* \(P0\+P1\)/);
   assert.equal(snapshot.findingsTotal, 4);
 });
 
@@ -66,7 +67,7 @@ test("formatDashboardMarkdown shows live raised before merge and a delta vs the 
   const progress = summarizeProgress(["Phase: r1: grok done (1/3) raised=5"].join("\n"));
   const prior = { phase: "r1", findingsTotal: 0, r1Count: 0, r2Done: 0, consensus: 0 };
   const { markdown } = formatDashboardMarkdown(job, progress, { nowMs: Date.parse("2026-07-10T00:01:00Z"), jobPhase: "r1: grok done (1/3)", skipped: ["claude"], prior });
-  assert.match(markdown, /\| grok \| 🟢 done \| – \| 5 \|/, "live raised from the log (verdict – until merge)");
+  assert.match(markdown, /\| 🟢 grok \| – \| 5 \|/, "live raised from the log (verdict – until merge)");
   assert.match(markdown, /Δ since last update/, "delta line present");
   assert.match(markdown, /R1 0→1/, "delta shows R1 progress");
 });
@@ -111,13 +112,13 @@ test("formatDashboardMarkdown renders verdict column, ledger/verify/scope lines,
     findings: summarizeFindings(DELIB.merged),
     extras: summarizeCouncilExtras(DELIB)
   });
-  assert.match(markdown, /\| Agent \| R1 \| verdict \| raised \| shared \| disputed \|/, "verdict column added");
+  assert.match(markdown, /\| Reviewer \| Verdict \| Raised \| Consensus \| Contested \|/, "verdict column present");
   assert.match(markdown, /⛔ block/, "claude verdict badge");
-  assert.match(markdown, /♻️ 1 recurring · 🆕 2 new/, "ledger split");
-  assert.match(markdown, /🔬 verified 2 · refuted 1/, "verify line");
-  assert.match(markdown, /🎯 2 fixable now · 📄 1 documented migration\b/, "scope split");
-  assert.match(markdown, /\*\*Top must-fix\*\*/);
-  assert.match(markdown, /🟥 P0 · Auth bypass · `b\.mjs`/, "worst finding listed with file");
+  assert.match(markdown, /♻️ 1 recurring.*🆕 2 new this run/, "ledger split labelled");
+  assert.match(markdown, /🔬 2 held up · 1 refuted/, "verify line labelled");
+  assert.match(markdown, /🎯 2 fixable in place · 📄 1 cross-cutting/, "scope split labelled");
+  assert.match(markdown, /\*\*Top issues to fix first\*\*/);
+  assert.match(markdown, /🟥 \*\*P0\*\* Auth bypass — `b\.mjs`/, "worst finding listed with file");
 });
 
 test("isTerminal treats cancelled and any non-active status as terminal", () => {
