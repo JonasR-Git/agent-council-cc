@@ -40,6 +40,7 @@ import { colorize, formatDashboard, summarizeFindings, summarizeProgress } from 
 import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
+import { runAuditReview } from "./lib/audit-review.mjs";
 import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
@@ -69,7 +70,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
-      "  node scripts/council-companion.mjs audit [--areas a,b] [--churn-days <n>] [--write-map] [--json]",
+      "  node scripts/council-companion.mjs audit [review] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--write-map] [--json]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
       "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
@@ -1648,9 +1649,9 @@ async function handleWatch(argv) {
 // findings + hotspots + coverage. No agents; read-only EXCEPT --write-map (which
 // writes docs/codebase-map.json). See docs/audit-design.md; deeper review + safe
 // --fix are later phases.
-function handleAudit(argv) {
-  const { options } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days"],
+async function handleAudit(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["areas", "churn-days", "budget", "max-units"],
     booleanOptions: ["json", "write-map"]
   });
   const cwd = process.cwd();
@@ -1669,11 +1670,53 @@ function handleAudit(argv) {
     fs.writeFileSync(mapPath, `${JSON.stringify(model, null, 2)}\n`, "utf8");
     if (!options.json) console.log(`Wrote ${mapPath}`);
   }
+
+  // `audit review` (v2): deep agent review of the top hotspots + global reduce.
+  if (positionals[0] === "review") {
+    const backends = probeBackends(cwd, ROOT_DIR);
+    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    const budget = options.budget != null ? Math.max(2, Number(options.budget)) : 20;
+    const maxUnits = options["max-units"] != null ? Math.max(1, Number(options["max-units"])) : 12;
+    const out = await runAuditReview(cwd, model, backends, {
+      ...merged,
+      budget,
+      maxUnits,
+      skipCodex: merged.skipCodex,
+      skipGrok: merged.skipGrok
+    });
+    if (options.json) {
+      outputResult(out, true);
+      return;
+    }
+    console.log(renderAuditReviewReport(out));
+    return;
+  }
+
   if (options.json) {
     outputResult(model, true);
     return;
   }
   console.log(renderAuditReport(model));
+}
+
+function renderAuditReviewReport(out) {
+  const c = out.coverage;
+  const L = [];
+  L.push("# Council Audit — deep review (v2)");
+  L.push("");
+  L.push(`Reviewed ${c.unitsReviewed}/${c.unitsSelected} hotspot modules with Codex+Grok (budget ${c.budgetSpent}/${c.budgetTotal} agent calls). ${c.suppliedChars}/${c.totalCharsOfReviewed} chars of reviewed modules supplied. Findings are candidates — Claude (you) should synthesize a decision table.`);
+  L.push("");
+  const rank = { P0: 0, P1: 1, P2: 2, nit: 3 };
+  const sorted = [...out.findings].sort((a, b) => (rank[a.severity] ?? 2) - (rank[b.severity] ?? 2));
+  L.push(`## Findings (${sorted.length})`);
+  for (const f of sorted) {
+    const agents = f.agents ? ` [${f.agents.join("+")}]` : "";
+    L.push(`- **${f.severity}** [${f.category}]${agents} ${f.title}${f.file ? ` · ${f.file}${f.line ? `:${f.line}` : ""}` : ""}${f.consensus ? " · consensus" : ""} · ${f.scope ?? "?"}`);
+    if (f.detail) L.push(`  ${f.detail}`);
+  }
+  L.push("");
+  L.push("Next (Claude): verify consensus + P0/P1, produce Fix now / Verify / Ignore.");
+  return L.join("\n");
 }
 
 async function handleUsage(argv) {
@@ -1818,7 +1861,7 @@ async function main() {
         await handleWatch(rest);
         break;
       case "audit":
-        handleAudit(rest);
+        await handleAudit(rest);
         break;
       case "usage":
         await handleUsage(rest);

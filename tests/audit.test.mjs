@@ -7,6 +7,7 @@ import test from "node:test";
 import { buildGraph, findCycles, findOrphanModules, parseModule, resolveImport, stripComments } from "../plugins/council/scripts/lib/import-graph.mjs";
 import { findDuplicateClusters } from "../plugins/council/scripts/lib/dup-detect.mjs";
 import { buildCodebaseModel } from "../plugins/council/scripts/lib/codebase-model.mjs";
+import { buildUnitPrompt, makeBudget, selectUnits } from "../plugins/council/scripts/lib/audit-review.mjs";
 
 // --- import graph ------------------------------------------------------------
 
@@ -117,6 +118,45 @@ test("findDuplicateClusters ignores short blocks and comments", () => {
 });
 
 // --- model integration -------------------------------------------------------
+
+// --- v2 review backbone -----------------------------------------------------
+
+test("makeBudget charges, gates, and never goes negative", () => {
+  const b = makeBudget(3);
+  assert.equal(b.remaining(), 3);
+  assert.equal(b.canSpend(3), true);
+  assert.equal(b.canSpend(4), false);
+  b.charge(2);
+  assert.equal(b.spent, 2);
+  assert.equal(b.remaining(), 1);
+  b.charge(5);
+  assert.equal(b.remaining(), 0, "remaining clamps at 0");
+});
+
+test("selectUnits ranks by hotspot, excludes tests, caps at maxUnits", () => {
+  const model = {
+    files: [
+      { id: "a.mjs", hotspot: 10, isTest: false },
+      { id: "hot.mjs", hotspot: 90, isTest: false },
+      { id: "mid.mjs", hotspot: 50, isTest: false },
+      { id: "x.test.mjs", hotspot: 99, isTest: true }
+    ]
+  };
+  assert.deepEqual(selectUnits(model, { maxUnits: 2 }), ["hot.mjs", "mid.mjs"]);
+  assert.ok(!selectUnits(model, { maxUnits: 10 }).includes("x.test.mjs"), "tests excluded");
+});
+
+test("buildUnitPrompt bounds oversized source and flags the split", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-unit-"));
+  fs.writeFileSync(path.join(dir, "big.mjs"), "x".repeat(50));
+  const model = { files: [{ id: "big.mjs", loc: 1, branches: 0, maxNesting: 0, fanIn: 0, fanOut: 0, churn: 0, smellCount: 0, tested: false, hotspot: 5 }] };
+  const p = buildUnitPrompt(dir, "big.mjs", model, { maxChars: 20 });
+  assert.equal(p.totalChars, 50);
+  assert.equal(p.suppliedChars, 20);
+  assert.equal(p.split, true);
+  assert.match(p.prompt, /hotspot=5/);
+  assert.match(p.prompt, /truncated to 20 of 50/);
+});
 
 test("buildCodebaseModel scans a fixture (fs fallback, no git) and returns candidates", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-audit-"));
