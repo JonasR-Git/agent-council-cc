@@ -1,10 +1,12 @@
 {
   "name": "council",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "description": "Multi-agent code review for Claude Code: independent review then peer critique across Claude + Codex + Grok, with consensus/verification, a findings ledger, solve, benchmarking, and a live dashboard.",
   "author": {
-    "name": "local"
+    "name": "JonasR"
   },
+  "homepage": "https://github.com/JonasR/agent-council-cc",
+  "repository": "https://github.com/JonasR/agent-council-cc",
   "license": "MIT",
   "keywords": [
     "code-review",

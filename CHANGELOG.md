@@ -5,7 +5,9 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-07-10
+
+First stable release. Now a single council plugin (the standalone grok plugin was removed; the council's Grok reviewer uses the `grok` CLI directly).
 
 ### Added
 
