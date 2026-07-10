@@ -1136,8 +1136,19 @@ function handleLedger(argv) {
 
 async function handleBenchmark(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["task-file", "claude-answer", "category", "codex-model", "grok-model", "grok-effort", "cwd"],
-    booleanOptions: ["json", "stats", "skip-codex", "skip-grok"]
+    valueOptions: [
+      "task-file",
+      "claude-answer",
+      "claude-answer-wait",
+      "claude-judgements",
+      "wait-timeout",
+      "category",
+      "codex-model",
+      "grok-model",
+      "grok-effort",
+      "cwd"
+    ],
+    booleanOptions: ["json", "stats", "skip-codex", "skip-grok", "judge-only"]
   });
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
 
@@ -1172,6 +1183,10 @@ async function handleBenchmark(argv) {
     ...mergedOpts,
     taskFile: options["task-file"] ? path.resolve(cwd, options["task-file"]) : null,
     claudeAnswer: options["claude-answer"] ? path.resolve(cwd, options["claude-answer"]) : null,
+    claudeAnswerWait: options["claude-answer-wait"] ? path.resolve(cwd, options["claude-answer-wait"]) : null,
+    claudeJudgements: options["claude-judgements"] ? path.resolve(cwd, options["claude-judgements"]) : null,
+    waitTimeoutMs: options["wait-timeout"] ? secondsToMs(options["wait-timeout"], "--wait-timeout") : null,
+    judgeOnly: Boolean(options["judge-only"]),
     category: options.category ?? null,
     nowIso: nowIso()
   });

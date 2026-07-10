@@ -7,13 +7,47 @@ import {
   loadPrompt,
   makeFenceNonce,
   runCodexStructured,
-  runGrokStructured
+  runGrokStructured,
+  waitForFile
 } from "./agents.mjs";
 import { extractJsonObject } from "./findings.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export function benchmarkFile(cwd) {
   return path.join(resolveStateDir(cwd), "benchmarks.jsonl");
+}
+
+const MAX_BENCHMARK_RECORDS = 1000;
+const MAX_ANSWER_CHARS = 12_000;
+
+function answersDir(cwd, taskHash) {
+  return path.join(resolveStateDir(cwd), "benchmark-answers", taskHash);
+}
+
+function persistAnswers(cwd, taskHash, answers) {
+  try {
+    const dir = answersDir(cwd, taskHash);
+    fs.mkdirSync(dir, { recursive: true });
+    for (const [agent, text] of Object.entries(answers)) {
+      fs.writeFileSync(path.join(dir, `${agent}.txt`), text, "utf8");
+    }
+    return dir;
+  } catch {
+    return null;
+  }
+}
+
+function loadPersistedAnswers(cwd, taskHash) {
+  const out = {};
+  try {
+    const dir = answersDir(cwd, taskHash);
+    for (const file of fs.readdirSync(dir).filter((f) => f.endsWith(".txt"))) {
+      out[path.basename(file, ".txt")] = fs.readFileSync(path.join(dir, file), "utf8").trim();
+    }
+  } catch {
+    /* none */
+  }
+  return out;
 }
 
 export function parseJudgeScore(stdout) {
@@ -46,28 +80,46 @@ export async function runBenchmark(cwd, backends, options = {}) {
     throw new Error("Provide a benchmark task: --task-file <path> or positional text.");
   }
   const taskHash = createHash("sha256").update(task).digest("hex").slice(0, 12);
-
-  // Phase 1: independent answers.
-  onPhase("answers");
-  const answerOpts = { ...options, maxTurns: options.maxTurnsR1 };
   const agents = [];
   if (!options.skipCodex) agents.push("codex");
   if (!options.skipGrok) agents.push("grok");
+  const clampAnswer = (text) => {
+    const t = String(text).trim();
+    return t.length > MAX_ANSWER_CHARS ? `${t.slice(0, MAX_ANSWER_CHARS)}\n[... answer truncated ...]` : t;
+  };
 
+  // Phase 1: independent answers. In judge-only mode, load persisted answers
+  // instead of re-running the agents (so a second pass can add Claude judgements
+  // for a symmetric ranking without paying for answers again).
   const answers = {};
-  const answerJobs = agents.map(async (agent) => {
-    const prompt = interpolate(loadPrompt("benchmark-task"), { AGENT: agent, TASK: task, NONCE: makeFenceNonce() });
-    const res = await taskAnswer(cwd, backends, agent, answerOpts, prompt, "benchmark-answer");
-    return { agent, res };
-  });
-  for (const { agent, res } of await Promise.all(answerJobs)) {
-    if (!res.skipped && res.status === 0 && String(res.stdout ?? "").trim()) {
-      answers[agent] = res.stdout.trim();
+  if (options.judgeOnly) {
+    Object.assign(answers, loadPersistedAnswers(cwd, taskHash));
+    if (!Object.keys(answers).length) {
+      throw new Error(`No persisted answers for this task (run the answer phase first).`);
     }
-  }
-  if (options.claudeAnswer && fs.existsSync(options.claudeAnswer)) {
-    const text = fs.readFileSync(options.claudeAnswer, "utf8").trim();
-    if (text) answers.claude = text;
+  } else {
+    onPhase("answers");
+    const answerOpts = { ...options, maxTurns: options.maxTurnsR1 };
+    const answerJobs = agents.map(async (agent) => {
+      const prompt = interpolate(loadPrompt("benchmark-task"), { AGENT: agent, TASK: task, NONCE: makeFenceNonce() });
+      const res = await taskAnswer(cwd, backends, agent, answerOpts, prompt, "benchmark-answer");
+      return { agent, res };
+    });
+    for (const { agent, res } of await Promise.all(answerJobs)) {
+      if (!res.skipped && res.status === 0 && String(res.stdout ?? "").trim()) {
+        answers[agent] = clampAnswer(res.stdout);
+      }
+    }
+    // Claude's answer: wait for it (parallel workflow) or read it if present.
+    if (options.claudeAnswerWait) {
+      const found = fs.existsSync(options.claudeAnswerWait)
+        ? options.claudeAnswerWait
+        : await waitForFile(options.claudeAnswerWait, Number(options.waitTimeoutMs ?? 300_000));
+      if (found) answers.claude = clampAnswer(fs.readFileSync(found, "utf8"));
+    } else if (options.claudeAnswer && fs.existsSync(options.claudeAnswer)) {
+      answers.claude = clampAnswer(fs.readFileSync(options.claudeAnswer, "utf8"));
+    }
+    persistAnswers(cwd, taskHash, answers);
   }
 
   const answeredAgents = Object.keys(answers);
@@ -97,6 +149,24 @@ export async function runBenchmark(cwd, backends, options = {}) {
   }
   const judgements = await Promise.all(judgeJobs);
 
+  // Optional: Claude's blind judgements, submitted by the orchestrator as a JSON
+  // file { "<targetAgent>": {score, rationale}, ... } so every answer (incl.
+  // codex/grok when the other is skipped) can be judged symmetrically.
+  if (options.claudeJudgements && fs.existsSync(options.claudeJudgements)) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(options.claudeJudgements, "utf8"));
+      for (const [target, val] of Object.entries(doc)) {
+        if (target === "claude" || !answeredAgents.includes(target)) continue;
+        const score = Math.min(10, Math.max(1, Number(val?.score)));
+        if (Number.isFinite(score)) {
+          judgements.push({ judge: "claude", target, score: { score, rationale: String(val?.rationale ?? "").trim() } });
+        }
+      }
+    } catch {
+      /* ignore malformed claude judgements */
+    }
+  }
+
   // Aggregate blind peer scores per answering agent.
   const scoresByAgent = {};
   for (const agent of answeredAgents) scoresByAgent[agent] = [];
@@ -122,21 +192,33 @@ export async function runBenchmark(cwd, backends, options = {}) {
     const file = benchmarkFile(cwd);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.appendFileSync(file, `${JSON.stringify(record)}\n`, "utf8");
+    // Cap growth, consistent with metrics.jsonl / the ledger.
+    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    if (lines.length > MAX_BENCHMARK_RECORDS) {
+      fs.writeFileSync(file, `${lines.slice(-MAX_BENCHMARK_RECORDS).join("\n")}\n`, "utf8");
+    }
   } catch {
     /* best effort */
   }
 
-  return { taskHash, task, answers, ranking, judgements, report: renderBenchmark(task, ranking) };
+  const dir = answersDir(cwd, taskHash);
+  return { taskHash, task, answers, answersDir: dir, ranking, judgements, report: renderBenchmark(task, ranking, dir) };
 }
 
-function renderBenchmark(task, ranking) {
+function renderBenchmark(task, ranking, dir) {
   const lines = ["# Council Benchmark", "", "## Task", task.trim().split(/\r?\n/)[0], "", "## Ranking (avg blind peer score)"];
   if (!ranking.length) lines.push("(no answers)");
   for (const [i, r] of ranking.entries()) {
-    lines.push(`${i + 1}. **${r.agent}** - ${r.avgScore == null ? "-" : `${r.avgScore}/10`} (${r.votes} judges)`);
+    lines.push(`${i + 1}. **${r.agent}** - ${r.avgScore == null ? "-" : `${r.avgScore}/10`} (${r.votes} judge${r.votes === 1 ? "" : "s"})`);
     for (const s of r.scores) lines.push(`   - ${s.judge}: ${s.score}/10 - ${s.rationale}`);
   }
-  lines.push("", "Note: agents scored answers blind (author hidden). Persisted to benchmarks.jsonl.");
+  const voteCounts = new Set(ranking.map((r) => r.votes));
+  if (voteCounts.size > 1) {
+    lines.push("", "**Note: judge counts differ across agents** — averages come from different sample sizes.");
+    lines.push("For a symmetric ranking, read the answers and add Claude's blind scores:");
+    lines.push("`benchmark --judge-only --task-file <same> --claude-judgements <json>`.");
+  }
+  lines.push("", `Answers persisted in: ${dir}`, "Blind scoring is nominal (a model may infer style). Persisted to benchmarks.jsonl.");
   return lines.join("\n");
 }
 

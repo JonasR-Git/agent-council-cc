@@ -29,6 +29,15 @@ test("aggregateBenchmarks computes runs, wins and average per agent", () => {
   assert.equal(agg.agents.grok.avgScore, 6.5);
 });
 
+test("aggregateBenchmarks treats ranking[0] as the winner", () => {
+  const agg = aggregateBenchmarks([
+    { taskHash: "t", ranking: [{ agent: "codex", avgScore: 9 }, { agent: "grok", avgScore: 8 }] }
+  ]);
+  assert.equal(agg.agents.codex.wins, 1);
+  assert.equal(agg.agents.grok.wins, 0);
+  assert.equal(agg.agents.grok.avgScore, 8);
+});
+
 test("readBenchmarks tolerates a missing store", async () => {
   const { readBenchmarks } = await import("../plugins/council/scripts/lib/benchmark.mjs");
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), "council-bench-"));
