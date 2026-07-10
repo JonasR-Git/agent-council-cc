@@ -1,6 +1,6 @@
 {
   "name": "agent-council-cc",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "description": "Claude Code plugin: multi-agent council code review (Claude + Codex + Grok)",
   "type": "module",

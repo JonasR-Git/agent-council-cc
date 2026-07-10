@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Multi-agent council code review for Claude Code: independent review then peer critique across Claude + Codex + Grok.",
-    "version": "2.0.0"
+    "version": "2.1.0"
   },
   "plugins": [
     {
       "name": "council",
       "description": "Multi-agent council: dual review + deliberate protocol (Claude + Codex + Grok).",
-      "version": "2.0.0",
+      "version": "2.1.0",
       "author": {
         "name": "JonasR-Git"
       },

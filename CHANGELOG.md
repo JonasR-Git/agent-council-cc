@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-07-10
+
+### Added
+
+- **`/council:audit` — whole-project audit**, built and council-reviewed in four
+  layers: **static** (zero-dep ESM import/export graph + Tarjan cycles, line-level
+  duplicate detection, complexity/churn/smell hotspot ranking, test-mapping →
+  confidence-tagged *candidate* findings, `--doc` proposals, `--write-map`);
+  **`review`** (deep Codex/Grok review of the top hotspots + global SSOT/architecture
+  reduce, finite agent-call budget, injection-fenced source); **`fix`** (safe
+  test-gated auto-fix of localized findings on an isolated `council/audit-fix-<sha>`
+  branch — touched-file enforcement + green-tests gate + rollback, clean-tree
+  required, protected paths incl. `.env`/CI/secrets, repo lock, never auto-merged);
+  **`endless`** (bounded review loop with progressive hotspot coverage, cross-run
+  dedupe, `--resume`, diminishing-returns/budget/max-pass stop). See
+  [docs/audit-design.md](docs/audit-design.md).
+- **Chat-optimized Markdown dashboard** — `/council:status --watch --md`: a real
+  table with emoji status, Unicode bars, severity squares, live per-agent `raised`,
+  and a "Δ since last update" line. On completion it becomes a decision aid: per-
+  reviewer verdict, top must-fix findings with `file:line`, cross-run ledger split
+  (recurring vs new), verify hold-up, and localized-vs-cross-cutting action split.
+  Untrusted finding text is sanitized against markdown/table injection.
+- **Tracking**: `audit fix` closes the detect→fix→resolved loop (marks verified,
+  test-gated fixes `fixed` in the cross-run ledger); `metrics.jsonl` now records the
+  review outcome (findings/must-fix/consensus/contested, verdicts, verify,
+  parse-failures), per-agent retries, per-phase wall-clock, and synchronous audit
+  runs — surfaced by `/council:metrics` (review quality, verify hold-up, per-phase
+  averages, audit-run aggregates).
+
+### Changed
+
+- **Robustness**: structured agent calls retry once on unparseable output (with a
+  budget-charged, "return only JSON" reminder — never on a skipped/timed-out/failed
+  backend), and unparseable returns are surfaced (deliberate phase line +
+  `coverage.unparsedReturns`) instead of silently read as "found nothing".
+
 ## [2.0.0] - 2026-07-10
 
 ### Changed

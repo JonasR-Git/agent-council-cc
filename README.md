@@ -7,14 +7,15 @@ clear "fix now / verify / ignore" decision instead of one model's opinion.
 
 ## What it does
 
-Six slash commands:
+Seven slash commands:
 
 | Command | Purpose |
 |---------|---------|
 | `/council:review` | Code review — 3-way deliberate (default), `--quick` dual, `--adversarial`, or `--loop` (review→fix→re-review) |
 | `/council:plan` | Design an approach: independent plans → scored critique → ranked synthesis (no code) |
 | `/council:solve` | Plan + one writer implements on a branch + council review |
-| `/council:status` | Job control: list/status, `--watch` (live dashboard), `--result` (`--summary`/`--html`), `--wait`, `--cancel` |
+| `/council:audit` | Whole-project audit — static candidates, deep agent `review` of hotspots, safe test-gated `fix`, and an `endless` loop (see below) |
+| `/council:status` | Job control: list/status, `--watch` (live dashboard, `--md` for chat), `--result` (`--summary`/`--html`), `--wait`, `--cancel` |
 | `/council:setup` | Check backends + scaffold `.council.yml` (`--init`) + `--usage` (limits/tokens) |
 | `/council:doctor` | End-to-end self-test (CLIs, state dir, limits, live agent pings) |
 
@@ -47,19 +48,23 @@ exact next step for anything missing.
 
 ## Install
 
-From Claude Code:
+From Claude Code, in any project you want to review:
 
 ```text
-/plugin marketplace add /path/to/agent-council-cc
+/plugin marketplace add JonasR-Git/agent-council-cc
 /plugin install council@agent-council
 /reload-plugins
 ```
 
-On Windows the marketplace path may use forward slashes, e.g.
-`C:/path/to/agent-council-cc`. Once published to a Git host, users add it with
-`/plugin marketplace add <owner>/<repo>` instead of a local path.
+Then check your backends and log in to whatever is missing:
 
-Smoke test without installing:
+```text
+/council:setup
+```
+
+(For local development on the plugin itself, add the checkout by path instead —
+`/plugin marketplace add C:/path/to/agent-council-cc`.) Smoke test without
+installing:
 
 ```bash
 node plugins/council/scripts/council-companion.mjs setup --json
@@ -126,18 +131,88 @@ Optional bounded debate (never a live chat): `--debate-rounds 1` gives each
 disputed item's author one rebuttal; `--debate-rounds 2` adds one counter by the
 original critic. Hard caps: 6 items, 2 rounds.
 
+## Whole-project audit
+
+`/council:audit` reviews the **entire project** (not a diff), in four layers you
+can run independently:
+
+```text
+/council:audit                     # static, read-only: candidate findings + hotspots + coverage
+/council:audit review --doc        # deep agent review of the top hotspots -> proposals in docs/AUDIT.md
+/council:audit endless             # bounded review loop: advances hotspots until returns diminish
+/council:audit fix --dry-run       # preview the safe auto-fix plan; drop --dry-run to apply
+```
+
+The engine is **static analysis as the precision layer, agents as the judgment**:
+a zero-dep import/export graph, line-level duplicate detection, complexity, git
+churn, smells and test-mapping produce a hotspot-ranked, confidence-tagged
+candidate list; `review`/`endless` then send the actual source of the top hotspots
+to Codex/Grok. Every static fact is a **candidate, never authority** — nothing is
+deleted or merged from a regex alone.
+
+`audit fix` is the only command that writes code, and only under hard safety
+rules: **localized** findings only (cross-cutting stay proposals), one writer per
+file on an isolated `council/audit-fix-<sha>` branch, each fix must touch **only**
+its target file and keep the project's tests **green** (else it is reverted), each
+kept fix is its own commit, the base branch is never modified and nothing is
+auto-merged. It requires a **clean working tree** and a **test gate** (see the
+per-project note below). `endless` is a review/propose loop — it never auto-fixes
+in a loop. Findings persist to the cross-run **ledger**, so a later run recognizes
+what was already flagged and `audit fix` marks what it fixed as resolved.
+
+Design rationale and phasing: [docs/audit-design.md](docs/audit-design.md).
+
+## Trying it on your project
+
+Works on **any language / any git repo**: `/council:review` (diff), `/council:deliberate`,
+and the agent-based `/council:audit review` / `endless` (the agents read your real
+source, so language doesn't matter).
+
+Two things are currently **JS/npm-tuned** — know this before you rely on them:
+
+- **`/council:audit` static analysis** — the import-graph / orphan / cycle layer is
+  ESM/JS-specific. On JS/TS you get the full signal; on other languages you still
+  get duplication, churn, complexity, smells and the file map, but no import graph.
+  The agent `review` works regardless.
+- **`/council:audit fix`** — the test gate is **`npm test`** only right now. No
+  `package.json` test script → it refuses (rather than commit unverified edits)
+  unless you pass `--allow-untested` (not recommended). So the safe fix path is
+  npm-projects-only for now.
+
+Recommended first run, read-only → writing:
+
+```text
+/council:setup                  # 1. which backends are available?
+/council:audit                  # 2. static overview (read-only)
+/council:review --background    # 3. review a branch with changes
+/council:audit review --doc     # 4. deep review + proposals doc
+/council:audit fix --dry-run    # 5. only on an npm project with tests, preview first
+```
+
+If a backend is down (e.g. Grok), runs degrade gracefully to whoever is available
+(`--skip-grok` / `--skip-codex`, or just let `/council:setup` show what's missing).
+State is stored **per workspace** and the plugin is zero-dependency and
+self-contained, so it can't contaminate the project you point it at.
+
 ## Live dashboard
 
 ```text
 /council:review --background
 /council:status --watch            # most recent job
+/council:status --watch --md       # rich Markdown snapshot for the chat
 ```
 
 `watch` shows per-agent Round 1 state, R1/R2 progress bars, elapsed + remaining
-estimate, and (on completion) a findings breakdown (raised / shared / disputed,
-severity histogram, must-fix count). In a real terminal it redraws live and is
-ANSI-colored; in the chat it prints a single snapshot (`--once`/`--json`). Tip:
-run it in a separate terminal pane for the smooth live view.
+estimate, and (on completion) a findings breakdown. In a real terminal it redraws
+live and is ANSI-colored; run it in a separate terminal pane for the smooth live
+view.
+
+Add **`--md`** for a chat-optimized Markdown snapshot (a real table with emoji
+status, Unicode bars, severity squares, live per-agent `raised`, and a "Δ since
+last update" line). When the run finishes it becomes a decision aid: each
+reviewer's **verdict**, the **top must-fix** findings with `file:line`, the
+cross-run **ledger split** (recurring vs new), verify hold-up, and the
+localized-vs-cross-cutting action split.
 
 ## Typical flows
 
