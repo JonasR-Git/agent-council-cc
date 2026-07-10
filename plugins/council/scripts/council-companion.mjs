@@ -39,6 +39,7 @@ import { renderOverview } from "./lib/overview.mjs";
 import { colorize, formatDashboard, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
 import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
+import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
 import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
@@ -68,6 +69,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
+      "  node scripts/council-companion.mjs audit [--areas a,b] [--churn-days <n>] [--write-map] [--json]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
       "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
@@ -1642,6 +1644,38 @@ async function handleWatch(argv) {
   }
 }
 
+// v1 whole-project audit: static. Builds the codebase model and emits CANDIDATE
+// findings + hotspots + coverage. No agents; read-only EXCEPT --write-map (which
+// writes docs/codebase-map.json). See docs/audit-design.md; deeper review + safe
+// --fix are later phases.
+function handleAudit(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["areas", "churn-days"],
+    booleanOptions: ["json", "write-map"]
+  });
+  const cwd = process.cwd();
+  const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+  let churnDays = 90;
+  if (options["churn-days"] != null) {
+    churnDays = Number(options["churn-days"]);
+    if (!Number.isFinite(churnDays) || churnDays < 1) throw new Error("--churn-days must be a positive number");
+  }
+  const model = buildCodebaseModel(cwd, { areas, churnDays });
+
+  if (options["write-map"]) {
+    const dir = path.join(workspaceRoot(cwd), "docs");
+    fs.mkdirSync(dir, { recursive: true });
+    const mapPath = path.join(dir, "codebase-map.json");
+    fs.writeFileSync(mapPath, `${JSON.stringify(model, null, 2)}\n`, "utf8");
+    if (!options.json) console.log(`Wrote ${mapPath}`);
+  }
+  if (options.json) {
+    outputResult(model, true);
+    return;
+  }
+  console.log(renderAuditReport(model));
+}
+
 async function handleUsage(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["days"],
@@ -1782,6 +1816,9 @@ async function main() {
         break;
       case "watch":
         await handleWatch(rest);
+        break;
+      case "audit":
+        handleAudit(rest);
         break;
       case "usage":
         await handleUsage(rest);
