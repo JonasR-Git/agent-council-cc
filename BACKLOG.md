@@ -2,7 +2,22 @@
 
 Council-approved improvement queue. Ordered within sections by value/effort.
 
-## Approved (user-confirmed, next up after the 0.5.0 merge)
+## Done in 0.5.0
+
+All six approved items shipped (budget guardrails, live progress, metrics history,
+debate completion, /council:fixloop, benchmark mode), each through its own council
+fix-loop, plus a three-round final acceptance. See CHANGELOG 0.5.0.
+
+## Candidates for the next release
+
+- **council gc / doctor size reporting**: a single place to inspect/clear the state-dir
+  stores (jobs, artifacts, metrics.jsonl, ledger.jsonl, benchmarks.jsonl, r1-cache).
+- **budget guard limits retry**: retry the (network) Claude limits fetch once before
+  failing closed, to tolerate a transient OAuth hiccup.
+- **CLI JSON contract tests**: spawn-based end-to-end tests for history/ledger/usage/
+  metrics/benchmark output shapes (fixloop-status is now covered).
+
+## Earlier candidates (still open)
 
 1. **Budget guardrails** - policy `budget_guard: <percent>`: check provider window
    limits (usage --limits) before deliberate/solve; warn or refuse when a window is
