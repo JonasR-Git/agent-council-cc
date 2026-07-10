@@ -22,7 +22,7 @@ import {
 import { runSolve } from "./lib/solve.mjs";
 import { aggregateBenchmarks, readBenchmarks, runBenchmark } from "./lib/benchmark.mjs";
 import { evaluateBudget, gatherWindowPressure, renderBudgetBreaches } from "./lib/budget.mjs";
-import { aggregateMetrics, readMetrics, recordJobMetrics, renderMetrics } from "./lib/metrics.mjs";
+import { aggregateMetrics, readMetrics, recordAuditMetrics, recordJobMetrics, renderMetrics } from "./lib/metrics.mjs";
 import {
   collectAllTokenUsage,
   collectCodexRateLimits,
@@ -1725,6 +1725,7 @@ async function handleAudit(argv) {
     const backends = probeBackends(cwd, ROOT_DIR);
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
+    const t0 = Date.now();
     const out = await runAuditReview(cwd, model, backends, {
       ...merged,
       budget,
@@ -1732,6 +1733,7 @@ async function handleAudit(argv) {
       skipCodex: merged.skipCodex,
       skipGrok: merged.skipGrok
     });
+    recordAuditMetrics(cwd, "review", { wallClockMs: Date.now() - t0, findings: out.findings.length, coverage: out.coverage }, nowIso());
     if (options.doc) {
       const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: "deep review" }, { docPath: options["doc-path"] });
       if (!options.json) console.log(`Wrote proposals to ${docPath}`);
@@ -1773,6 +1775,7 @@ async function handleAudit(argv) {
       if (!Number.isFinite(n) || n < 1) throw new Error("--max-fixes must be a positive number");
       maxFixes = Math.floor(n);
     }
+    const tFix = Date.now();
     const out = await runAuditFix(cwd, findings, backends, {
       ...merged,
       dryRun: options["dry-run"],
@@ -1781,6 +1784,9 @@ async function handleAudit(argv) {
       maxFixes,
       onProgress: options.json ? undefined : (m) => console.error(m)
     });
+    if (!options["dry-run"]) {
+      recordAuditMetrics(cwd, "fix", { wallClockMs: Date.now() - tFix, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, rejected: out.rejected?.length ?? 0, ledgerResolved: out.ledgerResolved ?? 0, integrationFailed: Boolean(out.integrationFailed) }, nowIso());
+    }
     if (options.json) {
       outputResult(out, true);
       return;
@@ -1832,11 +1838,13 @@ async function handleAudit(argv) {
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok
       });
+    const tEndless = Date.now();
     const out = await runEndless(
       cwd,
       { budget, maxPasses, dryStreak, resume: options.resume, onProgress: options.json ? undefined : (m) => console.error(m) },
       { review }
     );
+    recordAuditMetrics(cwd, "endless", { wallClockMs: Date.now() - tEndless, passesRun: out.passesRun, spent: out.spent, findings: out.findings.length, stopReason: out.stopReason }, nowIso());
     if (options.doc) {
       const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: `endless (${out.passesRun} passes)` }, { docPath: options["doc-path"] });
       if (!options.json) console.log(`Wrote proposals to ${docPath}`);

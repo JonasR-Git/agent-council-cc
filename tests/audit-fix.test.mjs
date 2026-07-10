@@ -136,6 +136,7 @@ const baseDeps = (git, over = {}) => ({
   readFile: () => "export const x = 1;\n",
   testCmd: { cmd: "true", args: [] },
   runTests: async () => ({ ok: true }),
+  resolveLedger: () => true,
   ...over
 });
 
@@ -149,6 +150,32 @@ test("runAuditFix commits a fix when the edit is in-scope and tests pass", async
   assert.equal(out.fixed[0].verified, true);
   assert.ok(git.calls.some((c) => c[0] === "commitFile" && c[1] === "a.mjs"), "staged only the target file");
   assert.match(out.branch, /^council\/audit-fix-base0000/);
+});
+
+test("runAuditFix resolves each committed fix in the ledger, but not on a red integration run", async () => {
+  // happy: fix committed + integration green -> ledger resolved
+  const git = fakeGit();
+  const resolved = [];
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix me" })], {}, {}, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    resolveLedger: (fp, status) => (resolved.push([fp, status]), true)
+  }));
+  assert.equal(out.ledgerResolved, 1);
+  assert.equal(resolved.length, 1);
+  assert.equal(resolved[0][1], "fixed");
+
+  // red final integration: commits kept on the branch but NOT marked fixed (may be discarded)
+  const git2 = fakeGit();
+  let n = 0;
+  const resolved2 = [];
+  const out2 = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix me" })], {}, {}, baseDeps(git2, {
+    applyFix: async () => git2.setChanged(["a.mjs"]),
+    runTests: async () => ({ ok: ++n === 1 }), // per-fix green, integration red
+    resolveLedger: (fp, status) => (resolved2.push([fp, status]), true)
+  }));
+  assert.equal(out2.integrationFailed, true);
+  assert.equal(out2.ledgerResolved, 0, "nothing resolved when the branch may be discarded");
+  assert.equal(resolved2.length, 0);
 });
 
 test("runAuditFix reverts + rejects an out-of-scope edit; never commits", async () => {

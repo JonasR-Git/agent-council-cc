@@ -3,8 +3,9 @@ import path from "node:path";
 
 import { makeFenceNonce } from "./agents.mjs";
 import { findClaudeBinary } from "./discover.mjs";
+import { fingerprintFinding, resolveLedgerEntry } from "./ledger.mjs";
 import { runCommand, runCommandAsync } from "./process.mjs";
-import { ensureStateDir, resolveStateDir, workspaceRoot } from "./state.mjs";
+import { ensureStateDir, nowIso, resolveStateDir, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 
 // Audit V3 - the SAFE auto-fix path. The council's hard-won rule holds:
@@ -293,6 +294,11 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
       }
     });
 
+  // Close the detect->fix->resolved loop: mark a committed fix's finding 'fixed' in
+  // the cross-run ledger (same fingerprint audit review recorded it under), so the
+  // next run recognizes it as resolved instead of re-flagging it as recurring.
+  const resolveLedger = deps.resolveLedger ?? ((fingerprint, status) => resolveLedgerEntry(cwd, fingerprint, status, nowIso()));
+
   if (!git.isRepo()) return { ok: false, error: "not a git repository — --fix needs git for branch isolation + rollback" };
   // Clean tree is mandatory: the rollback ops would otherwise destroy user WIP.
   if (!git.isClean()) return { ok: false, error: "working tree not clean — commit or stash your changes first (audit fix has no --allow-dirty; the rollback would destroy uncommitted work)" };
@@ -422,6 +428,19 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     if (gated && fixed.length) integration = await runTests();
     const integrationFailed = integration ? !integration.ok : false;
 
+    // Only resolve the ledger when the run succeeded as a whole — a red integration
+    // means the branch may be discarded, so marking the findings 'fixed' would lie.
+    let ledgerResolved = 0;
+    if (!integrationFailed) {
+      for (const f of fixed) {
+        try {
+          if (resolveLedger(fingerprintFinding(f.finding), "fixed")) ledgerResolved += 1;
+        } catch {
+          /* ledger update is best-effort */
+        }
+      }
+    }
+
     // Return the user to their original branch; the base was never touched.
     let returnedToBase = false;
     if (git.isClean()) returnedToBase = git.checkout(baseBranch);
@@ -436,6 +455,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
       integration: integration ? { ok: integration.ok } : null,
       integrationFailed,
       unverified: fixed.some((f) => !f.verified),
+      ledgerResolved,
       capped,
       fixed,
       failed,

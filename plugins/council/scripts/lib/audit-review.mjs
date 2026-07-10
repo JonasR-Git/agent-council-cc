@@ -3,8 +3,9 @@ import path from "node:path";
 
 import { interpolate, makeFenceNonce, runCodexStructured, runGrokStructured, runStructuredWithRetry } from "./agents.mjs";
 import { mergeFindings, parseAgentFindings } from "./findings.mjs";
+import { recordAndAnnotate } from "./ledger.mjs";
 import { annotateScopes } from "./scope.mjs";
-import { workspaceRoot } from "./state.mjs";
+import { nowIso, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 
 // Audit v2 - deep, agent-driven review of the hotspots the static model
@@ -267,7 +268,12 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
   const reduce = options.skipReduce ? { all: [], consensus: [], unique: [], ran: false } : await globalReduce(cwd, backends, options, model, budget);
 
   const allFindings = [...results.flatMap((r) => r.merged.all), ...reduce.all];
-  const scoped = annotateScopes({ all: allFindings, consensus: [], unique: [] });
+  let scoped = annotateScopes({ all: allFindings, consensus: [], unique: [] });
+  // Persist findings to the cross-run ledger (unless opted out) so re-runs recognize
+  // "already flagged" issues (seenBefore/timesSeen) and `audit fix` can later resolve
+  // them to 'fixed'. Best-effort; fingerprint keys are file+title (audit-fix uses the
+  // same fingerprint to close the loop).
+  if (options.ledger !== false) scoped = recordAndAnnotate(cwd, options.jobId ?? "audit-review", scoped, options.nowIso ?? nowIso());
   // Only units that actually got >=1 successful agent review count as reviewed;
   // dispatched-but-empty/failed units must not inflate coverage.
   const reviewedUnits = results.filter((r) => r.reviewed);

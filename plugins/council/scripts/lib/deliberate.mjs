@@ -545,6 +545,9 @@ export async function runDeliberation(cwd, backends, options = {}) {
     merged,
     debates,
     verification,
+    // Count of reviewers whose R1 stayed unparseable after the retry — a backend
+    // reliability signal that metrics tracks over time.
+    parseFailures: unparsedR1.length,
     claudeIncluded: Boolean(claudeDoc),
     report,
     sections
