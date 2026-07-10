@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Separated Claude reviewer backend: `claude_backend: spawn` (or `--claude-backend spawn`, with `--claude-model`) runs an independent `claude -p` headless as the R1 Claude reviewer, decoupled from the orchestrating session so it can judge Phase C neutrally. Confined to a read-only tool allow-list (`Read`/`Glob`/`Grep`) with `--strict-mcp-config` and a defense-in-depth deny-list, since it reads untrusted diff content; prompt piped on stdin. Parsed R1 docs are stamped with the runner's identity (a spawned reviewer cannot spoof a peer via `{"agent":...}`). Default stays `session` (orchestrator writes Claude's R1 file).
+- Configurable reviewers: `reviewers: [claude, codex, grok]` (or `--reviewers`) selects who participates; omitting an agent skips it. Explicit `--skip-claude` added alongside `--skip-codex`/`--skip-grok`.
+- `setup --init`: scaffold a `.council.yml` from defaults plus `--reviewers`/`--claude-backend`/`--claude-model`/`--codex-model`/`--grok-model`/`--default-mode` (refuses to clobber without `--force`). `setup` report now shows per-reviewer reachability and the Claude backend; `doctor` gained an optional Claude-CLI check.
 - `result --html`: self-contained styled HTML report (sortable severity-coloured findings table with consensus/policy/contested/seen badges, verdict chips, solve ranking, collapsed full report) written to the job's artifacts dir. All fields HTML-escaped; light/dark aware.
 - `worktree add|remove|list`: isolated git worktrees for single-writer `/council:solve` implementations (branch `council-solve/<slug>`). Idempotent add, re-attaches a kept branch after remove (fixloop-safe), and refuses to remove a worktree with uncommitted changes unless `--force`.
 

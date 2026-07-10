@@ -25,7 +25,10 @@ export const DEFAULT_POLICY = {
   debate_resume: false,
   solve_writer: "claude",
   budget_guard: 0,
-  verify_findings: false
+  verify_findings: false,
+  reviewers: ["claude", "codex", "grok"],
+  claude_backend: "session", // session | spawn
+  claude_model: null
 };
 
 /**
@@ -168,12 +171,20 @@ export function loadPolicy(cwd) {
 export function mergeOptionsWithPolicy(options, policy) {
   const timeoutMinutes = Number(policy.agent_timeout_minutes ?? DEFAULT_POLICY.agent_timeout_minutes);
   const policyTimeoutMs = Number.isFinite(timeoutMinutes) && timeoutMinutes > 0 ? timeoutMinutes * 60_000 : null;
+  // `reviewers` (policy or flag) says WHO participates; an agent absent from the
+  // list is skipped. Explicit --skip-<agent> flags still force-skip on top.
+  const reviewers = normalizeReviewers(options.reviewers ?? policy.reviewers ?? DEFAULT_POLICY.reviewers);
+  const reviewerSet = new Set(reviewers);
   return {
     ...options,
     adversarial: Boolean(options.adversarial),
     deliberate: Boolean(options.deliberate),
-    skipCodex: Boolean(options.skipCodex),
-    skipGrok: Boolean(options.skipGrok),
+    reviewers,
+    skipCodex: Boolean(options.skipCodex) || !reviewerSet.has("codex"),
+    skipGrok: Boolean(options.skipGrok) || !reviewerSet.has("grok"),
+    skipClaude: Boolean(options.skipClaude) || !reviewerSet.has("claude"),
+    claudeBackend: normalizeClaudeBackend(options.claudeBackend ?? policy.claude_backend),
+    claudeModel: options.claudeModel ?? policy.claude_model ?? null,
     claudeFindingsPath: options.claudeFindingsPath ?? null,
     claudeFindingsWaitPath: options.claudeFindingsWaitPath ?? null,
     waitTimeoutMs: options.waitTimeoutMs ?? null,
@@ -211,6 +222,33 @@ function clampPercent(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return 0;
   return Math.min(100, n);
+}
+
+const VALID_REVIEWERS = new Set(["claude", "codex", "grok"]);
+
+export function normalizeReviewers(value) {
+  const list = Array.isArray(value) ? value : String(value ?? "").split(",");
+  const normalized = list.map((s) => String(s).trim().toLowerCase()).filter((s) => VALID_REVIEWERS.has(s));
+  return normalized.length ? [...new Set(normalized)] : ["claude", "codex", "grok"];
+}
+
+/**
+ * Tokens the caller passed that are NOT valid reviewers. Lets the CLI warn on a
+ * typo (`--reviewers gork`) instead of silently falling back to all three -
+ * running MORE reviewers than intended is the opposite of the user's intent.
+ * Returns [] for empty/null input (the legitimate "use defaults" case).
+ */
+export function unknownReviewers(value) {
+  if (value == null || value === "") return [];
+  const list = Array.isArray(value) ? value : String(value).split(",");
+  return list
+    .map((s) => String(s).trim())
+    .filter((s) => s && !VALID_REVIEWERS.has(s.toLowerCase()));
+}
+
+/** session | spawn, case-insensitive; anything else degrades to the safe session backend. */
+export function normalizeClaudeBackend(value) {
+  return String(value ?? "").trim().toLowerCase() === "spawn" ? "spawn" : "session";
 }
 
 function normalizeSeverityList(value) {

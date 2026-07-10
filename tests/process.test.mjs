@@ -45,6 +45,36 @@ test("runCommandAsync roundtrips args with spaces and ampersand", async (t) => {
   assert.equal(result.stdout.trim(), "a b & c");
 });
 
+test("runCommandAsync pipes options.input to the child's stdin", async (t) => {
+  const result = await runCommandAsync(
+    process.execPath,
+    ["-e", "process.stdin.on('data', (d) => process.stdout.write(d))"],
+    { input: "hello from stdin", timeoutMs: 5000 }
+  );
+  if (spawnBlocked(result)) {
+    t.skip("child_process.spawn is blocked by this sandbox");
+    return;
+  }
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.equal(result.stdout.trim(), "hello from stdin");
+});
+
+test("runCommandAsync without input closes stdin so stdin-readers see EOF", async (t) => {
+  const result = await runCommandAsync(
+    process.execPath,
+    ["-e", "let n=0; process.stdin.on('data',()=>{n++}); process.stdin.on('end',()=>process.stdout.write('end:'+n))"],
+    { timeoutMs: 5000 }
+  );
+  if (spawnBlocked(result)) {
+    t.skip("child_process.spawn is blocked by this sandbox");
+    return;
+  }
+  // stdio[0] is "ignore" with no input; the child should still terminate (EOF),
+  // not hang until the timeout.
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.equal(result.timedOut, false);
+});
+
 test("runCommandAsync timeout kills long-running process", async (t) => {
   const result = await runCommandAsync(
     process.execPath,
