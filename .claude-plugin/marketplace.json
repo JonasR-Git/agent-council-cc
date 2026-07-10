@@ -1,8 +1,8 @@
 {
   "name": "agent-council",
   "owner": {
-    "name": "JonasR",
-    "url": "https://github.com/JonasR/agent-council-cc"
+    "name": "JonasR-Git",
+    "url": "https://github.com/JonasR-Git/agent-council-cc"
   },
   "metadata": {
     "description": "Multi-agent council code review for Claude Code: independent review then peer critique across Claude + Codex + Grok.",
@@ -14,7 +14,7 @@
       "description": "Multi-agent council: dual review + deliberate protocol (Claude + Codex + Grok).",
       "version": "1.0.0",
       "author": {
-        "name": "JonasR"
+        "name": "JonasR-Git"
       },
       "source": "./plugins/council"
     }
