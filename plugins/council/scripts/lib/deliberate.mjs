@@ -23,6 +23,8 @@ import {
   slimFindingsDoc
 } from "./findings.mjs";
 import { collectReviewContext, resolveReviewTarget } from "./git-context.mjs";
+import { recordAndAnnotate } from "./ledger.mjs";
+import { readCachedR1, writeCachedR1 } from "./resume.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 
 export { READONLY_DISALLOWED_TOOLS, runCodexStructured, runGrokStructured };
@@ -204,8 +206,18 @@ export async function runDeliberation(cwd, backends, options = {}) {
     policyFocus: options.policyFocus ?? options.focusText ?? ""
   };
 
+  // Resume: reuse cached successful R1 outputs for this snapshot so only the
+  // failed/missing agents (e.g. a timed-out codex) re-run.
+  const resume = Boolean(options.resume);
+  const cachedCodex = resume ? readCachedR1(cwd, context.snapshotId, "codex") : null;
+  const cachedGrok = resume ? readCachedR1(cwd, context.snapshotId, "grok") : null;
+
   const r1Jobs = [];
-  if (!options.skipCodex) {
+  if (options.skipCodex) {
+    r1Jobs.push(Promise.resolve({ agent: "codex", skipped: true, reason: "skip", stdout: "" }));
+  } else if (cachedCodex) {
+    r1Jobs.push(Promise.resolve(cachedCodex));
+  } else {
     r1Jobs.push(
       runCodexStructured(
         cwd,
@@ -215,11 +227,13 @@ export async function runDeliberation(cwd, backends, options = {}) {
         "r1"
       )
     );
-  } else {
-    r1Jobs.push(Promise.resolve({ agent: "codex", skipped: true, reason: "skip", stdout: "" }));
   }
 
-  if (!options.skipGrok) {
+  if (options.skipGrok) {
+    r1Jobs.push(Promise.resolve({ agent: "grok", skipped: true, reason: "skip", stdout: "" }));
+  } else if (cachedGrok) {
+    r1Jobs.push(Promise.resolve(cachedGrok));
+  } else {
     r1Jobs.push(
       runGrokStructured(
         cwd,
@@ -230,13 +244,16 @@ export async function runDeliberation(cwd, backends, options = {}) {
         buildR1Prompt("grok", context, r1TemplateOpts)
       )
     );
-  } else {
-    r1Jobs.push(Promise.resolve({ agent: "grok", skipped: true, reason: "skip", stdout: "" }));
   }
 
-  onPhase("r1");
+  onPhase(resume && (cachedCodex || cachedGrok) ? "r1 (resuming)" : "r1");
   const r1Raw = await Promise.all(r1Jobs);
   onPhase("r1-done");
+
+  // Cache successful R1 outputs for a future --resume of this snapshot.
+  for (const raw of r1Raw) {
+    if (raw && !raw.skipped && !raw.resumedFromCache) writeCachedR1(cwd, context.snapshotId, raw.agent, raw);
+  }
   const claudeDoc = await loadClaudeDoc(options);
 
   const r1Docs = [];
@@ -383,6 +400,9 @@ export async function runDeliberation(cwd, backends, options = {}) {
   }
 
   merged = applyConsensusPolicy(merged, options.requireConsensusFor ?? []);
+  if (options.ledger !== false) {
+    merged = recordAndAnnotate(cwd, options.jobId ?? "unknown", merged, options.nowIso ?? new Date().toISOString());
+  }
 
   let debates = [];
   if ((options.debateRounds ?? 0) > 0) {

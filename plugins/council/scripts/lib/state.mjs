@@ -42,6 +42,24 @@ export function resolveJobsDir(cwd) {
   return path.join(resolveStateDir(cwd), "jobs");
 }
 
+export function resolveStateRoot() {
+  return process.env[STATE_ROOT_ENV] || FALLBACK_STATE_ROOT_DIR;
+}
+
+/** All per-workspace jobs dirs under the state root (for --global history). */
+export function listAllJobsDirs() {
+  const root = resolveStateRoot();
+  try {
+    return fs
+      .readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => ({ workspace: e.name, jobsDir: path.join(root, e.name, "jobs") }))
+      .filter((d) => fs.existsSync(d.jobsDir));
+  } catch {
+    return [];
+  }
+}
+
 export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }

@@ -200,6 +200,7 @@ export function mergeOptionsWithPolicy(options, policy) {
     solveWriter: options.solveWriter ?? policy.solve_writer ?? "claude",
     budgetGuard: clampPercent(options.budgetGuard ?? policy.budget_guard ?? 0),
     forceBudget: options.forceBudget ?? false,
+    resume: options.resume ?? false,
     policySource: policy._source
   };
 }

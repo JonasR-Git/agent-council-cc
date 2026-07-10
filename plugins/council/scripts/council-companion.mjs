@@ -25,11 +25,13 @@ import {
 import { runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import {
   appendLogLine,
   archiveJobResults,
   createJobLogFile,
   generateJobId,
+  listAllJobsDirs,
   listJobs,
   nowIso,
   readJobFile,
@@ -51,6 +53,8 @@ function printUsage() {
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
       "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
+      "  node scripts/council-companion.mjs history [--kind <k>] [--since <days>] [--global] [--json]",
+      "  node scripts/council-companion.mjs ledger [--status open|fixed|ignored] [--resolve <fp> fixed|ignored]",
       "  node scripts/council-companion.mjs result [job-id] [--summary] [--json]",
       "",
       "Flags:",
@@ -520,6 +524,9 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       claudeFindingsWaitPath: mergedOpts.claudeFindingsWaitPath,
       waitTimeoutMs: mergedOpts.waitTimeoutMs,
       policyFocus: policy.focus,
+      resume: mergedOpts.resume,
+      jobId: job.id,
+      nowIso: nowIso(),
       onPhase: makePhaseReporter(root, job)
     });
     const r1Failed = deliberation.r1.some((r) => !r.skipped && r.status !== 0);
@@ -656,7 +663,7 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
       "budget-guard",
       "cwd"
     ],
-    booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "debate-resume", "force-budget"]
+    booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "debate-resume", "force-budget", "resume"]
   });
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const focusText = positionals.join(" ").trim();
@@ -687,6 +694,7 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
     peerCritiqueSeverities: options["peer-severities"] ?? undefined,
     debateRounds: options["debate-rounds"] != null ? Number(options["debate-rounds"]) : undefined,
     debateResume: options["debate-resume"] ? true : undefined,
+    resume: options.resume ? true : undefined,
     budgetGuard: options["budget-guard"] != null ? Number(options["budget-guard"]) : undefined,
     forceBudget: options["force-budget"] ? true : undefined,
     waitTimeoutMs,
@@ -1019,6 +1027,105 @@ async function runGrokPing(cwd, backends, prompt) {
   }
 }
 
+function handleHistory(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["kind", "since", "status"],
+    booleanOptions: ["json", "global"]
+  });
+  const cwd = process.cwd();
+  const sinceMs = options.since ? Date.now() - Number(options.since) * 86_400_000 : 0;
+  if (options.since != null && !Number.isFinite(Number(options.since))) {
+    throw new Error("--since must be a number of days");
+  }
+
+  const sources = options.global
+    ? listAllJobsDirs()
+    : [{ workspace: path.basename(resolveStateDir(cwd)), jobsDir: path.join(resolveStateDir(cwd), "jobs") }];
+
+  const rows = [];
+  for (const { workspace, jobsDir } of sources) {
+    let files;
+    try {
+      files = fs.readdirSync(jobsDir).filter((f) => f.endsWith(".json"));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      let job;
+      try {
+        job = JSON.parse(fs.readFileSync(path.join(jobsDir, file), "utf8"));
+      } catch {
+        continue;
+      }
+      if (options.kind && job.kind !== options.kind) continue;
+      if (options.status && job.status !== options.status) continue;
+      const at = Date.parse(job.finishedAt ?? job.createdAt ?? "");
+      if (sinceMs && (!Number.isFinite(at) || at < sinceMs)) continue;
+      const consensus = job.deliberation?.merged?.consensus?.length ?? null;
+      rows.push({
+        workspace,
+        id: job.id,
+        kind: job.kind,
+        status: job.status,
+        createdAt: job.createdAt ?? null,
+        summary: job.summary ?? "",
+        consensusFindings: consensus
+      });
+    }
+  }
+  rows.sort((a, b) => (Date.parse(b.createdAt ?? "") || 0) - (Date.parse(a.createdAt ?? "") || 0));
+
+  if (options.json) {
+    outputResult({ jobs: rows.length, global: Boolean(options.global), rows }, true);
+    return;
+  }
+  if (!rows.length) {
+    console.log("No matching council jobs.\n");
+    return;
+  }
+  const lines = [`Council history (${rows.length} jobs${options.global ? ", all workspaces" : ""}):`];
+  for (const r of rows.slice(0, 60)) {
+    const ws = options.global ? `${r.workspace.slice(0, 20).padEnd(20)}  ` : "";
+    const cons = r.consensusFindings != null ? ` · consensus=${r.consensusFindings}` : "";
+    lines.push(`  ${ws}${r.id}  ${String(r.status).padEnd(22)} ${String(r.kind).padEnd(11)} ${(r.createdAt ?? "").slice(0, 16)}${cons}  ${r.summary.slice(0, 50)}`);
+  }
+  console.log(`${lines.join("\n")}\n`);
+}
+
+function handleLedger(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["resolve", "status"],
+    booleanOptions: ["json"]
+  });
+  const cwd = process.cwd();
+  if (options.resolve) {
+    const status = positionals[0] ?? "fixed";
+    if (!["fixed", "ignored", "open"].includes(status)) {
+      throw new Error("resolve status must be fixed | ignored | open");
+    }
+    const ok = resolveLedgerEntry(cwd, options.resolve, status, nowIso());
+    outputResult(options.json ? { fingerprint: options.resolve, status, updated: ok } : `${ok ? "Updated" : "Not found"}: ${options.resolve} -> ${status}\n`, options.json);
+    return;
+  }
+  let entries = readLedgerEntries(cwd);
+  if (options.status) entries = entries.filter((e) => e.status === options.status);
+  entries.sort((a, b) => (b.timesSeen ?? 0) - (a.timesSeen ?? 0));
+  if (options.json) {
+    outputResult({ entries: entries.length, rows: entries }, true);
+    return;
+  }
+  if (!entries.length) {
+    console.log("Findings ledger is empty.\n");
+    return;
+  }
+  const lines = [`Findings ledger (${entries.length} tracked):`];
+  for (const e of entries.slice(0, 60)) {
+    lines.push(`  [${String(e.status).padEnd(7)}] seen ${String(e.timesSeen ?? 1).padStart(2)}x  ${(e.file ?? "-").slice(0, 40).padEnd(40)}  ${String(e.title ?? "").slice(0, 50)}`);
+    lines.push(`            fp=${e.fingerprint}`);
+  }
+  console.log(`${lines.join("\n")}\n`);
+}
+
 function handleMetrics(argv) {
   const { options } = parseCommandInput(argv, { valueOptions: ["days"], booleanOptions: ["json"] });
   const cwd = process.cwd();
@@ -1213,6 +1320,12 @@ async function main() {
         break;
       case "metrics":
         handleMetrics(rest);
+        break;
+      case "history":
+        handleHistory(rest);
+        break;
+      case "ledger":
+        handleLedger(rest);
         break;
       case "cancel":
         handleCancel(rest);

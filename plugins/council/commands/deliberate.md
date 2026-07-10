@@ -77,3 +77,5 @@ After the report (or `/council:result`):
   `r2_effort` (Grok). `--debate-rounds 1|2` adds a bounded rebuttal/counter exchange on
   contested items only — no free-running chat. With `--debate-resume` (or policy
   `debate_resume: true`) Grok authors defend inside their own R1 session.
+- `--resume`: reuse cached successful R1 outputs for the same diff snapshot and only
+  re-run the agents that failed/timed out last time (e.g. after a codex timeout).
