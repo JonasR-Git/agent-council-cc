@@ -1836,6 +1836,7 @@ function renderAuditReviewReport(out) {
   if (c.reduceRan === false) extras.push("global SSOT/architecture reduce SKIPPED (budget/reviewers)");
   if (c.truncatedUnits) extras.push(`${c.truncatedUnits} module(s) truncated — tail unreviewed`);
   if (c.unitsFailed) extras.push(`${c.unitsFailed} unit(s) failed`);
+  if (c.unparsedReturns) extras.push(`${c.unparsedReturns} unparseable reviewer return(s) after retry`);
   L.push(`Reviewed ${c.unitsReviewed}/${c.unitsSelected} hotspot modules with ${reviewers} (budget ${c.budgetSpent}/${c.budgetTotal} agent calls). ${c.suppliedChars}/${c.totalCharsOfReviewed} chars of reviewed modules supplied.${extras.length ? ` ⚠ ${extras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);
   L.push("");
   const rank = { P0: 0, P1: 1, P2: 2, nit: 3 };

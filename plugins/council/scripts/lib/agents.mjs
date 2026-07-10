@@ -12,6 +12,40 @@ import { runCommandAsync } from "./process.mjs";
 export const READONLY_DISALLOWED_TOOLS =
   "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal";
 
+export const JSON_ONLY_REMINDER =
+  "\n\nIMPORTANT: your previous reply could not be parsed. Reply with ONLY the raw JSON object specified above — no explanation, no markdown code fences, nothing before or after it.";
+
+/**
+ * Run a structured agent call and retry ONCE (by default) if it ran but produced
+ * unparseable output. `runFor(prompt)` issues the call and returns a runner result
+ * ({ stdout, status, skipped, timedOut, ... }); `parse(stdout)` returns a doc with
+ * a `.parseOk` flag. A reminder is appended to the prompt on retry. Only retries a
+ * genuine parse miss (status 0, not skipped/timed-out) — a reminder cannot fix a
+ * crashed or absent backend.
+ *
+ * A retry is a REAL extra agent call, so when a finite `budget` is supplied the
+ * retry is charged (`retryCost`, default 1) and declined when the budget can't
+ * afford it — the caller charges the first call up front, this charges the retry,
+ * so budget accounting stays honest and bounded. Returns the final runner result
+ * plus `retryAttempts` and `parseMissed` (true if any attempt produced status-0
+ * output that failed to parse, even if a later attempt failed differently).
+ */
+export async function runStructuredWithRetry(runFor, prompt, parse, { reminder = JSON_ONLY_REMINDER, maxRetries = 1, budget = null, retryCost = 1 } = {}) {
+  let result = await runFor(prompt);
+  let attempts = 1;
+  let parseMissed = false;
+  while (attempts <= maxRetries) {
+    if (result.skipped || result.status !== 0 || result.timedOut) break;
+    if (parse(result.stdout)?.parseOk !== false) break;
+    parseMissed = true;
+    if (budget && !budget.canSpend(retryCost)) break; // never exceed the finite budget
+    if (budget) budget.charge(retryCost);
+    result = await runFor(prompt + reminder);
+    attempts += 1;
+  }
+  return { ...result, retryAttempts: attempts, parseMissed };
+}
+
 /**
  * A per-run token that fences untrusted content in prompts. Hostile repo text
  * cannot forge the closing marker because it cannot predict the nonce.

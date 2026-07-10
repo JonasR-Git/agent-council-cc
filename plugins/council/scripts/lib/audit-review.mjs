@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { interpolate, makeFenceNonce, runCodexStructured, runGrokStructured } from "./agents.mjs";
+import { interpolate, makeFenceNonce, runCodexStructured, runGrokStructured, runStructuredWithRetry } from "./agents.mjs";
 import { mergeFindings, parseAgentFindings } from "./findings.mjs";
 import { annotateScopes } from "./scope.mjs";
 import { workspaceRoot } from "./state.mjs";
@@ -152,24 +152,41 @@ ssot|architecture|dead-code|design, scope "cross-cutting" for structural items.`
  * skipped/unavailable backend is never charged. `reviewed` is true only when at
  * least one backend actually returned findings.
  */
-export async function reviewUnit(cwd, backends, options, unitId, model) {
+export async function reviewUnit(cwd, backends, options, unitId, model, budget) {
   const root = workspaceRoot(cwd);
   const { prompt, suppliedChars, totalChars, split } = buildUnitPrompt(root, unitId, model);
   const jobs = [];
   if (reviewerActive("codex", backends, options)) {
-    jobs.push(runCodexStructured(cwd, backends, options, prompt, "audit").then((r) => ({ ...r, agent: "codex" })));
+    jobs.push(
+      runStructuredWithRetry((p) => runCodexStructured(cwd, backends, options, p, "audit"), prompt, (s) => parseAgentFindings(s, "codex"), { budget }).then((r) => ({ ...r, agent: "codex" }))
+    );
   }
   if (reviewerActive("grok", backends, options)) {
-    jobs.push(runGrokStructured(cwd, backends, options, prompt).then((r) => ({ ...r, agent: "grok" })));
+    jobs.push(
+      runStructuredWithRetry((p) => runGrokStructured(cwd, backends, options, p), prompt, (s) => parseAgentFindings(s, "grok"), { budget }).then((r) => ({ ...r, agent: "grok" }))
+    );
   }
   const raw = await Promise.all(jobs);
-  const docs = raw.filter((r) => !r.skipped && r.status === 0).map((r) => parseAgentFindings(r.stdout, r.agent));
+  const docs = [];
+  let unparsed = 0;
+  for (const r of raw) {
+    if (r.skipped) continue;
+    if (r.status === 0) {
+      const doc = parseAgentFindings(r.stdout, r.agent);
+      if (doc.parseOk) docs.push(doc);
+      else unparsed += 1; // ran, status 0, still unparseable after retry
+    } else if (r.parseMissed) {
+      // produced malformed output, then the retry failed (nonzero/timeout): a
+      // real reviewer return that yielded nothing — surface it, don't drop it.
+      unparsed += 1;
+    }
+  }
   const merged = mergeFindings(docs);
   // stamp the unit + supplied coverage onto each finding
   for (const finding of merged.all) {
     finding.file = finding.file || unitId;
   }
-  return { unitId, merged, suppliedChars, totalChars, split, reviewed: docs.length > 0 };
+  return { unitId, merged, suppliedChars, totalChars, split, reviewed: docs.length > 0, unparsed };
 }
 
 /**
@@ -191,11 +208,18 @@ export async function globalReduce(cwd, backends, options, model, budget) {
   const prompt = interpolate(AUDIT_REDUCE_TEMPLATE, { DUPES: dupes, CYCLES: cycles, ORPHANS: orphans, NONCE: nonce });
   budget.charge(1);
   const useCodex = codexOk; // prefer Codex; fall back to Grok only when Codex is unavailable
-  const res = useCodex
-    ? await runCodexStructured(cwd, backends, options, prompt, "audit-reduce")
-    : await runGrokStructured(cwd, backends, options, prompt);
-  if (res.skipped || res.status !== 0) return { all: [], consensus: [], unique: [], ran: false };
-  const doc = parseAgentFindings(res.stdout, useCodex ? "codex" : "grok");
+  const agent = useCodex ? "codex" : "grok";
+  const res = await runStructuredWithRetry(
+    useCodex ? (p) => runCodexStructured(cwd, backends, options, p, "audit-reduce") : (p) => runGrokStructured(cwd, backends, options, p),
+    prompt,
+    (s) => parseAgentFindings(s, agent),
+    { budget }
+  );
+  // A parse miss whose retry then failed still means the reduce RAN (it just
+  // yielded nothing parseable) — report ran:true + unparsed, not a "skipped".
+  if (res.skipped || (res.status !== 0 && !res.parseMissed)) return { all: [], consensus: [], unique: [], ran: false };
+  const doc = res.status === 0 ? parseAgentFindings(res.stdout, agent) : { parseOk: false };
+  if (!doc.parseOk) return { all: [], consensus: [], unique: [], ran: true, unparsed: 1 };
   return { ...mergeFindings([doc]), ran: true };
 }
 
@@ -229,7 +253,7 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
       idx += 1;
       budget.charge(costPerUnit);
       try {
-        results.push(await reviewUnit(cwd, backends, options, unitId, model));
+        results.push(await reviewUnit(cwd, backends, options, unitId, model, budget));
       } catch (err) {
         failed.push({ unitId, error: String(err?.message ?? err) });
       }
@@ -250,6 +274,10 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
   const suppliedChars = reviewedUnits.reduce((s, r) => s + r.suppliedChars, 0);
   const totalChars = reviewedUnits.reduce((s, r) => s + r.totalChars, 0);
   const truncatedUnits = reviewedUnits.filter((r) => r.split).length;
+  // Returns that ran but stayed unparseable even after the retry (a garbled
+  // backend reply), across all units + the reduce — surfaced so it is not mistaken
+  // for "found nothing".
+  const unparsedReturns = results.reduce((s, r) => s + (r.unparsed ?? 0), 0) + (reduce.unparsed ?? 0);
   return {
     findings: scoped.all,
     reviewed: reviewedUnits.map((r) => r.unitId),
@@ -259,6 +287,7 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
       unitsSelected: units.length,
       unitsFailed: failed.length,
       truncatedUnits,
+      unparsedReturns,
       reduceRan: reduce.ran,
       reviewers: { codex: reviewerActive("codex", backends, options), grok: reviewerActive("grok", backends, options) },
       failed,

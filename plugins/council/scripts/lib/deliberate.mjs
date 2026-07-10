@@ -8,6 +8,7 @@ import {
   makeFenceNonce,
   runCodexStructured,
   runGrokStructured,
+  runStructuredWithRetry,
   waitForFile
 } from "./agents.mjs";
 import { runClaudeStructured } from "./claude-agent.mjs";
@@ -235,12 +236,10 @@ export async function runDeliberation(cwd, backends, options = {}) {
     r1Jobs.push(Promise.resolve(cachedCodex));
   } else {
     r1Jobs.push(
-      runCodexStructured(
-        cwd,
-        backends,
-        { ...options, maxTurns: options.maxTurnsR1 },
+      runStructuredWithRetry(
+        (p) => runCodexStructured(cwd, backends, { ...options, maxTurns: options.maxTurnsR1 }, p, "r1"),
         buildR1Prompt("codex", context, r1TemplateOpts),
-        "r1"
+        (stdout) => parseAgentFindings(stdout, "codex")
       )
     );
   }
@@ -251,13 +250,12 @@ export async function runDeliberation(cwd, backends, options = {}) {
     r1Jobs.push(Promise.resolve(cachedGrok));
   } else {
     r1Jobs.push(
-      runGrokStructured(
-        cwd,
-        backends,
-        // Capture the session id so debate rebuttals can resume the author's
-        // own R1 context (opt-in via debate_resume).
-        { ...options, maxTurns: options.maxTurnsR1, captureGrokSession: Boolean(options.debateResume) },
-        buildR1Prompt("grok", context, r1TemplateOpts)
+      runStructuredWithRetry(
+        // Capture the session id so debate rebuttals can resume the author's own
+        // R1 context (opt-in via debate_resume).
+        (p) => runGrokStructured(cwd, backends, { ...options, maxTurns: options.maxTurnsR1, captureGrokSession: Boolean(options.debateResume) }, p),
+        buildR1Prompt("grok", context, r1TemplateOpts),
+        (stdout) => parseAgentFindings(stdout, "grok")
       )
     );
   }
@@ -272,7 +270,13 @@ export async function runDeliberation(cwd, backends, options = {}) {
       r1Jobs.push(Promise.resolve(cachedClaude));
     } else {
       // No --max-turns on this CLI: the bound is the wall-clock agentTimeoutMs.
-      r1Jobs.push(runClaudeStructured(cwd, backends, options, buildR1Prompt("claude", context, r1TemplateOpts)));
+      r1Jobs.push(
+        runStructuredWithRetry(
+          (p) => runClaudeStructured(cwd, backends, options, p),
+          buildR1Prompt("claude", context, r1TemplateOpts),
+          (stdout) => parseAgentFindings(stdout, "claude")
+        )
+      );
     }
   }
 
@@ -324,6 +328,12 @@ export async function runDeliberation(cwd, backends, options = {}) {
       skipped: false
     });
   }
+  // Surface reviewers whose R1 output was unparseable, so a silent "raised 0" (a
+  // garbled backend reply OR a malformed --claude-findings file) is visible rather
+  // than mistaken for "found nothing". Computed AFTER the session-Claude push so
+  // the file backend is covered too.
+  const unparsedR1 = r1Results.filter((r) => !r.skipped && r.findings && r.findings.parseOk === false).map((r) => r.agent);
+  if (unparsedR1.length) onPhase(`r1: unparseable after retry: ${unparsedR1.join(", ")}`);
   // Unified claude doc for R2 peer critique / debate, from whichever source.
   const claudeDoc = fileClaudeDoc ?? r1Docs.find((d) => d.agent === "claude") ?? null;
 
