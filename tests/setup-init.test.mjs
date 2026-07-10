@@ -48,6 +48,17 @@ test("setup --init scaffolds a .council.yml that loadPolicy reads back", (t) => 
   assert.equal(policy.default_mode, "deliberate");
 });
 
+test("setup --init rejects model strings that could inject into the YAML", (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "council-init-"));
+  const result = runSetupInit(cwd, ["--claude-model", "opus\n#danger: true"]);
+  if (result.error && (result.error.code === "EPERM" || result.error.code === "ENOENT")) {
+    t.skip("child_process.spawn is blocked by this sandbox");
+    return;
+  }
+  assert.notEqual(result.status, 0, "a newline/# in a model value must be rejected");
+  assert.equal(fs.existsSync(path.join(cwd, ".council.yml")), false, "no file written on invalid input");
+});
+
 test("setup --init refuses to clobber an existing file without --force", (t) => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "council-init-"));
   const first = runSetupInit(cwd);

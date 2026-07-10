@@ -183,7 +183,7 @@ export function mergeOptionsWithPolicy(options, policy) {
     skipCodex: Boolean(options.skipCodex) || !reviewerSet.has("codex"),
     skipGrok: Boolean(options.skipGrok) || !reviewerSet.has("grok"),
     skipClaude: Boolean(options.skipClaude) || !reviewerSet.has("claude"),
-    claudeBackend: options.claudeBackend ?? policy.claude_backend ?? "session",
+    claudeBackend: normalizeClaudeBackend(options.claudeBackend ?? policy.claude_backend),
     claudeModel: options.claudeModel ?? policy.claude_model ?? null,
     claudeFindingsPath: options.claudeFindingsPath ?? null,
     claudeFindingsWaitPath: options.claudeFindingsWaitPath ?? null,
@@ -224,11 +224,31 @@ function clampPercent(value) {
   return Math.min(100, n);
 }
 
+const VALID_REVIEWERS = new Set(["claude", "codex", "grok"]);
+
 export function normalizeReviewers(value) {
   const list = Array.isArray(value) ? value : String(value ?? "").split(",");
-  const valid = new Set(["claude", "codex", "grok"]);
-  const normalized = list.map((s) => String(s).trim().toLowerCase()).filter((s) => valid.has(s));
+  const normalized = list.map((s) => String(s).trim().toLowerCase()).filter((s) => VALID_REVIEWERS.has(s));
   return normalized.length ? [...new Set(normalized)] : ["claude", "codex", "grok"];
+}
+
+/**
+ * Tokens the caller passed that are NOT valid reviewers. Lets the CLI warn on a
+ * typo (`--reviewers gork`) instead of silently falling back to all three -
+ * running MORE reviewers than intended is the opposite of the user's intent.
+ * Returns [] for empty/null input (the legitimate "use defaults" case).
+ */
+export function unknownReviewers(value) {
+  if (value == null || value === "") return [];
+  const list = Array.isArray(value) ? value : String(value).split(",");
+  return list
+    .map((s) => String(s).trim())
+    .filter((s) => s && !VALID_REVIEWERS.has(s.toLowerCase()));
+}
+
+/** session | spawn, case-insensitive; anything else degrades to the safe session backend. */
+export function normalizeClaudeBackend(value) {
+  return String(value ?? "").trim().toLowerCase() === "spawn" ? "spawn" : "session";
 }
 
 function normalizeSeverityList(value) {

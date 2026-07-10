@@ -90,7 +90,12 @@ export function normalizeFindingsDoc(doc, agentFallback = "unknown") {
   }
 
   const findings = Array.isArray(doc.findings) ? doc.findings : [];
-  const agent = String(doc.agent ?? agentFallback);
+  // Trust the RUNNER's identity (agentFallback), never the model-provided
+  // doc.agent: an injected diff could make a spawned reviewer emit
+  // {"agent":"codex"} to spoof a peer, and a stray "Claude"/"claude-opus"
+  // would drop it from agent===... lookups (R2/consensus). Only honor
+  // doc.agent when the caller genuinely doesn't know who ran ("unknown").
+  const agent = agentFallback !== "unknown" ? agentFallback : String(doc.agent ?? "unknown");
   const normalized = findings.map((f, i) => ({
     id: String(f?.id ?? `${agentFallback}-${i + 1}`),
     severity: normalizeSeverity(f?.severity),

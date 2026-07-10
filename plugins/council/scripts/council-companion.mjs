@@ -10,7 +10,14 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { READONLY_DISALLOWED_TOOLS, runDeliberation } from "./lib/deliberate.mjs";
 import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover.mjs";
-import { DEFAULT_POLICY, loadPolicy, mergeOptionsWithPolicy, normalizeReviewers } from "./lib/policy.mjs";
+import {
+  DEFAULT_POLICY,
+  loadPolicy,
+  mergeOptionsWithPolicy,
+  normalizeClaudeBackend,
+  normalizeReviewers,
+  unknownReviewers
+} from "./lib/policy.mjs";
 import { runSolve } from "./lib/solve.mjs";
 import { aggregateBenchmarks, readBenchmarks, runBenchmark } from "./lib/benchmark.mjs";
 import { evaluateBudget, gatherWindowPressure, renderBudgetBreaches } from "./lib/budget.mjs";
@@ -126,10 +133,17 @@ async function handleSetup(argv) {
 
   const backends = probeBackends(cwd, ROOT_DIR);
   const policy = loadPolicy(cwd);
-  const reviewers = policy.reviewers ?? DEFAULT_POLICY.reviewers;
+  // Normalize like mergeOptionsWithPolicy does: a scalar YAML value
+  // (reviewers: claude, codex) is a string, and mixed case would break
+  // includes()/join() and mis-report readiness. Warn on unknown tokens.
+  const reviewers = normalizeReviewers(policy.reviewers ?? DEFAULT_POLICY.reviewers);
+  const unknown = unknownReviewers(policy.reviewers);
+  if (unknown.length) {
+    console.error(`Warning: .council.yml has unknown reviewer(s): ${unknown.join(", ")} (valid: claude, codex, grok).`);
+  }
   const wants = (agent) => reviewers.includes(agent);
   // A reviewer is "reachable" if it participates AND a backend can run it.
-  const claudeBackend = policy.claude_backend ?? "session";
+  const claudeBackend = normalizeClaudeBackend(policy.claude_backend);
   const claudeReachable = !wants("claude") || claudeBackend === "session" || backends.claude.cli.available;
   const codexReachable = !wants("codex") || backends.codex.companionAvailable || backends.codex.cli.available;
   const grokReachable = !wants("grok") || backends.grok.companionAvailable || backends.grok.cli.available;
@@ -249,10 +263,12 @@ function scaffoldPolicyFile(cwd, options) {
   }
 
   const reviewers = normalizeReviewers(options.reviewers ?? DEFAULT_POLICY.reviewers);
-  const claudeBackend = options["claude-backend"] === "spawn" ? "spawn" : "session";
-  const claudeModel = options["claude-model"] ?? "";
-  const codexModel = options["codex-model"] ?? "";
-  const grokModel = options["grok-model"] ?? "";
+  const claudeBackend = normalizeClaudeBackend(options["claude-backend"]);
+  // Model strings are interpolated into YAML - a newline or '#' could smuggle
+  // extra keys or truncate parsing. Reject them rather than emit broken config.
+  const claudeModel = sanitizeModelValue(options["claude-model"], "--claude-model");
+  const codexModel = sanitizeModelValue(options["codex-model"], "--codex-model");
+  const grokModel = sanitizeModelValue(options["grok-model"], "--grok-model");
   const defaultMode = options["default-mode"] === "review" ? "review" : "deliberate";
 
   const contents = [
@@ -281,6 +297,22 @@ function scaffoldPolicyFile(cwd, options) {
 
   fs.writeFileSync(target, contents, "utf8");
   return { written: true, path: target, contents };
+}
+
+/**
+ * Reject model strings that could break or inject into the scaffolded YAML.
+ * Model ids are short tokens (letters/digits/.-_) plus optional whitespace-free
+ * form; anything with newlines, '#', quotes, or ':' is refused.
+ */
+function sanitizeModelValue(value, flag) {
+  if (value == null || value === "") return "";
+  const text = String(value).trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(text)) {
+    throw new Error(
+      `Invalid ${flag} value '${value}': model ids may contain only letters, digits, '.', '_' and '-'.`
+    );
+  }
+  return text;
 }
 
 function resolveAgentModels(options = {}) {
@@ -507,8 +539,11 @@ function jobSummary(mergedOpts) {
 }
 
 async function executeCouncilReview(cwd, options, existingJob = null) {
-  const backends = probeBackends(cwd, ROOT_DIR);
   const policy = loadPolicy(cwd);
+  // Only probe the Claude CLI when the spawn backend actually needs it - avoids
+  // `claude --version` latency on every session-backend run.
+  const needsClaudeProbe = normalizeClaudeBackend(options.claudeBackend ?? policy.claude_backend) === "spawn";
+  const backends = probeBackends(cwd, ROOT_DIR, { probeClaude: needsClaudeProbe });
   const mergedOpts = mergeOptionsWithPolicy(options, policy);
   const adversarial = Boolean(mergedOpts.adversarial);
   const deliberate = Boolean(mergedOpts.deliberate);
@@ -793,6 +828,12 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const focusText = positionals.join(" ").trim();
   const waitTimeoutMs = secondsToMs(options["wait-timeout"], "--wait-timeout");
+  // A typo like `--reviewers gork` would silently fall back to all three (more
+  // reviewers than intended). Surface the dropped tokens instead of swallowing.
+  const unknownRev = unknownReviewers(options.reviewers);
+  if (unknownRev.length) {
+    console.error(`Warning: ignoring unknown --reviewers value(s): ${unknownRev.join(", ")} (valid: claude, codex, grok).`);
+  }
   const request = {
     adversarial,
     deliberate,
@@ -839,7 +880,14 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
   const guardPolicy = mergeOptionsWithPolicy(request, loadPolicy(cwd));
   if ((deliberate || solve) && guardPolicy.budgetGuard > 0 && !guardPolicy.forceBudget) {
     const pressure = await gatherWindowPressure();
-    const skipAgents = [request.skipCodex ? "codex" : null, request.skipGrok ? "grok" : null].filter(Boolean);
+    // Use the RESOLVED skips (reviewers list + explicit flags), not the raw
+    // request flags: a provider dropped via `reviewers:` must not gate the run
+    // on its own usage. Claude spawn draws on the same Claude window as usage.
+    const skipAgents = [
+      guardPolicy.skipCodex ? "codex" : null,
+      guardPolicy.skipGrok ? "grok" : null,
+      guardPolicy.skipClaude ? "claude" : null
+    ].filter(Boolean);
     const { breaches, checked, unreadable } = evaluateBudget(pressure, guardPolicy.budgetGuard, skipAgents);
     // Fail closed if ANY participating provider's limits are unreadable - a guard
     // that only checks the readable providers would silently under-protect.
@@ -1039,6 +1087,10 @@ async function handleDoctor(argv) {
   const { options } = parseCommandInput(argv, { booleanOptions: ["json", "no-ping"] });
   const cwd = process.cwd();
   const backends = probeBackends(cwd, ROOT_DIR);
+  const policy = loadPolicy(cwd);
+  const claudeSpawnRequired =
+    normalizeClaudeBackend(policy.claude_backend) === "spawn" &&
+    normalizeReviewers(policy.reviewers ?? DEFAULT_POLICY.reviewers).includes("claude");
   const checks = [];
 
   // 1. CLI availability / versions
@@ -1055,11 +1107,15 @@ async function handleDoctor(argv) {
   });
   checks.push({ name: "grok-cli", ok: backends.grok.cli.available, detail: backends.grok.cli.detail });
   checks.push({
-    name: "claude-cli (optional)",
-    ok: true, // optional: only the spawn backend needs it; session backend always works
+    name: claudeSpawnRequired ? "claude-cli (spawn backend)" : "claude-cli (optional)",
+    // Required only when policy actually configures the spawn backend for a
+    // participating Claude reviewer; otherwise the session backend needs no CLI.
+    ok: claudeSpawnRequired ? backends.claude.cli.available : true,
     detail: backends.claude.cli.available
       ? backends.claude.cli.detail
-      : "not found - spawn backend unavailable, session backend (default) still works"
+      : claudeSpawnRequired
+        ? "not found - required because .council.yml sets claude_backend: spawn"
+        : "not found - spawn backend unavailable, session backend (default) still works"
   });
 
   // 2. State dir writable

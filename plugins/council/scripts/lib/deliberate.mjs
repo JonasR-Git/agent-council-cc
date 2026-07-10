@@ -219,6 +219,9 @@ export async function runDeliberation(cwd, backends, options = {}) {
     codexModel: options.codexModel,
     grokModel: options.grokModel,
     grokEffort: options.grokEffort,
+    // A different Claude backend/model produces different R1 - don't reuse it.
+    claudeBackend: options.claudeBackend,
+    claudeModel: options.claudeModel,
     base: options.base,
     scope: options.scope
   });
@@ -263,18 +266,17 @@ export async function runDeliberation(cwd, backends, options = {}) {
   // (pinnable model), so the orchestrating session judges neutrally. 'session'
   // (default) keeps Claude's R1 as the orchestrator's own findings file.
   const claudeSpawned = options.claudeBackend === "spawn" && !options.skipClaude;
+  const cachedClaude = resume && claudeSpawned ? readCachedR1(cwd, context.snapshotId, "claude", ctxKey) : null;
   if (claudeSpawned) {
-    r1Jobs.push(
-      runClaudeStructured(
-        cwd,
-        backends,
-        { ...options, maxTurns: options.maxTurnsR1 },
-        buildR1Prompt("claude", context, r1TemplateOpts)
-      )
-    );
+    if (cachedClaude) {
+      r1Jobs.push(Promise.resolve(cachedClaude));
+    } else {
+      // No --max-turns on this CLI: the bound is the wall-clock agentTimeoutMs.
+      r1Jobs.push(runClaudeStructured(cwd, backends, options, buildR1Prompt("claude", context, r1TemplateOpts)));
+    }
   }
 
-  onPhase(resume && (cachedCodex || cachedGrok) ? "r1 (resuming)" : "r1");
+  onPhase(resume && (cachedCodex || cachedGrok || cachedClaude) ? "r1 (resuming)" : "r1");
   // Emit per-agent completion so a slow/stuck agent (e.g. a codex backend stall)
   // is visible - you can see grok finished while r1 still waits on codex.
   let r1Done = 0;
@@ -290,8 +292,10 @@ export async function runDeliberation(cwd, backends, options = {}) {
   );
   onPhase("r1-done");
   // In spawn mode Claude's findings arrive via r1Raw (spawned CLI); in session
-  // mode they come from the orchestrator's findings file.
-  const fileClaudeDoc = claudeSpawned ? null : await loadClaudeDoc(options);
+  // mode they come from the orchestrator's findings file. When Claude is not a
+  // reviewer (--skip-claude / reviewers omits claude), ingest neither - and do
+  // not block on --claude-findings-wait.
+  const fileClaudeDoc = claudeSpawned || options.skipClaude ? null : await loadClaudeDoc(options);
 
   const r1Docs = [];
   const r1Results = [];

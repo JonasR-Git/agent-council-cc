@@ -114,8 +114,11 @@ export function findClaudeBinary() {
   const fromEnv = process.env.CLAUDE_BIN || process.env.CLAUDE_PATH;
   if (fromEnv && exists(fromEnv)) return fromEnv;
   const home = os.homedir();
+  const exe = process.platform === "win32" ? "claude.exe" : "claude";
   const candidates = [
-    path.join(home, ".local", "bin", process.platform === "win32" ? "claude.exe" : "claude"),
+    path.join(home, ".local", "bin", exe),
+    path.join(home, ".claude", "local", exe),
+    // Older local installs shipped the bare name without the .exe suffix.
     path.join(home, ".claude", "local", "claude")
   ];
   for (const c of candidates) {
@@ -124,15 +127,23 @@ export function findClaudeBinary() {
   return "claude";
 }
 
-export function probeBackends(cwd, councilRoot) {
+export function probeBackends(cwd, councilRoot, options = {}) {
+  // Version probes spawn a child; cap them so a hung CLI can't stall a run.
+  const probeOpts = { cwd, timeout: 10_000 };
   const codexCompanion = findCodexCompanion();
   const grokCompanion = findGrokCompanion(councilRoot);
   const grokBin = findGrokBinary();
   const claudeBin = findClaudeBinary();
-  const codexCli = binaryAvailable("codex", ["--version"], { cwd });
-  const grokCli = binaryAvailable(grokBin, ["--version"], { cwd });
-  const claudeCli = binaryAvailable(claudeBin, ["--version"], { cwd });
-  const node = binaryAvailable("node", ["--version"], { cwd });
+  const codexCli = binaryAvailable("codex", ["--version"], probeOpts);
+  const grokCli = binaryAvailable(grokBin, ["--version"], probeOpts);
+  // The Claude version probe is only needed for the spawn backend / doctor /
+  // setup. Skip it on the hot review path (probeClaude: false) to avoid paying
+  // `claude --version` startup latency on every run when session backend is used.
+  const claudeCli =
+    options.probeClaude === false
+      ? { available: false, detail: "not probed" }
+      : binaryAvailable(claudeBin, ["--version"], probeOpts);
+  const node = binaryAvailable("node", ["--version"], probeOpts);
 
   return {
     node,

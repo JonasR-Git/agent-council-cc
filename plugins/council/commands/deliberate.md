@@ -82,7 +82,9 @@ After the report (or `/council:result`):
 ## Rules
 
 - Review-only during this command.
-- Never skip Phase A (Claude must think alone first).
+- Session backend: never skip Phase A (Claude must think alone first). Spawn
+  backend (`--claude-backend spawn`): skip Phase A — the independent spawned
+  Claude produces R1; you go straight to Phase B then Phase C.
 - Prefer `--background` for non-trivial diffs; then `/council:status` + `/council:result`.
 - Models: `--codex-model` / `--grok-model` / `--claude-model` or `.council.yml` / CLI config files.
 - Reviewers: `--reviewers` (or policy `reviewers:`) sets who participates; `--claude-backend

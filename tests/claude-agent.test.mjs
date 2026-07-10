@@ -3,13 +3,32 @@ import assert from "node:assert/strict";
 
 import { buildClaudeArgs } from "../plugins/council/scripts/lib/claude-agent.mjs";
 
-test("buildClaudeArgs runs headless print mode and disallows all write tools", () => {
+function valuesAfter(args, flag, stopFlags) {
+  const i = args.indexOf(flag);
+  if (i === -1) return [];
+  const out = [];
+  for (let j = i + 1; j < args.length; j += 1) {
+    if (args[j].startsWith("--") && (!stopFlags || stopFlags.has(args[j]))) break;
+    if (args[j].startsWith("--")) break;
+    out.push(args[j]);
+  }
+  return out;
+}
+
+test("buildClaudeArgs confines the reviewer with a read-only ALLOW-list + strict MCP", () => {
   const args = buildClaudeArgs({});
   assert.deepEqual(args.slice(0, 3), ["-p", "--output-format", "text"]);
-  const di = args.indexOf("--disallowed-tools");
-  assert.notEqual(di, -1, "read-only reviewer must disallow write tools");
-  const disallowed = args.slice(di + 1);
-  for (const tool of ["Edit", "Write", "NotebookEdit", "Bash"]) {
+
+  // Allowlist: only read/search tools are reachable.
+  const allowed = valuesAfter(args, "--allowed-tools");
+  assert.deepEqual(allowed, ["Read", "Glob", "Grep"]);
+
+  // strict MCP prevents the repo's own .mcp.json servers from loading.
+  assert.ok(args.includes("--strict-mcp-config"), "must not load project MCP servers");
+
+  // Defense in depth: write/exec AND exfiltration/subagent tools denied too.
+  const disallowed = valuesAfter(args, "--disallowed-tools");
+  for (const tool of ["Edit", "Write", "NotebookEdit", "Bash", "WebFetch", "WebSearch", "Task"]) {
     assert.ok(disallowed.includes(tool), `${tool} must be disallowed for a read-only reviewer`);
   }
 });
