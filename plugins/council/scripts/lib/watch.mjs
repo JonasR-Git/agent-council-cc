@@ -1,9 +1,9 @@
 // Live-dashboard helpers for `council watch <job>`: derive per-agent progress
-// from the job's phase log and render a compact, tidy snapshot. Pure and
-// testable - no I/O, no clock reads (caller passes nowMs).
+// from the job's phase log + merged findings, and render a tidy boxed table.
+// Pure and testable - no I/O, no clock reads (caller passes nowMs).
 
 const AGENTS = ["codex", "grok", "claude"];
-const RULE = "-".repeat(52);
+const W = 58; // inner box width (all glyphs used are single display-width)
 
 // A job is "terminal" when it is neither running nor queued - matches handleWait
 // so `cancelled` (and any future non-active status) also ends the watch loop.
@@ -14,12 +14,7 @@ export function isTerminal(status) {
 /**
  * Parse the job phase log into per-agent R1/R2 progress. Only `Phase:` lines are
  * considered: the log also carries banners like "Deliberation stored (N chars)"
- * that must not be mistaken for the current phase. Emitted by the onPhase
- * reporter, e.g.
- *   Phase: r1
- *   Phase: r1: grok done (1/3)
- *   Phase: r2 (3 critiques)
- *   Phase: r2: codex->claude done (2/3)
+ * that must not be mistaken for the current phase.
  */
 export function summarizeProgress(logText) {
   const lines = String(logText ?? "")
@@ -58,13 +53,9 @@ export function summarizeProgress(logText) {
 }
 
 /**
- * Per-agent R1 state. Reconciles three realities the raw log can't express:
- *  - session-backed Claude is provided via a findings file, not run as a live
- *    R1 job, so it never emits `r1: claude done` -> shown as "file", not stuck
- *    "running";
- *  - a terminal job means every participating agent is done even if its done
- *    line was never parsed (or the mode emits no r1 phases at all);
- *  - a failed job leaves un-acked agents "unknown" rather than falsely "done".
+ * Per-agent R1 state. session-backed Claude is provided via file (never emits an
+ * r1 done line) -> "file"; a terminal job reconciles un-acked participants to
+ * "done" (a failed job leaves them "unknown"); skipped agents win.
  */
 export function agentR1States(progress, { skipped = [], claudeBackend = "session", status = "running" } = {}) {
   const skip = new Set(skipped);
@@ -72,35 +63,52 @@ export function agentR1States(progress, { skipped = [], claudeBackend = "session
   const failed = status === "failed";
   const states = {};
   for (const agent of AGENTS) {
-    if (skip.has(agent)) {
-      states[agent] = "skipped";
-    } else if (agent === "claude" && claudeBackend === "session") {
-      states[agent] = "file";
-    } else if (progress.r1Done.has(agent)) {
-      states[agent] = "done";
-    } else if (terminal) {
-      states[agent] = failed ? "unknown" : "done";
-    } else if (progress.reachedR1) {
-      states[agent] = "running";
-    } else {
-      states[agent] = "pending";
-    }
+    if (skip.has(agent)) states[agent] = "skipped";
+    else if (agent === "claude" && claudeBackend === "session") states[agent] = "file";
+    else if (progress.r1Done.has(agent)) states[agent] = "done";
+    else if (terminal) states[agent] = failed ? "unknown" : "done";
+    else if (progress.reachedR1) states[agent] = "running";
+    else states[agent] = "pending";
   }
   return states;
 }
 
-const STATE_MARK = {
-  done: "[x]",
-  running: "[~]",
-  pending: "[ ]",
-  skipped: "[-]",
-  file: "[f]",
-  unknown: "[?]"
-};
-const STATE_NOTE = {
-  skipped: " (not a reviewer)",
-  file: " (from file, session backend)",
-  unknown: " (no completion recorded)"
+/**
+ * Findings breakdown from the stored merged doc: totals, consensus/unique/
+ * contested, per-severity, and per-agent (how many each RAISED and how many of
+ * those are shared/consensus). Null when findings aren't available yet.
+ */
+export function summarizeFindings(merged) {
+  const all = merged?.all;
+  if (!Array.isArray(all)) return null;
+  const bySeverity = { P0: 0, P1: 0, P2: 0, nit: 0 };
+  const byAgent = { codex: { raised: 0, shared: 0 }, grok: { raised: 0, shared: 0 }, claude: { raised: 0, shared: 0 } };
+  let consensus = 0;
+  let contested = 0;
+  for (const f of all) {
+    const sev = f.severity in bySeverity ? f.severity : "nit";
+    bySeverity[sev] += 1;
+    if (f.consensus) consensus += 1;
+    if (f.contested) contested += 1;
+    for (const a of f.agents ?? []) {
+      if (!byAgent[a]) continue;
+      byAgent[a].raised += 1;
+      if (f.consensus) byAgent[a].shared += 1;
+    }
+  }
+  return { total: all.length, consensus, unique: all.length - consensus, contested, bySeverity, byAgent };
+}
+
+// ASCII-only status words: box-drawing + block bars are reliably single-width,
+// but check/diamond glyphs are "ambiguous width" and would break the right
+// border in some terminals. Color (in the live TTY) provides the visual accent.
+const R1_LABEL = {
+  done: "done",
+  running: "running",
+  pending: "pending",
+  skipped: "skipped",
+  file: "file",
+  unknown: "unknown"
 };
 
 export function formatDuration(ms) {
@@ -111,32 +119,39 @@ export function formatDuration(ms) {
   return m > 0 ? `${m}m${String(rem).padStart(2, "0")}s` : `${rem}s`;
 }
 
-/** A fixed-width unicode progress bar. */
+/** A fixed-width block progress bar. */
 export function progressBar(done, total, width = 12) {
-  if (!Number.isFinite(total) || total <= 0) return "-".repeat(width);
+  if (!Number.isFinite(total) || total <= 0) return "░".repeat(width);
   const filled = Math.max(0, Math.min(width, Math.round((done / total) * width)));
-  return "#".repeat(filled) + ".".repeat(width - filled);
+  return "█".repeat(filled) + "░".repeat(width - filled);
 }
 
-/** The 4-stage pipeline line with the current stage marked. */
-export function pipelineLine(phase, terminal) {
-  const stages = ["context", "R1", "R2", "done"];
-  let idx = 0;
-  if (terminal) idx = 3;
-  else if (/^(r2|verify|debate)\b/.test(String(phase))) idx = 2;
-  else if (/^r1/.test(String(phase))) idx = 1;
-  return stages
-    .map((label, i) => `${i < idx ? "(x)" : i === idx ? "(*)" : "( )"} ${label}`)
-    .join("  >  ");
+// --- box helpers (all content uses single-width glyphs, so .length == width) --
+const TOP = `╔${"═".repeat(W)}╗`;
+const MID = `╠${"═".repeat(W)}╣`;
+const SEP = `╟${"─".repeat(W)}╢`;
+const BOT = `╚${"═".repeat(W)}╝`;
+function box(content = "") {
+  const c = `  ${content}`;
+  return `║${(c.length > W ? c.slice(0, W) : c.padEnd(W))}║`;
+}
+function boxLR(left, right) {
+  const l = `  ${left}`;
+  const r = `${right}  `;
+  const gap = Math.max(1, W - l.length - r.length);
+  return `║${(l + " ".repeat(gap) + r).slice(0, W).padEnd(W)}║`;
+}
+function col(s, n) {
+  const t = String(s);
+  return t.length >= n ? `${t} ` : t.padEnd(n);
 }
 
 /**
- * Render a compact, tidy dashboard snapshot. `etaMs` is an optional median
- * full-job wall-clock from history (shown as remaining while running);
- * `skipped` lists non-participating agents; `jobPhase` (job.phase) is preferred
- * over the log-derived phase since it is never a stray banner line.
+ * Render the boxed dashboard. `etaMs` = median full-job wall-clock (shown as
+ * remaining while running); `findings` = summarizeFindings(...) or null;
+ * `jobPhase` (job.phase) is preferred over the log-derived phase.
  */
-export function formatDashboard(job, progress, { nowMs, etaMs = null, skipped = [], claudeBackend = "session", jobPhase = null } = {}) {
+export function formatDashboard(job, progress, { nowMs, etaMs = null, skipped = [], claudeBackend = "session", jobPhase = null, findings = null } = {}) {
   const created = job.createdAt ? Date.parse(job.createdAt) : null;
   const finished = job.finishedAt ? Date.parse(job.finishedAt) : null;
   const terminal = isTerminal(job.status);
@@ -145,46 +160,44 @@ export function formatDashboard(job, progress, { nowMs, etaMs = null, skipped = 
   const states = agentR1States(progress, { skipped, claudeBackend, status: job.status });
   const phase = terminal ? "done" : jobPhase || progress.lastPhase || "queued";
 
-  // ETA reads as remaining time while running; over-median shows a hint.
-  let timeLine = `elapsed ${formatDuration(elapsedMs)}`;
+  let timeMeta = formatDuration(elapsedMs);
   if (!terminal && etaMs && elapsedMs != null) {
     const remaining = etaMs - elapsedMs;
-    timeLine +=
-      remaining > 0
-        ? `  |  ~${formatDuration(remaining)} left (median ${formatDuration(etaMs)})`
-        : `  |  over median ${formatDuration(etaMs)} - a slow agent?`;
-  } else if (!terminal && etaMs) {
-    timeLine += `  |  median ${formatDuration(etaMs)}`;
+    timeMeta += remaining > 0 ? ` · ~${formatDuration(remaining)} left` : ` · over median ${formatDuration(etaMs)}`;
   }
 
   const r1Count = AGENTS.filter((a) => states[a] === "done" || states[a] === "file").length;
   const r1Total = AGENTS.filter((a) => states[a] !== "skipped").length;
+  const r2Total = progress.r2Total ?? 0;
 
   const lines = [];
-  lines.push(RULE);
-  lines.push(`  council watch  ${job.id}   [${job.status}]`);
-  lines.push(`  ${job.title ?? "Council"}${job.kind ? ` - ${job.kind}` : ""}`);
-  lines.push(`  ${timeLine}`);
-  lines.push(RULE);
-  lines.push(`  ${pipelineLine(phase, terminal)}`);
-  lines.push(`  phase: ${phase}`);
-  lines.push(RULE);
-  lines.push(`  Round 1  independent      [${progressBar(r1Count, r1Total)}] ${r1Count}/${r1Total}`);
+  lines.push(TOP);
+  lines.push(boxLR(`COUNCIL ${String(job.kind ?? "review").toUpperCase()}`, job.id));
+  lines.push(SEP);
+  lines.push(box(`${job.status}  ·  ${timeMeta}`));
+  lines.push(box(`phase  ${phase}`));
+  lines.push(SEP);
+  lines.push(box(`${col("agent", 10)}${col("round 1", 11)}${col("findings", 11)}shared`));
   for (const agent of AGENTS) {
-    lines.push(`    ${STATE_MARK[states[agent]]} ${agent}${STATE_NOTE[states[agent]] ?? ""}`);
+    const fa = findings?.byAgent?.[agent];
+    const raised = fa ? String(fa.raised) : "·";
+    const shared = fa ? String(fa.shared) : "·";
+    lines.push(box(`${col(agent, 10)}${col(R1_LABEL[states[agent]], 11)}${col(raised, 11)}${shared}`));
   }
-  if (progress.reachedR2 || progress.r2Total) {
-    const total = progress.r2Total ?? 0;
-    lines.push(`  Round 2  peer critique    [${progressBar(progress.r2Done, total)}] ${progress.r2Done}/${total || "?"}`);
-  }
-  if (!terminal && /^verify\b/.test(phase)) lines.push("  Verify   refuting P0/P1 findings...");
-  if (!terminal && /^debate\b/.test(phase)) lines.push("  Debate   bounded rebuttals...");
-  lines.push(RULE);
-  if (terminal) {
-    lines.push(`  DONE (${job.status}) in ${formatDuration(elapsedMs)}  ->  /council:result ${job.id}`);
+  lines.push(SEP);
+  lines.push(box(`R1  ${progressBar(r1Count, r1Total, 12)} ${r1Count}/${r1Total}    R2  ${progressBar(progress.r2Done, r2Total, 12)} ${progress.r2Done}/${r2Total || "?"}`));
+  lines.push(SEP);
+  if (findings) {
+    lines.push(box(`${findings.total} findings  ·  ${findings.consensus} consensus  ·  ${findings.unique} unique  ·  ${findings.contested} contested`));
+    const sev = Object.entries(findings.bySeverity)
+      .filter(([, n]) => n > 0)
+      .map(([k, n]) => `${k} ${n}`)
+      .join("   ");
+    lines.push(box(`severity  ${sev || "none"}`));
   } else {
-    lines.push(`  live: redraws until done  |  /council:result ${job.id} when finished`);
+    lines.push(box("findings  pending — available when the run completes"));
   }
-  lines.push(RULE);
+  lines.push(BOT);
+  lines.push(`  → /council:result ${job.id}`);
   return { text: lines.join("\n"), terminal, elapsedMs };
 }
