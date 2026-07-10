@@ -69,6 +69,64 @@ function walk(dir, acc = []) {
   return acc;
 }
 
+// File classes so detectors can declare what they can PARSE — "mapped" (inventoried)
+// never implies "parsed" (docs/audit-schema.md §4). The import-graph + complexity
+// detectors parse only the "js" class today; everything else is mapped-only.
+const FILE_CLASS = [
+  [/\.(mjs|cjs|jsx?|tsx?)$/, "js"],
+  [/(^|\/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|requirements\.txt|go\.(mod|sum)|cargo\.(toml|lock)|pom\.xml|composer\.(json|lock)|gemfile(\.lock)?)$/i, "manifest"],
+  [/(^|\/)(\.github\/workflows\/|dockerfile|docker-compose|\.gitlab-ci|jenkinsfile|\.circleci\/|\.buildkite\/)/i, "ci"],
+  [/\.(ya?ml|toml|ini|cfg|conf)$/i, "config"],
+  [/(^|\/)\.env(\.|$)|\.(pem|key|p12|pfx|crt)$/i, "secret"],
+  [/\.(md|mdx|rst|txt|adoc)$/i, "doc"],
+  [/\.(py|rb|go|rs|java|kt|php|cs|swift|c|cc|cpp|h|hpp)$/i, "code-other"]
+];
+
+/** Classify a file for detector eligibility (js | manifest | ci | config | secret | doc | code-other | other). */
+export function fileClassOf(id) {
+  for (const [re, cls] of FILE_CLASS) if (re.test(String(id ?? ""))) return cls;
+  return "other";
+}
+
+function walkAll(dir, acc = []) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const e of entries) {
+    if (e.name === "node_modules" || e.name === ".git") continue;
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) walkAll(full, acc);
+    else acc.push(full);
+  }
+  return acc;
+}
+
+/**
+ * Full inventory: EVERY non-ignored file (tracked + untracked, minus gitignored),
+ * tagged with its fileClass — not just the JS subset enumerateFiles returns for the
+ * graph. Lets coverage report the whole mapped surface (and what is only mapped, not
+ * parsed) honestly. Bodies are not read here (cheap); the reviewer supplies source.
+ */
+export function inventoryFiles(root, { areas } = {}) {
+  const res = runCommand("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { cwd: root });
+  let rel;
+  if (res.status === 0 && res.stdout.length) rel = res.stdout.split("\0").filter(Boolean);
+  else rel = walkAll(root).map((abs) => toPosix(path.relative(root, abs)));
+  const prefixes = (areas ?? []).map((a) => toPosix(a).replace(/\/+$/, ""));
+  const seen = new Set();
+  const out = [];
+  for (const id of rel) {
+    if (seen.has(id) || IGNORE_RE.test(id)) continue;
+    if (prefixes.length && !prefixes.some((p) => id === p || id.startsWith(`${p}/`))) continue;
+    seen.add(id);
+    out.push({ id, fileClass: fileClassOf(id) });
+  }
+  return out.sort((a, b) => a.id.localeCompare(b.id));
+}
+
 function fileFacts(text) {
   const lines = String(text).split(/\r?\n/);
   const loc = lines.filter((l) => l.trim()).length;
