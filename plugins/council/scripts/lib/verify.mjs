@@ -6,6 +6,7 @@ import {
   runGrokStructured
 } from "./agents.mjs";
 import { extractJsonObject } from "./findings.mjs";
+import { skippedAgents } from "./policy.mjs";
 
 /**
  * Verification-first: before surfacing findings, ask an agent that did NOT raise
@@ -27,7 +28,7 @@ export function parseRefutation(stdout) {
 const VERIFY_CONCURRENCY = 4;
 
 export function verifierFor(finding, options) {
-  const skip = new Set([options.skipCodex ? "codex" : null, options.skipGrok ? "grok" : null].filter(Boolean));
+  const skip = new Set(skippedAgents(options));
   const raisedBy = new Set(finding.agents ?? []);
   // ONLY an agent that did not raise the finding may verify it. If no such
   // independent agent is available (peers skipped), do not verify at all - a

@@ -30,6 +30,7 @@ import { annotateScopes } from "./scope.mjs";
 import { verifyFindings } from "./verify.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 import { formatExit } from "./util.mjs";
+import { skippedAgents } from "./policy.mjs";
 
 export { READONLY_DISALLOWED_TOOLS, runCodexStructured, runGrokStructured };
 
@@ -162,9 +163,7 @@ function r2Options(options) {
 }
 
 function buildDebateEntries(merged, options, sessions = {}, criticSessions = {}) {
-  const skipped = new Set(
-    [options.skipCodex ? "codex" : null, options.skipGrok ? "grok" : null].filter(Boolean)
-  );
+  const skipped = new Set(skippedAgents(options));
   return merged.all
     .filter((item) => item.contested)
     .map((item) => {

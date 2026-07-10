@@ -226,6 +226,19 @@ function clampPercent(value) {
 
 const VALID_REVIEWERS = new Set(["claude", "codex", "grok"]);
 
+/**
+ * Agents excluded from a run, derived from skip flags. `includeClaude` also
+ * honors skipClaude - pass it with the resolved/merged options (the raw R1/R2
+ * verify paths only ever skip codex/grok, since Claude there is the orchestrator).
+ */
+export function skippedAgents(options, { includeClaude = false } = {}) {
+  return [
+    options.skipCodex ? "codex" : null,
+    options.skipGrok ? "grok" : null,
+    includeClaude && options.skipClaude ? "claude" : null
+  ].filter(Boolean);
+}
+
 export function normalizeReviewers(value) {
   const list = Array.isArray(value) ? value : String(value ?? "").split(",");
   const normalized = list.map((s) => String(s).trim().toLowerCase()).filter((s) => VALID_REVIEWERS.has(s));

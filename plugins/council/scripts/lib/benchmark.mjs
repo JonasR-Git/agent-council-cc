@@ -11,7 +11,9 @@ import {
   waitForFile
 } from "./agents.mjs";
 import { extractJsonObject } from "./findings.mjs";
+import { readJsonl, writeJsonlCapped } from "./jsonl.mjs";
 import { resolveStateDir } from "./state.mjs";
+import { avg, clampScore } from "./stats.mjs";
 
 function benchmarkFile(cwd) {
   return path.join(resolveStateDir(cwd), "benchmarks.jsonl");
@@ -53,14 +55,8 @@ function loadPersistedAnswers(cwd, taskHash) {
 export function parseJudgeScore(stdout) {
   const doc = extractJsonObject(stdout);
   if (!doc || !Number.isFinite(Number(doc.score))) return null;
-  const score = Math.min(10, Math.max(1, Number(doc.score)));
+  const score = clampScore(doc.score, 1, 10);
   return { score, rationale: String(doc.rationale ?? "").trim() };
-}
-
-/** Average of an array of numbers, or null when empty. */
-function avg(nums) {
-  const valid = nums.filter((n) => Number.isFinite(n));
-  return valid.length ? Math.round((valid.reduce((a, b) => a + b, 0) / valid.length) * 10) / 10 : null;
 }
 
 function taskAnswer(cwd, backends, agent, options, prompt, label) {
@@ -157,7 +153,7 @@ export async function runBenchmark(cwd, backends, options = {}) {
       const doc = JSON.parse(fs.readFileSync(options.claudeJudgements, "utf8"));
       for (const [target, val] of Object.entries(doc)) {
         if (target === "claude" || !answeredAgents.includes(target)) continue;
-        const score = Math.min(10, Math.max(1, Number(val?.score)));
+        const score = clampScore(val?.score, 1, 10);
         if (Number.isFinite(score)) {
           judgements.push({ judge: "claude", target, score: { score, rationale: String(val?.rationale ?? "").trim() } });
         }
@@ -190,34 +186,22 @@ export async function runBenchmark(cwd, backends, options = {}) {
     ranking: ranking.map((r) => ({ agent: r.agent, avgScore: r.avgScore, votes: r.votes }))
   };
   try {
-    const file = benchmarkFile(cwd);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    let lines = [];
-    try {
-      lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
-    } catch {
-      /* new file */
-    }
+    const records = readJsonl(benchmarkFile(cwd));
     // judge-only SUPERSEDES only the MOST RECENT same-task record (the answer
     // phase of THIS run) - it must not wipe earlier chronological runs of the
     // same task, which are the longitudinal history --stats tracks.
     if (options.judgeOnly) {
       let lastIdx = -1;
-      for (let i = lines.length - 1; i >= 0; i -= 1) {
-        try {
-          if (JSON.parse(lines[i]).taskHash === taskHash) {
-            lastIdx = i;
-            break;
-          }
-        } catch {
-          /* skip */
+      for (let i = records.length - 1; i >= 0; i -= 1) {
+        if (records[i]?.taskHash === taskHash) {
+          lastIdx = i;
+          break;
         }
       }
-      if (lastIdx >= 0) lines.splice(lastIdx, 1);
+      if (lastIdx >= 0) records.splice(lastIdx, 1);
     }
-    lines.push(JSON.stringify(record));
-    if (lines.length > MAX_BENCHMARK_RECORDS) lines = lines.slice(-MAX_BENCHMARK_RECORDS);
-    fs.writeFileSync(file, `${lines.join("\n")}\n`, "utf8");
+    records.push(record);
+    writeJsonlCapped(benchmarkFile(cwd), records, MAX_BENCHMARK_RECORDS);
   } catch {
     /* best effort */
   }
@@ -244,22 +228,7 @@ function renderBenchmark(task, ranking, dir) {
 }
 
 export function readBenchmarks(cwd) {
-  try {
-    return fs
-      .readFileSync(benchmarkFile(cwd), "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => {
-        try {
-          return JSON.parse(l);
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean);
-  } catch {
-    return [];
-  }
+  return readJsonl(benchmarkFile(cwd));
 }
 
 export function aggregateBenchmarks(records) {

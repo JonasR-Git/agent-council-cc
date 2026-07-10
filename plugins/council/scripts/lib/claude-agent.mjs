@@ -1,3 +1,4 @@
+import { buildAgentResult } from "./agents.mjs";
 import { findClaudeBinary } from "./discover.mjs";
 import { runCommandAsync } from "./process.mjs";
 
@@ -60,16 +61,8 @@ export async function runClaudeStructured(cwd, backends, options, prompt) {
     input: prompt,
     timeoutMs: options.agentTimeoutMs
   });
-  return {
-    agent: "claude",
-    backend: "claude-cli",
-    status: result.status,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    timedOut: Boolean(result.timedOut),
-    truncated: Boolean(result.truncated),
-    durationMs: result.durationMs ?? null,
+  return buildAgentResult("claude", "claude-cli", result, {
     model: options.claudeModel ?? "(claude CLI default)",
     command: `${bin} -p --model ${options.claudeModel ?? "(default)"} ...`
-  };
+  });
 }

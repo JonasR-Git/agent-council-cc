@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Removed dead code (`clearR1Cache`), narrowed the lib API surface (9 internal-only helpers un-exported), untracked the runtime `.claude/scheduled_tasks.lock`, and dropped a dev-only upstream memo. Docs/runtime now point at `/council:setup --init` instead of copying the repo-only `.council.example.yml`.
 - De-duplicated verbatim helpers into `lib/util.mjs` (`isObject`, `firstLines`, `hashLite`, `formatExit`) and single-sourced `SEVERITY_RANK`, removing 8 copy-pasted definitions across `findings`/`solve`/`ledger`/`git-context`/`debate`/`deliberate` and the companion.
+- Further consolidation: `lib/jsonl.mjs` (shared read/append/cap for the metrics, ledger and benchmark JSONL stores), `lib/stats.mjs` (`median`/`avg`/`clampScore`), `agents.buildAgentResult` (one canonical agent-result shape, replacing 6 literals) and `agents.withTempPrompt` (temp-prompt write/run/unlink, replacing 3 hand-rolled copies), and `policy.skippedAgents` for the skip-flag list.
 
 ## [0.5.0]
 

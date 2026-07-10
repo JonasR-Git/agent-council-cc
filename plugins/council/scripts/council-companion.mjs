@@ -16,6 +16,7 @@ import {
   mergeOptionsWithPolicy,
   normalizeClaudeBackend,
   normalizeReviewers,
+  skippedAgents,
   unknownReviewers
 } from "./lib/policy.mjs";
 import { runSolve } from "./lib/solve.mjs";
@@ -37,6 +38,8 @@ import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
 import { colorize, formatDashboard, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
 import { formatExit } from "./lib/util.mjs";
+import { median } from "./lib/stats.mjs";
+import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
@@ -365,20 +368,12 @@ async function runCodexReview(cwd, backends, options, adversarial, focusText) {
     cwd,
     timeoutMs: options.agentTimeoutMs
   });
-  return {
-    agent: "codex",
-    backend: "codex-companion",
+  return buildAgentResult("codex", "codex-companion", result, {
     companion: backends.codex.companion,
     model: codexModel ?? "(Codex default from ~/.codex/config.toml)",
     skipped: false,
-    status: result.status,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    timedOut: Boolean(result.timedOut),
-    truncated: Boolean(result.truncated),
-    durationMs: result.durationMs ?? null,
     command: `node ${args.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`
-  };
+  });
 }
 
 async function runGrokReview(cwd, backends, options, adversarial, focusText) {
@@ -396,20 +391,12 @@ async function runGrokReview(cwd, backends, options, adversarial, focusText) {
       cwd,
       timeoutMs: options.agentTimeoutMs
     });
-    return {
-      agent: "grok",
-      backend: "grok-companion",
+    return buildAgentResult("grok", "grok-companion", result, {
       companion: backends.grok.companion,
       model: grokModel ?? "(Grok default from ~/.grok/config.toml [models].default)",
       skipped: false,
-      status: result.status,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      timedOut: Boolean(result.timedOut),
-      truncated: Boolean(result.truncated),
-      durationMs: result.durationMs ?? null,
       command: `node ${args.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`
-    };
+    });
   }
 
   if (!backends.grok.cli.available) {
@@ -426,46 +413,35 @@ async function runGrokReview(cwd, backends, options, adversarial, focusText) {
     focus
   ].join("\n");
 
-  const promptFile = path.join(resolveStateDir(cwd), `prompt-${Date.now()}.md`);
-  fs.mkdirSync(path.dirname(promptFile), { recursive: true });
-  fs.writeFileSync(promptFile, prompt, "utf8");
+  return withTempPrompt(
+    prompt,
+    async (promptFile) => {
+      const args = [
+        "--prompt-file",
+        promptFile,
+        "--cwd",
+        cwd,
+        "--always-approve",
+        "--disallowed-tools",
+        READONLY_DISALLOWED_TOOLS,
+        "--max-turns",
+        "40",
+        "--output-format",
+        "plain"
+      ];
+      if (grokModel) args.push("--model", grokModel);
+      if (grokEffort) args.push("--effort", grokEffort);
 
-  const args = [
-    "--prompt-file",
-    promptFile,
-    "--cwd",
-    cwd,
-    "--always-approve",
-    "--disallowed-tools",
-    READONLY_DISALLOWED_TOOLS,
-    "--max-turns",
-    "40",
-    "--output-format",
-    "plain"
-  ];
-  if (grokModel) args.push("--model", grokModel);
-  if (grokEffort) args.push("--effort", grokEffort);
-
-  const result = await runCommandAsync(bin, args, { cwd, timeoutMs: options.agentTimeoutMs });
-  try {
-    fs.unlinkSync(promptFile);
-  } catch {
-    /* ignore */
-  }
-  return {
-    agent: "grok",
-    backend: "grok-cli-direct",
-    companion: bin,
-    model: grokModel ?? "(Grok default from ~/.grok/config.toml [models].default)",
-    skipped: false,
-    status: result.status,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    timedOut: Boolean(result.timedOut),
-    truncated: Boolean(result.truncated),
-    durationMs: result.durationMs ?? null,
-    command: `${bin} ${args.filter((a) => a !== promptFile).join(" ")}`
-  };
+      const result = await runCommandAsync(bin, args, { cwd, timeoutMs: options.agentTimeoutMs });
+      return buildAgentResult("grok", "grok-cli-direct", result, {
+        companion: bin,
+        model: grokModel ?? "(Grok default from ~/.grok/config.toml [models].default)",
+        skipped: false,
+        command: `${bin} ${args.filter((a) => a !== promptFile).join(" ")}`
+      });
+    },
+    { dir: resolveStateDir(cwd) }
+  );
 }
 
 
@@ -883,11 +859,7 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
     // Use the RESOLVED skips (reviewers list + explicit flags), not the raw
     // request flags: a provider dropped via `reviewers:` must not gate the run
     // on its own usage. Claude spawn draws on the same Claude window as usage.
-    const skipAgents = [
-      guardPolicy.skipCodex ? "codex" : null,
-      guardPolicy.skipGrok ? "grok" : null,
-      guardPolicy.skipClaude ? "claude" : null
-    ].filter(Boolean);
+    const skipAgents = skippedAgents(guardPolicy, { includeClaude: true });
     const { breaches, checked, unreadable } = evaluateBudget(pressure, guardPolicy.budgetGuard, skipAgents);
     // Fail closed if ANY participating provider's limits are unreadable - a guard
     // that only checks the readable providers would silently under-protect.
@@ -1183,57 +1155,51 @@ function pingFailDetail(result) {
 }
 
 async function runCodexStructuredPing(cwd, backends, prompt) {
-  const promptFile = path.join(resolveStateDir(cwd), `doctor-ping-${process.pid}.md`);
-  fs.mkdirSync(path.dirname(promptFile), { recursive: true });
-  fs.writeFileSync(promptFile, prompt, "utf8");
-  const args = [backends.codex.companion, "task", "--prompt-file", promptFile];
   try {
-    const result = await runCommandAsync(process.execPath, args, { cwd, timeoutMs: 120_000 });
-    const ok = result.status === 0 && /COUNCIL-OK/.test(result.stdout);
-    return { ok, detail: ok ? "responded" : pingFailDetail(result) };
+    return await withTempPrompt(
+      prompt,
+      async (promptFile) => {
+        const args = [backends.codex.companion, "task", "--prompt-file", promptFile];
+        const result = await runCommandAsync(process.execPath, args, { cwd, timeoutMs: 120_000 });
+        const ok = result.status === 0 && /COUNCIL-OK/.test(result.stdout);
+        return { ok, detail: ok ? "responded" : pingFailDetail(result) };
+      },
+      { dir: resolveStateDir(cwd) }
+    );
   } catch (error) {
     return { ok: false, detail: error instanceof Error ? error.message : String(error) };
-  } finally {
-    try {
-      fs.unlinkSync(promptFile);
-    } catch {
-      /* ignore */
-    }
   }
 }
 
 async function runGrokPing(cwd, backends, prompt) {
   const bin = backends.grok.bin ?? findGrokBinary();
-  const promptFile = path.join(resolveStateDir(cwd), `doctor-grok-${process.pid}.md`);
-  fs.mkdirSync(path.dirname(promptFile), { recursive: true });
-  fs.writeFileSync(promptFile, prompt, "utf8");
-  // Match production grok invocation: auto-approve + read-only lockdown, else a
-  // tool attempt or approval gate hangs the ping until timeout.
-  const args = [
-    "--prompt-file",
-    promptFile,
-    "--cwd",
-    cwd,
-    "--always-approve",
-    "--disallowed-tools",
-    READONLY_DISALLOWED_TOOLS,
-    "--max-turns",
-    "1",
-    "--output-format",
-    "plain"
-  ];
   try {
-    const result = await runCommandAsync(bin, args, { cwd, timeoutMs: 120_000 });
-    const ok = result.status === 0 && /COUNCIL-OK/.test(result.stdout);
-    return { ok, detail: ok ? "responded" : pingFailDetail(result) };
+    return await withTempPrompt(
+      prompt,
+      async (promptFile) => {
+        // Match production grok invocation: auto-approve + read-only lockdown,
+        // else a tool attempt or approval gate hangs the ping until timeout.
+        const args = [
+          "--prompt-file",
+          promptFile,
+          "--cwd",
+          cwd,
+          "--always-approve",
+          "--disallowed-tools",
+          READONLY_DISALLOWED_TOOLS,
+          "--max-turns",
+          "1",
+          "--output-format",
+          "plain"
+        ];
+        const result = await runCommandAsync(bin, args, { cwd, timeoutMs: 120_000 });
+        const ok = result.status === 0 && /COUNCIL-OK/.test(result.stdout);
+        return { ok, detail: ok ? "responded" : pingFailDetail(result) };
+      },
+      { dir: resolveStateDir(cwd) }
+    );
   } catch (error) {
     return { ok: false, detail: error instanceof Error ? error.message : String(error) };
-  } finally {
-    try {
-      fs.unlinkSync(promptFile);
-    } catch {
-      /* ignore */
-    }
   }
 }
 
@@ -1573,12 +1539,6 @@ async function handleWait(argv) {
   if (!finished) process.exitCode = 1;
 }
 
-function median(sortedNums) {
-  if (!sortedNums.length) return null;
-  const mid = Math.floor(sortedNums.length / 2);
-  return sortedNums.length % 2 ? sortedNums[mid] : Math.round((sortedNums[mid - 1] + sortedNums[mid]) / 2);
-}
-
 // Median wall-clock for this kind, bucketed by participant count so a codex-only
 // run and a 3-agent run don't share one ETA. Falls back to all runs of the kind
 // when the same-size bucket is too small to be meaningful.
@@ -1600,11 +1560,7 @@ function watchContext(cwd, job) {
   let claudeBackend = "session";
   if (hasRequest) {
     const merged = mergeOptionsWithPolicy(job.request, loadPolicy(cwd));
-    skipped = [
-      merged.skipCodex ? "codex" : null,
-      merged.skipGrok ? "grok" : null,
-      merged.skipClaude ? "claude" : null
-    ].filter(Boolean);
+    skipped = skippedAgents(merged, { includeClaude: true });
     claudeBackend = merged.claudeBackend;
   }
   const participantCount = 3 - skipped.length;

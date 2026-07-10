@@ -14,6 +14,7 @@ import { extractJsonObject } from "./findings.mjs";
 import { runCommand } from "./process.mjs";
 import { SCHEMAS } from "./schemas.mjs";
 import { validate } from "./validate.mjs";
+import { clampScore } from "./stats.mjs";
 import { firstLines, isObject } from "./util.mjs";
 
 const REPO_HINT_MAX_FILES = 300;
@@ -64,12 +65,6 @@ export function parsePlanDoc(stdout, agent) {
   };
 }
 
-function clampScore(value, max) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  return Math.min(max, Math.max(1, n));
-}
-
 /**
  * Normalize a peer critique of a plan (scores 1-5, overall 1-10).
  */
@@ -96,14 +91,14 @@ export function parsePlanCritique(stdout, agent, aboutAgent) {
     aboutAgent,
     parseOk: true,
     scores: {
-      feasibility: clampScore(scores.feasibility, 5),
-      risk: clampScore(scores.risk, 5),
-      simplicity: clampScore(scores.simplicity, 5),
-      completeness: clampScore(scores.completeness, 5)
+      feasibility: clampScore(scores.feasibility, 1, 5),
+      risk: clampScore(scores.risk, 1, 5),
+      simplicity: clampScore(scores.simplicity, 1, 5),
+      completeness: clampScore(scores.completeness, 1, 5)
     },
     blockers: Array.isArray(doc.blockers) ? doc.blockers.map(String) : [],
     improvements: Array.isArray(doc.improvements) ? doc.improvements.map(String) : [],
-    overall: clampScore(doc.overall, 10),
+    overall: clampScore(doc.overall, 1, 10),
     summary: String(doc.summary ?? "").trim(),
     raw: String(stdout ?? "")
   };

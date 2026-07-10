@@ -1,7 +1,7 @@
-import fs from "node:fs";
 import path from "node:path";
 
-import { resolveStateDir, writeFileAtomic } from "./state.mjs";
+import { readJsonl, writeJsonlCapped } from "./jsonl.mjs";
+import { resolveStateDir } from "./state.mjs";
 import { hashLite } from "./util.mjs";
 
 /**
@@ -42,30 +42,15 @@ export function fingerprintFinding(finding) {
 }
 
 function readLedger(cwd) {
-  const file = ledgerFile(cwd);
-  let text;
-  try {
-    text = fs.readFileSync(file, "utf8");
-  } catch {
-    return new Map();
-  }
   const map = new Map();
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.fingerprint) map.set(entry.fingerprint, entry);
-    } catch {
-      /* skip */
-    }
+  for (const entry of readJsonl(ledgerFile(cwd))) {
+    if (entry.fingerprint) map.set(entry.fingerprint, entry);
   }
   return map;
 }
 
 function writeLedger(cwd, map) {
-  const file = ledgerFile(cwd);
-  const entries = [...map.values()].slice(-MAX_LEDGER_ENTRIES);
-  writeFileAtomic(file, entries.map((e) => JSON.stringify(e)).join("\n") + (entries.length ? "\n" : ""));
+  writeJsonlCapped(ledgerFile(cwd), [...map.values()], MAX_LEDGER_ENTRIES);
 }
 
 /**
