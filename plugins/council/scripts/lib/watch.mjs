@@ -139,12 +139,6 @@ function box(content = "") {
   const c = `  ${content}`;
   return `║${(c.length > W ? c.slice(0, W) : c.padEnd(W))}║`;
 }
-function boxLR(left, right) {
-  const l = `  ${left}`;
-  const r = `${right}  `;
-  const gap = Math.max(1, W - l.length - r.length);
-  return `║${(l + " ".repeat(gap) + r).slice(0, W).padEnd(W)}║`;
-}
 function col(s, n) {
   const t = String(s);
   return t.length >= n ? `${t} ` : t.padEnd(n);
@@ -176,9 +170,10 @@ export function formatDashboard(job, progress, { nowMs, etaMs = null, skipped = 
 
   const lines = [];
   lines.push(TOP);
-  lines.push(boxLR(`COUNCIL ${String(job.kind ?? "review").toUpperCase()}`, job.id));
-  lines.push(SEP);
-  lines.push(box(`${job.status}  │  ${timeMeta}`));
+  // Everything is left-aligned for a consistent gutter (no lone right-floated
+  // element); the box pads the right edge, so it stays flush regardless of id.
+  lines.push(box(`COUNCIL ${String(job.kind ?? "review").toUpperCase()}`));
+  lines.push(box(`${job.id}  │  ${job.status}  │  ${timeMeta}`));
   lines.push(box(`phase  ${phase}`));
   lines.push(SEP);
   lines.push(box(`${col("agent", 9)}${col("round 1", 10)}${col("raised", 8)}${col("shared", 8)}disputed`));
