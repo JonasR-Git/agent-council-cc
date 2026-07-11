@@ -70,15 +70,15 @@ export function toCanonicalFinding(raw = {}, { unit, ordinal } = {}) {
   const scope = raw.scope === "cross-cutting" || isProposeOnly(lens) ? "cross-cutting" : "localized";
   const fixDisposition = scope === "cross-cutting" ? "propose-only" : "localized";
   const lifecycle = verified || raw.consensus ? "confirmed" : severity === "P0" || severity === "P1" ? "verification_required" : "candidate";
-  const path = raw.file ?? unit ?? "unknown";
-  const line = Number.isFinite(Number(raw.line)) ? Number(raw.line) : 1;
+  const path = String(raw.file || unit || "unknown");
+  const line = Math.max(1, Math.round(Number(raw.line)) || 1);
 
   const finding = {
     schemaVersion: 1,
     ruleId: String(raw.ruleId ?? raw.category ?? lens),
     lens,
     category: raw.category ?? lens,
-    title: String(raw.title ?? ""),
+    title: String(raw.title ?? "").trim() || "(untitled)",
     lifecycle,
     severity,
     likelihood: L,

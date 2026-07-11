@@ -55,7 +55,7 @@ export async function runAudit(cwd, model, backends = {}, options = {}, deps = {
       budgetSpent: rev.coverage?.budgetSpent ?? null,
       mandatoryReasons: mand.reasons
     },
-    verificationComplete: true,
+    verificationComplete: canonical.every((f) => f.lifecycle !== "verification_required"),
     confirmedCount: canonical.filter((f) => f.lifecycle === "confirmed").length,
     refutedFp: 0
   });
