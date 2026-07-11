@@ -134,6 +134,18 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     }
   }
 
+  // Tier-0 proposals (dead modules, over-layered indirection) the caller ran the detector
+  // for once — surface them alongside the fixer's rejected set (they never gate below the
+  // confidence floor, but a human should see them).
+  for (const p of options.logicalProposals ?? []) {
+    const f = { file: p?.location?.path ?? p?.file, title: p?.title, severity: p?.severity, category: p?.category, rejectedReason: `Tier-0: ${p?.verdict ?? "review"}` };
+    const k = proposedKey(f);
+    if (!seenProposed.has(k)) {
+      seenProposed.add(k);
+      proposedAll.push(f);
+    }
+  }
+
   // Charge the budget by what a phase actually spent, falling back to its allotment and
   // flooring so an under-reporting dep can't make the budget cap a silent no-op.
   const charge = (amount, fallback) => {

@@ -45,6 +45,8 @@ import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
 import { runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
+import { detectLogical } from "./lib/audit-logical.mjs";
+import { nodesFromGraph } from "./lib/import-graph.mjs";
 import { resolveAutonomy } from "./lib/audit-autonomy.mjs";
 import { reconcilePendingFixes } from "./lib/ledger.mjs";
 import { runEndless } from "./lib/audit-endless.mjs";
@@ -1882,17 +1884,27 @@ async function handleAudit(argv) {
         coverage = loadCoverage(workspaceRoot(cwd));
         if (!coverage && !options.json) console.error("  (no coverage artifact found — coverage gate off; tests still gate)");
       }
+      // Tier-0 detector: run once over the exposed graph -> logical_sense proposals (dead
+      // modules, over-layered indirection) + a verdict map (gates only above the confidence
+      // floor; today they surface as proposals, they don't autonomously prune).
+      let logical = { findings: [], verdictMap: {} };
+      try {
+        logical = await detectLogical({ nodes: nodesFromGraph(model.graph), entrypoints: new Set(model.graph?.entrypoints ?? []) }, {});
+      } catch {
+        /* Tier-0 detection is best-effort */
+      }
       const deps = makeFixLoopDeps(cwd, model, backends, {
         maxUnits,
         minSeverity: fixMinSeverity,
         allowUntested: options["allow-untested"],
         coverage,
+        verdictMap: logical.verdictMap,
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
         claudeModel: merged["claude-model"]
       });
       const tLoop = Date.now();
-      const out = await runFixLoop(cwd, { budget: loopBudget, maxPasses, dryStreak, maxUnits, resume: options.resume, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
+      const out = await runFixLoop(cwd, { budget: loopBudget, maxPasses, dryStreak, maxUnits, resume: options.resume, logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
       // Return to the base branch after the final pass (fix stayed on the integration
       // branch); report if the checkout couldn't complete so the user isn't stranded silently.
       out.baseBranch = baseBranch;

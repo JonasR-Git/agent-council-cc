@@ -132,6 +132,14 @@ test("resume restores changedFiles so it continues the localized scope (not a st
   assert.deepEqual(scopes[0], ["a.mjs"], "resumed run continues the checkpointed scope");
 });
 
+test("Tier-0 detector proposals are surfaced in the loop's proposals", async () => {
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 1 } });
+  const fix = async () => ({ ok: true, fixed: [], changedFiles: [] });
+  const logicalProposals = [{ location: { path: "dead.mjs" }, title: "dead capability?", severity: "P2", verdict: "remove" }];
+  const out = await runFixLoop("/x", { budget: 20, dryStreak: 1, logicalProposals }, { review, fix, checkpoint: noCheckpoint });
+  assert.ok(out.proposed.some((p) => p.file === "dead.mjs" && /Tier-0/.test(p.rejectedReason)), "the dead-module proposal is surfaced");
+});
+
 test("requires deps.review and deps.fix", async () => {
   await assert.rejects(runFixLoop("/x", {}, { fix: async () => ({}) }), /requires deps\.review/);
   await assert.rejects(runFixLoop("/x", {}, { review: async () => ({}) }), /requires deps\.fix/);
