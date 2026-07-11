@@ -44,3 +44,11 @@ test("unknown lens / lifecycle / severity enum values are rejected", () => {
   assert.equal(validate(SCHEMAS.auditFinding, { ...good, likelihood: 7 }).valid, false, "L/B/E are 1..5");
   assert.equal(validate(SCHEMAS.auditFinding, { ...good, location: { path: "x" } }).valid, false, "startLine required");
 });
+
+test("identity + handling fields are required so a gate/fix consumer always has them", () => {
+  for (const field of ["fingerprint", "scope", "fixDisposition", "schemaVersion"]) {
+    const missing = { ...good };
+    delete missing[field];
+    assert.equal(validate(SCHEMAS.auditFinding, missing).valid, false, `${field} is required`);
+  }
+});

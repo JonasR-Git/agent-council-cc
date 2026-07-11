@@ -18,14 +18,35 @@
         "newHighSeverity": { "type": "integer", "minimum": 0 }
       }
     },
-    "register": { "type": "array", "items": { "type": "object" } },
+    "register": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ruleId", "lens", "severity"],
+        "properties": {
+          "ruleId": { "type": "string" },
+          "fingerprint": { "type": "string" },
+          "lens": { "type": "string" },
+          "severity": { "type": "string", "enum": ["P0", "P1", "P2", "nit"] }
+        }
+      }
+    },
     "proposals": { "type": "array", "items": { "type": "object" } },
     "coverage": {
       "type": "object",
+      "required": ["total", "mandatory"],
       "properties": {
         "total": { "type": "integer", "minimum": 0 },
         "byState": { "type": "object" },
-        "mandatory": { "type": "object" },
+        "mandatory": {
+          "type": "object",
+          "required": ["total", "done", "complete"],
+          "properties": {
+            "total": { "type": "integer", "minimum": 0 },
+            "done": { "type": "integer", "minimum": 0 },
+            "complete": { "type": "boolean" }
+          }
+        },
         "uncovered": { "type": "array", "items": { "type": "object" } }
       }
     },

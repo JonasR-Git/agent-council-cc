@@ -28,7 +28,7 @@ test("audit-report validates the envelope and constrains the gate status", () =>
     schemaVersion: 1,
     generatedAt: "2026-07-11T00:00:00Z",
     gate: { status: "indeterminate", reason: "mandatory surface incomplete", newHighSeverity: 0 },
-    register: [{ ruleId: "x", severity: "P1" }],
+    register: [{ ruleId: "x", lens: "correctness", severity: "P1" }],
     coverage: { total: 10, byState: { verified: 3 }, mandatory: { total: 5, done: 3, complete: false }, uncovered: [{ file: "a.mjs" }] },
     falsePositiveRate: null,
     provenance: { models: { codex: "gpt-5.6" } }
@@ -36,4 +36,7 @@ test("audit-report validates the envelope and constrains the gate status", () =>
   assert.ok(validate(SCHEMAS.auditReport, rep).valid, validate(SCHEMAS.auditReport, rep).errors.join("; "));
   assert.equal(validate(SCHEMAS.auditReport, { ...rep, gate: { status: "green" } }).valid, false, "gate status is pass|fail|indeterminate");
   assert.equal(validate(SCHEMAS.auditReport, { schemaVersion: 1 }).valid, false, "gate/register/coverage required");
+  // the review's holes: empty register items and mandatory-less coverage must NOT validate
+  assert.equal(validate(SCHEMAS.auditReport, { ...rep, register: [{}] }).valid, false, "a register item needs ruleId/lens/severity");
+  assert.equal(validate(SCHEMAS.auditReport, { ...rep, coverage: {} }).valid, false, "coverage needs total + mandatory{total,done,complete}");
 });
