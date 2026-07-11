@@ -1,37 +1,40 @@
-// M6 — the multi-file structure fixer (the crux; docs/enterprise-fix-design.md §9, M6).
-// A consolidation (move a symbol into a survivor + rewrite its importers) inherently
-// touches N files, so the single-file enforceTouched can't gate it. This does, safely:
-//   1. a transform PLAN is computed FIRST — the explicit set of files the transform is
-//      allowed to touch (survivor + victims + importers);
-//   2. planned-touched-set enforcement — the ACTUAL touched set must EQUAL the planned set
-//      (an unplanned file OR a missing planned file reverts the whole transform); no
-//      unplanned edits, no half-done plan;
-//   3. the gates run on the WHOLE transform as one atomic unit — the UNION export surface
-//      across the touched files must be preserved (a moved symbol leaves the victim and
-//      appears in the survivor, so the union is unchanged; a genuine DROP reverts), plus
-//      char-test acceptance + full suite + coverage;
-//   4. one commit per transform, full rollback on any gate red; top-autonomy only.
-// Pure control flow; every side effect (the multi-file write, git, tests, coverage,
-// char-test) is injectable, so the plan/enforcement/rollback logic is testable without a
-// repo or an agent. This lib NEVER auto-merges and is only reached at the top autonomy
-// level.
+// M6 — the multi-file structure fixer (the crux; docs/enterprise-fix-design.md §9).
+// A consolidation (move a symbol into a survivor + rewrite its importers) touches N
+// files, so the single-file enforceTouched can't gate it. This does.
+//
+// SAFETY DEFAULT (the §9 rule, confirmed by the M6 council): auto-consolidation stays
+// PROPOSE-ONLY until a *verified deterministic transform* exists. So runMultiFix EMITS A
+// PROPOSAL by default and only COMMITS a transform explicitly marked
+// kind === "deterministic-codemod" (a reproducible ast codemod, NOT a free-form LLM edit
+// — a shape gate + suite is luck, not proof) that also passes a determinism re-run and
+// the full gate stack. The enforcement/surface/rollback harness below is ready for when a
+// deterministic codemod planner lands; it is NOT wired into the loop yet (deliberately
+// deferred — the highest-risk automation in the system).
+//
+//   1. planTouchedSet — the transform PLAN (survivor + victims + importers) computed FIRST.
+//   2. enforcePlannedTouched — the ACTUAL touched set must EQUAL the plan (extra OR missing
+//      reverts), re-checked AGAIN right before the commit (the gates can dirty the tree).
+//   3. gates on the WHOLE transform: union export surface preserved (a move is fine; a
+//      DROP, a lost default, OR a same-name collision across files reverts; fails closed on
+//      an un-enumerable surface) + char-test + coverage + full suite.
+//   4. one commit per transform; a revert is VERIFIED (a failed rollback aborts the whole
+//      batch rather than silently poisoning the next transform), and the tree is
+//      re-asserted clean before every transform.
+// Pure control flow; every side effect injectable.
 
 import { toPosix } from "./audit-fix.mjs";
 import { exportSnapshot } from "./audit-snapshot.mjs";
 import { coverageOfLines } from "./audit-coverage-ingest.mjs";
 
-/** The set of files a transform is allowed to touch (survivor + victims + importers). */
+const DEFAULT_MAX_BLAST = 12;
+
+/** The files a transform is allowed to touch (survivor + victims + importers). */
 export function planTouchedSet(transform = {}) {
   const files = [transform.survivor, ...(transform.victims ?? []), ...(transform.importers ?? [])].filter(Boolean).map(toPosix);
   return [...new Set(files)].sort();
 }
 
-/**
- * Enforce that the ACTUAL touched set equals the PLANNED set. Returns { ok, missing,
- * extra }: `extra` = files touched but NOT planned (unplanned edits — the dangerous
- * direction), `missing` = planned but NOT touched (an incomplete transform). Both revert
- * by default; a plan is a contract.
- */
+/** Touched set must EQUAL the plan. { ok, missing, extra } — both directions revert. */
 export function enforcePlannedTouched(changedFiles = [], plannedSet = []) {
   const changed = new Set(changedFiles.map(toPosix));
   const planned = new Set(plannedSet.map(toPosix));
@@ -40,126 +43,145 @@ export function enforcePlannedTouched(changedFiles = [], plannedSet = []) {
   return { ok: missing.length === 0 && extra.length === 0, missing, extra };
 }
 
-/** Union export surface (names + default) across a { file: source } map. */
+/**
+ * Union export surface across a { file: source } map, tracking each name's ORIGIN files
+ * and the DEFAULT-export count so a collision or a lost default can't hide behind an
+ * OR'd boolean / a collapsed name set.
+ */
 export function unionSurface(sourcesByFile = {}) {
-  const names = new Set();
-  let hasDefault = false;
+  const byName = new Map();
+  let defaultCount = 0;
   let opaque = false;
-  for (const src of Object.values(sourcesByFile)) {
+  for (const [file, src] of Object.entries(sourcesByFile)) {
     const s = exportSnapshot(src);
-    for (const n of s.names) names.add(n);
-    hasDefault = hasDefault || s.hasDefault;
+    for (const n of s.names) {
+      if (!byName.has(n)) byName.set(n, new Set());
+      byName.get(n).add(file);
+    }
+    if (s.hasDefault) defaultCount += 1;
     opaque = opaque || s.opaque;
   }
-  return { names: [...names].sort(), hasDefault, opaque };
+  return { names: [...byName.keys()].sort(), byName, defaultCount, opaque };
 }
 
 /**
- * A structure transform must PRESERVE the union export surface: a moved symbol leaves the
- * victim and reappears in the survivor, so the union is unchanged; a genuine DROP (a name
- * gone from ALL touched files, or the default export lost) is a violation. Additions are
- * allowed (the survivor grows). Fails closed on an un-enumerable surface. Returns a reason
- * string or null.
+ * A structure transform must PRESERVE the union surface: a moved symbol leaves the victim
+ * and reappears in the survivor (union unchanged). Violations: an un-enumerable surface;
+ * a name exported by >1 touched file BEFORE the merge (two different symbols under one
+ * name — the merge silently drops one); a genuinely dropped name; >1 default across the
+ * touched files (a default is necessarily lost); a lost default. Additions are allowed.
  */
 export function unionSurfaceViolation(beforeByFile, afterByFile) {
   const b = unionSurface(beforeByFile);
   const a = unionSurface(afterByFile);
   if (b.opaque || a.opaque) return "union export surface unverifiable (star re-export / whole-module CommonJS) — fail-closed";
+  const collision = [...b.byName].filter(([, files]) => files.size > 1).map(([n]) => n);
+  if (collision.length) return `export name collision across touched files (can't safely merge): ${collision.join(", ")}`;
   const removed = b.names.filter((n) => !a.names.includes(n));
   if (removed.length) return `consolidation dropped exported name(s): ${removed.join(", ")}`;
-  if (b.hasDefault && !a.hasDefault) return "consolidation dropped the default export";
+  if (b.defaultCount > 1) return "multiple default exports across touched files — a default would be lost on merge";
+  if (b.defaultCount >= 1 && a.defaultCount < 1) return "consolidation dropped the default export";
   return null;
 }
 
 /**
- * Orchestrate one atomic multi-file transform. Returns { ok, committed, reason }.
- * deps: { git: { head, changedFiles, resetHard, commitFiles(files,msg) },
- *         readFiles(files)->{file:source}, applyTransform(transform)->void,
- *         runTests()->{ok}, acceptCharTest?()->{accept,reason},
- *         coverage?: Map, diffLines?(file, ref)->number[] }.
+ * One transform. Returns { outcome: "commit"|"propose"|"reject"|"abort", ... }.
+ * "abort" is fatal for the whole batch (a failed rollback / dirty precondition).
  */
 async function runOneTransform(transform, deps, options) {
   const planned = planTouchedSet(transform);
-  if (planned.length < 2) return { ok: false, reason: "not a multi-file transform (planned set < 2)" };
+  if (planned.length < 2) return { outcome: "reject", reason: "not a multi-file transform (planned set < 2)" };
+
+  // §9 safety rule: only a verified deterministic codemod may COMMIT; else PROPOSE.
+  const maxBlast = Number.isFinite(options.maxBlastRadius) ? options.maxBlastRadius : DEFAULT_MAX_BLAST;
+  if (transform.kind !== "deterministic-codemod") return { outcome: "propose", reason: "not a verified deterministic transform — propose-only (§9)" };
+  if (planned.length > maxBlast) return { outcome: "propose", reason: `blast radius ${planned.length} > ${maxBlast} — propose-only (§7)` };
+
+  // Per-transform clean-tree re-assert: never build on a tree a prior revert left dirty.
+  if (deps.git.isClean && !deps.git.isClean()) return { outcome: "abort", reason: "working tree not clean before transform (a prior rollback may have failed) — aborting batch" };
 
   const snapshot = deps.git.head();
   const before = deps.readFiles(planned);
-  try {
-    await deps.applyTransform(transform);
-  } catch (err) {
-    try {
-      deps.git.resetHard(snapshot);
-    } catch {
-      /* best effort */
-    }
-    return { ok: false, reason: `transform write failed: ${String(err?.message ?? err)}` };
-  }
-
   const revert = (reason) => {
     try {
       deps.git.resetHard(snapshot);
     } catch {
-      /* best effort */
+      /* verified below */
     }
-    return { ok: false, reason };
+    if (deps.git.isClean && !deps.git.isClean()) return { outcome: "abort", reason: `rollback FAILED — repo left dirty after: ${reason}` };
+    return { outcome: "reject", reason };
   };
 
-  // 2. planned-touched-set enforcement (no unplanned edits, no half-done plan).
+  try {
+    await deps.applyTransform(transform);
+  } catch (err) {
+    return revert(`transform write failed: ${String(err?.message ?? err)}`);
+  }
+
+  // A real codemod must be reproducible (a second run yields an identical result).
+  if (typeof deps.isDeterministic === "function" && !(await deps.isDeterministic(transform))) {
+    return revert("codemod is not reproducible (a second run differs) — propose-only");
+  }
+
   const guard = enforcePlannedTouched(deps.git.changedFiles(), planned);
   if (!guard.ok) return revert(`touched set != planned set (extra: ${guard.extra.join(", ") || "-"}; missing: ${guard.missing.join(", ") || "-"})`);
 
   const after = deps.readFiles(planned);
-  // 3a. union export surface preserved (a move is fine; a drop is not).
   const surf = unionSurfaceViolation(before, after);
   if (surf) return revert(surf);
 
-  // 3b. characterization test (if the transform touched thinly-covered code).
   if (typeof deps.acceptCharTest === "function") {
     const ct = await deps.acceptCharTest(transform);
     if (!ct?.accept) return revert(`characterization test not accepted: ${ct?.reason ?? "unknown"}`);
   }
-
-  // 3c. coverage: every changed line across the touched files must be executed.
   if (options.coverage && typeof deps.diffLines === "function") {
     for (const file of planned) {
       const lines = deps.diffLines(file, snapshot);
-      if (lines.length && !coverageOfLines(options.coverage, file, lines).allCovered) {
-        return revert(`changed lines in ${file} not executed by any test — consolidation stays propose-only`);
-      }
+      if (lines.length && !coverageOfLines(options.coverage, file, lines).allCovered) return revert(`changed lines in ${file} not executed by any test`);
     }
   }
-
-  // 3d. full suite green as one unit.
   const t = await deps.runTests();
   if (!t?.ok) return revert("full suite went red after the transform");
 
-  // 4. one commit for the whole transform.
+  // Re-assert the touched set immediately before staging — the gates (char-test / tests /
+  // pre/post hooks) may have dirtied the tree; commitFiles must stage ONLY the planned
+  // pathspec (never add -A), which its adapter contract requires.
+  const guard2 = enforcePlannedTouched(deps.git.changedFiles(), planned);
+  if (!guard2.ok) return revert(`tree changed during gating (extra: ${guard2.extra.join(", ") || "-"}) — refusing to commit`);
+
   const commit = deps.git.commitFiles(planned, `audit-multifix: ${transform.title ?? "consolidation"} (${planned.length} files)`);
-  return { ok: true, committed: commit, planned };
+  return { outcome: "commit", committed: commit, planned };
 }
 
 /**
- * Apply a list of structure transforms, each atomic + independently reverted. Never
- * throws for one failed transform. Top-autonomy only (the caller gates on that).
+ * Apply a list of structure transforms. Each is atomic + independently reverted; a
+ * verified-deterministic-codemod may commit, everything else is PROPOSED (§9). A failed
+ * rollback aborts the whole batch. Returns { ok, aborted, applied, proposed, rejected }.
  */
 export async function runMultiFix(cwd, transforms = [], backends = {}, options = {}, deps = {}) {
   if (!deps.git || typeof deps.applyTransform !== "function" || typeof deps.readFiles !== "function" || typeof deps.runTests !== "function") {
     return { ok: false, error: "runMultiFix requires deps.git + applyTransform + readFiles + runTests" };
   }
-  if (!deps.git.isRepo?.() && deps.git.isRepo) return { ok: false, error: "not a git repository" };
+  if (deps.git.isRepo && !deps.git.isRepo()) return { ok: false, error: "not a git repository" };
   if (deps.git.isClean && !deps.git.isClean()) return { ok: false, error: "working tree not clean" };
 
   const applied = [];
+  const proposed = [];
   const rejected = [];
+  let aborted = null;
   for (const transform of transforms) {
     let res;
     try {
       res = await runOneTransform(transform, deps, options);
     } catch (err) {
-      res = { ok: false, reason: `transform error: ${String(err?.message ?? err)}` };
+      res = { outcome: "reject", reason: `transform error: ${String(err?.message ?? err)}` };
     }
-    if (res.ok) applied.push({ transform, commit: res.committed, files: res.planned });
-    else rejected.push({ transform, reason: res.reason });
+    if (res.outcome === "commit") applied.push({ transform, commit: res.committed, files: res.planned });
+    else if (res.outcome === "propose") proposed.push({ transform, plannedSet: planTouchedSet(transform), reason: res.reason });
+    else if (res.outcome === "abort") {
+      aborted = res.reason;
+      break; // fatal — do not build further transforms on a compromised tree
+    } else rejected.push({ transform, reason: res.reason });
   }
-  return { ok: true, applied, rejected };
+  return { ok: !aborted, aborted, applied, proposed, rejected };
 }

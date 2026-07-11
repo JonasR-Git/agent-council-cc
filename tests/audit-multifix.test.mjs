@@ -9,52 +9,53 @@ test("planTouchedSet is the sorted, de-duped survivor + victims + importers", ()
 
 test("enforcePlannedTouched requires the touched set to EQUAL the plan", () => {
   assert.equal(enforcePlannedTouched(["a.mjs", "b.mjs"], ["a.mjs", "b.mjs"]).ok, true);
-  const extra = enforcePlannedTouched(["a.mjs", "b.mjs", "c.mjs"], ["a.mjs", "b.mjs"]);
-  assert.equal(extra.ok, false);
-  assert.deepEqual(extra.extra, ["c.mjs"], "an unplanned edit reverts");
-  const missing = enforcePlannedTouched(["a.mjs"], ["a.mjs", "b.mjs"]);
-  assert.equal(missing.ok, false);
-  assert.deepEqual(missing.missing, ["b.mjs"], "a half-done plan reverts");
+  assert.deepEqual(enforcePlannedTouched(["a.mjs", "b.mjs", "c.mjs"], ["a.mjs", "b.mjs"]).extra, ["c.mjs"]);
+  assert.deepEqual(enforcePlannedTouched(["a.mjs"], ["a.mjs", "b.mjs"]).missing, ["b.mjs"]);
 });
 
-test("unionSurfaceViolation: a MOVE preserves the union; a DROP violates; opaque fails closed", () => {
-  // foo moves from helper into core -> union {bar,foo} unchanged
+test("unionSurfaceViolation: move preserved; drop / collision / multi-default / opaque caught", () => {
   assert.equal(unionSurfaceViolation({ "h.mjs": "export const foo=1;", "c.mjs": "export const bar=2;" }, { "h.mjs": "", "c.mjs": "export const bar=2;\nexport const foo=1;" }), null);
-  // foo dropped from everywhere
   assert.match(unionSurfaceViolation({ "h.mjs": "export const foo=1;" }, { "h.mjs": "" }), /dropped/);
-  // additions are allowed
-  assert.equal(unionSurfaceViolation({ "c.mjs": "export const bar=2;" }, { "c.mjs": "export const bar=2;\nexport const baz=3;" }), null);
-  // un-enumerable surface -> fail closed
+  // same name in TWO touched files pre-merge -> collision (two symbols, one silently lost)
+  assert.match(unionSurfaceViolation({ "h.mjs": "export const validate=1;", "c.mjs": "export const validate=2;" }, { "h.mjs": "", "c.mjs": "export const validate=2;" }), /collision/);
+  // two defaults -> one necessarily lost (OR'd boolean used to hide this)
+  assert.match(unionSurfaceViolation({ "h.mjs": "export default 1;", "c.mjs": "export default 2;" }, { "h.mjs": "", "c.mjs": "export default 2;" }), /multiple default/);
   assert.match(unionSurfaceViolation({ "h.mjs": "export * from './x.mjs';" }, { "h.mjs": "export * from './y.mjs';" }), /unverifiable/);
 });
 
-function fakeGit() {
+function fakeGit({ resetLeavesDirty = false } = {}) {
   const calls = [];
   let head = "base0";
   let changed = [];
+  let dirty = false;
   return {
     calls,
     setChanged: (c) => {
       changed = c;
     },
     isRepo: () => true,
-    isClean: () => true,
+    isClean: () => !dirty && changed.length === 0,
     head: () => head,
     changedFiles: () => changed,
     resetHard: (ref) => {
       calls.push(["resetHard", ref]);
-      changed = [];
+      if (resetLeavesDirty) dirty = true;
+      else {
+        changed = [];
+        dirty = false;
+      }
     },
     commitFiles: (files, msg) => {
       calls.push(["commitFiles", files, msg]);
       head = `c${calls.length}`;
       changed = [];
+      dirty = false;
       return head;
     }
   };
 }
 
-const moveTransform = { survivor: "core.mjs", victims: ["helper.mjs"], importers: ["app.mjs"], title: "fold helper into core" };
+const codemod = { kind: "deterministic-codemod", survivor: "core.mjs", victims: ["helper.mjs"], importers: ["app.mjs"], title: "fold helper into core" };
 const beforeMap = { "helper.mjs": "export const foo = 1;\n", "core.mjs": "export const bar = 2;\n", "app.mjs": "import { foo } from './helper.mjs';\n" };
 const afterMoved = { "helper.mjs": "\n", "core.mjs": "export const bar = 2;\nexport const foo = 1;\n", "app.mjs": "import { foo } from './core.mjs';\n" };
 
@@ -64,45 +65,65 @@ const deps = (git, over = {}) => {
     git,
     readFiles: () => (phase++ === 0 ? beforeMap : afterMoved),
     applyTransform: async () => git.setChanged(["app.mjs", "core.mjs", "helper.mjs"]),
+    isDeterministic: async () => true,
     runTests: async () => ({ ok: true }),
     ...over
   };
 };
 
-test("runMultiFix commits an atomic move whose touched set matches the plan + preserves the surface", async () => {
+test("runMultiFix PROPOSES by default (§9: no auto-commit without a verified deterministic transform)", async () => {
   const git = fakeGit();
-  const out = await runMultiFix("/x", [moveTransform], {}, {}, deps(git));
+  const out = await runMultiFix("/x", [{ ...codemod, kind: undefined }], {}, {}, deps(git));
+  assert.equal(out.applied.length, 0);
+  assert.equal(out.proposed.length, 1);
+  assert.match(out.proposed[0].reason, /propose-only/);
+  assert.ok(!git.calls.some((c) => c[0] === "commitFiles"), "nothing committed");
+});
+
+test("a verified deterministic codemod that passes every gate commits atomically", async () => {
+  const git = fakeGit();
+  const out = await runMultiFix("/x", [codemod], {}, {}, deps(git));
   assert.equal(out.applied.length, 1);
-  assert.equal(out.rejected.length, 0);
   const commit = git.calls.find((c) => c[0] === "commitFiles");
   assert.deepEqual(commit[1], ["app.mjs", "core.mjs", "helper.mjs"], "one commit for all planned files");
 });
 
-test("runMultiFix reverts a transform that touches an UNPLANNED file", async () => {
-  const git = fakeGit();
-  const out = await runMultiFix("/x", [moveTransform], {}, {}, deps(git, { applyTransform: async () => git.setChanged(["app.mjs", "core.mjs", "helper.mjs", "sneaky.mjs"]) }));
-  assert.equal(out.applied.length, 0);
-  assert.match(out.rejected[0].reason, /touched set != planned/);
-  assert.ok(git.calls.some((c) => c[0] === "resetHard"));
-});
+test("reverts an unplanned edit, a dropped export, a red suite, or a rejected char-test", async () => {
+  const g1 = fakeGit();
+  const unplanned = await runMultiFix("/x", [codemod], {}, {}, deps(g1, { applyTransform: async () => g1.setChanged(["app.mjs", "core.mjs", "helper.mjs", "sneaky.mjs"]) }));
+  assert.match(unplanned.rejected[0].reason, /touched set != planned/);
 
-test("runMultiFix reverts a consolidation that DROPS an exported name", async () => {
-  const git = fakeGit();
   let phase = 0;
   const dropped = { "helper.mjs": "\n", "core.mjs": "export const bar = 2;\n", "app.mjs": "import { foo } from './core.mjs';\n" };
-  const out = await runMultiFix("/x", [moveTransform], {}, {}, deps(git, { readFiles: () => (phase++ === 0 ? beforeMap : dropped) }));
-  assert.equal(out.applied.length, 0);
-  assert.match(out.rejected[0].reason, /dropped exported name/);
-});
+  const drop = await runMultiFix("/x", [codemod], {}, {}, deps(fakeGit(), { readFiles: () => (phase++ === 0 ? beforeMap : dropped) }));
+  assert.match(drop.rejected[0].reason, /dropped exported name/);
 
-test("runMultiFix reverts when the full suite goes red, or the char-test is rejected", async () => {
-  const red = await runMultiFix("/x", [moveTransform], {}, {}, deps(fakeGit(), { runTests: async () => ({ ok: false }) }));
+  const red = await runMultiFix("/x", [codemod], {}, {}, deps(fakeGit(), { runTests: async () => ({ ok: false }) }));
   assert.match(red.rejected[0].reason, /suite went red/);
-  const ct = await runMultiFix("/x", [moveTransform], {}, {}, deps(fakeGit(), { acceptCharTest: async () => ({ accept: false, reason: "non-deterministic target" }) }));
+
+  const ct = await runMultiFix("/x", [codemod], {}, {}, deps(fakeGit(), { acceptCharTest: async () => ({ accept: false, reason: "non-deterministic" }) }));
   assert.match(ct.rejected[0].reason, /characterization test not accepted/);
 });
 
+test("a non-reproducible codemod is reverted to propose-only", async () => {
+  const out = await runMultiFix("/x", [codemod], {}, {}, deps(fakeGit(), { isDeterministic: async () => false }));
+  assert.match(out.rejected[0].reason, /not reproducible/);
+});
+
+test("a FAILED rollback aborts the whole batch (never poisons the next transform)", async () => {
+  const git = fakeGit({ resetLeavesDirty: true });
+  const out = await runMultiFix("/x", [codemod, codemod], {}, {}, deps(git, { runTests: async () => ({ ok: false }) }));
+  assert.equal(out.ok, false);
+  assert.match(out.aborted, /rollback FAILED/);
+});
+
+test("blast-radius breaker: a transform above the threshold is proposed, not committed", async () => {
+  const out = await runMultiFix("/x", [codemod], {}, { maxBlastRadius: 2 }, deps(fakeGit()));
+  assert.equal(out.applied.length, 0);
+  assert.match(out.proposed[0].reason, /blast radius/);
+});
+
 test("runMultiFix requires its injectable deps", async () => {
-  const out = await runMultiFix("/x", [moveTransform], {}, {}, { git: fakeGit() });
+  const out = await runMultiFix("/x", [codemod], {}, {}, { git: fakeGit() });
   assert.match(out.error, /requires deps/);
 });
