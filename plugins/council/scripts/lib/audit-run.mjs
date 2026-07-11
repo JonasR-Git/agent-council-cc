@@ -7,6 +7,7 @@ import { assembleReport } from "./audit-assemble.mjs";
 import { normalizeFindings } from "./audit-normalize.mjs";
 import { mandatorySet } from "./audit-targets.mjs";
 import { inventoryFiles } from "./codebase-model.mjs";
+import { applyGovernance, loadGovernance } from "./audit-baseline.mjs";
 import { runAuditReview } from "./audit-review.mjs";
 import { nowIso, workspaceRoot } from "./state.mjs";
 
@@ -33,7 +34,9 @@ export async function runAudit(cwd, model, backends = {}, options = {}, deps = {
 
   const review = deps.review ?? ((o) => runAuditReview(cwd, model, backends, o));
   const rev = (await review({ ...options, budget: options.budget, maxUnits: options.maxUnits, skipCodex: options.skipCodex, skipGrok: options.skipGrok })) ?? {};
-  const canonical = normalizeFindings(rev.findings ?? [], {});
+  const rawCanonical = normalizeFindings(rev.findings ?? [], {});
+  const governance = deps.governance ?? loadGovernance(root);
+  const canonical = applyGovernance(rawCanonical, governance, deps.nowIso ? deps.nowIso() : nowIso());
 
   // Honest coverage units: mandatory files not actually reviewed stay "mapped"
   // (js) / mapped-only (non-js), so the gate reports indeterminate rather than a
