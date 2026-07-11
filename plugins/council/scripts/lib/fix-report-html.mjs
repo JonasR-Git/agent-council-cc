@@ -106,6 +106,19 @@ ul.honesty{list-style:none;padding:0;margin:0;display:flex;flex-direction:column
 ul.honesty .mk{font-family:var(--font-mono);font-size:.66rem;padding:.16rem .45rem;border-radius:5px;white-space:nowrap}.mk.yes{color:var(--pass);border:1px solid color-mix(in srgb,var(--pass) 40%,var(--line))}.mk.no{color:var(--muted);border:1px solid var(--line)}
 footer{border-top:1px solid var(--line);padding:2rem 0 3rem;color:var(--muted);font-family:var(--font-mono);font-size:.72rem}
 .toggle{position:fixed;top:15px;right:16px;font-family:var(--font-mono);font-size:.65rem;letter-spacing:.1em;text-transform:uppercase;background:var(--surface);color:var(--ink-soft);border:1px solid var(--line);border-radius:999px;padding:.4rem .75rem;cursor:pointer}.toggle:hover{border-color:var(--brass);color:var(--brass)}
+.seatgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:.8rem;margin-bottom:1.6rem}@media(max-width:720px){.seatgrid{grid-template-columns:1fr}}
+.seatcard{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:1.1rem 1.15rem}
+.seatcard h3{font-family:var(--font-mono);font-size:.92rem;margin:0 0 .8rem;color:var(--brass);display:flex;align-items:center;gap:.5rem}
+.seatcard h3 .d{width:7px;height:7px;border-radius:50%;background:var(--brass)}
+dl.kv{display:grid;grid-template-columns:auto 1fr;gap:.34rem .8rem;margin:0;font-size:.8rem}
+dl.kv dt{color:var(--muted);font-family:var(--font-mono);font-size:.72rem}
+dl.kv dd{margin:0;font-family:var(--font-mono);font-variant-numeric:tabular-nums;text-align:right;color:var(--ink)}
+.cols2{display:grid;grid-template-columns:1fr 1fr;gap:2rem}@media(max-width:720px){.cols2{grid-template-columns:1fr;gap:1.4rem}}
+.subhead{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 .9rem}
+.funnel{display:flex;flex-direction:column;gap:.5rem}
+.frow{display:grid;grid-template-columns:5.5rem 1fr 2.2rem;gap:.6rem;align-items:center;font-family:var(--font-mono);font-size:.74rem}
+.frow .fg{color:var(--ink-soft)}.frow .fn{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
+.fbar{height:8px;border-radius:4px;background:var(--surface-2);overflow:hidden}.fbar span{display:block;height:100%;background:var(--warn);border-radius:4px}
 `;
 
 const SCRIPT = `(function(){var r=document.documentElement,t=document.getElementById('tt');function c(){return r.dataset.theme?r.dataset.theme:(window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}t&&t.addEventListener('click',function(){r.dataset.theme=c()==='dark'?'light':'dark'})})();`;
@@ -135,6 +148,63 @@ function councilCards(rows) {
     return `<div class="council-card"><div class="ch">${pill} ${escapeHtml(f.severity ?? "")} · ${escapeHtml(f.category ?? "")} · ${escapeHtml(String(f.file ?? "").split("/").pop())}</div><div class="cb"><p class="tt" style="margin:0 0 .8rem">${escapeHtml(f.title ?? "")}</p>${vrows}</div></div>`;
   }).join("\n");
   return `<section class="band"><div class="wrap"><div class="bi"><b>§6</b> / Council-Urteile</div><h2>Sensible Fixes — jeder Patch einstimmig geprüft</h2><p class="sub">Für §6-Klassen (Concurrency, Auth, Data-Integrity) musste jeder Sitz den Patch bestätigen, bevor er committen durfte.</p>${cards}</div></section>`;
+}
+
+function fmtTok(n) {
+  n = Number(n) || 0;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return String(n);
+}
+function fmtDur(ms) {
+  const s = Math.round((Number(ms) || 0) / 1000);
+  return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s` : `${s}s`;
+}
+
+function seatCard(name, s = {}) {
+  const v = s.verdicts ?? {};
+  return `<div class="seatcard"><h3><span class="d"></span>${escapeHtml(name)}</h3><dl class="kv">
+<dt>Aufrufe</dt><dd>${Number(s.calls) || 0}</dd>
+<dt>Input</dt><dd>${fmtTok(s.inputTokens)}</dd>
+<dt>Output</dt><dd>${fmtTok(s.outputTokens)}</dd>
+<dt>Dauer</dt><dd>${fmtDur(s.durationMs)}</dd>
+<dt>Dateien</dt><dd>${(s.filesReviewed ?? []).length}</dd>
+<dt>Funde</dt><dd>${Number(s.findingsRaised) || 0}</dd>
+<dt>confirm / dissent</dt><dd>${Number(v.confirm) || 0} / ${Number(v.dissent) || 0}</dd>
+</dl></div>`;
+}
+
+/** Render the per-model telemetry section from a buildRunMetrics object. Pure. */
+export function renderMetricsSection(m) {
+  if (!m) return "";
+  const seats = m.seats ?? {};
+  const funnel = m.gates ?? {};
+  const entries = Object.entries(funnel).filter(([, n]) => n > 0);
+  const maxRevert = Math.max(1, ...entries.map(([, n]) => n));
+  const funnelRows = entries.length
+    ? entries.map(([g, n]) => `<div class="frow"><span class="fg">${escapeHtml(g)}</span><div class="fbar"><span style="width:${Math.round((n / maxRevert) * 100)}%"></span></div><span class="fn">${n}</span></div>`).join("")
+    : `<div class="frow"><span class="fg">—</span><div class="fbar"></div><span class="fn">0</span></div>`;
+  const c = m.council ?? { reviewed: 0, unanimous: 0, dissented: 0 };
+  const cost = m.cost ?? {};
+  return `<section class="band"><div class="wrap"><div class="bi"><b>04</b> / Telemetrie</div>
+<h2>Was die drei Modelle verbraucht — und gefunden — haben</h2>
+<p class="sub">Pro-Modell-Verbrauch, Gate-Funnel und §6-Konsens. Über Läufe akkumuliert, um das Tool datengetrieben zu tunen: welcher Sitz welche Bug-Klasse fängt.</p>
+<div class="seatgrid">
+${seatCard("Claude", seats.claude)}
+${seatCard("Codex", seats.codex)}
+${seatCard("Grok", seats.grok)}
+</div>
+<div class="cols2">
+<div><div class="subhead">Gate-Funnel · wo Fixes reverteten</div><div class="funnel">${funnelRows}</div></div>
+<div><div class="subhead">§6-Konsens &amp; Kosten</div><dl class="kv">
+<dt>Patches reviewt</dt><dd>${c.reviewed}</dd>
+<dt>einstimmig ✓</dt><dd>${c.unanimous}</dd>
+<dt>Dissent (Veto)</dt><dd>${c.dissented}</dd>
+<dt>Tokens gesamt</dt><dd>${fmtTok((cost.inputTokens || 0) + (cost.outputTokens || 0))}</dd>
+<dt>≈ Kosten</dt><dd>$${(Number(cost.estUsd) || 0).toFixed(2)}</dd>
+<dt>Wall-clock</dt><dd>${fmtDur(m.wallClockMs)}</dd>
+</dl></div>
+</div></div></section>`;
 }
 
 /** Render the full self-contained HTML report for a runAuditFix result. Pure. */
@@ -201,7 +271,9 @@ ${tableRows}
 
 ${councilCards(rows)}
 
-<section class="band"><div class="wrap"><div class="bi"><b>04</b> / Ehrlichkeit</div><h2>Verifiziert vs. nicht verifiziert</h2>
+${meta.metrics ? renderMetricsSection(meta.metrics) : ""}
+
+<section class="band"><div class="wrap"><div class="bi"><b>05</b> / Ehrlichkeit</div><h2>Verifiziert vs. nicht verifiziert</h2>
 <ul class="honesty">
 <li><span class="mk yes">verifiziert</span><span><b>Test-Gate</b> — volle Suite grün pro Commit + finaler Integrationslauf.</span></li>
 <li><span class="mk yes">verifiziert</span><span><b>Oracle</b> — Lint/Typecheck grün pro Fix.</span></li>

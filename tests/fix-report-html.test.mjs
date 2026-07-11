@@ -69,6 +69,27 @@ test("renderFixReportHtml escapes a malicious finding title", () => {
   assert.match(html, /&lt;script&gt;/);
 });
 
+test("renderFixReportHtml injects the telemetry section when meta.metrics is present", () => {
+  const metrics = {
+    seats: {
+      claude: { calls: 3, inputTokens: 1200, outputTokens: 300, durationMs: 60000, filesReviewed: ["a.mjs"], findingsRaised: 4, verdicts: { confirm: 2, dissent: 0 } },
+      codex: { calls: 2, inputTokens: 800, outputTokens: 150, durationMs: 40000, filesReviewed: ["b.mjs"], findingsRaised: 3, verdicts: { confirm: 2, dissent: 0 } },
+      grok: { calls: 2, inputTokens: 600, outputTokens: 120, durationMs: 45000, filesReviewed: ["b.mjs"], findingsRaised: 2, verdicts: { confirm: 1, dissent: 1 } }
+    },
+    gates: { council: 1, test: 1, eligibility: 2, touched: 0, content: 0, snapshot: 0, coverage: 0, oracle: 0, other: 0 },
+    council: { reviewed: 2, unanimous: 1, dissented: 1 },
+    cost: { inputTokens: 2600, outputTokens: 570, estUsd: 0.03 },
+    wallClockMs: 145000
+  };
+  const html = renderFixReportHtml(sampleOut(), { metrics });
+  assert.match(html, /Telemetrie/);
+  assert.match(html, /Gate-Funnel/);
+  assert.match(html, /§6-Konsens/);
+  assert.match(html, /Claude/);
+  // no telemetry section when metrics absent
+  assert.ok(!/Telemetrie/.test(renderFixReportHtml(sampleOut(), {})));
+});
+
 test("renderFixReportHtml renders a RED integration run distinctly", () => {
   const out = { ...sampleOut(), ok: false, integrationFailed: true };
   const html = renderFixReportHtml(out);
