@@ -13,7 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { dedupeNew, endlessStopReason } from "./audit-endless.mjs";
-import { applyTierGating, orderByTier } from "./audit-tiers.mjs";
+import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
 import { resolveStateDir, writeFileAtomic } from "./state.mjs";
 
@@ -109,6 +109,14 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   let stopReason = null;
   let changedFiles = null; // null = full scope on the first pass
   let branch = null;
+  // Per-tier convergence (§3, opt-in): run each tier (0 logical -> 1 structure -> 2
+  // correctness -> 3 quality) to dry before advancing, so a Structure consolidation lands
+  // before Correctness runs on the consolidated code. OFF by default (structure is
+  // propose-only today, so it would only march through empty tiers); turned on when
+  // structure auto-apply lands.
+  const perTier = Boolean(options.perTierConvergence);
+  let currentTier = 0;
+  let tierDryStreak = 0;
 
   if (options.resume) {
     const prior = deps.loadCheckpoint ? deps.loadCheckpoint() : loadFixLoopCheckpoint(cwd);
@@ -156,6 +164,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   for (;;) {
     stopReason = endlessStopReason({ passNo, spent, dryStreak }, { maxPasses, totalBudget, dryStop });
     if (!stopReason && stalledStreak >= dryStop) stopReason = `stalled — actionable findings remain but none are auto-applicable (${stalledStreak} passes)`;
+    if (!stopReason && perTier && currentTier > 3) stopReason = "all tiers converged (structure -> correctness -> quality)";
     if (stopReason) break;
 
     passNo += 1;
@@ -183,9 +192,12 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       }
     }
 
+    // Per-tier convergence restricts a pass to the CURRENT tier's actionable set.
+    const actionable = perTier ? gated.actionable.filter((f) => (typeof f.tier === "number" ? f.tier : tierOfLens(f.lens)) === currentTier) : gated.actionable;
+
     let fx;
     try {
-      fx = await fix(gated.actionable, { budget: Math.max(1, Math.min(perPassBudget, totalBudget - spent)), pass: passNo, branch, stayOnBranch: true });
+      fx = await fix(actionable, { budget: Math.max(1, Math.min(perPassBudget, totalBudget - spent)), pass: passNo, branch, stayOnBranch: true });
     } catch (err) {
       passes.push({ pass: passNo, error: String(err?.message ?? err) });
       stopReason = `fix error on pass ${passNo}: ${String(err?.message ?? err)}`;
@@ -233,6 +245,15 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // findings exist but none could be auto-applied this pass.
     dryStreak = freshFindings.length === 0 ? dryStreak + 1 : 0;
     stalledStreak = freshFindings.length > 0 && freshFixed.length === 0 ? stalledStreak + 1 : 0;
+    // Advance to the next tier once the current one has nothing new to fix for K passes.
+    if (perTier) {
+      const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier).length;
+      if (actionable.length > 0 || tierFresh > 0) tierDryStreak = 0;
+      else if ((tierDryStreak += 1) >= dryStop) {
+        currentTier += 1;
+        tierDryStreak = 0;
+      }
+    }
 
     passes.push({ pass: passNo, reviewed: findings.length, fresh: freshFindings.length, actionable: gated.actionable.length, fixed: freshFixed.length, failed: (fx?.failed ?? []).length, spent });
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);

@@ -132,6 +132,21 @@ test("resume restores changedFiles so it continues the localized scope (not a st
   assert.deepEqual(scopes[0], ["a.mjs"], "resumed run continues the checkpointed scope");
 });
 
+test("per-tier convergence processes tier 0 before advancing to later tiers", async () => {
+  let p = 0;
+  const review = async () =>
+    p++ === 0
+      ? { findings: [finding({ lens: "logical_sense", file: "l.mjs", title: "t0" }), finding({ lens: "correctness", file: "c.mjs", title: "t2" })], coverage: { budgetSpent: 1 } }
+      : { findings: [], coverage: { budgetSpent: 1 } };
+  const fixedPasses = [];
+  const fix = async (actionable) => {
+    fixedPasses.push(actionable.map((f) => f.file));
+    return { ok: true, fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "c" })), changedFiles: [] };
+  };
+  await runFixLoop("/x", { budget: 40, dryStreak: 1, maxPasses: 20, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  assert.deepEqual(fixedPasses[0], ["l.mjs"], "tier 0 (logical) is processed before tier 2 (correctness)");
+});
+
 test("Tier-0 detector proposals are surfaced in the loop's proposals", async () => {
   const review = async () => ({ findings: [], coverage: { budgetSpent: 1 } });
   const fix = async () => ({ ok: true, fixed: [], changedFiles: [] });
