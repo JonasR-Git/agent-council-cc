@@ -26,6 +26,7 @@ export function buildOverview(entries) {
       total: 0,
       open: 0,
       fixed: 0,
+      pendingMerge: 0,
       dismissed: 0,
       ignored: 0,
       recurring: 0,
@@ -33,6 +34,7 @@ export function buildOverview(entries) {
     });
     c.total += 1;
     if (e.status === "fixed") c.fixed += 1;
+    else if (e.status === "fixed-pending-merge") c.pendingMerge += 1; // committed, not yet merged — not "open"
     else if (e.status === "dismissed") c.dismissed += 1;
     else if (e.status === "ignored") c.ignored += 1;
     else c.open += 1;

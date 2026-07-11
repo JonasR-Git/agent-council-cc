@@ -73,8 +73,12 @@ function mergeAndWriteLedger(cwd, map) {
         disk.set(fp, entry);
         continue;
       }
+      // If the concurrent write resolved the entry (non-open), adopt its status AND its
+      // fix provenance so a concurrently-landed resolveLedgerEntry isn't left promotable.
+      const adoptOther = other.status !== "open";
       disk.set(fp, {
         ...entry,
+        ...(adoptOther ? { resolvedCommit: other.resolvedCommit, branch: other.branch, baseBranch: other.baseBranch, resolvedAt: other.resolvedAt } : {}),
         timesSeen: Math.max(entry.timesSeen ?? 0, other.timesSeen ?? 0),
         consensusSeen: Math.max(entry.consensusSeen ?? 0, other.consensusSeen ?? 0),
         category: entry.category ?? other.category ?? "other",
@@ -82,7 +86,7 @@ function mergeAndWriteLedger(cwd, map) {
         firstJobId: (entry.firstSeen ?? "") <= (other.firstSeen ?? "") ? entry.firstJobId : other.firstJobId,
         lastSeen: (entry.lastSeen ?? "") >= (other.lastSeen ?? "") ? entry.lastSeen : other.lastSeen,
         lastJobId: (entry.lastSeen ?? "") >= (other.lastSeen ?? "") ? entry.lastJobId : other.lastJobId,
-        status: other.status !== "open" ? other.status : entry.status
+        status: adoptOther ? other.status : entry.status
       });
     }
     writeLedger(cwd, disk);
@@ -111,7 +115,7 @@ export function recordAndAnnotate(cwd, jobId, merged, nowIso) {
       // reconcilePendingFixes promotes it to 'fixed' — but its resolution metadata
       // (resolvedCommit/branch) is CARRIED so reconcile can still find the commit.
       const resolved = prior?.status && prior.status !== "open";
-      const carry = resolved ? { resolvedCommit: prior.resolvedCommit, branch: prior.branch, resolvedAt: prior.resolvedAt } : {};
+      const carry = resolved ? { resolvedCommit: prior.resolvedCommit, branch: prior.branch, baseBranch: prior.baseBranch, resolvedAt: prior.resolvedAt } : {};
       map.set(fingerprint, {
         fingerprint,
         title: item.title,
@@ -154,7 +158,11 @@ export function resolveLedgerEntry(cwd, fingerprint, status, nowIso, meta = {}) 
     const map = readLedger(cwd);
     const entry = map.get(fingerprint);
     if (!entry) return false;
-    map.set(fingerprint, { ...entry, ...meta, status, resolvedAt: nowIso });
+    // Only 'fixed-pending-merge' carries fix provenance; any other status (ignored /
+    // dismissed / open) must NOT keep stale resolvedCommit/branch that would misreport
+    // it as "fixed by commit X".
+    const cleared = status === "fixed-pending-merge" ? {} : { resolvedCommit: undefined, branch: undefined, baseBranch: undefined };
+    map.set(fingerprint, { ...entry, ...cleared, ...meta, status, resolvedAt: nowIso });
     writeLedger(cwd, map);
     return true;
   });
@@ -162,11 +170,16 @@ export function resolveLedgerEntry(cwd, fingerprint, status, nowIso, meta = {}) 
 
 /**
  * Reconcile provisional fixes: a fix committed on an isolated branch is recorded
- * 'fixed-pending-merge', not durable 'fixed'. This flips it to 'fixed' ONLY once its
- * commit is an ancestor of the base branch (the branch was merged), and REOPENS it to
- * 'open' if the commit no longer exists (the branch was discarded) — so the audit's
- * memory never hides a defect whose fix never actually landed. `git` is injectable:
- * { isAncestor(sha)->bool, commitExists(sha)->bool }. Returns the count changed.
+ * 'fixed-pending-merge', not durable 'fixed'. This promotes it to 'fixed' ONLY on a
+ * positive merge signal — its commit is an ancestor of the fix's own BASE branch
+ * (recorded at resolve time, NOT the current HEAD, so reconciling while checked out on
+ * the integration branch during a --resume can't see every pending fix as an ancestor
+ * of the tip and wrongly promote it). It NEVER reopens on an unreachable sha:
+ * squash/rebase/cherry-pick merges (the common case) leave the original sha
+ * un-ancestored and eventually gc'd, so treating unreachability as "discarded" would
+ * falsely reopen a shipped fix. An un-promoted pending fix keeps re-surfacing in review
+ * anyway, so a genuinely-discarded defect stays visible without a false reopen.
+ * `git` is injectable: { isAncestor(sha, ref)->bool }. Returns the count promoted.
  */
 export function reconcilePendingFixes(cwd, git) {
   return withFileLock(ledgerLockPath(cwd), () => {
@@ -175,23 +188,17 @@ export function reconcilePendingFixes(cwd, git) {
     for (const [fp, entry] of map) {
       if (entry.status !== "fixed-pending-merge") continue;
       const sha = entry.resolvedCommit;
+      if (!sha) continue;
       let merged = false;
-      let exists = true;
       try {
-        merged = Boolean(sha) && git.isAncestor(sha);
-        exists = typeof git.commitExists === "function" ? git.commitExists(sha) : true;
+        merged = git.isAncestor(sha, entry.baseBranch || "HEAD");
       } catch {
         merged = false;
-        exists = true;
       }
       if (merged) {
         map.set(fp, { ...entry, status: "fixed" });
         reconciled += 1;
-      } else if (sha && !exists) {
-        map.set(fp, { ...entry, status: "open" }); // branch discarded -> the defect is back
-        reconciled += 1;
       }
-      // else: branch still open, unmerged -> leave pending.
     }
     if (reconciled) writeLedger(cwd, map);
     return reconciled;

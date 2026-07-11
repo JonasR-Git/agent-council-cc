@@ -110,6 +110,18 @@ export function contentProtectionReason(source) {
   return null;
 }
 
+// §6 NEVER-auto-apply classes: an auth/crypto/concurrency/data-integrity fix stays a
+// PROPOSAL regardless of autonomy level, because a green test suite can't prove a
+// weakened auth check, a reintroduced race, or a downgraded crypto comparison is safe.
+// Detected structurally by the finding's category (review) or lens (canonical).
+const SENSITIVE_CATEGORIES = new Set(["security", "auth", "concurrency", "data-loss", "data-integrity", "crypto"]);
+const SENSITIVE_LENSES = new Set(["security_secrets", "concurrency_resources", "data_integrity", "config_cicd_security"]);
+
+/** True if a finding is in a §6 never-auto-apply class (propose-only regardless of level). */
+export function isSensitiveClass(f) {
+  return SENSITIVE_CATEGORIES.has(String(f?.category ?? "").toLowerCase()) || SENSITIVE_LENSES.has(String(f?.lens ?? ""));
+}
+
 /** Reason a finding is NOT eligible for auto-fix, or null if it is. Fail-closed. */
 export function ineligibleReason(f, { maxRank = RANK.P2, protectedRe = PROTECTED_RE } = {}) {
   // Fail CLOSED on scope: only an explicit "localized" is auto-fixable. Missing /
@@ -118,6 +130,8 @@ export function ineligibleReason(f, { maxRank = RANK.P2, protectedRe = PROTECTED
   if (!f.file) return "no target file";
   const file = toPosix(f.file);
   if (/[\r\n]/.test(file) || file.split("/").includes("..") || path.isAbsolute(f.file) || /^[a-zA-Z]:/.test(file)) return "unsafe file path";
+  // §6: a sensitive-class fix is never auto-applied, even localized + gated + green.
+  if (isSensitiveClass(f)) return "sensitive class (auth/crypto/concurrency/data — §6) → propose-only";
   if ((RANK[f.severity] ?? RANK.P2) > maxRank) return `below severity gate (${f.severity})`;
   if (protectedRe.some((re) => re.test(file))) return "protected path";
   return null;
@@ -601,7 +615,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         try {
           // Provisional: 'fixed-pending-merge', not durable 'fixed' — the branch isn't
           // merged yet. reconcilePendingFixes promotes it once the commit lands on base.
-          if (resolveLedger(fingerprintFinding(f.finding), "fixed-pending-merge", { resolvedCommit: f.commit, branch })) ledgerResolved += 1;
+          if (resolveLedger(fingerprintFinding(f.finding), "fixed-pending-merge", { resolvedCommit: f.commit, branch, baseBranch })) ledgerResolved += 1;
         } catch {
           /* ledger update is best-effort */
         }

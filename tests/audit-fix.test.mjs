@@ -32,6 +32,14 @@ test("ineligibleReason is fail-closed: needs explicit localized scope + safe fil
   assert.match(ineligibleReason({ severity: "nit", scope: "localized", file: "a.mjs" }), /severity gate/);
 });
 
+test("ineligibleReason rejects §6 sensitive classes (auth/crypto/concurrency/data) even when localized", () => {
+  assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "security" }), /sensitive/);
+  assert.match(ineligibleReason({ severity: "P0", scope: "localized", file: "a.mjs", category: "concurrency" }), /sensitive/);
+  assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "auth" }), /sensitive/);
+  assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", lens: "data_integrity" }), /sensitive/);
+  assert.equal(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "correctness" }), null, "ordinary bugs stay fixable");
+});
+
 test("PROTECTED_RE blocks secrets/CI/infra AND matches Windows separators", () => {
   for (const file of ["node_modules/x/i.mjs", ".git/config", "dist/b.js", ".env", ".env.production", ".github/workflows/ci.yml", "Dockerfile", "secrets/key.pem", "config/id.key"]) {
     assert.match(ineligibleReason({ severity: "P1", scope: "localized", file }), /protected/, `posix ${file} protected`);

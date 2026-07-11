@@ -1715,7 +1715,7 @@ async function handleWatch(argv) {
 // team is a later phase.
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy"],
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base"],
     booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop"]
   });
   const cwd = process.cwd();
@@ -1811,6 +1811,16 @@ async function handleAudit(argv) {
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
 
+    // Autonomy dial (M4): resolve the level -> commit/propose gate, shared by the loop
+    // AND single-shot paths. --min-severity may only TIGHTEN, never loosen, the dial.
+    const auto = resolveAutonomy(options.autonomy ?? "aggressive");
+    const SEVRANK = { P0: 0, P1: 1, P2: 2, nit: 3 };
+    let fixMinSeverity = auto.minSeverity;
+    if (options["min-severity"]) {
+      fixMinSeverity = (SEVRANK[options["min-severity"]] ?? 2) <= (SEVRANK[auto.minSeverity] ?? 2) ? options["min-severity"] : auto.minSeverity;
+    }
+    if (!auto.apply && !options["dry-run"]) throw new Error("--autonomy propose-only: use `audit run` for a review-only pass (audit fix applies fixes)");
+
     // `audit fix --loop` (M3): the autonomous fix-until-dry loop. Reviews -> Tier-0
     // gates -> fixes the localized set on ONE isolated branch -> re-scopes to the blast
     // radius -> repeats until dry/budget/max-passes. Nothing auto-merged.
@@ -1828,20 +1838,18 @@ async function handleAudit(argv) {
       if (st.status === 0 && st.stdout.trim() !== "") throw new Error("working tree not clean — commit or stash first (the loop's rollback would destroy uncommitted work)");
       if (!detectTestCmd(workspaceRoot(cwd)) && !options["allow-untested"]) throw new Error("no test command detected — audit fix --loop needs a test gate; pass --allow-untested to run without verification (not recommended)");
 
-      // Autonomy dial: level -> commit/propose gate config. Aggressive is the default.
-      const auto = resolveAutonomy(options.autonomy ?? "aggressive");
-      if (!auto.apply) throw new Error("--autonomy propose-only: use `audit run` for a review-only pass (the loop applies fixes)");
-      const loopMinSeverity = options["min-severity"] ?? auto.minSeverity;
-      // Reconcile prior provisional fixes (merged -> fixed, discarded -> reopened) so the
-      // ledger reflects what actually landed on base before this run.
-      try {
-        const rg = {
-          isAncestor: (sha) => runCommand("git", ["merge-base", "--is-ancestor", String(sha), "HEAD"], { cwd }).status === 0,
-          commitExists: (sha) => runCommand("git", ["cat-file", "-e", `${String(sha)}^{commit}`], { cwd }).status === 0
-        };
-        reconcilePendingFixes(cwd, rg);
-      } catch {
-        /* reconcile is best-effort */
+      // Reconcile prior provisional fixes -> durable 'fixed' when their commit landed on
+      // the fix's own base branch. Skip when checked out ON an integration branch
+      // (--resume): reconcile keys on each entry's stored baseBranch, but skipping is a
+      // clear belt-and-suspenders against a mis-stored base.
+      if (!/^council\/audit-fix-/.test(baseBranch)) {
+        try {
+          reconcilePendingFixes(cwd, {
+            isAncestor: (sha, ref) => runCommand("git", ["merge-base", "--is-ancestor", String(sha), String(ref || "HEAD")], { cwd, timeoutMs: 10_000 }).status === 0
+          });
+        } catch {
+          /* reconcile is best-effort */
+        }
       }
 
       let maxPasses = 8;
@@ -1865,7 +1873,7 @@ async function handleAudit(argv) {
 
       const deps = makeFixLoopDeps(cwd, model, backends, {
         maxUnits,
-        minSeverity: loopMinSeverity,
+        minSeverity: fixMinSeverity,
         allowUntested: options["allow-untested"],
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
@@ -1917,7 +1925,7 @@ async function handleAudit(argv) {
       ...merged,
       dryRun: options["dry-run"],
       allowUntested: options["allow-untested"],
-      minSeverity: options["min-severity"] ?? "P2",
+      minSeverity: fixMinSeverity,
       maxFixes,
       onProgress: options.json ? undefined : (m) => console.error(m)
     });

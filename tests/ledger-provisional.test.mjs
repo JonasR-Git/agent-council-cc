@@ -13,48 +13,49 @@ const tmp = () => {
   return d;
 };
 const rec = (cwd, job, iso) => recordAndAnnotate(cwd, job, { all: [{ title: "the bug", file: "a.mjs", category: "correctness", severity: "P1", consensus: false }] }, iso);
+const statusOf = (cwd, fp) => readLedgerEntries(cwd).find((e) => e.fingerprint === fp).status;
 
 test("a committed fix is provisional (pending-merge) and keeps re-surfacing until reconciled", () => {
   const cwd = tmp();
   rec(cwd, "job1", "2026-01-01T00:00:00Z");
   const fp = readLedgerEntries(cwd)[0].fingerprint;
-  resolveLedgerEntry(cwd, fp, "fixed-pending-merge", "2026-01-02T00:00:00Z", { resolvedCommit: "abc123", branch: "council/x" });
-
-  // A re-audit before merge still SEES the finding (pending is not durably resolved),
-  // and the resolution metadata is carried so reconcile can find the commit.
+  resolveLedgerEntry(cwd, fp, "fixed-pending-merge", "2026-01-02T00:00:00Z", { resolvedCommit: "abc123", branch: "council/x", baseBranch: "main" });
   const re = rec(cwd, "job2", "2026-01-03T00:00:00Z");
   assert.equal(re.all[0].ledgerStatus, "fixed-pending-merge");
   const entry = readLedgerEntries(cwd).find((e) => e.fingerprint === fp);
   assert.equal(entry.status, "fixed-pending-merge");
   assert.equal(entry.resolvedCommit, "abc123", "resolvedCommit carried across recordAndAnnotate");
+  assert.equal(entry.baseBranch, "main", "baseBranch carried too (reconcile needs it)");
 });
 
-test("reconcile promotes a pending fix to 'fixed' once its commit landed on base", () => {
+test("reconcile promotes to 'fixed' once the commit is an ancestor of the fix's BASE branch", () => {
   const cwd = tmp();
   rec(cwd, "job1", "2026-01-01T00:00:00Z");
   const fp = readLedgerEntries(cwd)[0].fingerprint;
-  resolveLedgerEntry(cwd, fp, "fixed-pending-merge", "2026-01-02T00:00:00Z", { resolvedCommit: "abc123" });
-  const n = reconcilePendingFixes(cwd, { isAncestor: () => true, commitExists: () => true });
+  resolveLedgerEntry(cwd, fp, "fixed-pending-merge", "2026-01-02T00:00:00Z", { resolvedCommit: "abc123", baseBranch: "main" });
+  // isAncestor must be checked against 'main', NOT the current HEAD
+  const n = reconcilePendingFixes(cwd, { isAncestor: (sha, ref) => sha === "abc123" && ref === "main" });
   assert.equal(n, 1);
-  assert.equal(readLedgerEntries(cwd).find((e) => e.fingerprint === fp).status, "fixed");
+  assert.equal(statusOf(cwd, fp), "fixed");
 });
 
-test("reconcile REOPENS a pending fix whose commit was discarded (branch never merged)", () => {
+test("reconcile does NOT reopen a pending fix on an unreachable sha (squash/rebase-merge safe)", () => {
   const cwd = tmp();
   rec(cwd, "job1", "2026-01-01T00:00:00Z");
   const fp = readLedgerEntries(cwd)[0].fingerprint;
-  resolveLedgerEntry(cwd, fp, "fixed-pending-merge", "2026-01-02T00:00:00Z", { resolvedCommit: "dead999" });
-  const n = reconcilePendingFixes(cwd, { isAncestor: () => false, commitExists: () => false });
-  assert.equal(n, 1);
-  assert.equal(readLedgerEntries(cwd).find((e) => e.fingerprint === fp).status, "open", "discarded branch -> the defect is back");
-});
-
-test("reconcile leaves an un-merged, still-existing pending fix pending", () => {
-  const cwd = tmp();
-  rec(cwd, "job1", "2026-01-01T00:00:00Z");
-  const fp = readLedgerEntries(cwd)[0].fingerprint;
-  resolveLedgerEntry(cwd, fp, "fixed-pending-merge", "2026-01-02T00:00:00Z", { resolvedCommit: "abc123" });
-  const n = reconcilePendingFixes(cwd, { isAncestor: () => false, commitExists: () => true });
+  resolveLedgerEntry(cwd, fp, "fixed-pending-merge", "2026-01-02T00:00:00Z", { resolvedCommit: "squashed", baseBranch: "main" });
+  const n = reconcilePendingFixes(cwd, { isAncestor: () => false });
   assert.equal(n, 0);
-  assert.equal(readLedgerEntries(cwd).find((e) => e.fingerprint === fp).status, "fixed-pending-merge");
+  assert.equal(statusOf(cwd, fp), "fixed-pending-merge", "unreachable sha is ambiguous -> stays pending, never falsely reopened");
+});
+
+test("resolving to a NON-fix status clears stale fix provenance", () => {
+  const cwd = tmp();
+  rec(cwd, "job1", "2026-01-01T00:00:00Z");
+  const fp = readLedgerEntries(cwd)[0].fingerprint;
+  resolveLedgerEntry(cwd, fp, "fixed-pending-merge", "2026-01-02T00:00:00Z", { resolvedCommit: "abc123", baseBranch: "main" });
+  resolveLedgerEntry(cwd, fp, "ignored", "2026-01-03T00:00:00Z"); // human dismisses it
+  const entry = readLedgerEntries(cwd).find((e) => e.fingerprint === fp);
+  assert.equal(entry.status, "ignored");
+  assert.equal(entry.resolvedCommit, undefined, "an ignored entry must not claim it was fixed by commit X");
 });
