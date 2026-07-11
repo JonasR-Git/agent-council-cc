@@ -2004,6 +2004,20 @@ function renderAuditFixReport(out) {
   L.push(`Integration branch **${out.branch}** (off ${String(out.baseRef).slice(0, 8)}), ${gate}. Base branch never modified${out.returnedToBase ? `; returned to ${out.baseBranch}` : ""}.`);
   if (out.integration) L.push(out.integration.ok ? "Final full test run: **green**." : "Final full test run: **RED** — ok:false; review the branch before merging, do NOT merge as-is.");
   if (out.capped) L.push(`⚠ ${out.capped} eligible finding(s) skipped by the --max-fixes cap.`);
+  // Automation-bias counter (docs/enterprise-fix-design.md §6): make the gaps as
+  // visible as the passes so a human scrutinizes the branch instead of a wall of green.
+  const oStates = {
+    active: "oracle (lint/typecheck): **green per fix**",
+    disabled: "oracle (lint/typecheck): **DISABLED** (baseline not green) — only tests gated these fixes",
+    none: "oracle (lint/typecheck): **none detected** — only tests gated these fixes"
+  };
+  L.push("");
+  L.push("## Verified vs. NOT verified (review the gaps)");
+  L.push(`- test gate: ${out.gated ? "**green per commit + final integration**" : "**OFF — fixes UNVERIFIED**"}`);
+  L.push(`- ${oStates[out.oracleState] ?? "oracle: unknown"}`);
+  L.push("- export/API snapshot: name-level, regex-based (fails closed on star-reexport / whole CommonJS)");
+  L.push("- content protection: **pattern-based**, not a full secret/CI/migration scanner — eyeball the diffs");
+  L.push("- NOT measured yet: change-line coverage, behaviour-equivalence, mutation adequacy (later milestones)");
   L.push("");
   L.push(`## Fixed (${out.fixed.length})`);
   for (const f of out.fixed) L.push(`- ✓ ${f.finding.severity} ${f.finding.title} · \`${f.file}\` · ${String(f.commit).slice(0, 8)}`);

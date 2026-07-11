@@ -42,3 +42,21 @@ test("snapshotViolation allowAdditions tolerates a new export (Structure tier) b
   assert.equal(snapshotViolation("export const x=1;\n", "export const x=1;\nexport const z=2;\n", { allowAdditions: true }), null);
   assert.match(snapshotViolation("export const x=1;\nexport const y=2;\n", "export const x=1;\n", { allowAdditions: true }), /removed y/);
 });
+
+test("exportSnapshot sees TS type-level exports and CommonJS members", () => {
+  const ts = exportSnapshot("export interface Opts {}\nexport type T = number;\nexport enum E { A }\n");
+  assert.deepEqual(ts.names, ["E", "Opts", "T"]);
+  const cjs = exportSnapshot("exports.foo = 1;\nmodule.exports.bar = 2;\n");
+  assert.deepEqual(cjs.names, ["bar", "foo"]);
+  const obj = exportSnapshot("const a=1,c=3;\nmodule.exports = { a, b: 2, c };\n");
+  assert.deepEqual(obj.names, ["a", "b", "c"]);
+  assert.equal(obj.opaque, false, "an object literal is enumerable, not opaque");
+});
+
+test("exportSnapshot marks un-enumerable surfaces opaque; snapshotViolation fails closed", () => {
+  assert.equal(exportSnapshot("export * from './a.mjs';\n").opaque, true);
+  assert.equal(exportSnapshot("module.exports = makeThing();\n").opaque, true);
+  assert.equal(exportSnapshot("export const x = 1;\n").opaque, false);
+  assert.match(snapshotViolation("export * from './a.mjs';\n", "export * from './b.mjs';\n"), /unverifiable/);
+  assert.match(snapshotViolation("module.exports = build();\n", "module.exports = build();\n"), /unverifiable/);
+});

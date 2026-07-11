@@ -268,8 +268,48 @@ test("runAuditFix disables the oracle gate when the baseline is already red", as
     runOracle: async () => (calls++, { ok: false }) // always red -> gate must disable, not block every fix
   }));
   assert.equal(out.oracleGated, false, "a red baseline disables the oracle gate");
+  assert.equal(out.oracleState, "disabled");
   assert.equal(out.fixed.length, 1, "the fix still commits under the test gate");
-  assert.equal(calls, 1, "oracle ran once (baseline) and was not used per-fix");
+  assert.equal(calls, 3, "baseline retried 3x before disabling, then not used per-fix");
+});
+
+test("runAuditFix protects test files, refuses to self-edit assertions", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [loc({ file: "tests/foo.test.mjs", title: "assertion inverted" })], {}, {}, baseDeps(git, { applyFix: async () => git.setChanged(["tests/foo.test.mjs"]) }));
+  assert.equal(out.fixed?.length ?? 0, 0);
+  assert.ok((out.rejected ?? []).some((r) => /protected/.test(r.reason)), "a test file is off-limits to the fix writer");
+});
+
+test("runAuditFix reverts a fix that INTRODUCES protected content (hardcoded secret)", async () => {
+  const git = fakeGit();
+  let phase = 0;
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "unblock" })], {}, {}, baseDeps(git, {
+    readFile: () => (phase++ === 0 ? "export const x = 1;\n" : "export const x = 1;\nconst k = 'sk_live_ABCDEFGHIJKLMNOP';\n"),
+    applyFix: async () => git.setChanged(["a.mjs"])
+  }));
+  assert.equal(out.fixed.length, 0);
+  assert.match(out.rejected[0].reason, /introduced protected content/);
+  assert.ok(git.calls.some((c) => c[0] === "resetHard"));
+});
+
+test("runAuditFix skips a file above the size cap (propose-only)", async () => {
+  const git = fakeGit();
+  const big = `export const x = 1;\n${"x".repeat(2_000_001)}`;
+  let applied = 0;
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "huge" })], {}, {}, baseDeps(git, { readFile: () => big, applyFix: async () => { applied += 1; } }));
+  assert.equal(applied, 0);
+  assert.equal(out.fixed.length, 0);
+  assert.ok(out.rejected.some((r) => /too large/.test(r.reason)));
+});
+
+test("runAuditFix does not revert on an oracle TIMEOUT (only on a real diagnostic)", async () => {
+  const git = fakeGit();
+  let oc = 0;
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix" })], {}, {}, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    runOracle: async () => (oc++ === 0 ? { ok: true } : { ok: false, timedOut: true }) // baseline ok, post-fix times out
+  }));
+  assert.equal(out.fixed.length, 1, "a timeout skips the gate rather than reverting a possibly-correct fix");
 });
 
 test("runAuditFix reverts + fails a fix when tests go red", async () => {
