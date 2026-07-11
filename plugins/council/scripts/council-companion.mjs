@@ -42,7 +42,7 @@ import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
 import { activeReviewerCount, runAuditReview } from "./lib/audit-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
-import { detectTestCmd, runAuditFix } from "./lib/audit-fix.mjs";
+import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
 import { runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { resolveAutonomy } from "./lib/audit-autonomy.mjs";
@@ -1871,10 +1871,22 @@ async function handleAudit(argv) {
         loopBudget = Math.floor(n);
       }
 
+      // Coverage gate (§5): produce coverage ONCE via a project script and ingest it, so
+      // a fix on an unexecuted line downgrades to propose-only. Off (tests still gate)
+      // when no coverage script exists — reported, not silently skipped.
+      let coverage = null;
+      const covCmd = detectCoverageCmd(workspaceRoot(cwd));
+      if (covCmd) {
+        if (!options.json) console.error("Running coverage once for the coverage gate…");
+        await runCommandAsync(covCmd.cmd, covCmd.args, { cwd, timeoutMs: 300_000 });
+        coverage = loadCoverage(workspaceRoot(cwd));
+        if (!coverage && !options.json) console.error("  (no coverage artifact found — coverage gate off; tests still gate)");
+      }
       const deps = makeFixLoopDeps(cwd, model, backends, {
         maxUnits,
         minSeverity: fixMinSeverity,
         allowUntested: options["allow-untested"],
+        coverage,
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
         claudeModel: merged["claude-model"]

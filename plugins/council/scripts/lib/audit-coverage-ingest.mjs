@@ -3,6 +3,12 @@
 // changed lines aren't run by any test can be downgraded to propose-only — only then
 // does "tests green" actually mean the change was exercised. Pure: text/JSON in,
 // executed-line map out; no I/O.
+//
+// Scope (honest MVP): lcov + istanbul, i.e. JS-first. Python (pytest --cov-report=lcov)
+// and Go (gcov2lcov) reach this via lcov; JaCoCo XML is NOT parsed (out of MVP scope).
+// Coverage is LINE/STATEMENT granularity, not BRANCH: a line can read "covered" while a
+// branch the fix adds on it (e.g. a §6 fail-open `??`/`||` fallback) was never taken —
+// those classes are already propose-only via isSensitiveClass, but note the gap.
 
 const posix = (p) =>
   String(p ?? "")
@@ -30,7 +36,14 @@ export function parseLcov(text) {
 
 /** Parse istanbul coverage-final.json -> Map<posixFile, Set<executedLine>>. */
 export function parseIstanbul(json) {
-  const data = typeof json === "string" ? JSON.parse(json) : (json ?? {});
+  let data = json ?? {};
+  if (typeof json === "string") {
+    try {
+      data = JSON.parse(json);
+    } catch {
+      return new Map(); // a corrupt report degrades to "no coverage" (fail-closed), never throws
+    }
+  }
   const map = new Map();
   for (const [rawPath, cov] of Object.entries(data)) {
     const file = posix(cov?.path ?? rawPath);
@@ -63,13 +76,42 @@ export function ingestCoverage({ lcov, istanbul } = {}) {
   return merged;
 }
 
-// Coverage paths are often absolute while findings are repo-relative; match by suffix
-// when there's no exact key.
+// Resolve a finding's file to a coverage entry. Exact (case-insensitive) match first;
+// else a SEGMENT-BOUNDARY suffix match, but ONLY when it is UNIQUE — an ambiguous suffix
+// (a repeated leaf name like index/utils/types, a vendored fork, a fixture mirror of
+// lib/) is treated as ABSENT (fail-closed), never guessed, because a wrong bind would
+// credit an untested fix with another file's coverage. No bare, non-boundary suffixes.
 function lookup(coverage, file) {
-  const f = posix(file);
-  if (coverage.has(f)) return coverage.get(f);
-  for (const [k, v] of coverage) if (k.endsWith(`/${f}`) || f.endsWith(`/${k}`) || k.endsWith(f) || f.endsWith(k)) return v;
-  return null;
+  const f = posix(file).toLowerCase();
+  for (const [k, v] of coverage) if (posix(k).toLowerCase() === f) return v;
+  let hit = null;
+  let count = 0;
+  for (const [k, v] of coverage) {
+    const kk = posix(k).toLowerCase();
+    if (kk.endsWith(`/${f}`) || f.endsWith(`/${kk}`)) {
+      hit = v;
+      count += 1;
+    }
+  }
+  return count === 1 ? hit : null; // ambiguous or none -> uncovered (fail-closed)
+}
+
+/**
+ * Parse `git diff --unified=0` output -> the NEW-side line numbers that were added or
+ * modified (the changed-line set the coverage gate judges). Pure text parser over the
+ * `@@ -a,b +c,d @@` hunk headers.
+ */
+export function parseDiffLines(diffText) {
+  const out = [];
+  const re = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+  for (const raw of String(diffText ?? "").split(/\r?\n/)) {
+    const m = re.exec(raw);
+    if (!m) continue;
+    const start = Number(m[1]);
+    const count = m[2] == null ? 1 : Number(m[2]);
+    for (let i = 0; i < count; i += 1) out.push(start + i);
+  }
+  return out;
 }
 
 /**

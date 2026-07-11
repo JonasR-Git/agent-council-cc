@@ -6,6 +6,7 @@ import { findClaudeBinary } from "./discover.mjs";
 import { fingerprintFinding, resolveLedgerEntry } from "./ledger.mjs";
 import { runCommand, runCommandAsync } from "./process.mjs";
 import { snapshotViolation } from "./audit-snapshot.mjs";
+import { coverageOfLines, ingestCoverage, parseDiffLines } from "./audit-coverage-ingest.mjs";
 import { ensureStateDir, nowIso, resolveStateDir, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 
@@ -299,8 +300,39 @@ function realGit(root) {
       const res = g(["commit", "-m", message, "--no-verify"]);
       if (res.status !== 0) throw new Error(`git commit failed: ${res.stderr.trim()}`);
       return g(["rev-parse", "HEAD"]).stdout.trim();
+    },
+    // NEW-side changed line numbers of `file` relative to `ref` (the pre-fix snapshot vs
+    // the working tree) — the changed-line set the coverage gate judges.
+    diffLines: (file, ref) => parseDiffLines(g(["diff", "--unified=0", String(ref), "--", file]).stdout)
+  };
+}
+
+/** Detect a coverage-producing command (project script) if the project defines one. */
+export function detectCoverageCmd(root) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+    const s = pkg?.scripts ?? {};
+    if (s.coverage) return { cmd: "npm", args: ["run", "coverage", "--silent"] };
+    if (s["test:coverage"]) return { cmd: "npm", args: ["run", "test:coverage", "--silent"] };
+  } catch {
+    /* no package.json / no coverage script */
+  }
+  return null;
+}
+
+/** Load coverage from the standard artifact paths (lcov + istanbul), or null if none. */
+export function loadCoverage(root) {
+  const read = (rel) => {
+    try {
+      return fs.readFileSync(path.join(root, rel), "utf8");
+    } catch {
+      return null;
     }
   };
+  const lcov = read("coverage/lcov.info");
+  const istanbul = read("coverage/coverage-final.json");
+  if (!lcov && !istanbul) return null;
+  return ingestCoverage({ lcov, istanbul });
 }
 
 /** Detect the project's test command (npm test) if it is defined. */
@@ -552,6 +584,19 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               git.resetHard(snapshot);
               rejected.push({ finding, reason: `export surface changed (${viol})` });
               log(`  reverted — export surface changed (${viol})`);
+              continue;
+            }
+          }
+          // Coverage gate (§5): a fix whose changed lines aren't executed by any test is
+          // downgraded to propose-only — only then does "tests green" mean the change was
+          // actually exercised. Uses coverage produced once before the run (options.coverage).
+          if (options.coverage) {
+            const changedLines = typeof git.diffLines === "function" ? git.diffLines(task.file, snapshot) : [];
+            const cov = coverageOfLines(options.coverage, task.file, changedLines);
+            if (!cov.allCovered) {
+              git.resetHard(snapshot);
+              rejected.push({ finding, reason: `changed lines not executed by any test (${cov.uncovered.length} uncovered) → propose-only` });
+              log(`  reverted — changed lines uncovered (coverage gate)`);
               continue;
             }
           }

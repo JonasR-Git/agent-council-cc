@@ -64,6 +64,7 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       minSeverity: options.minSeverity ?? "P2",
       maxFixes: options.maxFixesPerPass ?? 10,
       allowUntested: options.allowUntested,
+      coverage: options.coverage, // §5 coverage gate (a fix on an unexecuted line -> propose-only)
       claudeModel: options.claudeModel
     });
 

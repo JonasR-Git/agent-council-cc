@@ -320,6 +320,24 @@ test("runAuditFix does not revert on an oracle TIMEOUT (only on a real diagnosti
   assert.equal(out.fixed.length, 1, "a timeout skips the gate rather than reverting a possibly-correct fix");
 });
 
+test("coverage gate: a fix whose changed lines aren't executed is downgraded to propose-only", async () => {
+  const git = fakeGit();
+  git.diffLines = () => [5]; // the fix changed line 5
+  const coverage = new Map([["a.mjs", new Set([1, 2])]]); // line 5 was never executed
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix" })], {}, { coverage }, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]) }));
+  assert.equal(out.fixed.length, 0);
+  assert.match(out.rejected.at(-1).reason, /not executed by any test/);
+  assert.ok(git.calls.some((c) => c[0] === "resetHard"));
+});
+
+test("coverage gate: a fix whose changed lines ARE covered commits normally", async () => {
+  const git = fakeGit();
+  git.diffLines = () => [1];
+  const coverage = new Map([["a.mjs", new Set([1, 2])]]);
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix" })], {}, { coverage }, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]) }));
+  assert.equal(out.fixed.length, 1);
+});
+
 test("runAuditFix reverts + fails a fix when tests go red", async () => {
   const git = fakeGit();
   const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix" })], {}, {}, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]), runTests: async () => ({ ok: false, output: "1 failing" }) }));
