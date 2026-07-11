@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { enforcePlannedTouched, planTouchedSet, runMultiFix, unionSurfaceViolation } from "../plugins/council/scripts/lib/audit-multifix.mjs";
+import { enforcePlannedTouched, missingImporters, planConsolidation, planTouchedSet, runMultiFix, unionSurfaceViolation } from "../plugins/council/scripts/lib/audit-multifix.mjs";
 
 test("planTouchedSet is the sorted, de-duped survivor + victims + importers", () => {
   assert.deepEqual(planTouchedSet({ survivor: "core.mjs", victims: ["h.mjs"], importers: ["app.mjs", "core.mjs"] }), ["app.mjs", "core.mjs", "h.mjs"]);
@@ -121,6 +121,32 @@ test("blast-radius breaker: a transform above the threshold is proposed, not com
   const out = await runMultiFix("/x", [codemod], {}, { maxBlastRadius: 2 }, deps(fakeGit()));
   assert.equal(out.applied.length, 0);
   assert.match(out.proposed[0].reason, /blast radius/);
+});
+
+test("planConsolidation builds a codemod transform from the graph; missingImporters finds gaps", () => {
+  const graph = { importers: { "helper.mjs": ["app.mjs", "core.mjs"] } };
+  const plan = planConsolidation(graph, { victim: "helper.mjs", survivor: "core.mjs" });
+  assert.equal(plan.kind, "deterministic-codemod");
+  assert.deepEqual(plan.victims, ["helper.mjs"]);
+  assert.deepEqual(plan.importers, ["app.mjs"], "the survivor is not listed as its own importer");
+  assert.deepEqual(missingImporters(graph, ["helper.mjs"], ["helper.mjs", "core.mjs", "app.mjs"]), []);
+  assert.deepEqual(missingImporters(graph, ["helper.mjs"], ["helper.mjs", "core.mjs"]), ["app.mjs"]);
+});
+
+test("an incomplete plan (a victim importer outside the plan) is PROPOSED, not committed", async () => {
+  const graph = { importers: { "helper.mjs": ["app.mjs", "other.mjs"] } };
+  const out = await runMultiFix("/x", [codemod], {}, { graph }, deps(fakeGit()));
+  assert.equal(out.applied.length, 0);
+  assert.match(out.proposed[0].reason, /plan incomplete.*other\.mjs/);
+});
+
+test("reverts a transform that carries protected content into a survivor, or regresses the oracle", async () => {
+  let phase = 0;
+  const withSecret = { "helper.mjs": "\n", "core.mjs": "export const bar=2;\nexport const foo=1;\nconst k='sk_live_ABCDEFGHIJKLMNOP';\n", "app.mjs": "import { foo } from './core.mjs';\n" };
+  const secret = await runMultiFix("/x", [codemod], {}, {}, deps(fakeGit(), { readFiles: () => (phase++ === 0 ? beforeMap : withSecret) }));
+  assert.match(secret.rejected[0].reason, /protected content/);
+  const oracle = await runMultiFix("/x", [codemod], {}, {}, deps(fakeGit(), { runOracle: async () => ({ ok: false }) }));
+  assert.match(oracle.rejected[0].reason, /oracle regression/);
 });
 
 test("runMultiFix requires its injectable deps", async () => {

@@ -22,11 +22,31 @@
 //      re-asserted clean before every transform.
 // Pure control flow; every side effect injectable.
 
-import { toPosix } from "./audit-fix.mjs";
+import { contentProtectionReason, toPosix } from "./audit-fix.mjs";
 import { exportSnapshot } from "./audit-snapshot.mjs";
 import { coverageOfLines } from "./audit-coverage-ingest.mjs";
 
 const DEFAULT_MAX_BLAST = 12;
+
+/**
+ * Plan a consolidation from the exposed graph: fold `victim` into `survivor`, rewriting
+ * every importer of the victim. Produces a deterministic-codemod transform whose plan the
+ * enforcement + gates then verify. The importer list comes from the graph adjacency.
+ */
+export function planConsolidation(graph = {}, { victim, survivor, title } = {}) {
+  const v = toPosix(victim);
+  const s = toPosix(survivor);
+  const importers = (graph.importers?.[v] ?? []).map(toPosix).filter((i) => i !== s);
+  return { kind: "deterministic-codemod", survivor: s, victims: [v], importers, title: title ?? `fold ${v} into ${s}` };
+}
+
+/** Importers of the victims that the plan does NOT include (an incomplete, unsafe plan). */
+export function missingImporters(graph = {}, victims = [], plannedSet = []) {
+  const planned = new Set(plannedSet.map(toPosix));
+  const miss = new Set();
+  for (const victim of victims) for (const imp of graph.importers?.[toPosix(victim)] ?? []) if (!planned.has(toPosix(imp))) miss.add(toPosix(imp));
+  return [...miss].sort();
+}
 
 /** The files a transform is allowed to touch (survivor + victims + importers). */
 export function planTouchedSet(transform = {}) {
@@ -97,6 +117,13 @@ async function runOneTransform(transform, deps, options) {
   if (transform.kind !== "deterministic-codemod") return { outcome: "propose", reason: "not a verified deterministic transform — propose-only (§9)" };
   if (planned.length > maxBlast) return { outcome: "propose", reason: `blast radius ${planned.length} > ${maxBlast} — propose-only (§7)` };
 
+  // Plan completeness: every static importer of a victim must be in the plan, else the
+  // consolidation would break an un-rewritten importer -> PROPOSE, don't auto-commit.
+  if (options.graph && Array.isArray(transform.victims)) {
+    const miss = missingImporters(options.graph, transform.victims, planned);
+    if (miss.length) return { outcome: "propose", reason: `plan incomplete — importer(s) not in plan: ${miss.join(", ")}` };
+  }
+
   // Per-transform clean-tree re-assert: never build on a tree a prior revert left dirty.
   if (deps.git.isClean && !deps.git.isClean()) return { outcome: "abort", reason: "working tree not clean before transform (a prior rollback may have failed) — aborting batch" };
 
@@ -130,6 +157,13 @@ async function runOneTransform(transform, deps, options) {
   const surf = unionSurfaceViolation(before, after);
   if (surf) return revert(surf);
 
+  // Content protection: a consolidation must not carry protected material (secret /
+  // migration / generated marker) into a survivor.
+  for (const file of planned) {
+    const cp = contentProtectionReason(after[file] ?? "");
+    if (cp) return revert(`transform introduced protected content in ${file}: ${cp}`);
+  }
+
   if (typeof deps.acceptCharTest === "function") {
     const ct = await deps.acceptCharTest(transform);
     if (!ct?.accept) return revert(`characterization test not accepted: ${ct?.reason ?? "unknown"}`);
@@ -139,6 +173,12 @@ async function runOneTransform(transform, deps, options) {
       const lines = deps.diffLines(file, snapshot);
       if (lines.length && !coverageOfLines(options.coverage, file, lines).allCovered) return revert(`changed lines in ${file} not executed by any test`);
     }
+  }
+  // Oracle (type-check / lint): the fastest sound check that a broken import rewrite
+  // exists, before the slower suite. A timeout is not a regression.
+  if (typeof deps.runOracle === "function") {
+    const o = await deps.runOracle();
+    if (o && o.ok === false && !o.timedOut) return revert("oracle regression after the transform (likely a broken import rewrite)");
   }
   const t = await deps.runTests();
   if (!t?.ok) return revert("full suite went red after the transform");
