@@ -71,6 +71,48 @@ test("Tier-0 gating surfaces a skipped serious finding as a proposal (never drop
   assert.ok(out.proposed.some((f) => f.file === "dead.mjs"), "the P1 parked behind a remove? is surfaced, not silently skipped");
 });
 
+test("a structured fix blocker (dirty tree / lock / red integration) stops with the real reason, not 'dry'", async () => {
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: "b" })], coverage: { budgetSpent: 1 } });
+  const fix = async () => ({ ok: false, error: "working tree not clean" });
+  const out = await runFixLoop("/x", { budget: 20 }, { review, fix, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /fix blocked.*working tree not clean/);
+});
+
+test("integration going red stops the loop (does not layer more fixes onto a red branch)", async () => {
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: "b" })], coverage: { budgetSpent: 1 } });
+  const fix = async (a) => ({ ok: true, integrationFailed: true, branch: "council/x", fixed: a.map((f) => ({ file: f.file, finding: f, commit: "c" })), changedFiles: ["a.mjs"], spent: 1 });
+  const out = await runFixLoop("/x", { budget: 20 }, { review, fix, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /fix blocked.*red/i);
+  assert.equal(out.branch, "council/x");
+});
+
+test("budget is charged via fallback even when a dep under-reports spend (never a no-op)", async () => {
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: "b" })] }); // no coverage.budgetSpent
+  const fix = async (a) => ({ ok: true, fixed: a.map((f) => ({ file: f.file, finding: f, commit: "c" })), changedFiles: ["a.mjs"] }); // no spent
+  const out = await runFixLoop("/x", { budget: 8, maxPasses: 50, dryStreak: 9 }, { review, fix, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /budget/, "under-reported spend still consumes budget");
+});
+
+test("resume clamps out-of-range checkpoint numerics (negative spent can't bypass the budget)", async () => {
+  const prior = { fixed: [], failed: [], proposed: [], passes: [], spent: -500, passNo: 0, dryStreak: 0, branch: null };
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 1 } });
+  const out = await runFixLoop("/x", { budget: 10, resume: true, dryStreak: 1 }, { review, fix: async () => ({ ok: true, fixed: [], changedFiles: [] }), loadCheckpoint: () => prior, checkpoint: noCheckpoint });
+  assert.ok(out.spent >= 0, "negative resumed spend clamped to 0");
+});
+
+test("blast-radius re-scope: expandScope widens the next pass beyond the literal changed file", async () => {
+  const scopes = [];
+  let p = 0;
+  const review = async ({ changedFiles }) => {
+    scopes.push(changedFiles);
+    return p++ === 0 ? { findings: [finding({ file: "hub.mjs", title: "b" })], coverage: { budgetSpent: 1 } } : { findings: [], coverage: { budgetSpent: 1 } };
+  };
+  const fix = async (a) => ({ ok: true, fixed: a.map((f) => ({ file: f.file, finding: f, commit: "c" })), changedFiles: ["hub.mjs"], spent: 1 });
+  const expandScope = (changed) => [...changed, "dependent1.mjs", "dependent2.mjs"];
+  await runFixLoop("/x", { budget: 20, dryStreak: 1 }, { review, fix, expandScope, checkpoint: noCheckpoint });
+  assert.deepEqual(scopes[1], ["hub.mjs", "dependent1.mjs", "dependent2.mjs"], "dependents are re-reviewed, not just the hub");
+});
+
 test("requires deps.review and deps.fix", async () => {
   await assert.rejects(runFixLoop("/x", {}, { fix: async () => ({}) }), /requires deps\.review/);
   await assert.rejects(runFixLoop("/x", {}, { review: async () => ({}) }), /requires deps\.fix/);

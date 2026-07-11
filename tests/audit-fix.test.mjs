@@ -406,6 +406,18 @@ test("runAuditFix caps the number of fixes via --max-fixes", async () => {
   assert.equal(out.capped, 1);
 });
 
+test("runAuditFix continues an existing branch and can stay on it (fix loop)", async () => {
+  const git = fakeGit();
+  git.branchExists = (b) => b === "council/reuse"; // pretend the loop's branch already exists
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix" })], {}, { branch: "council/reuse", stayOnBranch: true }, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]) }));
+  assert.equal(out.branch, "council/reuse");
+  assert.ok(git.calls.some((c) => c[0] === "checkout" && c[1] === "council/reuse"), "checked out the existing branch");
+  assert.ok(!git.calls.some((c) => c[0] === "createAndCheckout"), "did not create a new branch over the existing one");
+  assert.equal(out.returnedToBase, false, "stayOnBranch keeps it on the fix branch for the next pass");
+  assert.equal(out.spent, 1, "reports a spend proxy (fix attempts)");
+  assert.deepEqual(out.changedFiles, ["a.mjs"]);
+});
+
 test("runAuditFix never auto-fixes cross-cutting findings even in a real run", async () => {
   const git = fakeGit();
   const out = await runAuditFix(tmp(), [{ severity: "P0", scope: "cross-cutting", file: "b.mjs", title: "consolidate" }], {}, {}, baseDeps(git, { applyFix: async () => git.setChanged(["b.mjs"]) }));

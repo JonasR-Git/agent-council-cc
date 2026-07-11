@@ -264,6 +264,7 @@ function realGit(root) {
     isClean: () => g(["status", "--porcelain"]).stdout.trim() === "",
     head: () => g(["rev-parse", "HEAD"]).stdout.trim(),
     currentBranch: () => g(["branch", "--show-current"]).stdout.trim(),
+    branchExists: (b) => g(["rev-parse", "--verify", "--quiet", b]).status === 0,
     createAndCheckout: (branch, baseRef) => {
       const res = g(["checkout", "-b", branch, baseRef]);
       if (res.status !== 0) throw new Error(`git checkout -b failed: ${res.stderr.trim()}`);
@@ -452,7 +453,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
 
   const baseRef = git.head();
   const baseBranch = git.currentBranch();
-  const branch = `council/audit-fix-${String(baseRef).slice(0, 8)}`;
+  const branch = options.branch ?? `council/audit-fix-${String(baseRef).slice(0, 8)}`;
   const fixed = [];
   const failed = [];
   const skipped = [];
@@ -460,9 +461,15 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
 
   try {
     try {
-      git.createAndCheckout(branch, baseRef);
+      // Continuation-aware: check out an EXISTING integration branch (a fix loop's
+      // later pass) instead of failing on `checkout -b`; otherwise create it.
+      if (typeof git.branchExists === "function" && git.branchExists(branch)) {
+        if (!git.checkout(branch)) throw new Error(`could not check out existing branch ${branch}`);
+      } else {
+        git.createAndCheckout(branch, baseRef);
+      }
     } catch (err) {
-      return { ok: false, error: `could not create integration branch: ${String(err?.message ?? err)}` };
+      return { ok: false, error: `could not open integration branch: ${String(err?.message ?? err)}` };
     }
 
     // Oracle state (docs/enterprise-fix-design.md §6): none (no oracle) | disabled
@@ -599,9 +606,11 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
       }
     }
 
-    // Return the user to their original branch; the base was never touched.
+    // Return the user to their original branch; the base was never touched. A fix loop
+    // passes stayOnBranch so later passes continue the SAME branch — it returns to base
+    // itself after the final pass.
     let returnedToBase = false;
-    if (git.isClean()) returnedToBase = git.checkout(baseBranch);
+    if (!options.stayOnBranch && git.isClean()) returnedToBase = git.checkout(baseBranch);
 
     return {
       ok: !integrationFailed,
@@ -617,6 +626,10 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
       unverified: fixed.some((f) => !f.verified),
       ledgerResolved,
       capped,
+      // Loop-facing accounting: a spend proxy (fix attempts) and the files committed,
+      // so a fix loop can charge its budget and re-scope the next pass honestly.
+      spent: fixed.length + failed.length,
+      changedFiles: [...new Set(fixed.map((x) => x.file))],
       fixed,
       failed,
       rejected,
