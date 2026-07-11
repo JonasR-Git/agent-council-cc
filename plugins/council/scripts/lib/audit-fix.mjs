@@ -303,10 +303,16 @@ function realGit(root) {
     checkout: (ref) => g(["checkout", ref]).status === 0,
     changedFiles: () => parsePorcelainZ(g(["status", "--porcelain", "-z"]).stdout),
     resetHard: (ref) => {
-      g(["reset", "--hard", ref]);
+      const r = g(["reset", "--hard", ref]);
       // -x also removes ignored files: safe because a clean tree is mandatory, so
       // anything present is the agent's own output (incl. ignored escape attempts).
-      g(["clean", "-fdx"]);
+      const c = g(["clean", "-fdx"]);
+      // A failed restore is an emergency: a rejected/vetoed patch left in the tree could be
+      // staged by a later same-file finding, committing bytes that were never accepted.
+      // Fail loud so the caller aborts instead of continuing over a dirty tree.
+      if (r.status !== 0 || c.status !== 0) {
+        throw new Error(`git revert failed (reset ${r.status}, clean ${c.status}) — tree may be dirty; aborting to avoid committing unreviewed changes`);
+      }
     },
     commitFile: (file, message) => {
       // Stage ONLY the enforced target so a commit is provably single-file and
@@ -555,7 +561,11 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
       if (!ok) log(`oracle (${oracleName}) baseline not green after ${ORACLE_BASELINE_TRIES} tries — oracle gate disabled for this run`);
     }
 
+    // Set if a revert leaves the tree unrestorable: we must stop rather than let a later
+    // finding stage a stranded, never-accepted patch. Surfaced as ok:false + stranded.
+    let fatalAbort = null;
     for (const task of tasks) {
+      if (fatalAbort) break;
       for (const finding of task.findings) {
         const snapshot = git.head();
         const source = readFile(task.file);
@@ -656,7 +666,15 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           // Dissent / a missing seat / a reviewer error all fail closed → revert → propose.
           let councilVerdict = null;
           if (sensitiveAutoApply && isSensitiveClass(finding)) {
-            const diff = typeof git.diffText === "function" ? git.diffText(task.file, snapshot) : afterSource;
+            // The reviewers judge the EXACT patch; without a real diff we fail closed
+            // rather than hand them the whole file as if it were the change.
+            if (typeof git.diffText !== "function") {
+              git.resetHard(snapshot);
+              rejected.push({ finding, reason: "§6 council: cannot produce a diff to review → propose-only" });
+              log(`  reverted — §6 no diff available for council review`);
+              continue;
+            }
+            const diff = git.diffText(task.file, snapshot);
             let verdicts;
             try {
               verdicts = await reviewPatch({ file: task.file, finding, diff, before: source, after: afterSource });
@@ -673,18 +691,37 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               log(`  reverted — §6 council not unanimous (${councilVerdict.summary})`);
               continue;
             }
+            // Bind the commit to what the council actually reviewed: if the changed set
+            // drifted during the async review (a reviewer side-effect or concurrent edit),
+            // the reviewed bytes are stale — revert rather than commit something unseen.
+            const postReview = enforceTouched(git.changedFiles(), task.file);
+            if (!postReview.ok) {
+              git.resetHard(snapshot);
+              rejected.push({ finding, reason: `§6 changed set drifted during review (${postReview.violations.join(", ")}) → propose-only`, council: councilVerdict });
+              log(`  reverted — §6 changed set drifted during review`);
+              continue;
+            }
             log(`  §6 council unanimous (${councilVerdict.summary}) — auto-apply approved`);
           }
           const commit = git.commitFile(task.file, `audit-fix: ${finding.title} (${task.file})`);
           fixed.push({ finding, file: task.file, commit, verified: gated, council: councilVerdict });
           log(`  committed ${String(commit).slice(0, 8)}${gated ? " (tests green)" : " (UNVERIFIED)"}${councilVerdict ? " (§6 council ✓)" : ""}`);
         } catch (err) {
-          // Any error in apply/enforce/commit reverts this unit and is recorded;
-          // it must never strand the branch or abort the whole run.
+          // Any error in apply/enforce/gate/commit reverts this unit and is recorded.
+          // If the revert itself cannot restore a clean tree (resetHard threw, or a
+          // leftover patch remains), we must NOT continue — a later same-file finding
+          // could stage un-reviewed bytes. Abort the run and let it be reported stranded.
+          let restored = true;
           try {
             git.resetHard(snapshot);
           } catch {
-            /* best effort */
+            restored = false;
+          }
+          if (!restored || (typeof git.isClean === "function" && !git.isClean())) {
+            fatalAbort = `revert failed after: ${String(err?.message ?? err)} — tree not restored, aborting run`;
+            failed.push({ finding, file: task.file, reason: fatalAbort });
+            log(`  ABORT — ${fatalAbort}`);
+            break;
           }
           failed.push({ finding, file: task.file, reason: `fix error: ${String(err?.message ?? err)}` });
           log(`  reverted — ${String(err?.message ?? err)}`);
@@ -696,14 +733,14 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     // means ok:false — the kept commits live on the (isolated) branch for review,
     // but the run is NOT reported as success.
     let integration = null;
-    if (gated && fixed.length) integration = await runTests();
+    if (!fatalAbort && gated && fixed.length) integration = await runTests();
     const integrationFailed = integration ? !integration.ok : false;
 
     // Resolve to 'fixed' only for VERIFIED fixes on a test-gated, green run: an
     // unverified (--allow-untested) or ungated fix must not suppress re-detection,
     // and a red final integration means the branch may be discarded.
     let ledgerResolved = 0;
-    if (gated && !integrationFailed) {
+    if (gated && !integrationFailed && !fatalAbort) {
       for (const f of fixed) {
         if (!f.verified) continue;
         try {
@@ -723,7 +760,9 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     if (!options.stayOnBranch && git.isClean()) returnedToBase = git.checkout(baseBranch);
 
     return {
-      ok: !integrationFailed,
+      ok: !integrationFailed && !fatalAbort,
+      aborted: fatalAbort ?? null,
+      stranded: Boolean(fatalAbort),
       branch,
       baseBranch,
       baseRef,

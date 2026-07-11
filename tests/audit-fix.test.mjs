@@ -255,6 +255,34 @@ test("runAuditFix: §6 stays propose-only when consent is absent (default safety
   assert.ok(out.rejected.some((r) => /sensitive class/.test(r.reason)));
 });
 
+test("runAuditFix: §6 fails closed when no diff can be produced for review", async () => {
+  const git = fakeGit(); // plain fakeGit has NO diffText
+  let reviewed = 0;
+  const out = await runAuditFix(tmp(), [race()], {}, { sensitiveAutoApply: true }, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    reviewPatch: async () => { reviewed += 1; return []; }
+  }));
+  assert.equal(out.fixed.length, 0);
+  assert.equal(reviewed, 0, "reviewer never consulted without a real diff");
+  assert.ok(out.rejected.some((r) => /cannot produce a diff/.test(r.reason)));
+});
+
+test("runAuditFix ABORTS (ok:false, stranded) when a revert cannot restore the tree", async () => {
+  const git = fakeGit();
+  git.resetHard = () => { throw new Error("git reset --hard failed: disk full"); };
+  const out = await runAuditFix(
+    tmp(),
+    [loc({ file: "a.mjs", title: "fix" }), loc({ file: "b.mjs", title: "second" })],
+    {},
+    {},
+    baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs", "sneaky.mjs"]) }) // out-of-scope → revert path
+  );
+  assert.equal(out.ok, false);
+  assert.equal(out.stranded, true);
+  assert.match(String(out.aborted), /tree not restored/);
+  assert.ok(!git.calls.some((c) => c[0] === "commitFile"), "never commits over an unrestored tree");
+});
+
 test("runAuditFix resolves each committed fix in the ledger, but not on a red integration run", async () => {
   // happy: fix committed + integration green -> ledger resolved
   const git = fakeGit();

@@ -76,19 +76,31 @@ export function buildPatchReviewPrompt(file, finding, diff, seat = "reviewer") {
  */
 export function parsePatchVerdict(text, seat = "reviewer") {
   const raw = String(text ?? "");
-  // Take the LAST explicit verdict token so a seat that "thinks out loud" and then
-  // states its decision is read by its conclusion, not an intermediate mention.
-  const matches = [...raw.matchAll(/VERDICT\s*[:=]\s*(CONFIRM|DISSENT|ABSTAIN|APPROVE|REJECT|BLOCK)/gi)];
-  const reasonM = raw.match(/REASON\s*[:=]\s*(.+)/i);
+  const reasonM = raw.match(/^[ \t>]*REASON\s*[:=]\s*(.+)$/im);
   const reason = reasonM ? clampStr(reasonM[1].trim(), 300) : "";
+  // Only LINE-ANCHORED verdict tokens count. A "VERDICT: CONFIRM" buried mid-sentence in
+  // the REASON prose, or quoted from the UNTRUSTED diff/finding, must NEVER be read as the
+  // seat's decision — otherwise a decoy token flips a dissent to a confirm and defeats the
+  // whole unanimity guarantee (a verified attack: both the Claude and Grok seats reproduced
+  // it). Leading blockquote markers (>) are tolerated so a quoted reply still parses, but
+  // the token must open its line.
+  const matches = [...raw.matchAll(/^[ \t>]*VERDICT\s*[:=]\s*(CONFIRM|DISSENT|ABSTAIN|APPROVE|REJECT|BLOCK)\b/gim)];
   if (!matches.length) {
     return { seat, verdict: VERDICT_UNKNOWN, reason: reason || "no parseable verdict", raw: clampStr(raw, 400) };
   }
-  const token = matches[matches.length - 1][1].toUpperCase();
-  let verdict = VERDICT_UNKNOWN;
-  if (token === "CONFIRM" || token === "APPROVE") verdict = VERDICT_CONFIRM;
-  else if (token === "DISSENT" || token === "REJECT" || token === "BLOCK") verdict = VERDICT_DISSENT;
-  else if (token === "ABSTAIN") verdict = VERDICT_ABSTAIN;
+  const canon = (tok) => {
+    const t = tok.toUpperCase();
+    if (t === "CONFIRM" || t === "APPROVE") return VERDICT_CONFIRM;
+    if (t === "DISSENT" || t === "REJECT" || t === "BLOCK") return VERDICT_DISSENT;
+    if (t === "ABSTAIN") return VERDICT_ABSTAIN;
+    return VERDICT_UNKNOWN;
+  };
+  const seen = new Set(matches.map((m) => canon(m[1])));
+  // One clear verdict is honored; multiple CONFLICTING line-anchored verdicts are
+  // ambiguous → fail closed (a contradictory reply can never approve).
+  let verdict;
+  if (seen.size === 1) [verdict] = seen;
+  else verdict = seen.has(VERDICT_DISSENT) ? VERDICT_DISSENT : VERDICT_UNKNOWN;
   return { seat, verdict, reason };
 }
 
@@ -119,11 +131,20 @@ export function normalizeVerdict(v, seat = "reviewer") {
  * AND confirms — unanimity, fail-closed. Returns a structured, serializable result.
  */
 export function evaluatePatchVerdicts(verdicts, { required = PATCH_REVIEW_SEATS } = {}) {
-  const req = [...required];
+  // Dedupe the required set so a repeated seat name can never double-count one seat into
+  // a false quorum. An EMPTY required set must never approve ("unanimity of nobody").
+  const req = [...new Set(required)];
   const norm = (Array.isArray(verdicts) ? verdicts : []).map((v, i) => normalizeVerdict(v, v?.seat ?? `seat${i}`));
-  // Keep the FIRST verdict per seat (a seat can't vote twice); later duplicates ignored.
+  // Reduce to the MOST-RESTRICTIVE verdict per seat: a seat that votes twice with a
+  // conflicting (or spoofed early-confirm) ballot must not have its veto dropped. Order
+  // of restrictiveness: dissent > unknown > abstain > confirm (higher wins).
+  const RESTRICT = { dissent: 3, unknown: 2, abstain: 1, confirm: 0 };
+  const rank = (verdict) => RESTRICT[verdict] ?? RESTRICT.unknown;
   const bySeat = new Map();
-  for (const v of norm) if (!bySeat.has(v.seat)) bySeat.set(v.seat, v);
+  for (const v of norm) {
+    const prev = bySeat.get(v.seat);
+    if (!prev || rank(v.verdict) > rank(prev.verdict)) bySeat.set(v.seat, v);
+  }
 
   const confirms = [];
   const dissents = [];
@@ -137,7 +158,7 @@ export function evaluatePatchVerdicts(verdicts, { required = PATCH_REVIEW_SEATS 
     else if (v.verdict === VERDICT_ABSTAIN) abstains.push(seat);
     else dissents.push(seat); // unknown counts as veto (fail-closed)
   }
-  const approved = confirms.length === req.length && dissents.length === 0 && abstains.length === 0 && missing.length === 0;
+  const approved = req.length > 0 && confirms.length === req.length && dissents.length === 0 && abstains.length === 0 && missing.length === 0;
 
   let summary;
   if (approved) summary = `${confirms.length}/${req.length} confirm`;

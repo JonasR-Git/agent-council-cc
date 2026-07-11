@@ -54,6 +54,7 @@ import { runAudit } from "./lib/audit-run.mjs";
 import { toSarif } from "./lib/audit-sarif.mjs";
 import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
+import { writeFixReportHtml } from "./lib/fix-report-html.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
 import {
@@ -1718,7 +1719,7 @@ async function handleWatch(argv) {
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier"]
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "html"]
   });
   const cwd = process.cwd();
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
@@ -1933,6 +1934,12 @@ async function handleAudit(argv) {
         outputResult(out, true);
         return;
       }
+      if (options.html) {
+        const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply: Boolean(out.sensitiveAutoApply), generatedAt: nowIso() });
+        console.log(renderFixLoopReport(out));
+        console.log(`\nHTML report: ${file}`);
+        return;
+      }
       console.log(renderFixLoopReport(out));
       return;
     }
@@ -1973,6 +1980,12 @@ async function handleAudit(argv) {
     }
     if (options.json) {
       outputResult(out, true);
+      return;
+    }
+    if (options.html) {
+      const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply: Boolean(out.sensitiveAutoApply), generatedAt: nowIso() });
+      console.log(renderAuditFixReport(out));
+      console.log(`\nHTML report: ${file}`);
       return;
     }
     console.log(renderAuditFixReport(out));
