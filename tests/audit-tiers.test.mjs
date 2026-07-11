@@ -3,12 +3,14 @@ import test from "node:test";
 
 import { lensIds } from "../plugins/council/scripts/lib/audit-lenses.mjs";
 import {
+  actionableByTier,
   applyTierGating,
   groupByTier,
   orderByTier,
   tierAction,
   tierOfLens,
   unmappedLenses,
+  SECURITY_OVERRIDE_LENSES,
   TIERS
 } from "../plugins/council/scripts/lib/audit-tiers.mjs";
 
@@ -93,5 +95,62 @@ test("applyTierGating annotates gateEffect and splits process/skipped/suppressed
   // process includes keep.mjs correctness AND the P0-security override on dead.mjs
   assert.ok(out.process.some((f) => f.file === "keep.mjs"));
   assert.ok(out.process.some((f) => f.file === "dead.mjs" && f.lens === "security_secrets"));
+  // skipped != dropped: the real P1 bug parked behind an unconfirmed remove? is surfaced
+  assert.equal(out.surfaced.length, 1);
+  assert.equal(out.surfaced[0].file, "dead.mjs");
+  assert.equal(out.surfaced[0].lens, "correctness");
   for (const f of out.findings) assert.ok(typeof f.tier === "number" && f.gateEffect);
+});
+
+test("override covers ALL P0-ceiling lenses (derived), obeys reachability", () => {
+  assert.deepEqual([...SECURITY_OVERRIDE_LENSES].sort(), ["concurrency_resources", "config_cicd_security", "data_integrity", "security_secrets"]);
+  const vm = { "x.mjs": { verdict: "remove" } };
+  // a P0 race and a P0 CI-injection on a remove? unit are still processed
+  assert.equal(tierAction({ lens: "concurrency_resources", severity: "P0", file: "x.mjs" }, vm).action, "process");
+  assert.equal(tierAction({ lens: "config_cicd_security", severity: "P0", file: "x.mjs" }, vm).action, "process");
+  // explicitly unreachable -> the override does NOT fire (don't verify a dead hole)
+  const dead = { "x.mjs": { verdict: "remove", reachable: false } };
+  assert.equal(tierAction({ lens: "security_secrets", severity: "P0", file: "x.mjs" }, dead).action, "skip");
+});
+
+test("merge-into: valid survivor redirects; missing/self survivor processes in place", () => {
+  assert.equal(tierAction({ lens: "correctness", severity: "P1", file: "a.mjs" }, { "a.mjs": { verdict: "merge-into", survivor: "core.mjs" } }).to, "core.mjs");
+  const noSurv = tierAction({ lens: "correctness", severity: "P1", file: "a.mjs" }, { "a.mjs": { verdict: "merge-into" } });
+  assert.equal(noSurv.action, "process");
+  assert.match(noSurv.reason, /missing\/self survivor/);
+  const self = tierAction({ lens: "correctness", severity: "P1", file: "a.mjs" }, { "a.mjs": { verdict: "merge-into", survivor: "a.mjs" } });
+  assert.equal(self.action, "process");
+});
+
+test("quarantine is kept+flagged (process); relocate suppresses quality polish", () => {
+  assert.equal(tierAction({ lens: "correctness", severity: "P1", file: "q.mjs" }, { "q.mjs": { verdict: "quarantine" } }).action, "process");
+  assert.equal(tierAction({ lens: "docs_maintainability", severity: "P2", file: "r.mjs" }, { "r.mjs": { verdict: "relocate" } }).action, "suppress");
+  assert.equal(tierAction({ lens: "correctness", severity: "P1", file: "r.mjs" }, { "r.mjs": { verdict: "relocate" } }).action, "process");
+});
+
+test("verdicts key on fingerprint first (survives a re-map); sentinel/unknown units are never gated", () => {
+  // same file path but the verdict is keyed by the AST-anchored fingerprint
+  const vm = { "fp:sym#1": { verdict: "remove" } };
+  assert.equal(tierAction({ lens: "correctness", severity: "P1", file: "moved.mjs", fingerprint: "fp:sym#1" }, vm).action, "skip");
+  // an unidentifiable unit ("" / "unknown") is never gated -> always process
+  assert.equal(tierAction({ lens: "correctness", severity: "P1", file: "" }, { "": { verdict: "remove" } }).action, "process");
+  assert.equal(tierAction({ lens: "correctness", severity: "P1", location: { path: "unknown" } }, { unknown: { verdict: "remove" } }).action, "process");
+});
+
+test("verdict lookup normalizes Windows separators; location.path shape works", () => {
+  const vm = { "src/a.mjs": { verdict: "remove" } };
+  // a finding whose path uses backslashes still matches the posix-keyed verdict
+  assert.equal(tierAction({ lens: "correctness", severity: "P1", location: { path: "src\\a.mjs" } }, vm).action, "skip");
+});
+
+test("actionableByTier groups process+redirect for the fix loop, tier-ordered", () => {
+  const findings = [
+    { lens: "logical_sense", severity: "P1", file: "l.mjs" },
+    { lens: "correctness", severity: "P1", file: "c.mjs" },
+    { lens: "correctness", severity: "P1", file: "m.mjs" }
+  ];
+  const vm = { "m.mjs": { verdict: "merge-into", survivor: "core.mjs" } };
+  const buckets = actionableByTier(applyTierGating(findings, vm));
+  assert.deepEqual(buckets.map((b) => b.tierId), [0, 1, 2, 3]);
+  assert.equal(buckets[2].findings.length, 2, "both correctness findings (one redirected) are actionable in tier 2");
 });
