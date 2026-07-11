@@ -23,7 +23,8 @@
         "dependencies_supply_chain",
         "compliance_governance",
         "docs_maintainability",
-        "config_cicd_security"
+        "config_cicd_security",
+        "logical_sense"
       ]
     },
     "category": { "type": "string" },
@@ -69,6 +70,18 @@
     "consensus": { "type": "string", "enum": ["single", "consensus", "contested"] },
     "owners": { "type": "array", "items": { "type": "string" } },
     "baseline": { "type": "string", "enum": ["new", "baselined", "waived"] },
-    "fixDisposition": { "type": "string", "enum": ["localized", "propose-only", "inconclusive"] }
+    "fixDisposition": { "type": "string", "enum": ["localized", "propose-only", "inconclusive"] },
+    "verdict": { "type": "string", "enum": ["keep", "remove", "merge-into", "redesign", "relocate", "quarantine"], "description": "Tier-0 logical-sense verdict over the finding's unit (docs/enterprise-fix-design.md §3)." },
+    "survivor": { "type": "string", "description": "For a merge-into verdict: the designated SSOT survivor the unit should fold into." },
+    "intentEvidence": {
+      "type": "object",
+      "description": "Result of the adversarial intent-defense: cited evidence that the code is intentional (demotes a removal-class finding to quarantine).",
+      "properties": {
+        "found": { "type": "boolean" },
+        "source": { "type": "string" },
+        "quote": { "type": "string" }
+      }
+    },
+    "gateEffect": { "type": "string", "enum": ["process", "skip", "redirect", "suppress"], "description": "How Tier 0 gated the mechanical work on this finding (auditable pruning trail)." }
   }
 }

@@ -4,7 +4,7 @@
 // capped at P2 until independently verified; a lens ceiling is only exceeded by
 // reclassification into the lens of the proven impact.
 
-export const LENS_REGISTRY_VERSION = 1;
+export const LENS_REGISTRY_VERSION = 2;
 
 // handling: "localized"    -> localized fixes allowed (cross-module -> propose)
 //           "conditional"  -> localized fix conditional; protocol/schema/redesign -> propose
@@ -21,7 +21,12 @@ export const LENSES = {
   dependencies_supply_chain: { ceiling: "P1", consensus: true, handling: "propose-only", reclassifyExploited: "security_secrets", standards: ["CWE-1104", "OWASP-A06", "OWASP-A08"] },
   compliance_governance: { ceiling: "P1", consensus: true, handling: "propose-only", standards: ["PRIVACY"] },
   docs_maintainability: { ceiling: "P2", consensus: false, handling: "localized", standards: ["AC-DOC"] },
-  config_cicd_security: { ceiling: "P0", consensus: true, handling: "propose-only", standards: ["CWE-16", "CWE-78", "CWE-94", "CWE-829", "OWASP-A05", "OWASP-A08"] }
+  config_cicd_security: { ceiling: "P0", consensus: true, handling: "propose-only", standards: ["CWE-16", "CWE-78", "CWE-94", "CWE-829", "OWASP-A05", "OWASP-A08"] },
+  // Tier 0 (docs/enterprise-fix-design.md §3): judges the DESIGN decision ("should
+  // this exist / be restructured / removed?"), not the implementation. Propose-only on
+  // every autonomy level except the narrow provably-dead-private-code carve-out
+  // (routed per-finding via fixDisposition). Consensus-gated for removal-class verdicts.
+  logical_sense: { ceiling: "P1", consensus: true, handling: "propose-only", standards: ["AC-DESIGN"] }
 };
 
 const RANK = { P0: 0, P1: 1, P2: 2, nit: 3 };

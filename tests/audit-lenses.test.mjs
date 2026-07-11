@@ -3,9 +3,10 @@ import test from "node:test";
 
 import { LENSES, LENS_REGISTRY_VERSION, cappedSeverity, getLens, isProposeOnly, lensIds, requiresConsensus } from "../plugins/council/scripts/lib/audit-lenses.mjs";
 
-test("the registry ships all twelve lenses, each fully specified", () => {
+test("the registry ships all thirteen lenses, each fully specified", () => {
   const ids = lensIds();
-  assert.equal(ids.length, 12);
+  assert.equal(ids.length, 13);
+  assert.ok(ids.includes("logical_sense"), "Tier-0 logical_sense lens is registered");
   for (const id of ids) {
     const l = LENSES[id];
     assert.ok(["P0", "P1", "P2", "nit"].includes(l.ceiling), `${id} has a valid ceiling`);
@@ -13,7 +14,7 @@ test("the registry ships all twelve lenses, each fully specified", () => {
     assert.ok(["localized", "conditional", "propose-only"].includes(l.handling), `${id} handling`);
     assert.ok(Array.isArray(l.standards) && l.standards.length > 0, `${id} has standards tags`);
   }
-  assert.equal(LENS_REGISTRY_VERSION, 1);
+  assert.equal(LENS_REGISTRY_VERSION, 2);
 });
 
 test("consensus + handling policy match the schema", () => {
