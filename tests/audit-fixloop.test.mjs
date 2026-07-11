@@ -1,0 +1,90 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { fixKey, gateFindings, runFixLoop } from "../plugins/council/scripts/lib/audit-fixloop.mjs";
+
+const finding = (o) => ({ lens: "correctness", severity: "P1", ...o });
+const noCheckpoint = () => {};
+
+test("runs review->fix passes until the dry streak, accumulating committed fixes", async () => {
+  let p = 0;
+  const review = async () => (p++ === 0 ? { findings: [finding({ file: "a.mjs", title: "bug" })], coverage: { budgetSpent: 2 } } : { findings: [], coverage: { budgetSpent: 1 } });
+  const fix = async (actionable) => ({ fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "abc" })), failed: [], branch: "council/x", changedFiles: ["a.mjs"], spent: 2 });
+  const out = await runFixLoop("/x", { budget: 40, dryStreak: 2 }, { review, fix, checkpoint: noCheckpoint });
+  assert.equal(out.fixed.length, 1);
+  assert.equal(out.branch, "council/x");
+  assert.match(out.stopReason, /diminishing returns/);
+});
+
+test("re-scopes each pass to the previous pass's changed files (diff-scoped re-review)", async () => {
+  const scopes = [];
+  let p = 0;
+  const review = async ({ changedFiles }) => {
+    scopes.push(changedFiles);
+    return p++ === 0 ? { findings: [finding({ file: "a.mjs", title: "b" })], coverage: { budgetSpent: 1 } } : { findings: [], coverage: { budgetSpent: 1 } };
+  };
+  const fix = async (a) => ({ fixed: a.map((f) => ({ file: f.file, finding: f, commit: "c" })), changedFiles: ["a.mjs"], spent: 1 });
+  await runFixLoop("/x", { budget: 20, dryStreak: 1 }, { review, fix, checkpoint: noCheckpoint });
+  assert.equal(scopes[0], null, "first pass reviews the full scope");
+  assert.deepEqual(scopes[1], ["a.mjs"], "the next pass re-scopes to what changed");
+});
+
+test("stops when the agent budget is exhausted", async () => {
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: "b" })], coverage: { budgetSpent: 10 } });
+  const fix = async (a) => ({ fixed: a.map((f) => ({ file: f.file, finding: f, commit: "c" })), changedFiles: ["a.mjs"], spent: 10 });
+  const out = await runFixLoop("/x", { budget: 20, dryStreak: 9, maxPasses: 50 }, { review, fix, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /budget/);
+});
+
+test("a fix that recurs across passes is counted once (dedupe drives convergence)", async () => {
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: "same bug" })], coverage: { budgetSpent: 1 } });
+  const fix = async (a) => ({ fixed: a.map((f) => ({ file: f.file, finding: f, commit: "c" })), changedFiles: ["a.mjs"], spent: 1 });
+  const out = await runFixLoop("/x", { budget: 30, dryStreak: 2, maxPasses: 6 }, { review, fix, checkpoint: noCheckpoint });
+  assert.equal(out.fixed.length, 1, "same file+title fix deduped across passes");
+  assert.match(out.stopReason, /diminishing returns/);
+});
+
+test("a review or fix error stops the loop gracefully with a reason", async () => {
+  const boom = async () => {
+    throw new Error("kaboom");
+  };
+  const r1 = await runFixLoop("/x", { budget: 10 }, { review: boom, fix: async () => ({}), checkpoint: noCheckpoint });
+  assert.match(r1.stopReason, /review error.*kaboom/);
+  const r2 = await runFixLoop("/x", { budget: 10 }, { review: async () => ({ findings: [finding({ file: "a.mjs", title: "b" })], coverage: { budgetSpent: 1 } }), fix: boom, checkpoint: noCheckpoint });
+  assert.match(r2.stopReason, /fix error.*kaboom/);
+});
+
+test("resume seeds fixed/spent/branch from the checkpoint instead of re-spending", async () => {
+  const prior = { fixed: [{ file: "a.mjs", finding: { title: "old" }, commit: "c" }], proposed: [], spent: 8, passNo: 2, dryStreak: 1, branch: "council/y" };
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 1 } });
+  const out = await runFixLoop("/x", { budget: 30, resume: true, dryStreak: 2 }, { review, fix: async () => ({ fixed: [], changedFiles: [] }), loadCheckpoint: () => prior, checkpoint: noCheckpoint });
+  assert.equal(out.branch, "council/y");
+  assert.ok(out.fixed.some((f) => f.finding.title === "old"), "the prior fix is retained, not re-done");
+  assert.ok(out.spent >= 8, "prior spend is carried");
+});
+
+test("Tier-0 gating surfaces a skipped serious finding as a proposal (never dropped)", async () => {
+  let p = 0;
+  const review = async () => (p++ === 0 ? { findings: [finding({ file: "dead.mjs", title: "bug in dead" })], coverage: { budgetSpent: 1 } } : { findings: [], coverage: { budgetSpent: 1 } });
+  const fix = async () => ({ fixed: [], changedFiles: [], spent: 0 });
+  const out = await runFixLoop("/x", { budget: 20, dryStreak: 1, verdictMap: { "dead.mjs": { verdict: "remove", confidence: 0.9 } } }, { review, fix, checkpoint: noCheckpoint });
+  assert.ok(out.proposed.some((f) => f.file === "dead.mjs"), "the P1 parked behind a remove? is surfaced, not silently skipped");
+});
+
+test("requires deps.review and deps.fix", async () => {
+  await assert.rejects(runFixLoop("/x", {}, { fix: async () => ({}) }), /requires deps\.review/);
+  await assert.rejects(runFixLoop("/x", {}, { review: async () => ({}) }), /requires deps\.fix/);
+});
+
+test("gateFindings tier-orders the actionable set and separates surfaced/skipped", () => {
+  const g = gateFindings(
+    [finding({ lens: "logical_sense", severity: "P1", file: "l.mjs", title: "x" }), finding({ file: "c.mjs", title: "y" })],
+    {}
+  );
+  assert.equal(g.actionable[0].file, "l.mjs", "tier-0 finding ordered first");
+  assert.equal(g.skipped.length, 0);
+});
+
+test("fixKey is line-independent and separator-normalized", () => {
+  assert.equal(fixKey({ file: "src\\a.mjs", finding: { title: "The  Bug" } }), fixKey({ file: "src/a.mjs", finding: { title: "the bug" } }));
+});
