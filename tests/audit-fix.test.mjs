@@ -40,6 +40,16 @@ test("ineligibleReason rejects §6 sensitive classes (auth/crypto/concurrency/da
   assert.equal(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "correctness" }), null, "ordinary bugs stay fixable");
 });
 
+test("ineligibleReason lets §6 through ONLY under consented sensitiveAutoApply; other gates still hold", () => {
+  const race = { severity: "P1", scope: "localized", file: "a.mjs", category: "concurrency" };
+  assert.match(ineligibleReason(race), /sensitive/, "default: propose-only");
+  assert.equal(ineligibleReason(race, { sensitiveAutoApply: true }), null, "consented: flows to the council gate");
+  // consent must NOT relax any other gate
+  assert.match(ineligibleReason({ ...race, scope: "cross-cutting" }, { sensitiveAutoApply: true }), /cross-cutting/);
+  assert.match(ineligibleReason({ ...race, file: "../x" }, { sensitiveAutoApply: true }), /unsafe file path/);
+  assert.match(ineligibleReason({ ...race, severity: "nit" }, { sensitiveAutoApply: true }), /severity gate/);
+});
+
 test("PROTECTED_RE blocks secrets/CI/infra AND matches Windows separators", () => {
   for (const file of ["node_modules/x/i.mjs", ".git/config", "dist/b.js", ".env", ".env.production", ".github/workflows/ci.yml", "Dockerfile", "secrets/key.pem", "config/id.key"]) {
     assert.match(ineligibleReason({ severity: "P1", scope: "localized", file }), /protected/, `posix ${file} protected`);
@@ -177,6 +187,72 @@ test("runAuditFix commits a fix when the edit is in-scope and tests pass", async
   assert.equal(out.fixed[0].verified, true);
   assert.ok(git.calls.some((c) => c[0] === "commitFile" && c[1] === "a.mjs"), "staged only the target file");
   assert.match(out.branch, /^council\/audit-fix-base0000/);
+});
+
+// --- §6 council gate: sensitive-class auto-apply -----------------------------
+
+const sensitiveGit = (o) => Object.assign(fakeGit(o), { diffText: () => "@@ -1 +1 @@\n-old\n+new\n" });
+const race = (o) => loc({ file: "a.mjs", title: "fix the race", category: "concurrency", ...o });
+
+test("runAuditFix: a §6 fix commits only after a UNANIMOUS council patch-review", async () => {
+  const git = sensitiveGit();
+  const seen = [];
+  const out = await runAuditFix(tmp(), [race()], {}, { sensitiveAutoApply: true }, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    reviewPatch: async ({ diff }) => {
+      seen.push(diff);
+      return [{ seat: "claude", verdict: "confirm" }, { seat: "codex", verdict: "confirm" }, { seat: "grok", verdict: "confirm" }];
+    }
+  }));
+  assert.equal(out.fixed.length, 1);
+  assert.ok(out.fixed[0].council?.approved, "carries the council verdict");
+  assert.match(seen[0], /\+new/, "the reviewer received the real unified diff");
+  assert.ok(git.calls.some((c) => c[0] === "commitFile"));
+});
+
+test("runAuditFix: a §6 fix is reverted + proposed when any seat dissents (fail-closed veto)", async () => {
+  const git = sensitiveGit();
+  const out = await runAuditFix(tmp(), [race()], {}, { sensitiveAutoApply: true }, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    reviewPatch: async () => [{ seat: "claude", verdict: "confirm" }, { seat: "codex", verdict: "confirm" }, { seat: "grok", verdict: "dissent" }]
+  }));
+  assert.equal(out.fixed.length, 0, "not committed");
+  assert.ok(git.calls.some((c) => c[0] === "resetHard"), "reverted");
+  assert.ok(out.rejected.some((r) => /council not unanimous/.test(r.reason)));
+});
+
+test("runAuditFix: a §6 fix is reverted when the reviewer throws (fail-closed)", async () => {
+  const git = sensitiveGit();
+  const out = await runAuditFix(tmp(), [race()], {}, { sensitiveAutoApply: true }, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    reviewPatch: async () => { throw new Error("codex offline"); }
+  }));
+  assert.equal(out.fixed.length, 0);
+  assert.ok(out.rejected.some((r) => /council review error/.test(r.reason)));
+});
+
+test("runAuditFix: §6 stays propose-only when consent is set but NO reviewer is injected", async () => {
+  const git = sensitiveGit();
+  let applied = 0;
+  const out = await runAuditFix(tmp(), [race()], {}, { sensitiveAutoApply: true }, baseDeps(git, {
+    applyFix: async () => { applied += 1; git.setChanged(["a.mjs"]); }
+    // no reviewPatch injected
+  }));
+  assert.equal(out.fixed.length, 0);
+  assert.equal(applied, 0, "writer never invoked — rejected upfront, no patch leaked");
+  assert.ok(out.rejected.some((r) => /sensitive class/.test(r.reason)));
+});
+
+test("runAuditFix: §6 stays propose-only when consent is absent (default safety)", async () => {
+  const git = sensitiveGit();
+  let reviewed = 0;
+  const out = await runAuditFix(tmp(), [race()], {}, {}, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    reviewPatch: async () => { reviewed += 1; return []; }
+  }));
+  assert.equal(out.fixed.length, 0);
+  assert.equal(reviewed, 0, "reviewer never consulted without consent");
+  assert.ok(out.rejected.some((r) => /sensitive class/.test(r.reason)));
 });
 
 test("runAuditFix resolves each committed fix in the ledger, but not on a red integration run", async () => {

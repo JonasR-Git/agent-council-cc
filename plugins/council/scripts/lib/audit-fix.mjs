@@ -6,6 +6,7 @@ import { findClaudeBinary } from "./discover.mjs";
 import { fingerprintFinding, resolveLedgerEntry } from "./ledger.mjs";
 import { runCommand, runCommandAsync } from "./process.mjs";
 import { snapshotViolation } from "./audit-snapshot.mjs";
+import { evaluatePatchVerdicts } from "./audit-council-gate.mjs";
 import { coverageOfLines, ingestCoverage, parseDiffLines } from "./audit-coverage-ingest.mjs";
 import { ensureStateDir, nowIso, resolveStateDir, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
@@ -132,28 +133,34 @@ export function isSensitiveClass(f) {
   return SENSITIVE_CATEGORIES.has(String(f?.category ?? "").toLowerCase()) || SENSITIVE_LENSES.has(String(f?.lens ?? ""));
 }
 
-/** Reason a finding is NOT eligible for auto-fix, or null if it is. Fail-closed. */
-export function ineligibleReason(f, { maxRank = RANK.P2, protectedRe = PROTECTED_RE } = {}) {
+/**
+ * Reason a finding is NOT eligible for auto-fix, or null if it is. Fail-closed.
+ * `sensitiveAutoApply` (opt-in, consent-gated at the CLI) lets §6 classes through the
+ * upfront filter so they can be verified by the patch-level council gate before commit;
+ * it never relaxes any OTHER gate (scope, path, severity, protected paths all still hold).
+ */
+export function ineligibleReason(f, { maxRank = RANK.P2, protectedRe = PROTECTED_RE, sensitiveAutoApply = false } = {}) {
   // Fail CLOSED on scope: only an explicit "localized" is auto-fixable. Missing /
   // unknown scope (e.g. hand-edited --from findings) must never slip through.
   if (f.scope !== "localized") return f.scope === "cross-cutting" ? "cross-cutting → propose-only (never auto-patched)" : "scope not 'localized' (fail-closed)";
   if (!f.file) return "no target file";
   const file = toPosix(f.file);
   if (/[\r\n]/.test(file) || file.split("/").includes("..") || path.isAbsolute(f.file) || /^[a-zA-Z]:/.test(file)) return "unsafe file path";
-  // §6: a sensitive-class fix is never auto-applied, even localized + gated + green.
-  if (isSensitiveClass(f)) return "sensitive class (auth/crypto/concurrency/data — §6) → propose-only";
+  // §6: a sensitive-class fix is propose-only UNLESS the operator has consented to
+  // council-gated auto-apply, in which case it must still clear the patch-review gate.
+  if (isSensitiveClass(f) && !sensitiveAutoApply) return "sensitive class (auth/crypto/concurrency/data — §6) → propose-only";
   if ((RANK[f.severity] ?? RANK.P2) > maxRank) return `below severity gate (${f.severity})`;
   if (protectedRe.some((re) => re.test(file))) return "protected path";
   return null;
 }
 
 /** Split findings into auto-fix candidates vs rejected-with-reason. Pure. */
-export function classifyFixable(findings, { minSeverity = "P2", protectedRe = PROTECTED_RE } = {}) {
+export function classifyFixable(findings, { minSeverity = "P2", protectedRe = PROTECTED_RE, sensitiveAutoApply = false } = {}) {
   const maxRank = RANK[minSeverity] ?? RANK.P2;
   const eligible = [];
   const rejected = [];
   for (const f of findings) {
-    const reason = ineligibleReason(f, { maxRank, protectedRe });
+    const reason = ineligibleReason(f, { maxRank, protectedRe, sensitiveAutoApply });
     if (reason) rejected.push({ finding: f, reason });
     else eligible.push(f);
   }
@@ -312,7 +319,10 @@ function realGit(root) {
     },
     // NEW-side changed line numbers of `file` relative to `ref` (the pre-fix snapshot vs
     // the working tree) — the changed-line set the coverage gate judges.
-    diffLines: (file, ref) => parseDiffLines(g(["diff", "--unified=0", String(ref), "--", file]).stdout)
+    diffLines: (file, ref) => parseDiffLines(g(["diff", "--unified=0", String(ref), "--", file]).stdout),
+    // Full unified diff text of `file` vs `ref` — the exact patch handed to the §6
+    // council seats for verification.
+    diffText: (file, ref) => g(["diff", String(ref), "--", file]).stdout
   };
 }
 
@@ -439,13 +449,18 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
   }
   const runTests = deps.runTests ?? (() => realRunTests(root, testCmd, options));
   const applyFix = deps.applyFix ?? ((prompt) => realApplyFix(root, backends, options, prompt));
+  // §6 council gate: only reachable when the operator consented to sensitiveAutoApply
+  // AND an orchestration layer injected a patch reviewer. Without a reviewer, sensitive
+  // findings still flow in (so they aren't silently dropped) but fail the gate → propose.
+  const sensitiveAutoApply = Boolean(options.sensitiveAutoApply) && typeof deps.reviewPatch === "function";
+  const reviewPatch = deps.reviewPatch;
   const oracleCmd = deps.oracleCmd ?? options.oracleCmd ?? detectOracleCmd(root);
   const runOracle = deps.runOracle ?? (oracleCmd ? (() => realRunOracle(root, oracleCmd, options)) : null);
   const oracleName = deps.oracleName ?? oracleCmd?.name ?? "lint/typecheck";
 
   // Normalize target paths ONCE so every downstream gate is separator-consistent.
   const normFindings = findings.map((f) => (f.file ? { ...f, file: toPosix(f.file) } : f));
-  const { eligible, rejected } = classifyFixable(normFindings, { minSeverity: options.minSeverity });
+  const { eligible, rejected } = classifyFixable(normFindings, { minSeverity: options.minSeverity, sensitiveAutoApply });
   const present = [];
   for (const f of eligible) {
     if (fileExists(f.file)) present.push(f);
@@ -635,9 +650,34 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               continue;
             }
           }
+          // §6 council gate (LAST, after every mechanical gate is green): a sensitive-class
+          // patch must be UNANIMOUSLY confirmed by the three council seats before it may
+          // commit. Runs only under consented sensitiveAutoApply with an injected reviewer.
+          // Dissent / a missing seat / a reviewer error all fail closed → revert → propose.
+          let councilVerdict = null;
+          if (sensitiveAutoApply && isSensitiveClass(finding)) {
+            const diff = typeof git.diffText === "function" ? git.diffText(task.file, snapshot) : afterSource;
+            let verdicts;
+            try {
+              verdicts = await reviewPatch({ file: task.file, finding, diff, before: source, after: afterSource });
+            } catch (err) {
+              git.resetHard(snapshot);
+              rejected.push({ finding, reason: `§6 council review error: ${String(err?.message ?? err)} → propose-only` });
+              log(`  reverted — §6 council review error`);
+              continue;
+            }
+            councilVerdict = evaluatePatchVerdicts(verdicts);
+            if (!councilVerdict.approved) {
+              git.resetHard(snapshot);
+              rejected.push({ finding, reason: `§6 council not unanimous (${councilVerdict.summary}) → propose-only`, council: councilVerdict });
+              log(`  reverted — §6 council not unanimous (${councilVerdict.summary})`);
+              continue;
+            }
+            log(`  §6 council unanimous (${councilVerdict.summary}) — auto-apply approved`);
+          }
           const commit = git.commitFile(task.file, `audit-fix: ${finding.title} (${task.file})`);
-          fixed.push({ finding, file: task.file, commit, verified: gated });
-          log(`  committed ${String(commit).slice(0, 8)}${gated ? " (tests green)" : " (UNVERIFIED)"}`);
+          fixed.push({ finding, file: task.file, commit, verified: gated, council: councilVerdict });
+          log(`  committed ${String(commit).slice(0, 8)}${gated ? " (tests green)" : " (UNVERIFIED)"}${councilVerdict ? " (§6 council ✓)" : ""}`);
         } catch (err) {
           // Any error in apply/enforce/commit reverts this unit and is recorded;
           // it must never strand the branch or abort the whole run.
