@@ -113,6 +113,25 @@ test("blast-radius re-scope: expandScope widens the next pass beyond the literal
   assert.deepEqual(scopes[1], ["hub.mjs", "dependent1.mjs", "dependent2.mjs"], "dependents are re-reviewed, not just the hub");
 });
 
+test("the fixer's rejected findings (propose-only / protected) surface as proposals", async () => {
+  let p = 0;
+  const review = async () => (p++ === 0 ? { findings: [finding({ file: "a.mjs", title: "b" })], coverage: { budgetSpent: 1 } } : { findings: [], coverage: { budgetSpent: 1 } });
+  const fix = async () => ({ ok: true, fixed: [], failed: [], rejected: [{ finding: { file: "big.mjs", title: "consolidate", severity: "P2" }, reason: "cross-cutting → propose-only" }], changedFiles: [], spent: 1 });
+  const out = await runFixLoop("/x", { budget: 20, dryStreak: 1 }, { review, fix, checkpoint: noCheckpoint });
+  assert.ok(out.proposed.some((f) => f.file === "big.mjs" && f.rejectedReason), "the not-auto-fixed product is surfaced, not hidden");
+});
+
+test("resume restores changedFiles so it continues the localized scope (not a stale full offset)", async () => {
+  const prior = { fixed: [], failed: [], proposed: [], passes: [], spent: 2, passNo: 3, dryStreak: 0, branch: "council/y", changedFiles: ["a.mjs"] };
+  const scopes = [];
+  const review = async ({ changedFiles }) => {
+    scopes.push(changedFiles);
+    return { findings: [], coverage: { budgetSpent: 1 } };
+  };
+  await runFixLoop("/x", { budget: 20, resume: true, dryStreak: 1 }, { review, fix: async () => ({ ok: true, fixed: [], changedFiles: [] }), loadCheckpoint: () => prior, checkpoint: noCheckpoint });
+  assert.deepEqual(scopes[0], ["a.mjs"], "resumed run continues the checkpointed scope");
+});
+
 test("requires deps.review and deps.fix", async () => {
   await assert.rejects(runFixLoop("/x", {}, { fix: async () => ({}) }), /requires deps\.review/);
   await assert.rejects(runFixLoop("/x", {}, { review: async () => ({}) }), /requires deps\.fix/);

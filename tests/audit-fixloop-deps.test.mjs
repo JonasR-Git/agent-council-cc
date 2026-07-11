@@ -4,23 +4,35 @@ import test from "node:test";
 import { makeFixLoopDeps } from "../plugins/council/scripts/lib/audit-fixloop-deps.mjs";
 
 const model = { files: [{ id: "a.mjs", fanIn: 2 }, { id: "hub.mjs", fanIn: 12 }, { id: "b.mjs", fanIn: 1 }] };
+const bigModel = { files: Array.from({ length: 6 }, (_, i) => ({ id: `f${i}.mjs`, fanIn: 1 })) };
 
-test("review scopes to changedFiles when set; full-scope passes advance the window", async () => {
+test("full-scope passes advance a WRAPPING window keyed to full passes, not the global pass counter", async () => {
   const calls = [];
   const runAuditReview = async (cwd, m, backends, opts) => {
-    calls.push({ files: m.files.map((f) => f.id), opts });
+    calls.push({ n: m.files.length, off: opts.unitOffset, skipReduce: opts.skipReduce });
+    return { findings: [], coverage: { budgetSpent: 1 } };
+  };
+  const deps = makeFixLoopDeps("/x", bigModel, {}, { maxUnits: 2 }, { runAuditReview });
+  await deps.review({ budget: 5, changedFiles: null }); // full -> 0
+  await deps.review({ budget: 5, changedFiles: ["f0.mjs"] }); // scoped -> MUST NOT advance the window
+  await deps.review({ budget: 5, changedFiles: null }); // full -> 2
+  await deps.review({ budget: 5, changedFiles: null }); // full -> 4
+  await deps.review({ budget: 5, changedFiles: null }); // full -> 6 % 6 = 0 (wrap, not an empty off-the-end review)
+  assert.deepEqual(calls.map((c) => c.off), [0, 0, 2, 4, 0]);
+  assert.equal(calls[1].n, 1, "the scoped pass reviewed only the changed file");
+  assert.equal(calls[0].skipReduce, false, "the SSOT reduce runs on the first full pass");
+  assert.equal(calls[2].skipReduce, true, "and not again");
+});
+
+test("a scoped pass whose files aren't in the model falls back to full scope, never an empty review", async () => {
+  let seen;
+  const runAuditReview = async (cwd, m) => {
+    seen = m.files.length;
     return { findings: [], coverage: { budgetSpent: 1 } };
   };
   const deps = makeFixLoopDeps("/x", model, {}, { maxUnits: 5 }, { runAuditReview });
-  await deps.review({ budget: 10, pass: 1, changedFiles: null });
-  await deps.review({ budget: 10, pass: 2, changedFiles: null });
-  await deps.review({ budget: 10, pass: 3, changedFiles: ["a.mjs"] });
-  assert.deepEqual(calls[0].files, ["a.mjs", "hub.mjs", "b.mjs"], "full scope reviews the whole model");
-  assert.equal(calls[0].opts.unitOffset, 0);
-  assert.equal(calls[1].opts.unitOffset, 5, "pass 2 advances the hotspot window");
-  assert.equal(calls[1].opts.skipReduce, true, "the SSOT reduce runs once");
-  assert.deepEqual(calls[2].files, ["a.mjs"], "a scoped pass restricts the model to changed files");
-  assert.equal(calls[2].opts.unitOffset, 0);
+  await deps.review({ budget: 5, changedFiles: ["nonexistent.mjs"] });
+  assert.equal(seen, model.files.length, "unknown changed files -> full scope, not zero units");
 });
 
 test("fix threads branch + stayOnBranch (and severity/max) to runAuditFix", async () => {

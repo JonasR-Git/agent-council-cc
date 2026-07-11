@@ -42,7 +42,7 @@ import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
 import { activeReviewerCount, runAuditReview } from "./lib/audit-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
-import { runAuditFix } from "./lib/audit-fix.mjs";
+import { detectTestCmd, runAuditFix } from "./lib/audit-fix.mjs";
 import { runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { runEndless } from "./lib/audit-endless.mjs";
@@ -1813,11 +1813,23 @@ async function handleAudit(argv) {
     // gates -> fixes the localized set on ONE isolated branch -> re-scopes to the blast
     // radius -> repeats until dry/budget/max-passes. Nothing auto-merged.
     if (options.loop) {
+      if (options["dry-run"]) throw new Error("--dry-run is not supported with --loop (the loop commits on an isolated branch). Preview a single pass with `audit fix --dry-run`, then run `audit fix --loop`.");
       if (activeReviewerCount(backends, merged) === 0) throw new Error("no callable reviewers (Codex/Grok unavailable or skipped) — audit fix --loop needs at least one");
+
+      // Preflight BEFORE paying for a review (the loop must never review-then-hard-stop):
+      // require a branch (not detached HEAD), a clean tree, and a test gate.
+      const bb = await runCommandAsync("git", ["branch", "--show-current"], { cwd, timeoutMs: 10_000 });
+      const baseBranch = bb.status === 0 ? bb.stdout.trim() : "";
+      if (!baseBranch) throw new Error("audit fix --loop requires being on a branch (detached HEAD detected) — check out a branch first");
+      if (/^council\/audit-fix-/.test(baseBranch) && !options.resume) throw new Error(`you are on an integration branch (${baseBranch}) — check out your base branch first, or pass --resume to continue it`);
+      const st = await runCommandAsync("git", ["status", "--porcelain"], { cwd, timeoutMs: 10_000 });
+      if (st.status === 0 && st.stdout.trim() !== "") throw new Error("working tree not clean — commit or stash first (the loop's rollback would destroy uncommitted work)");
+      if (!detectTestCmd(workspaceRoot(cwd)) && !options["allow-untested"]) throw new Error("no test command detected — audit fix --loop needs a test gate; pass --allow-untested to run without verification (not recommended)");
+
       let maxPasses = 8;
       if (options["max-passes"] != null) {
         const n = Number(options["max-passes"]);
-        if (!Number.isFinite(n) || n < 1) throw new Error("--max-passes must be a positive number");
+        if (!Number.isFinite(n) || n < 1 || n > 100) throw new Error("--max-passes must be between 1 and 100");
         maxPasses = Math.floor(n);
       }
       let dryStreak = 2;
@@ -1826,19 +1838,31 @@ async function handleAudit(argv) {
         if (!Number.isFinite(n) || n < 1) throw new Error("--dry-streak must be a positive number");
         dryStreak = Math.floor(n);
       }
-      const bb = await runCommandAsync("git", ["branch", "--show-current"], { cwd, timeoutMs: 10_000 });
-      const baseBranch = bb.status === 0 ? bb.stdout.trim() : null;
+      let loopBudget = 60; // the loop's OWN default (not the single-pass review default)
+      if (options.budget != null) {
+        const n = Number(options.budget);
+        if (!Number.isFinite(n) || n < 2 || n > 2000) throw new Error("--budget must be between 2 and 2000");
+        loopBudget = Math.floor(n);
+      }
+
       const deps = makeFixLoopDeps(cwd, model, backends, {
         maxUnits,
         minSeverity: options["min-severity"] ?? "P2",
+        allowUntested: options["allow-untested"],
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
         claudeModel: merged["claude-model"]
       });
       const tLoop = Date.now();
-      const out = await runFixLoop(cwd, { budget, maxPasses, dryStreak, maxUnits, resume: options.resume, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
-      // Return to the base branch after the final pass (fix stayed on the integration branch).
-      if (out.branch && baseBranch) await runCommandAsync("git", ["checkout", baseBranch], { cwd, timeoutMs: 30_000 });
+      const out = await runFixLoop(cwd, { budget: loopBudget, maxPasses, dryStreak, maxUnits, resume: options.resume, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
+      // Return to the base branch after the final pass (fix stayed on the integration
+      // branch); report if the checkout couldn't complete so the user isn't stranded silently.
+      out.baseBranch = baseBranch;
+      out.stranded = false;
+      if (out.branch) {
+        const co = await runCommandAsync("git", ["checkout", baseBranch], { cwd, timeoutMs: 30_000 });
+        out.stranded = co.status !== 0;
+      }
       recordAuditMetrics(cwd, "fixloop", { wallClockMs: Date.now() - tLoop, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, proposed: out.proposed?.length ?? 0, passes: out.passesRun ?? 0, spent: out.spent ?? 0 }, nowIso());
       if (options.json) {
         outputResult(out, true);
@@ -2089,16 +2113,30 @@ function renderFixLoopReport(out) {
   L.push("");
   L.push(`${out.passesRun} pass(es) · ${out.fixed.length} fix(es) committed · ${out.failed.length} reverted · ${out.proposed.length} proposal(s). Stopped: ${out.stopReason ?? "—"}.`);
   if (out.branch) L.push(`Integration branch **${out.branch}** — review + merge or discard. Nothing was auto-merged.`);
+  if (out.stranded) L.push(`⚠ Could not return to base **${out.baseBranch}** — you are still on the integration branch. Resolve the tree, then \`git checkout ${out.baseBranch}\`.`);
   L.push(`Budget: ${out.spent}/${out.budget} agent calls.`);
+
+  // Automation-bias counter (§6): make the gaps as visible as the passes.
+  const unverified = out.fixed.filter((f) => f.verified === false).length;
+  L.push("");
+  L.push("## Verified vs. NOT verified (review the gaps)");
+  L.push(`- ${out.fixed.length - unverified}/${out.fixed.length} fix(es) test-gated (green per commit + final integration)${unverified ? ` · ${unverified} UNVERIFIED (--allow-untested)` : ""}`);
+  L.push("- NOT measured: change-line coverage, behaviour-equivalence, mutation adequacy — eyeball the diffs + the proposals below");
+
   if (out.fixed.length) {
     L.push("");
     L.push(`## Fixed (${out.fixed.length})`);
-    for (const f of out.fixed) L.push(`- ✓ ${f.finding?.severity ?? ""} ${f.finding?.title ?? "(untitled)"} · \`${f.file}\``);
+    for (const f of out.fixed) L.push(`- ${f.verified === false ? "⚠" : "✓"} ${f.finding?.severity ?? ""} ${f.finding?.title ?? "(untitled)"} · \`${f.file}\``);
+  }
+  if (out.failed.length) {
+    L.push("");
+    L.push(`## Reverted (${out.failed.length})`);
+    for (const f of out.failed.slice(0, 20)) L.push(`- ✗ ${f.finding?.severity ?? ""} ${f.finding?.title ?? "(untitled)"} · \`${f.file ?? f.finding?.file ?? ""}\` — ${f.reason ?? "reverted"}`);
   }
   if (out.proposed.length) {
     L.push("");
     L.push(`## Proposals — surfaced, not auto-fixed (${out.proposed.length})`);
-    for (const p of out.proposed.slice(0, 20)) L.push(`- ${p.severity ?? ""} ${p.title ?? "(untitled)"}${p.file ? ` · \`${p.file}\`` : ""}`);
+    for (const p of out.proposed.slice(0, 20)) L.push(`- ${p.severity ?? ""} ${p.title ?? "(untitled)"}${p.file ? ` · \`${p.file}\`` : ""}${p.rejectedReason ? ` — ${p.rejectedReason}` : ""}`);
     if (out.proposed.length > 20) L.push(`- … and ${out.proposed.length - 20} more`);
   }
   if (out.branch) {

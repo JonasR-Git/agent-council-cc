@@ -1,18 +1,24 @@
 // Wiring for `audit fix --loop` (docs/enterprise-fix-design.md M3): compose the real
-// engine pieces into the injectable deps runFixLoop consumes. The composition itself is
-// where the council-flagged contract drift lived, so it is a separate, TESTABLE factory
-// (runAuditReview + runAuditFix are injectable) rather than inline CLI glue.
+// engine pieces into the injectable deps runFixLoop consumes. The composition is a
+// separate, TESTABLE factory (runAuditReview + runAuditFix injectable) because it is
+// exactly where the council found contract drift.
 //
-// - review: runAuditReview over the codebase model. On the FIRST pass (full scope) it
-//   advances a progressive unit window per pass (like endless); once the loop re-scopes
-//   to changed files it reviews exactly those.
-// - fix: runAuditFix on the actionable set, threading branch + stayOnBranch so the loop
-//   continues ONE integration branch across passes.
-// - expandScope: blast-radius (§7) — a change to a HUB file (fan-in >= threshold) forces
-//   a full re-scope next pass ("no incremental discount for hub files"); a leaf change
-//   stays narrow. Returns [] to signal "full re-scope" to the loop.
-// - verdictsFor: the Tier-0 verdict map (empty until the detector is wired to gate; the
-//   detector currently emits only observations, so this is honestly {} for now).
+// - review: runAuditReview over the codebase model. Full-scope passes advance a
+//   PROGRESSIVE hotspot window keyed to a FULL-SCOPE-pass counter (NOT the loop's global
+//   pass number, which mixes scope modes) and WRAP at the end so an overrun re-reviews
+//   the top band instead of returning an empty review the loop would misread as "dry".
+//   A localized pass reviews exactly the changed files; if none of them are known model
+//   units it falls back to full scope rather than reviewing nothing.
+// - fix: runAuditFix on the actionable set, threading branch + stayOnBranch so ONE
+//   integration branch continues across passes.
+// - expandScope: blast-radius (§7) — a HUB-file change (fan-in >= threshold) forces a
+//   full re-scope next pass; a leaf change stays narrow. NOTE (MVP limitation): the true
+//   dependent SET isn't cheaply available (the codebase model exposes fan-in as a COUNT,
+//   not importer ids), so a covered dependent regression is caught by the per-fix +
+//   integration test gates, and an UNCOVERED one on a leaf edit can be missed until the
+//   model exposes import edges. Documented gap.
+// - verdictsFor: the Tier-0 verdict map (empty until the detector is wired to gate; it
+//   currently emits only observations, so this is honestly {}).
 
 import { runAuditFix } from "./audit-fix.mjs";
 import { runAuditReview } from "./audit-review.mjs";
@@ -23,17 +29,28 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   const maxUnits = Math.max(1, options.maxUnits ?? 8);
   const hubFanIn = options.hubFanIn ?? 8;
   const files = model?.files ?? [];
+  const nonTestCount = Math.max(1, files.filter((f) => !f.isTest).length);
+  let fullPasses = 0; // counts ONLY full-scope passes, so the window advance is honest
 
-  const review = async ({ budget, pass, changedFiles }) => {
-    const scoped = changedFiles && changedFiles.length ? files.filter((f) => changedFiles.includes(f.id)) : files;
-    const scopedModel = scoped === files ? model : { ...model, files: scoped };
+  const review = async ({ budget, changedFiles }) => {
+    const scopedFiles = changedFiles && changedFiles.length ? files.filter((f) => changedFiles.includes(f.id)) : null;
+    let reviewFiles;
+    let offset = 0;
+    if (scopedFiles && scopedFiles.length) {
+      reviewFiles = scopedFiles; // localized pass: review the changed band from the top
+    } else {
+      // Full scope (first pass, hub-forced full, or empty-scoped fallback): advance the
+      // window by full-scope passes and WRAP so an overrun never returns an empty review.
+      reviewFiles = files;
+      offset = (fullPasses * maxUnits) % nonTestCount;
+      fullPasses += 1;
+    }
+    const scopedModel = reviewFiles === files ? model : { ...model, files: reviewFiles };
     return doReview(cwd, scopedModel, backends, {
       budget,
       maxUnits,
-      // Full-scope passes advance the hotspot window (progressive coverage); a
-      // change-scoped pass reviews exactly the changed band from the top.
-      unitOffset: changedFiles && changedFiles.length ? 0 : (pass - 1) * maxUnits,
-      skipReduce: pass > 1, // the global SSOT reduce is over static input — run it once
+      unitOffset: offset,
+      skipReduce: fullPasses > 1, // the SSOT reduce is over static input — run it once
       skipCodex: options.skipCodex,
       skipGrok: options.skipGrok,
       ledger: options.ledger
@@ -46,6 +63,7 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       stayOnBranch: ctx.stayOnBranch,
       minSeverity: options.minSeverity ?? "P2",
       maxFixes: options.maxFixesPerPass ?? 10,
+      allowUntested: options.allowUntested,
       claudeModel: options.claudeModel
     });
 

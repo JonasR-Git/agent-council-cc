@@ -127,6 +127,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       passNo = clamp(prior.passNo ?? 0, 0, maxPasses);
       dryStreak = clamp(prior.dryStreak ?? 0, 0, dryStop);
       branch = prior.branch ?? null;
+      // Restore the scope so a resumed run doesn't jump straight to a stale full-scope
+      // window offset (which would review off-the-end and falsely read "dry").
+      if (Array.isArray(prior.changedFiles) && prior.changedFiles.length) changedFiles = prior.changedFiles;
       onProgress(`resumed: ${fixedAll.length} fixed, ${spent}/${totalBudget} spent, ${passNo} passes, dry ${dryStreak}/${dryStop}`);
     }
   }
@@ -195,6 +198,17 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     });
     fixedAll.push(...freshFixed);
     failedAll.push(...(fx?.failed ?? []));
+    // Surface what the fixer deliberately did NOT touch (propose-only / cross-cutting /
+    // protected) as proposals — otherwise the whole "found but not auto-fixed" product is
+    // invisible in the report (§6 automation-bias counter).
+    for (const r of fx?.rejected ?? []) {
+      const f = { ...(r.finding ?? {}), rejectedReason: r.reason };
+      const k = proposedKey(f);
+      if (!seenProposed.has(k)) {
+        seenProposed.add(k);
+        proposedAll.push(f);
+      }
+    }
 
     // Re-scope the NEXT pass to what changed PLUS its blast radius (dependents + dup
     // peers via deps.expandScope); empty -> full re-scope (null). This is what keeps the
@@ -210,9 +224,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
 
     passes.push({ pass: passNo, reviewed: findings.length, fresh: freshFindings.length, actionable: gated.actionable.length, fixed: freshFixed.length, failed: (fx?.failed ?? []).length, spent });
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
-    checkpoint({ passNo, branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, stopReason: null, done: false });
+    checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, stopReason: null, done: false });
   }
 
-  checkpoint({ passNo, branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, stopReason, done: true });
+  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, stopReason, done: true });
   return { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak };
 }
