@@ -371,7 +371,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
   // Close the detect->fix->resolved loop: mark a committed fix's finding 'fixed' in
   // the cross-run ledger (same fingerprint audit review recorded it under), so the
   // next run recognizes it as resolved instead of re-flagging it as recurring.
-  const resolveLedger = deps.resolveLedger ?? ((fingerprint, status) => resolveLedgerEntry(cwd, fingerprint, status, nowIso()));
+  const resolveLedger = deps.resolveLedger ?? ((fingerprint, status, meta) => resolveLedgerEntry(cwd, fingerprint, status, nowIso(), meta));
 
   if (!git.isRepo()) return { ok: false, error: "not a git repository — --fix needs git for branch isolation + rollback" };
   // Clean tree is mandatory: the rollback ops would otherwise destroy user WIP.
@@ -599,7 +599,9 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
       for (const f of fixed) {
         if (!f.verified) continue;
         try {
-          if (resolveLedger(fingerprintFinding(f.finding), "fixed")) ledgerResolved += 1;
+          // Provisional: 'fixed-pending-merge', not durable 'fixed' — the branch isn't
+          // merged yet. reconcilePendingFixes promotes it once the commit lands on base.
+          if (resolveLedger(fingerprintFinding(f.finding), "fixed-pending-merge", { resolvedCommit: f.commit, branch })) ledgerResolved += 1;
         } catch {
           /* ledger update is best-effort */
         }

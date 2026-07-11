@@ -175,7 +175,7 @@ test("runAuditFix resolves each committed fix in the ledger, but not on a red in
   }));
   assert.equal(out.ledgerResolved, 1);
   assert.equal(resolved.length, 1);
-  assert.equal(resolved[0][1], "fixed");
+  assert.equal(resolved[0][1], "fixed-pending-merge", "provisional until the branch merges");
 
   // red final integration: commits kept on the branch but NOT marked fixed (may be discarded)
   const git2 = fakeGit();

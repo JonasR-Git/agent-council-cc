@@ -105,9 +105,13 @@ export function recordAndAnnotate(cwd, jobId, merged, nowIso) {
       const fingerprint = fingerprintFinding(item);
       const prior = map.get(fingerprint);
       const timesSeen = (prior?.timesSeen ?? 0) + 1;
-      // A resolved outcome (fixed/dismissed/ignored) is durable; only 'open'
-      // entries reopen. Category + consensus count are tracked model-agnostically.
+      // A resolved outcome (fixed/pending-merge/dismissed/ignored) keeps its status;
+      // only 'open' entries reopen. 'fixed-pending-merge' is NOT a durable resolution
+      // (downstream suppresses only 'fixed'), so the finding keeps re-surfacing until
+      // reconcilePendingFixes promotes it to 'fixed' — but its resolution metadata
+      // (resolvedCommit/branch) is CARRIED so reconcile can still find the commit.
       const resolved = prior?.status && prior.status !== "open";
+      const carry = resolved ? { resolvedCommit: prior.resolvedCommit, branch: prior.branch, resolvedAt: prior.resolvedAt } : {};
       map.set(fingerprint, {
         fingerprint,
         title: item.title,
@@ -115,6 +119,7 @@ export function recordAndAnnotate(cwd, jobId, merged, nowIso) {
         category: item.category ?? prior?.category ?? "other",
         severity: item.severity,
         status: resolved ? prior.status : "open",
+        ...carry,
         timesSeen,
         consensusSeen: (prior?.consensusSeen ?? 0) + (item.consensus ? 1 : 0),
         firstJobId: prior?.firstJobId ?? jobId,
@@ -137,17 +142,59 @@ export function recordAndAnnotate(cwd, jobId, merged, nowIso) {
   }
 }
 
-/** Explicitly set a ledger entry's status (fixed | ignored | open). */
-export function resolveLedgerEntry(cwd, fingerprint, status, nowIso) {
+/**
+ * Explicitly set a ledger entry's status (fixed | fixed-pending-merge | ignored | open).
+ * `meta` (e.g. { resolvedCommit, branch }) is merged so reconcilePendingFixes can later
+ * check whether the fix's commit actually landed on the base branch.
+ */
+export function resolveLedgerEntry(cwd, fingerprint, status, nowIso, meta = {}) {
   // Under the same lock as recordAndAnnotate so a concurrent finish can't clobber
   // the status we just set (and vice versa).
   return withFileLock(ledgerLockPath(cwd), () => {
     const map = readLedger(cwd);
     const entry = map.get(fingerprint);
     if (!entry) return false;
-    map.set(fingerprint, { ...entry, status, resolvedAt: nowIso });
+    map.set(fingerprint, { ...entry, ...meta, status, resolvedAt: nowIso });
     writeLedger(cwd, map);
     return true;
+  });
+}
+
+/**
+ * Reconcile provisional fixes: a fix committed on an isolated branch is recorded
+ * 'fixed-pending-merge', not durable 'fixed'. This flips it to 'fixed' ONLY once its
+ * commit is an ancestor of the base branch (the branch was merged), and REOPENS it to
+ * 'open' if the commit no longer exists (the branch was discarded) — so the audit's
+ * memory never hides a defect whose fix never actually landed. `git` is injectable:
+ * { isAncestor(sha)->bool, commitExists(sha)->bool }. Returns the count changed.
+ */
+export function reconcilePendingFixes(cwd, git) {
+  return withFileLock(ledgerLockPath(cwd), () => {
+    const map = readLedger(cwd);
+    let reconciled = 0;
+    for (const [fp, entry] of map) {
+      if (entry.status !== "fixed-pending-merge") continue;
+      const sha = entry.resolvedCommit;
+      let merged = false;
+      let exists = true;
+      try {
+        merged = Boolean(sha) && git.isAncestor(sha);
+        exists = typeof git.commitExists === "function" ? git.commitExists(sha) : true;
+      } catch {
+        merged = false;
+        exists = true;
+      }
+      if (merged) {
+        map.set(fp, { ...entry, status: "fixed" });
+        reconciled += 1;
+      } else if (sha && !exists) {
+        map.set(fp, { ...entry, status: "open" }); // branch discarded -> the defect is back
+        reconciled += 1;
+      }
+      // else: branch still open, unmerged -> leave pending.
+    }
+    if (reconciled) writeLedger(cwd, map);
+    return reconciled;
   });
 }
 

@@ -31,7 +31,7 @@ import {
   renderLimits,
   renderTokenUsage
 } from "./lib/token-usage.mjs";
-import { runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
+import { runCommand, runCommandAsync, terminateProcessTree } from "./lib/process.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
@@ -45,6 +45,8 @@ import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectTestCmd, runAuditFix } from "./lib/audit-fix.mjs";
 import { runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
+import { resolveAutonomy } from "./lib/audit-autonomy.mjs";
+import { reconcilePendingFixes } from "./lib/ledger.mjs";
 import { runEndless } from "./lib/audit-endless.mjs";
 import { runAudit } from "./lib/audit-run.mjs";
 import { toSarif } from "./lib/audit-sarif.mjs";
@@ -1713,7 +1715,7 @@ async function handleWatch(argv) {
 // team is a later phase.
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path"],
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy"],
     booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop"]
   });
   const cwd = process.cwd();
@@ -1826,6 +1828,22 @@ async function handleAudit(argv) {
       if (st.status === 0 && st.stdout.trim() !== "") throw new Error("working tree not clean — commit or stash first (the loop's rollback would destroy uncommitted work)");
       if (!detectTestCmd(workspaceRoot(cwd)) && !options["allow-untested"]) throw new Error("no test command detected — audit fix --loop needs a test gate; pass --allow-untested to run without verification (not recommended)");
 
+      // Autonomy dial: level -> commit/propose gate config. Aggressive is the default.
+      const auto = resolveAutonomy(options.autonomy ?? "aggressive");
+      if (!auto.apply) throw new Error("--autonomy propose-only: use `audit run` for a review-only pass (the loop applies fixes)");
+      const loopMinSeverity = options["min-severity"] ?? auto.minSeverity;
+      // Reconcile prior provisional fixes (merged -> fixed, discarded -> reopened) so the
+      // ledger reflects what actually landed on base before this run.
+      try {
+        const rg = {
+          isAncestor: (sha) => runCommand("git", ["merge-base", "--is-ancestor", String(sha), "HEAD"], { cwd }).status === 0,
+          commitExists: (sha) => runCommand("git", ["cat-file", "-e", `${String(sha)}^{commit}`], { cwd }).status === 0
+        };
+        reconcilePendingFixes(cwd, rg);
+      } catch {
+        /* reconcile is best-effort */
+      }
+
       let maxPasses = 8;
       if (options["max-passes"] != null) {
         const n = Number(options["max-passes"]);
@@ -1847,7 +1865,7 @@ async function handleAudit(argv) {
 
       const deps = makeFixLoopDeps(cwd, model, backends, {
         maxUnits,
-        minSeverity: options["min-severity"] ?? "P2",
+        minSeverity: loopMinSeverity,
         allowUntested: options["allow-untested"],
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
