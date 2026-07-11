@@ -44,6 +44,8 @@ import { activeReviewerCount, runAuditReview } from "./lib/audit-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { runAuditFix } from "./lib/audit-fix.mjs";
 import { runEndless } from "./lib/audit-endless.mjs";
+import { runAudit } from "./lib/audit-run.mjs";
+import { toSarif } from "./lib/audit-sarif.mjs";
 import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
@@ -1709,8 +1711,8 @@ async function handleWatch(argv) {
 // team is a later phase.
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume"]
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path"],
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif"]
   });
   const cwd = process.cwd();
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
@@ -1730,6 +1732,48 @@ async function handleAudit(argv) {
   }
 
   // `audit review` (v2): deep agent review of the top hotspots + global reduce.
+  // `audit run` (v5): the self-driving enterprise audit — inventory -> mandatory set
+  // -> reused review engine -> canonical findings -> ranked risk register -> gate,
+  // as one schema-valid report. `--sarif` also writes a SARIF 2.1.0 log (confined to
+  // the project root). Reuses the review engine; does not touch the other subcommands.
+  if (positionals[0] === "run") {
+    const backends = probeBackends(cwd, ROOT_DIR);
+    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    const { budget, maxUnits } = parseAuditBudgetOptions(options);
+    const tRun = Date.now();
+    const report = await runAudit(cwd, model, backends, {
+      ...merged,
+      budget,
+      maxUnits,
+      areas,
+      base: options.base,
+      skipCodex: merged.skipCodex,
+      skipGrok: merged.skipGrok
+    });
+    recordAuditMetrics(cwd, "run", { wallClockMs: Date.now() - tRun, findings: report.register.length, gate: report.gate.status, mandatory: report.mandatorySurface?.count ?? 0 }, nowIso());
+    if (options.sarif) {
+      const base = workspaceRoot(cwd);
+      const rel = String(options["sarif-path"] ?? "docs/audit.sarif.json");
+      const target = path.resolve(base, rel);
+      const relCheck = path.relative(base, target);
+      if (relCheck === "" || relCheck.startsWith("..") || path.isAbsolute(relCheck)) throw new Error(`--sarif-path must stay within the project root (got: ${rel})`);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, `${JSON.stringify(toSarif(report.register, { toolVersion: "2.1.0" }), null, 2)}\n`, "utf8");
+      if (!options.json) console.log(`Wrote SARIF to ${target}`);
+    }
+    if (options.doc) {
+      const docFindings = report.proposals.map((p) => ({ severity: p.severity, category: p.lens, title: p.title, scope: p.scope, file: p.location?.path, line: p.location?.startLine, detail: p.failureScenario, confidence: p.confidence }));
+      const docPath = writeAuditDoc(workspaceRoot(cwd), docFindings, { source: "audit run" }, { docPath: options["doc-path"] });
+      if (!options.json) console.log(`Wrote proposals to ${docPath}`);
+    }
+    if (options.json) {
+      outputResult(report, true);
+      return;
+    }
+    console.log(renderAuditRunReport(report));
+    return;
+  }
+
   if (positionals[0] === "review") {
     const backends = probeBackends(cwd, ROOT_DIR);
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
@@ -1980,6 +2024,35 @@ function renderAuditFixReport(out) {
   }
   L.push("");
   L.push(`Review: \`git checkout ${out.branch}\` → inspect the per-fix commits → merge or discard. Nothing was auto-merged.`);
+  return L.join("\n");
+}
+
+function renderAuditRunReport(report) {
+  const GATE = { pass: "✅ PASS", fail: "⛔ FAIL", indeterminate: "🟠 INDETERMINATE" };
+  const c = report.coverage ?? {};
+  const L = [];
+  L.push("# Council Audit — full report (v5)");
+  L.push("");
+  L.push(`Gate: **${GATE[report.gate?.status] ?? report.gate?.status}**${report.gate?.newHighSeverity ? ` · ${report.gate.newHighSeverity} new P0/P1` : ""}`);
+  L.push(`Coverage: ${c.mandatory?.done ?? 0}/${c.mandatory?.total ?? 0} mandatory reviewed · ${c.total ?? 0} files mapped${c.mandatory?.complete ? "" : " · ⚠ mandatory surface incomplete"}`);
+  if (report.falsePositiveRate) L.push(`False-positive rate: ${Math.round(report.falsePositiveRate.rate * 100)}% (n=${report.falsePositiveRate.n})`);
+  L.push("");
+  const rank = { P0: 0, P1: 1, P2: 2, nit: 3 };
+  const flat = (s, n = 140) => String(s ?? "").replace(/[\r\n]+/g, " ").replace(/`/g, "'").slice(0, n);
+  const top = [...(report.register ?? [])].sort((a, b) => (b.risk?.calibrated ?? 0) - (a.risk?.calibrated ?? 0)).slice(0, 15);
+  L.push(`## Risk register (top ${top.length} of ${report.register?.length ?? 0})`);
+  for (const f of top) {
+    L.push(`- **${f.severity}** [${f.lens}] risk ${f.risk?.calibrated ?? "?"} · ${flat(f.title)}${f.location?.path ? ` · \`${f.location.path}:${f.location.startLine}\`` : ""}${f.lifecycle ? ` · ${f.lifecycle}` : ""}`);
+  }
+  if (report.proposals?.length) {
+    L.push("");
+    L.push(`## Propose-only (cross-cutting, ${report.proposals.length}) — never auto-fixed`);
+    for (const p of [...report.proposals].sort((a, b) => (rank[a.severity] ?? 2) - (rank[b.severity] ?? 2)).slice(0, 10)) {
+      L.push(`- **${p.severity}** [${p.lens}] ${flat(p.title)}${p.location?.path ? ` · \`${p.location.path}\`` : ""}`);
+    }
+  }
+  L.push("");
+  L.push("Next (Claude): synthesize; `audit fix` handles only confirmed localized findings.");
   return L.join("\n");
 }
 
