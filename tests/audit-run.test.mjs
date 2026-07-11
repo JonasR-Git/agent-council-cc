@@ -15,6 +15,7 @@ const deps = (over = {}) => ({
     { id: "README.md", fileClass: "doc" }
   ],
   nowIso: () => "2026-07-11T00:00:00Z",
+  governance: { baselined: new Set(), waivers: new Map() },
   review: async () => ({
     findings: [{ severity: "P1", category: "security", title: "auth bypass", detail: "no check", file: "src/auth.mjs", line: 10, agents: ["codex", "claude"], consensus: true, anchor: "checkAuth" }],
     reviewed: ["src/auth.mjs"],
@@ -29,16 +30,29 @@ test("runAudit assembles a schema-valid report end-to-end (injected review)", as
   assert.ok(v.valid, v.errors.join("; "));
   assert.equal(rep.register.length, 1);
   assert.equal(rep.register[0].lens, "security_secrets");
-  assert.equal(rep.coverage.total, 4, "all inventory files are coverage units");
-  // src/auth.mjs (security path) + package.json (manifest) are mandatory
+  assert.equal(rep.coverage.total, 4);
   assert.ok(rep.mandatorySurface.count >= 2);
   assert.equal(rep.mandatorySurface.reasons["package.json"], "dependency manifest/lockfile");
 });
 
-test("gate is indeterminate while the mandatory surface is only mapped, not reviewed", async () => {
+test("gate reaches fail when the mandatory surface is covered and a new confirmed P1 exists", async () => {
   const rep = await runAudit("/x", model, {}, {}, deps());
-  // package.json is mandatory but not "reviewed" -> mandatory.complete false -> indeterminate
-  assert.equal(rep.gate.status, "indeterminate", "honest: full mandatory surface not yet reviewed");
+  assert.equal(rep.gate.status, "fail");
+  assert.deepEqual(rep.mandatoryUnreviewed, []);
+});
+
+test("gate is indeterminate when a mandatory JS file was not reviewed", async () => {
+  const d = deps({
+    inventory: [
+      { id: "src/auth.mjs", fileClass: "js" },
+      { id: "src/login.mjs", fileClass: "js" },
+      { id: "package.json", fileClass: "manifest" }
+    ],
+    review: async () => ({ findings: [], reviewed: ["src/auth.mjs"], coverage: {} })
+  });
+  const rep = await runAudit("/x", model, {}, {}, d);
+  assert.ok(rep.mandatoryUnreviewed.includes("src/login.mjs"));
+  assert.equal(rep.gate.status, "indeterminate", "unreviewed mandatory JS keeps the gate honest");
 });
 
 test("runAudit tolerates a review that returns nothing", async () => {

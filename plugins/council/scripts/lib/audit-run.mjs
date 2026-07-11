@@ -38,17 +38,23 @@ export async function runAudit(cwd, model, backends = {}, options = {}, deps = {
   const governance = deps.governance ?? loadGovernance(root);
   const canonical = applyGovernance(rawCanonical, governance, deps.nowIso ? deps.nowIso() : nowIso());
 
-  // Honest coverage units: mandatory files not actually reviewed stay "mapped"
-  // (js) / mapped-only (non-js), so the gate reports indeterminate rather than a
-  // false pass until the full mandatory surface is reviewed.
+  // Coverage state per file class. Non-JS classes have no agent detector, so their
+  // deepest available coverage IS the static pass -> count them done (state
+  // "reviewed") but surface them as static-only. A JS file the agent did not review
+  // stays "parsed" (NOT done), so a hot mandatory JS file keeps the gate honest
+  // (indeterminate) while a fully-reviewed mandatory surface lets the gate reach
+  // pass/fail.
   const reviewed = new Set(rev.reviewed ?? []);
-  const units = inv.map((f) => ({
-    file: f.id,
-    lens: null,
-    state: reviewed.has(f.id) ? "reviewed" : f.fileClass === "js" ? "parsed" : "mapped",
-    mandatory: mandIds.has(f.id),
-    requiresVerification: false
-  }));
+  const units = inv.map((f) => {
+    let state;
+    if (reviewed.has(f.id)) state = "reviewed";
+    else if (f.fileClass === "js") state = "parsed";
+    else state = "reviewed"; // static-only class: no deeper detector exists
+    return { file: f.id, lens: null, state, mandatory: mandIds.has(f.id), requiresVerification: false };
+  });
+  // Mandatory JS files the agent review did not reach — the explicit gap that keeps
+  // the gate indeterminate until coverage is raised.
+  const mandatoryUnreviewed = inv.filter((f) => mandIds.has(f.id) && f.fileClass === "js" && !reviewed.has(f.id)).map((f) => f.id);
 
   const report = assembleReport(canonical, units, {
     generatedAt: deps.nowIso ? deps.nowIso() : nowIso(),
@@ -63,5 +69,6 @@ export async function runAudit(cwd, model, backends = {}, options = {}, deps = {
     refutedFp: 0
   });
   report.mandatorySurface = { count: mand.ids.length, reasons: mand.reasons };
+  report.mandatoryUnreviewed = mandatoryUnreviewed;
   return report;
 }
