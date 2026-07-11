@@ -5,6 +5,8 @@
 
 const LEVEL = { P0: "error", P1: "error", P2: "warning", nit: "note" };
 
+const toUri = (p) => { const s = String(p ?? "unknown").split(String.fromCharCode(92)).join("/"); return s.split("/").map((seg) => encodeURIComponent(seg)).join("/"); };
+
 /**
  * Build a SARIF 2.1.0 log from canonical audit findings. Each ruleId becomes a rule
  * (deduped); each finding a result with a physical location, the audit fingerprint as
@@ -30,7 +32,7 @@ export function toSarif(findings = [], { toolVersion = "0.0.0" } = {}) {
       locations: [
         {
           physicalLocation: {
-            artifactLocation: { uri: String(f.location?.path ?? "unknown") },
+            artifactLocation: { uri: toUri(f.location?.path) },
             region: { startLine: Math.max(1, Number(f.location?.startLine) || 1) }
           }
         }

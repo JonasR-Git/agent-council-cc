@@ -1762,7 +1762,7 @@ async function handleAudit(argv) {
       if (!options.json) console.log(`Wrote SARIF to ${target}`);
     }
     if (options.doc) {
-      const docFindings = report.proposals.map((p) => ({ severity: p.severity, category: p.lens, title: p.title, scope: p.scope, file: p.location?.path, line: p.location?.startLine, detail: p.failureScenario, confidence: p.confidence }));
+      const docFindings = report.register.map((p) => ({ severity: p.severity, category: p.lens, title: p.title, scope: p.scope, file: p.location?.path, line: p.location?.startLine, detail: p.failureScenario, confidence: p.confidence }));
       const docPath = writeAuditDoc(workspaceRoot(cwd), docFindings, { source: "audit run" }, { docPath: options["doc-path"] });
       if (!options.json) console.log(`Wrote proposals to ${docPath}`);
     }
