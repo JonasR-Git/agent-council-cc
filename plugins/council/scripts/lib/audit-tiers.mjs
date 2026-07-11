@@ -53,6 +53,12 @@ export const VERDICTS = ["keep", "remove", "merge-into", "redesign", "relocate",
 // integrity, concurrency, ci/config injection). Hand-listing missed two of them.
 export const SECURITY_OVERRIDE_LENSES = new Set(lensIds().filter((id) => getLens(id)?.ceiling === "P0"));
 
+// A verdict only GATES (skip/redirect/suppress) when its confidence clears this floor
+// (docs/enterprise-fix-design.md §3 "confidence floor -> observations not verdicts").
+// A regex-grade single-signal verdict stays below it -> it surfaces as a proposal but
+// never autonomously prunes mechanical work. Corroborated (multi-fact) verdicts clear it.
+export const GATE_CONFIDENCE_FLOOR = 0.7;
+
 // Unit ids that don't uniquely identify a file: never gate on these (fail-open).
 const SENTINEL_UNITS = new Set(["", "unknown"]);
 const SURFACE_FLOOR = new Set(["P0", "P1"]);
@@ -162,7 +168,10 @@ export function tierAction(finding, verdictMap = {}, { securityLenses = SECURITY
   const identifiable = (path && !SENTINEL_UNITS.has(path)) || Boolean(finding?.fingerprint);
   if (!identifiable) return { action: "process", reason: "unit not uniquely identifiable — not gated" };
 
-  const entry = verdictFor(finding, verdictMap);
+  let entry = verdictFor(finding, verdictMap);
+  // Confidence floor: a below-floor verdict is an OBSERVATION, not a gate — ignore it
+  // (treat as keep) so a regex-grade signal never autonomously skips/redirects a fix.
+  if (entry && Number.isFinite(entry.confidence) && entry.confidence < GATE_CONFIDENCE_FLOOR) entry = null;
   const base = baseAction(finding, entry?.verdict ?? "keep", entry);
 
   const reachable = entry?.reachable !== false;
@@ -184,7 +193,9 @@ export function tierAction(finding, verdictMap = {}, { securityLenses = SECURITY
 export function applyTierGating(findings = [], verdictMap = {}, opts = {}) {
   const gated = orderByTier(findings).map((f) => {
     const d = tierAction(f, verdictMap, opts);
-    const surfaceInReport = d.action === "skip" && SURFACE_FLOOR.has(f.severity);
+    // A serious finding that is skipped OR redirected (fix routed off to a survivor) is
+    // surfaced so the §6 report foregrounds it — a misdirected P0/P1 is never invisible.
+    const surfaceInReport = (d.action === "skip" || d.action === "redirect") && SURFACE_FLOOR.has(f.severity);
     return {
       ...f,
       tier: tierOfLens(f.lens),

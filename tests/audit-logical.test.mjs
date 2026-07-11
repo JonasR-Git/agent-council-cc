@@ -13,73 +13,91 @@ const node = (id, { exports = [], hasDefault = false, inn = [], out = [], opaque
 });
 const graph = (...nodes) => new Map(nodes.map((n) => [n.id, n]));
 
-test("deadModule predicate: an orphan non-entry module -> remove?, reachable:false", async () => {
-  const facts = {
-    nodes: graph(node("entry.mjs"), node("dead.mjs", { exports: ["x"] })),
-    entrypoints: new Set(["entry.mjs"])
-  };
+test("deadModule is a LOW-confidence OBSERVATION: surfaced, but never gates", async () => {
+  const facts = { nodes: graph(node("entry.mjs"), node("dead.mjs", { exports: ["x"] })), entrypoints: new Set(["entry.mjs"]) };
   const { findings, verdictMap } = await detectLogical(facts);
   const dead = findings.find((f) => f.location.path === "dead.mjs");
-  assert.ok(dead, "the dead module is flagged");
-  assert.equal(dead.lens, "logical_sense");
+  assert.ok(dead, "the dead module is surfaced as a proposal");
   assert.equal(dead.verdict, "remove");
-  assert.equal(dead.scope, "cross-cutting");
+  assert.equal(dead.observation, true, "a regex-grade signal is an observation, not a gating verdict");
   assert.equal(dead.fixDisposition, "propose-only");
-  assert.equal(verdictMap["dead.mjs"].verdict, "remove");
-  assert.equal(verdictMap["dead.mjs"].reachable, false);
+  assert.deepEqual(verdictMap, {}, "below the confidence floor -> no gating entry (does not disarm the override)");
 });
 
-test("singleConsumer predicate: a one-importer module -> merge-into that survivor", async () => {
-  const facts = {
-    nodes: graph(node("a.mjs", { out: ["b.mjs"] }), node("b.mjs", { exports: ["foo"], inn: ["a.mjs"] })),
-    entrypoints: new Set(["a.mjs"])
-  };
+test("singleConsumer is a LOW-confidence observation, labelled over-layered-indirection", async () => {
+  const facts = { nodes: graph(node("a.mjs", { out: ["b.mjs"] }), node("b.mjs", { exports: ["foo"], inn: ["a.mjs"] })), entrypoints: new Set(["a.mjs"]) };
   const { findings, verdictMap } = await detectLogical(facts);
   const b = findings.find((f) => f.location.path === "b.mjs");
-  assert.equal(b.verdict, "merge-into");
-  assert.equal(b.survivor, "a.mjs");
-  assert.equal(verdictMap["b.mjs"].survivor, "a.mjs");
+  assert.equal(b.category, "over-layered-indirection");
+  assert.equal(b.observation, true);
+  assert.deepEqual(verdictMap, {}, "a single regex import edge never redirects a real fix");
 });
 
-test("entry points are never flagged dead; predicate-driven -> no candidates -> empty", async () => {
+test("a corroborated (>= floor) gating verdict IS written to the verdict map", async () => {
+  const predicates = {
+    hi: () => [{ unit: "g.mjs", category: "dead-feature", verdict: "remove", confidence: 0.95, severity: "P2", reason: "corroborated dead" }]
+  };
+  const { findings, verdictMap } = await detectLogical({ nodes: new Map(), entrypoints: new Set() }, { predicates });
+  assert.equal(findings[0].observation, false);
+  assert.equal(verdictMap["g.mjs"].verdict, "remove");
+  assert.equal(verdictMap["g.mjs"].confidence, 0.95);
+});
+
+test("entry points are never flagged dead; no firing predicate -> empty", async () => {
   const facts = {
     nodes: graph(node("a1.mjs", { out: ["b.mjs"] }), node("a2.mjs", { out: ["b.mjs"] }), node("b.mjs", { exports: ["foo"], inn: ["a1.mjs", "a2.mjs"] })),
     entrypoints: new Set(["a1.mjs", "a2.mjs"])
   };
   const { findings, verdictMap } = await detectLogical(facts);
-  assert.equal(findings.length, 0, "nothing fires when every module is reachable + multiply-imported");
+  assert.equal(findings.length, 0);
   assert.deepEqual(verdictMap, {});
 });
 
-test("adversarial intent-defense demotes a removal-class verdict to quarantine", async () => {
-  const facts = {
-    nodes: graph(node("a.mjs", { out: ["b.mjs"] }), node("b.mjs", { exports: ["foo"], inn: ["a.mjs"] })),
-    entrypoints: new Set(["a.mjs"])
+test("adversarial intent-defense is batched (one call) and demotes removal -> quarantine", async () => {
+  const predicates = {
+    hi: () => [{ unit: "b.mjs", category: "dead-feature", verdict: "remove", confidence: 0.95, severity: "P2", reason: "dead?" }]
   };
-  const intentDefense = async (c) => (c.unit === "b.mjs" ? { found: true, source: "README", quote: "kept on purpose" } : { found: false });
-  const { findings, verdictMap } = await detectLogical(facts, { intentDefense });
+  let calls = 0;
+  const intentDefense = async (cands) => {
+    calls += 1;
+    return new Map(cands.map((c) => [c.unit, { found: true, source: "README", quote: "kept on purpose" }]));
+  };
+  const { findings, verdictMap } = await detectLogical({ nodes: new Map(), entrypoints: new Set() }, { predicates, intentDefense });
+  assert.equal(calls, 1, "defense runs ONCE for all candidates, not per-candidate");
   const b = findings.find((f) => f.location.path === "b.mjs");
-  assert.equal(b.verdict, "quarantine", "documented intent demotes merge-into to quarantine");
-  assert.equal(b.intentEvidence.found, true);
+  assert.equal(b.verdict, "quarantine");
   assert.equal(b.intentEvidence.source, "README");
-  assert.equal(verdictMap["b.mjs"].verdict, "quarantine");
+  assert.deepEqual(verdictMap, {}, "a quarantined (intent-defended) unit does not gate");
 });
 
-test("age guard suppresses speculative-generality on young code", async () => {
+test("a throwing intent-defense degrades gracefully (candidates remain, as observations)", async () => {
+  const predicates = { hi: () => [{ unit: "b.mjs", category: "dead-feature", verdict: "remove", confidence: 0.95, severity: "P2", reason: "x" }] };
+  const intentDefense = async () => {
+    throw new Error("agent timed out");
+  };
+  const { findings } = await detectLogical({ nodes: new Map(), entrypoints: new Set() }, { predicates, intentDefense });
+  assert.equal(findings.length, 1, "one defense failure must not abort the whole pass");
+});
+
+test("age guard suppresses speculative AND removal-class candidates on young code", async () => {
   const facts = {
-    nodes: graph(node("a.mjs", { out: ["b.mjs"] }), node("b.mjs", { exports: ["foo"], inn: ["a.mjs"] })),
+    nodes: graph(node("a.mjs", { out: ["b.mjs"] }), node("b.mjs", { exports: ["foo"], inn: ["a.mjs"] }), node("young.mjs", { exports: ["z"] })),
     entrypoints: new Set(["a.mjs"]),
-    ageOf: (id) => (id === "b.mjs" ? 5 : 100)
+    ageOf: (id) => (id === "b.mjs" || id === "young.mjs" ? 5 : 100)
   };
   const { findings } = await detectLogical(facts, { ageGuardDays: 30 });
-  assert.equal(findings.find((f) => f.location.path === "b.mjs"), undefined, "a 5-day-old one-consumer module is a plan, not a finding");
+  assert.equal(findings.find((f) => f.location.path === "b.mjs"), undefined, "young single-consumer suppressed");
+  assert.equal(findings.find((f) => f.location.path === "young.mjs"), undefined, "young dead-module suppressed (a plan, not dead)");
+});
+
+test("a partial/malformed node degrades to no-candidate instead of crashing", async () => {
+  const bad = { id: "bad.mjs", exports: new Set(["x"]), hasDefault: false, out: new Set(), opaque: false }; // no `.in`
+  const { findings } = await detectLogical({ nodes: new Map([["bad.mjs", bad]]), entrypoints: new Set() });
+  assert.ok(Array.isArray(findings), "detection did not throw on a node missing .in");
 });
 
 test("opaque modules (star re-export / dynamic) are not flagged single-consumer", async () => {
-  const facts = {
-    nodes: graph(node("a.mjs", { out: ["b.mjs"] }), node("b.mjs", { exports: ["foo"], inn: ["a.mjs"], opaque: true })),
-    entrypoints: new Set(["a.mjs"])
-  };
+  const facts = { nodes: graph(node("a.mjs", { out: ["b.mjs"] }), node("b.mjs", { exports: ["foo"], inn: ["a.mjs"], opaque: true })), entrypoints: new Set(["a.mjs"]) };
   const { findings } = await detectLogical(facts);
-  assert.equal(findings.length, 0, "an opaque module's true fan-in is unknowable");
+  assert.equal(findings.find((f) => f.location.path === "b.mjs" && f.category === "over-layered-indirection"), undefined);
 });

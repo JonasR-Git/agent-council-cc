@@ -143,6 +143,13 @@ test("verdict lookup normalizes Windows separators; location.path shape works", 
   assert.equal(tierAction({ lens: "correctness", severity: "P1", location: { path: "src\\a.mjs" } }, vm).action, "skip");
 });
 
+test("a below-floor-confidence verdict is an observation, not a gate (treated as keep)", () => {
+  const lowConf = { "x.mjs": { verdict: "remove", confidence: 0.3 } };
+  assert.equal(tierAction({ lens: "correctness", severity: "P1", file: "x.mjs" }, lowConf).action, "process", "regex-grade verdict does not skip a real fix");
+  const hiConf = { "x.mjs": { verdict: "remove", confidence: 0.9 } };
+  assert.equal(tierAction({ lens: "correctness", severity: "P1", file: "x.mjs" }, hiConf).action, "skip", "a corroborated verdict gates");
+});
+
 test("actionableByTier groups process+redirect for the fix loop, tier-ordered", () => {
   const findings = [
     { lens: "logical_sense", severity: "P1", file: "l.mjs" },
