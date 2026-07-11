@@ -1846,8 +1846,23 @@ async function handleAudit(argv) {
       // clear belt-and-suspenders against a mis-stored base.
       if (!/^council\/audit-fix-/.test(baseBranch)) {
         try {
+          const patchIdOf = (rev) => {
+            const show = runCommand("git", ["show", "--no-color", String(rev)], { cwd, timeoutMs: 10_000 });
+            if (show.status !== 0 || !show.stdout) return null;
+            const pid = runCommand("git", ["patch-id", "--stable"], { cwd, input: show.stdout, timeoutMs: 10_000 });
+            return pid.status === 0 ? pid.stdout.trim().split(/\s+/)[0] || null : null;
+          };
           reconcilePendingFixes(cwd, {
-            isAncestor: (sha, ref) => runCommand("git", ["merge-base", "--is-ancestor", String(sha), String(ref || "HEAD")], { cwd, timeoutMs: 10_000 }).status === 0
+            isAncestor: (sha, ref) => runCommand("git", ["merge-base", "--is-ancestor", String(sha), String(ref || "HEAD")], { cwd, timeoutMs: 10_000 }).status === 0,
+            // Squash/rebase/cherry-pick: the original sha isn't an ancestor, but the same
+            // change (patch-id) is reachable from the base — promote it too.
+            patchIdMerged: (sha, ref) => {
+              const target = patchIdOf(sha);
+              if (!target) return false;
+              const log = runCommand("git", ["log", "--format=%H", "-n", "300", String(ref || "HEAD")], { cwd, timeoutMs: 15_000 });
+              if (log.status !== 0) return false;
+              return log.stdout.split(/\r?\n/).filter(Boolean).some((h) => patchIdOf(h) === target);
+            }
           });
         } catch {
           /* reconcile is best-effort */

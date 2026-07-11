@@ -49,6 +49,16 @@ test("reconcile does NOT reopen a pending fix on an unreachable sha (squash/reba
   assert.equal(statusOf(cwd, fp), "fixed-pending-merge", "unreachable sha is ambiguous -> stays pending, never falsely reopened");
 });
 
+test("reconcile promotes a squash/rebase-merged fix via patch-id (original sha not an ancestor)", () => {
+  const cwd = tmp();
+  rec(cwd, "job1", "2026-01-01T00:00:00Z");
+  const fp = readLedgerEntries(cwd)[0].fingerprint;
+  resolveLedgerEntry(cwd, fp, "fixed-pending-merge", "2026-01-02T00:00:00Z", { resolvedCommit: "squashed", baseBranch: "main" });
+  const n = reconcilePendingFixes(cwd, { isAncestor: () => false, patchIdMerged: (sha, ref) => sha === "squashed" && ref === "main" });
+  assert.equal(n, 1);
+  assert.equal(statusOf(cwd, fp), "fixed", "the change landed under a new sha -> promoted via patch-id");
+});
+
 test("resolving to a NON-fix status clears stale fix provenance", () => {
   const cwd = tmp();
   rec(cwd, "job1", "2026-01-01T00:00:00Z");

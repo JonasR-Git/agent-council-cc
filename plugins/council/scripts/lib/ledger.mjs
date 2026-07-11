@@ -179,7 +179,9 @@ export function resolveLedgerEntry(cwd, fingerprint, status, nowIso, meta = {}) 
  * un-ancestored and eventually gc'd, so treating unreachability as "discarded" would
  * falsely reopen a shipped fix. An un-promoted pending fix keeps re-surfacing in review
  * anyway, so a genuinely-discarded defect stays visible without a false reopen.
- * `git` is injectable: { isAncestor(sha, ref)->bool }. Returns the count promoted.
+ * `git` is injectable: { isAncestor(sha, ref)->bool, patchIdMerged?(sha, ref)->bool }
+ * (the latter promotes squash/rebase/cherry-pick merges by matching the change's patch-id
+ * among commits reachable from the base). Returns the count promoted.
  */
 export function reconcilePendingFixes(cwd, git) {
   return withFileLock(ledgerLockPath(cwd), () => {
@@ -189,9 +191,12 @@ export function reconcilePendingFixes(cwd, git) {
       if (entry.status !== "fixed-pending-merge") continue;
       const sha = entry.resolvedCommit;
       if (!sha) continue;
+      const base = entry.baseBranch || "HEAD";
       let merged = false;
       try {
-        merged = git.isAncestor(sha, entry.baseBranch || "HEAD");
+        // Ancestor covers merge-commit / fast-forward; the patch-id fallback covers
+        // squash / rebase / cherry-pick merges (a new sha, but the same change landed).
+        merged = git.isAncestor(sha, base) || (typeof git.patchIdMerged === "function" && git.patchIdMerged(sha, base));
       } catch {
         merged = false;
       }
