@@ -43,6 +43,8 @@ import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs"
 import { activeReviewerCount, runAuditReview } from "./lib/audit-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { runAuditFix } from "./lib/audit-fix.mjs";
+import { runFixLoop } from "./lib/audit-fixloop.mjs";
+import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { runEndless } from "./lib/audit-endless.mjs";
 import { runAudit } from "./lib/audit-run.mjs";
 import { toSarif } from "./lib/audit-sarif.mjs";
@@ -1712,7 +1714,7 @@ async function handleWatch(argv) {
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif"]
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop"]
   });
   const cwd = process.cwd();
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
@@ -1806,6 +1808,46 @@ async function handleAudit(argv) {
     const backends = probeBackends(cwd, ROOT_DIR);
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
+
+    // `audit fix --loop` (M3): the autonomous fix-until-dry loop. Reviews -> Tier-0
+    // gates -> fixes the localized set on ONE isolated branch -> re-scopes to the blast
+    // radius -> repeats until dry/budget/max-passes. Nothing auto-merged.
+    if (options.loop) {
+      if (activeReviewerCount(backends, merged) === 0) throw new Error("no callable reviewers (Codex/Grok unavailable or skipped) — audit fix --loop needs at least one");
+      let maxPasses = 8;
+      if (options["max-passes"] != null) {
+        const n = Number(options["max-passes"]);
+        if (!Number.isFinite(n) || n < 1) throw new Error("--max-passes must be a positive number");
+        maxPasses = Math.floor(n);
+      }
+      let dryStreak = 2;
+      if (options["dry-streak"] != null) {
+        const n = Number(options["dry-streak"]);
+        if (!Number.isFinite(n) || n < 1) throw new Error("--dry-streak must be a positive number");
+        dryStreak = Math.floor(n);
+      }
+      const bb = await runCommandAsync("git", ["branch", "--show-current"], { cwd, timeoutMs: 10_000 });
+      const baseBranch = bb.status === 0 ? bb.stdout.trim() : null;
+      const deps = makeFixLoopDeps(cwd, model, backends, {
+        maxUnits,
+        minSeverity: options["min-severity"] ?? "P2",
+        skipCodex: merged.skipCodex,
+        skipGrok: merged.skipGrok,
+        claudeModel: merged["claude-model"]
+      });
+      const tLoop = Date.now();
+      const out = await runFixLoop(cwd, { budget, maxPasses, dryStreak, maxUnits, resume: options.resume, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
+      // Return to the base branch after the final pass (fix stayed on the integration branch).
+      if (out.branch && baseBranch) await runCommandAsync("git", ["checkout", baseBranch], { cwd, timeoutMs: 30_000 });
+      recordAuditMetrics(cwd, "fixloop", { wallClockMs: Date.now() - tLoop, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, proposed: out.proposed?.length ?? 0, passes: out.passesRun ?? 0, spent: out.spent ?? 0 }, nowIso());
+      if (options.json) {
+        outputResult(out, true);
+        return;
+      }
+      console.log(renderFixLoopReport(out));
+      return;
+    }
+
     let findings;
     if (options.from) {
       // Confine --from to the project root (no absolute/.. escape) the same way
@@ -2038,6 +2080,31 @@ function renderAuditFixReport(out) {
   }
   L.push("");
   L.push(`Review: \`git checkout ${out.branch}\` → inspect the per-fix commits → merge or discard. Nothing was auto-merged.`);
+  return L.join("\n");
+}
+
+function renderFixLoopReport(out) {
+  const L = [];
+  L.push("# Council Audit — autonomous fix loop (M3)");
+  L.push("");
+  L.push(`${out.passesRun} pass(es) · ${out.fixed.length} fix(es) committed · ${out.failed.length} reverted · ${out.proposed.length} proposal(s). Stopped: ${out.stopReason ?? "—"}.`);
+  if (out.branch) L.push(`Integration branch **${out.branch}** — review + merge or discard. Nothing was auto-merged.`);
+  L.push(`Budget: ${out.spent}/${out.budget} agent calls.`);
+  if (out.fixed.length) {
+    L.push("");
+    L.push(`## Fixed (${out.fixed.length})`);
+    for (const f of out.fixed) L.push(`- ✓ ${f.finding?.severity ?? ""} ${f.finding?.title ?? "(untitled)"} · \`${f.file}\``);
+  }
+  if (out.proposed.length) {
+    L.push("");
+    L.push(`## Proposals — surfaced, not auto-fixed (${out.proposed.length})`);
+    for (const p of out.proposed.slice(0, 20)) L.push(`- ${p.severity ?? ""} ${p.title ?? "(untitled)"}${p.file ? ` · \`${p.file}\`` : ""}`);
+    if (out.proposed.length > 20) L.push(`- … and ${out.proposed.length - 20} more`);
+  }
+  if (out.branch) {
+    L.push("");
+    L.push(`Review: \`git checkout ${out.branch}\` → inspect the per-fix commits → merge or discard.`);
+  }
   return L.join("\n");
 }
 
