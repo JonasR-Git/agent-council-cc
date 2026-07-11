@@ -5,11 +5,29 @@ import { FINGERPRINT_VERSION, isVersioned, semanticFingerprint } from "../plugin
 
 const base = { file: "src/a.mjs", lens: "correctness", ruleId: "empty-catch", anchor: "handleRequest" };
 
-test("fingerprint is versioned and posix/case-normalized", () => {
+test("fingerprint is versioned + slash-normalized but CASE-preserving", () => {
   const fp = semanticFingerprint(base);
   assert.ok(isVersioned(fp));
   assert.match(fp, new RegExp(`^fp${FINGERPRINT_VERSION}\\|src/a.mjs\\|correctness\\|empty-catch\\|`));
-  assert.equal(semanticFingerprint({ ...base, file: "src\\A.mjs" }), fp, "backslashes + case normalized to one identity");
+  assert.equal(semanticFingerprint({ ...base, file: "src\\a.mjs" }), fp, "backslashes normalize to one identity");
+  assert.notEqual(semanticFingerprint({ ...base, file: "src/A.mjs" }), fp, "case is significant (case-sensitive FS)");
+});
+
+test("file comes from location.path (canonical shape) and distinguishes files", () => {
+  const viaLoc = semanticFingerprint({ lens: "correctness", ruleId: "empty-catch", anchor: "handleRequest", location: { path: "src/a.mjs", startLine: 5 } });
+  assert.equal(viaLoc, semanticFingerprint(base), "location.path === f.file identity");
+  assert.notEqual(
+    semanticFingerprint({ ...base, file: "src/b.mjs" }),
+    semanticFingerprint({ ...base, file: "src/a.mjs" }),
+    "different files never collide even with same lens/rule/anchor"
+  );
+});
+
+test("ordinal disambiguates two findings sharing file+lens+rule+anchor", () => {
+  const first = semanticFingerprint({ ...base, ordinal: 0 });
+  const second = semanticFingerprint({ ...base, ordinal: 1 });
+  assert.notEqual(first, second, "two empty catches in one function get distinct identities");
+  assert.equal(semanticFingerprint(base), semanticFingerprint(base), "no ordinal -> stable");
 });
 
 test("stable across line moves, distinct across rule/anchor", () => {

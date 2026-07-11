@@ -13,7 +13,9 @@ import { workspaceRoot } from "./state.mjs";
 // analysis cannot prove reachability/soundness.
 
 const SOURCE_RE = /\.(mjs|cjs|js)$/;
-const IGNORE_RE = /(^|\/)(node_modules|dist|build|out|coverage|vendor|\.min\.)/;
+// Segment-anchored so legitimate prefix-matching dirs (src/builders, src/output,
+// src/vendorized) are NOT dropped; .min. is a filename marker, kept separate.
+const IGNORE_RE = /(^|\/)(node_modules|dist|build|out|coverage|vendor)(\/|$)|\.min\.(js|css|mjs|cjs)/;
 const GOD_FILE_LOC = 400;
 const HIGH_BRANCHES = 60;
 const BIG_CLONE_LINES = 12;
@@ -113,7 +115,9 @@ function walkAll(dir, acc = []) {
 export function inventoryFiles(root, { areas } = {}) {
   const res = runCommand("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { cwd: root });
   let rel;
-  if (res.status === 0 && res.stdout.length) rel = res.stdout.split("\0").filter(Boolean);
+  // git succeeded: trust it (an empty repo is genuinely empty — do NOT fall back to a
+  // non-gitignore-aware walk that would leak dist/coverage). Only walk when git failed.
+  if (res.status === 0) rel = res.stdout.length ? res.stdout.split("\0").filter(Boolean) : [];
   else rel = walkAll(root).map((abs) => toPosix(path.relative(root, abs)));
   const prefixes = (areas ?? []).map((a) => toPosix(a).replace(/\/+$/, ""));
   const seen = new Set();
@@ -124,7 +128,9 @@ export function inventoryFiles(root, { areas } = {}) {
     seen.add(id);
     out.push({ id, fileClass: fileClassOf(id) });
   }
-  return out.sort((a, b) => a.id.localeCompare(b.id));
+  // Deterministic codepoint sort (locale-independent) so the inventory + any baseline
+  // diff derived from it is reproducible across machines.
+  return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 function fileFacts(text) {

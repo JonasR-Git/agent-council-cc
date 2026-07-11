@@ -29,9 +29,12 @@ test("summarizeCoverage: mapped is NOT reviewed, and mandatory completion needs 
 });
 
 test("gateStatus: indeterminate over false-pass, fail on new P0/P1", () => {
-  const complete = { complete: true };
+  const complete = { complete: true, computed: true };
   assert.equal(gateStatus({ mandatory: complete, newHighSeverity: 0, verificationComplete: true }), "pass");
   assert.equal(gateStatus({ mandatory: complete, newHighSeverity: 2, verificationComplete: true }), "fail");
-  assert.equal(gateStatus({ mandatory: { complete: false }, newHighSeverity: 0 }), "indeterminate", "incomplete surface is never a pass");
+  assert.equal(gateStatus({ mandatory: { complete: false, computed: true }, newHighSeverity: 0 }), "indeterminate", "incomplete surface is never a pass");
   assert.equal(gateStatus({ mandatory: complete, newHighSeverity: 0, verificationComplete: false }), "indeterminate");
+  // the exact false-pass the review caught:
+  assert.equal(gateStatus({}), "indeterminate", "absent mandatory data is indeterminate, never pass");
+  assert.equal(gateStatus({ mandatory: { complete: true } }), "indeterminate", "uncomputed surface is indeterminate");
 });

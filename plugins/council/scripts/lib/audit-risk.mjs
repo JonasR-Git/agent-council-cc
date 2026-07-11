@@ -32,12 +32,19 @@ export function riskScore({ severity, likelihood, blastRadius, exploitability, c
   const C = Math.max(0, Math.min(1, Number.isFinite(confidence) ? confidence : 0.6));
   const raw = 100 * (S / 10) * (L / 5) * (B / 5) * (E / 5);
   const confidenceFactor = 0.25 + 0.75 * C;
-  return { raw: Math.round(raw), calibrated: Math.round(raw * confidenceFactor), components: { S, L, B, E, C } };
+  // Keep raw at full precision (auditable); round only the calibrated score.
+  return { raw, calibrated: Math.round(raw * confidenceFactor), components: { S, L, B, E, C } };
 }
 
-/** Wilson 95% interval for a proportion (zero-dep). Null when n<=0. */
+/**
+ * Wilson 95% interval for a proportion (zero-dep). Null unless n is a positive
+ * integer, successes an integer in [0,n], and z finite/positive — degenerate inputs
+ * (e.g. successes>n) would otherwise yield NaN bounds.
+ */
 export function wilson(successes, n, z = 1.96) {
-  if (!Number.isFinite(n) || n <= 0) return null;
+  if (!Number.isInteger(n) || n <= 0) return null;
+  if (!Number.isInteger(successes) || successes < 0 || successes > n) return null;
+  if (!Number.isFinite(z) || z <= 0) return null;
   const phat = successes / n;
   const z2 = z * z;
   const denom = 1 + z2 / n;

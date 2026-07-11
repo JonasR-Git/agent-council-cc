@@ -39,18 +39,21 @@ export function summarizeCoverage(units = []) {
   return {
     total: units.length,
     byState,
-    mandatory: { total: mandatoryTotal, done: mandatoryDone, complete: mandatoryTotal === 0 || mandatoryDone === mandatoryTotal },
+    // `computed` records that this summary actually ran over units, so gateStatus can
+    // distinguish "genuinely zero mandatory files" from "tagging never ran". `complete`
+    // requires a NON-EMPTY, fully-done mandatory set — an empty set is never a pass.
+    mandatory: { total: mandatoryTotal, done: mandatoryDone, complete: mandatoryTotal > 0 && mandatoryDone === mandatoryTotal, computed: true },
     uncovered
   };
 }
 
 /**
- * Gate verdict. `indeterminate` when the mandatory surface or required verification
- * is incomplete (budget/tool limits) — never a false pass; `fail` on any NEW P0/P1;
- * else `pass`.
+ * Gate verdict. `indeterminate` unless the mandatory surface was COMPUTED and is
+ * complete AND verification is complete — an absent/uncomputed/empty surface is never
+ * a false pass (docs §4 blocker 3). `fail` on any NEW P0/P1; else `pass`.
  */
 export function gateStatus({ mandatory, newHighSeverity = 0, verificationComplete = true } = {}) {
-  const mandatoryComplete = mandatory ? mandatory.complete !== false : true;
+  const mandatoryComplete = Boolean(mandatory && mandatory.computed === true && mandatory.complete === true);
   if (!mandatoryComplete || !verificationComplete) return "indeterminate";
   return newHighSeverity > 0 ? "fail" : "pass";
 }

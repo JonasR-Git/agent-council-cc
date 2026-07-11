@@ -23,10 +23,16 @@ test("riskScore computes raw + calibrated and keeps every component", () => {
   assert.deepEqual(worst.components, { S: 10, L: 5, B: 5, E: 5, C: 1 });
   // out-of-range inputs are clamped, not NaN
   assert.ok(Number.isFinite(riskScore({ severity: "bogus", likelihood: 99, blastRadius: -3, confidence: 2 }).calibrated));
+  // raw is kept at full precision (auditable), only calibrated is rounded
+  const tiny = riskScore({ severity: "nit", likelihood: 1, blastRadius: 1, exploitability: 1, confidence: 1 });
+  assert.ok(Math.abs(tiny.raw - 0.08) < 1e-9, "raw is not rounded away to 0");
+  assert.equal(tiny.calibrated, 0);
 });
 
 test("wilson interval + falsePositiveRate handle sparse data honestly", () => {
   assert.equal(wilson(0, 0), null, "no sample -> no interval");
+  assert.equal(wilson(2, 1), null, "successes > n -> null, not NaN bounds");
+  assert.equal(wilson(1.5, 4), null, "non-integer successes rejected");
   assert.equal(falsePositiveRate(0, 0), null, "nothing resolved -> null, not 0% precision");
   const fp = falsePositiveRate(8, 2); // 2 false positives out of 10 resolved
   assert.equal(fp.n, 10);

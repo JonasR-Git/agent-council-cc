@@ -15,11 +15,28 @@ test("path classifiers flag the high-blast-radius surface", () => {
   assert.ok(!isManifest("src/index.mjs"));
 });
 
-test("hasSecuritySink detects dangerous source markers", () => {
+test("hasSecuritySink detects dangerous markers without over-matching benign ones", () => {
   assert.ok(hasSecuritySink("import cp from 'child_process'; cp.execSync(x)"));
   assert.ok(hasSecuritySink("el.innerHTML = userInput"));
   assert.ok(hasSecuritySink("db.query(`select * from t where id=${id}`)"));
+  assert.ok(hasSecuritySink("crypto.createHash('md5')"), "weak-crypto specifics still flagged");
   assert.ok(!hasSecuritySink("export const add = (a, b) => a + b;"));
+  // the review's over-match cases: benign crypto import + RegExp.prototype.exec
+  assert.ok(!hasSecuritySink("import { randomUUID } from 'node:crypto'; const id = randomUUID();"), "bare crypto import is not a sink");
+  assert.ok(!hasSecuritySink("const m = /foo/.exec(str);"), "RegExp.exec is not a shell-exec sink");
+});
+
+test("mandatorySet recognizes plugin manifests, IaC, non-JS manifests and migrations", () => {
+  const { reasons } = mandatorySet([
+    { id: "plugins/council/.claude-plugin/plugin.json" },
+    { id: "infra/main.tf" },
+    { id: "pyproject.toml" },
+    { id: "src/migrations/drop-all.mjs" }
+  ]);
+  assert.equal(reasons["plugins/council/.claude-plugin/plugin.json"], "plugin manifest");
+  assert.equal(reasons["infra/main.tf"], "CI/infra config");
+  assert.equal(reasons["pyproject.toml"], "dependency manifest/lockfile");
+  assert.equal(reasons["src/migrations/drop-all.mjs"], "persistence/migration code");
 });
 
 test("mandatorySet unions the surface with a strongest-reason per file", () => {
