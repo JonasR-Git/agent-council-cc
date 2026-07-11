@@ -171,6 +171,27 @@ export function findCycles(nodes) {
  * low-confidence candidates for review, never for deletion. Pass `entrypoints`
  * (a Set of ids) to exclude known CLI/entry modules.
  */
+/**
+ * Reconstruct a nodes Map (in/out/exports Sets) from the JSON-safe adjacency the codebase
+ * model exposes (graph.importers/imports/exports/hasDefault/opaque). Lets downstream (the
+ * Tier-0 detector) reuse findOrphanModules et al. without re-parsing the whole tree.
+ */
+export function nodesFromGraph(graph = {}) {
+  const nodes = new Map();
+  const ids = new Set([...Object.keys(graph.importers ?? {}), ...Object.keys(graph.imports ?? {}), ...Object.keys(graph.exports ?? {})]);
+  for (const id of ids) {
+    nodes.set(id, {
+      id,
+      in: new Set(graph.importers?.[id] ?? []),
+      out: new Set(graph.imports?.[id] ?? []),
+      exports: new Set(graph.exports?.[id] ?? []),
+      hasDefault: Boolean(graph.hasDefault?.[id]),
+      opaque: Boolean(graph.opaque?.[id])
+    });
+  }
+  return nodes;
+}
+
 export function findOrphanModules(nodes, { entrypoints = new Set() } = {}) {
   const importedModules = new Set();
   for (const n of nodes.values()) for (const t of n.out) importedModules.add(t);

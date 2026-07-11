@@ -241,10 +241,26 @@ export function buildCodebaseModel(cwd, { areas, churnDays = 90 } = {}) {
   const dupClusters = findDuplicateClusters(files.filter((f) => !isTestId(f.id)), { minLines: 6 });
   const findings = buildFindings({ facts, cycles, orphans, dupClusters });
 
+  // Expose the import-graph EDGES (JSON-safe adjacency) so downstream consumers can
+  // compute dependents/importers without re-parsing: expandScope's blast radius, the
+  // Tier-0 detector's fact-base, and the M6 codemod planner all need this.
+  const importers = {};
+  const importsOf = {};
+  const exportsOf = {};
+  const hasDefault = {};
+  const opaque = {};
+  for (const [id, n] of nodes) {
+    importers[id] = [...n.in].sort();
+    importsOf[id] = [...n.out].sort();
+    exportsOf[id] = [...n.exports].sort();
+    hasDefault[id] = Boolean(n.hasDefault);
+    opaque[id] = Boolean(n.opaque);
+  }
+
   const supplied = facts.reduce((s, x) => s + x.loc, 0);
   return {
     files: facts,
-    graph: { cycles, orphans },
+    graph: { cycles, orphans, importers, imports: importsOf, exports: exportsOf, hasDefault, opaque, entrypoints: [...entrypoints].sort() },
     dupClusters,
     findings,
     coverage: {

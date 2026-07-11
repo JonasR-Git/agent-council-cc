@@ -23,6 +23,19 @@
 import { runAuditFix } from "./audit-fix.mjs";
 import { runAuditReview } from "./audit-review.mjs";
 
+/** file -> Set(peer files that share a duplicate cluster with it). */
+function buildDupPeers(dupClusters = []) {
+  const peers = new Map();
+  for (const cluster of dupClusters) {
+    const inCluster = [...new Set((cluster.locations ?? []).map((l) => l.file).filter(Boolean))];
+    for (const f of inCluster) {
+      if (!peers.has(f)) peers.set(f, new Set());
+      for (const g of inCluster) if (g !== f) peers.get(f).add(g);
+    }
+  }
+  return peers;
+}
+
 export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   const doReview = impl.runAuditReview ?? runAuditReview;
   const doFix = impl.runAuditFix ?? runAuditFix;
@@ -30,6 +43,8 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   const hubFanIn = options.hubFanIn ?? 8;
   const files = model?.files ?? [];
   const nonTestCount = Math.max(1, files.filter((f) => !f.isTest).length);
+  const importersOf = model?.graph?.importers ?? {};
+  const dupPeers = buildDupPeers(model?.dupClusters);
   let fullPasses = 0; // counts ONLY full-scope passes, so the window advance is honest
 
   const review = async ({ budget, changedFiles }) => {
@@ -68,9 +83,18 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       claudeModel: options.claudeModel
     });
 
+  // Blast radius (§7): re-scope the next pass to the changed files PLUS their real
+  // dependents (importers, from the graph) and dup-cluster peers (editing B can flip A's
+  // duplicate status). If that set is a large fraction of the repo (a hub), fall back to a
+  // full re-scope — cheaper + more honest than a huge scoped list.
   const expandScope = (changed) => {
-    const anyHub = changed.some((c) => (files.find((f) => f.id === c)?.fanIn ?? 0) >= hubFanIn);
-    return anyHub ? [] : changed; // a hub change -> full re-scope next pass (design §7)
+    const set = new Set(changed);
+    for (const c of changed) {
+      for (const imp of importersOf[c] ?? []) set.add(imp);
+      for (const peer of dupPeers.get(c) ?? []) set.add(peer);
+    }
+    if (set.size > Math.max(hubFanIn, Math.ceil(nonTestCount * 0.5))) return [];
+    return [...set];
   };
 
   const verdictsFor = () => options.verdictMap ?? {};

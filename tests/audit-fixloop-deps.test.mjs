@@ -49,11 +49,16 @@ test("fix threads branch + stayOnBranch (and severity/max) to runAuditFix", asyn
   assert.equal(seen.maxFixes, 3);
 });
 
-test("expandScope forces a full re-scope after a hub-file change, stays narrow for a leaf", () => {
-  const deps = makeFixLoopDeps("/x", model, {}, { hubFanIn: 8 });
-  assert.deepEqual(deps.expandScope(["b.mjs"]), ["b.mjs"], "a leaf change stays narrow");
-  assert.deepEqual(deps.expandScope(["hub.mjs"]), [], "a hub change -> full re-scope (empty signals full)");
-  assert.deepEqual(deps.expandScope(["a.mjs", "hub.mjs"]), [], "any hub in the set forces full re-scope");
+test("expandScope re-scopes to real dependents + dup-cluster peers; a hub-sized radius falls back to full", () => {
+  const model2 = {
+    files: Array.from({ length: 6 }, (_, i) => ({ id: `f${i}.mjs`, fanIn: 1, isTest: false })),
+    graph: { importers: { "f0.mjs": ["f1.mjs", "f2.mjs"], "f5.mjs": ["f0.mjs", "f1.mjs", "f2.mjs", "f3.mjs", "f4.mjs"] } },
+    dupClusters: [{ locations: [{ file: "f3.mjs" }, { file: "f4.mjs" }] }]
+  };
+  const deps = makeFixLoopDeps("/x", model2, {}, { hubFanIn: 4 });
+  assert.deepEqual(deps.expandScope(["f0.mjs"]).sort(), ["f0.mjs", "f1.mjs", "f2.mjs"], "importers are re-reviewed");
+  assert.deepEqual(deps.expandScope(["f3.mjs"]).sort(), ["f3.mjs", "f4.mjs"], "dup-cluster peers are re-reviewed");
+  assert.deepEqual(deps.expandScope(["f5.mjs"]), [], "a hub-sized blast radius falls back to a full re-scope");
 });
 
 test("verdictsFor returns the configured verdict map (empty by default)", () => {
