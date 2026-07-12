@@ -112,6 +112,15 @@ test("council Codex C2: a recurring PROPOSE-ONLY finding does not pin its tier (
   assert.match(out.stopReason, /all tiers converged/);
 });
 
+test("council Codex C2: 'all tiers converged' wins over the max-passes ceiling when they coincide", async () => {
+  // dryStreak 1 → each empty pass advances a tier; starting tier 1, 3 passes reach tier 4 (converged)
+  // exactly at maxPasses 3. The convergence reason must win over the generic "reached max passes".
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 1 } });
+  const fix = async () => ({ fixed: [], failed: [], spent: 0 });
+  const out = await runFixLoop("/x", { budget: 100, dryStreak: 1, maxPasses: 3, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /all tiers converged/, "reports convergence, not 'reached max passes', when the last tier finishes at the ceiling");
+});
+
 test("council Codex C2: the full-scope window survives --resume (no offset-0 restart, later units reached)", async () => {
   const bigModel = { files: Array.from({ length: 6 }, (_, i) => ({ id: `f${i}.mjs`, fanIn: 1 })) };
   const offsets = [];

@@ -194,9 +194,12 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // fixed (council B5 grok P1). So while per-tier is staging, global dry/stalled must NOT stop the
     // loop — tier advancement drives progress and the "all tiers converged" reason ends it. Global
     // dry/stalled apply only in flat (non-per-tier) mode.
-    stopReason = endlessStopReason({ passNo, spent, dryStreak: perTier ? 0 : dryStreak }, { maxPasses, totalBudget, dryStop });
+    // Check per-tier CONVERGENCE first (council Codex C2 P2): a run that advances past the last tier
+    // on the SAME iteration it also hits maxPasses/budget should report the meaningful "all tiers
+    // converged", not the generic ceiling — the tiers genuinely finished.
+    stopReason = perTier && currentTier > 3 ? "all tiers converged (structure -> correctness -> quality)" : null;
+    if (!stopReason) stopReason = endlessStopReason({ passNo, spent, dryStreak: perTier ? 0 : dryStreak }, { maxPasses, totalBudget, dryStop });
     if (!stopReason && !perTier && stalledStreak >= dryStop) stopReason = `stalled — actionable findings remain but none are auto-applicable (${stalledStreak} passes)`;
-    if (!stopReason && perTier && currentTier > 3) stopReason = "all tiers converged (structure -> correctness -> quality)";
     if (stopReason) break;
 
     passNo += 1;

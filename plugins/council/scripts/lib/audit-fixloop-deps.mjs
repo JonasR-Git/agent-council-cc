@@ -103,7 +103,12 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     const cov = rev?.coverage ?? {};
     const selected = cov.unitsSelected ?? 0;
     const reviewed = cov.unitsReviewed ?? 0;
-    return { ...rev, findings, ran: reviewed > 0 || selected === 0 };
+    // ran:false must not DISCARD real findings (council Codex C2 P2): on a budget-starved pass where no
+    // unit could be dispatched but the reserved global SSOT reduce still ran and produced a structural
+    // finding, keying ran solely on unitsReviewed dropped that finding before it was ever gated. A pass
+    // that yielded ANY finding (from a unit OR the reduce) DID run — surface it; only a genuinely empty
+    // undispatched pass (selected>0, reviewed=0, no findings) is the "couldn't review" stop.
+    return { ...rev, findings, ran: reviewed > 0 || selected === 0 || findings.length > 0 };
   };
 
   const fix = async (actionable, ctx = {}) =>

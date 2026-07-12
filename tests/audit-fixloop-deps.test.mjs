@@ -45,6 +45,16 @@ test("review surfaces a top-level `ran` from the REAL coverage shape (throttled 
   assert.equal((await nothing.review({ budget: 5, changedFiles: null })).ran, true, "0 selected is not a failure");
 });
 
+test("council Codex C2: a budget-starved pass with reduce-only findings is ran:true (findings not discarded)", async () => {
+  // no unit dispatched (reviewed=0) but the reserved global SSOT reduce ran and produced a finding —
+  // keying ran only on unitsReviewed would drop it before gating.
+  const runAuditReview = async () => ({ findings: [{ file: "x.mjs", title: "ssot dup", category: "design", severity: "P2" }], coverage: { unitsSelected: 1, unitsReviewed: 0, reduceRan: true, budgetSpent: 1 } });
+  const deps = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview });
+  const rev = await deps.review({ budget: 2, changedFiles: null });
+  assert.equal(rev.ran, true, "a reduce finding means the pass ran — surface it, don't stop as 'couldn't review'");
+  assert.equal(rev.findings.length, 1);
+});
+
 test("review assigns a canonical lens to every finding (repairs loop-path tier staging)", async () => {
   // Regression guard: the loop path used to leave finding.lens undefined, so tierOfLens
   // dropped everything into the Quality tier and structure-first --per-tier was inert.
