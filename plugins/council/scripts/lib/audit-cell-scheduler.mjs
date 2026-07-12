@@ -178,13 +178,15 @@ export function makeCellReviewer(cwd, backends, options = {}, deps = {}) {
     }
     const doc = parseAgentFindings(res.stdout, cell.model);
     if (!doc.parseOk) return { ok: false, cell, res, unparsed: true };
-    // B5: stamp each finding's LENS from the GROUP it was found in — the pass is scoped to exactly
-    // one group, so the group's parent lens is authoritative (a model-claimed class would anyway be
-    // re-found + tagged by that class's own group pass under six-eyes). Without this, tierOfLens(
-    // f.lens) sees undefined → the finding falls into the Quality tier and structure-first per-tier
-    // staging silently breaks. Falls back to any model lens only when the group has none.
-    const groupLens = cell.group?.lenses?.[0] ?? null;
-    const findings = doc.findings.map((f) => ({ ...f, lens: groupLens ?? f.lens ?? null }));
+    // B5: stamp each finding's LENS so tierOfLens(f.lens) works (else it falls into the Quality
+    // tier and structure-first per-tier staging silently breaks). For a SINGLE-lens group (the
+    // 'lens'/'fine' presets) the group's lens is authoritative and overrides any model-claimed
+    // class. For a MULTI-lens group (the 'tier' preset bundles several lenses per pass, or a custom
+    // group) forcing lenses[0] would DISCARD the finding's real lens and could defeat the P0
+    // live-hole override, which keys on the specific lens (council B5 codex P2) — so there we keep
+    // the model-supplied lens and only fall back to the first group lens when the model gave none.
+    const lenses = Array.isArray(cell.group?.lenses) ? cell.group.lenses : [];
+    const findings = doc.findings.map((f) => ({ ...f, lens: (lenses.length === 1 ? lenses[0] : f.lens) ?? lenses[0] ?? null }));
     return { ok: true, cell, findings };
   };
 }

@@ -2,6 +2,7 @@
  * Parse / normalize / merge structured council findings.
  */
 
+import { getLens } from "./audit-lenses.mjs";
 import { SCHEMAS } from "./schemas.mjs";
 import { validate } from "./validate.mjs";
 import { firstLines, isObject } from "./util.mjs";
@@ -102,6 +103,11 @@ function normalizeFindingsDoc(doc, agentFallback = "unknown") {
     file: f?.file != null ? String(f.file) : null,
     line: Number.isFinite(Number(f?.line)) ? Number(f.line) : null,
     confidence: Number.isFinite(Number(f?.confidence)) ? Number(f.confidence) : 0.6,
+    // Preserve a VALID model-supplied lens (a registered lens id) so a multi-lens group pass keeps
+    // each finding's real class — without it the lens is dropped and a security_secrets P0 surfaced
+    // under a multi-lens group would lose the tag the P0 live-hole override keys on (council B5
+    // codex P2). An unknown/absent lens stays undefined for downstream categoryToLens to fill.
+    lens: f?.lens && getLens(f.lens) ? String(f.lens) : undefined,
     agent,
     // Honor an explicit agent scope override ("localized"/"cross-cutting");
     // anything else stays undefined so annotateScopes falls back to heuristics.

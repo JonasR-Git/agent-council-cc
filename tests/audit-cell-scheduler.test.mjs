@@ -221,9 +221,21 @@ test("B5: makeCellReviewer stamps each finding's LENS from its group (so tier ga
   });
   const cell = { model: "codex", groupId: "correctness-logic", group: { id: "correctness-logic", lenses: ["correctness"], focus: "logic" }, file: "a.mjs", chunk: 0, chunkData: { text: "x", index: 0, total: 1, startLine: 1, endLine: 1 } };
   const r = await review(cell);
-  // the pass is scoped to the correctness-logic group → every finding is tagged its group's lens
+  // the pass is scoped to the single-lens correctness-logic group → every finding is tagged its lens
   assert.equal(r.findings[0].lens, "correctness");
-  assert.equal(r.findings[1].lens, "correctness", "the group lens is authoritative for a group-scoped pass");
+  assert.equal(r.findings[1].lens, "correctness", "the group lens is authoritative for a single-lens group-scoped pass");
+});
+
+test("B5 (council codex P2): a MULTI-lens group keeps a finding's specific lens (P0 live-hole override intact)", async () => {
+  const review = makeCellReviewer("/x", {}, {}, {
+    runCodex: async () => ({ status: 0, stdout: '{"agent":"codex","findings":[{"severity":"P0","title":"sqli","detail":"d","lens":"security_secrets"},{"severity":"P2","title":"x","detail":"d"}]}' })
+  });
+  // the built-in 'tier' preset bundles several lenses per group — forcing lenses[0] would relabel a
+  // security_secrets P0 as 'correctness' and defeat SECURITY_OVERRIDE_LENSES.
+  const cell = { model: "codex", groupId: "tier-correctness", group: { id: "tier-correctness", lenses: ["correctness", "concurrency_resources", "security_secrets"] }, file: "a.mjs", chunk: 0, chunkData: { text: "x", index: 0, total: 1, startLine: 1, endLine: 1 } };
+  const r = await review(cell);
+  assert.equal(r.findings[0].lens, "security_secrets", "a multi-lens group must NOT overwrite the finding's real lens");
+  assert.equal(r.findings[1].lens, "correctness", "an unlensed finding falls back to the group's first lens");
 });
 
 test("B4 (council grok-4): enumerateCells threads per-file static facts onto each cell + into the prompt", async () => {

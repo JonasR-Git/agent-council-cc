@@ -126,7 +126,13 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // copies). The pure default is OFF so the function contract is stable; the audit-fix CLI defaults
   // it ON (B5, --per-tier) at the call site, where real findings carry a lens (see the wiring).
   const perTier = Boolean(options.perTierConvergence);
-  let currentTier = 0;
+  // Start at Tier 1 (Structure), NOT 0 (Logical): tier 0 = logical_sense is propose-only and is
+  // NEVER review-sourced (no category maps to it; categoryToLens falls back to correctness), so its
+  // proposals arrive once via logicalProposals → proposedAll and never enter gate/actionable.
+  // Starting at 0 therefore burned dryStop full review+fix passes of warm-up tax every run once
+  // per-tier became the CLI default (council B5 codex P1). Logical proposals are still surfaced.
+  const FIRST_TIER = 1;
+  let currentTier = FIRST_TIER;
   let tierDryStreak = 0;
 
   if (options.resume) {
@@ -148,7 +154,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       // Restore the per-tier staging position so a resume (the M10 supervisor path) continues at the
       // tier it was fixing, not from tier 0 — which would re-walk structure every restart (council
       // B5 grok P2/Claude). Clamped so a corrupt checkpoint can't push currentTier out of range.
-      currentTier = clamp(prior.currentTier ?? 0, 0, 4);
+      currentTier = clamp(prior.currentTier ?? FIRST_TIER, FIRST_TIER, 4);
       tierDryStreak = clamp(prior.tierDryStreak ?? 0, 0, dryStop);
       stalledStreak = clamp(prior.stalledStreak ?? 0, 0, dryStop);
       branch = prior.branch ?? null;

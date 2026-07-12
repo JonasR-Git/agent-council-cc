@@ -97,6 +97,18 @@ test("B5 council (grok P2): per-tier position is checkpointed and restored on re
   assert.equal(out.fixed.length, 0);
 });
 
+test("B5 (council codex P1): per-tier starts at Tier 1 (Structure), skipping the empty Logical Tier 0", async () => {
+  // Tier 0 (logical_sense) is propose-only and never review-sourced, so starting there burned
+  // dryStop warm-up passes every run. currentTier now starts at 1.
+  let saved = null;
+  await runFixLoop(
+    "/x",
+    { budget: 4, dryStreak: 5, perTierConvergence: true, maxPasses: 2 },
+    { review: async () => ({ findings: [], coverage: { budgetSpent: 1 } }), fix: async () => ({ fixed: [], failed: [], spent: 0 }), checkpoint: (s) => { saved = s; } }
+  );
+  assert.ok(saved.currentTier >= 1, "no run wastes passes on the structurally-empty Logical tier 0");
+});
+
 test("without --retry-on-limit, a rate-limited review still stops the loop (opt-in only)", async () => {
   const review = async () => { throw new Error("HTTP 429 rate limit"); };
   const out = await runFixLoop("/x", { budget: 10 }, { review, fix: async () => ({}), checkpoint: noCheckpoint });
@@ -241,11 +253,12 @@ test("resume restores changedFiles so it continues the localized scope (not a st
   assert.deepEqual(scopes[0], ["a.mjs"], "resumed run continues the checkpointed scope");
 });
 
-test("per-tier convergence processes tier 0 before advancing to later tiers", async () => {
+test("per-tier convergence processes Structure (tier 1) before Correctness (tier 2)", async () => {
+  // Tier 0 (logical_sense) is structurally empty on the review path, so staging starts at Structure.
   let p = 0;
   const review = async () =>
     p++ === 0
-      ? { findings: [finding({ lens: "logical_sense", file: "l.mjs", title: "t0" }), finding({ lens: "correctness", file: "c.mjs", title: "t2" })], coverage: { budgetSpent: 1 } }
+      ? { findings: [finding({ lens: "architecture_ssot", file: "s.mjs", title: "t1" }), finding({ lens: "correctness", file: "c.mjs", title: "t2" })], coverage: { budgetSpent: 1 } }
       : { findings: [], coverage: { budgetSpent: 1 } };
   const fixedPasses = [];
   const fix = async (actionable) => {
@@ -253,7 +266,7 @@ test("per-tier convergence processes tier 0 before advancing to later tiers", as
     return { ok: true, fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "c" })), changedFiles: [] };
   };
   await runFixLoop("/x", { budget: 40, dryStreak: 1, maxPasses: 20, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
-  assert.deepEqual(fixedPasses[0], ["l.mjs"], "tier 0 (logical) is processed before tier 2 (correctness)");
+  assert.deepEqual(fixedPasses[0], ["s.mjs"], "Structure (tier 1) is processed before Correctness (tier 2) — no wasted tier-0 pass");
 });
 
 test("Tier-0 detector proposals are surfaced in the loop's proposals", async () => {
