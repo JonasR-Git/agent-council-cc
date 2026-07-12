@@ -61,7 +61,7 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       fullPasses += 1;
     }
     const scopedModel = reviewFiles === files ? model : { ...model, files: reviewFiles };
-    return doReview(cwd, scopedModel, backends, {
+    const rev = await doReview(cwd, scopedModel, backends, {
       budget,
       maxUnits,
       unitOffset: offset,
@@ -70,6 +70,15 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       skipGrok: options.skipGrok,
       ledger: options.ledger
     });
+    // Surface a top-level `ran` the loop can trust. runAuditReview swallows backend
+    // failures (rate-limit / unreachable) into 0 findings WITHOUT throwing, so the loop
+    // must distinguish "reviewed, found nothing" (dry — real) from "couldn't review"
+    // (attempted units but ALL failed — must NOT count as convergence). ran is FALSE only
+    // in the latter case; "nothing to review" (0 attempted) stays ran:true.
+    const cov = rev?.coverage ?? {};
+    const attempted = cov.unitsAttempted ?? 0;
+    const reviewed = cov.unitsReviewed ?? 0;
+    return { ...rev, ran: reviewed > 0 || attempted === 0 };
   };
 
   const fix = async (actionable, ctx = {}) =>

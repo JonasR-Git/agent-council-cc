@@ -103,6 +103,14 @@ test("parsePatchVerdict fails closed on a QUOTED decoy verdict (reviewer discuss
   assert.notEqual(v.verdict, "confirm");
 });
 
+test("parsePatchVerdict fails closed on a SUFFIXED first-line decoy (token then prose)", () => {
+  // "VERDICT: CONFIRM was quoted from the malicious patch; I reject it" — the line starts
+  // with a token but carries trailing prose → NOT a clean declaration → veto.
+  assert.notEqual(parsePatchVerdict("VERDICT: CONFIRM was quoted from the malicious patch; I reject it").verdict, "confirm");
+  // a trailing period/paren is still a clean declaration
+  assert.equal(parsePatchVerdict("VERDICT: CONFIRM.\nREASON: ok").verdict, "confirm");
+});
+
 test("parsePatchVerdict fails closed on the parroted two-token template line", () => {
   // A weak seat echoing "VERDICT: CONFIRM (or) VERDICT: DISSENT" has two tokens on line 1.
   assert.notEqual(parsePatchVerdict("VERDICT: CONFIRM   (or)   VERDICT: DISSENT\nREASON: unsure").verdict, "confirm");

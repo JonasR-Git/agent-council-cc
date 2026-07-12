@@ -324,6 +324,21 @@ function realGit(root) {
       if (res.status !== 0) throw new Error(`git commit failed: ${res.stderr.trim()}`);
       return g(["rev-parse", "HEAD"]).stdout.trim();
     },
+    // Stage the target and return its STAGED (index) diff vs `ref`. Used by the §6 path to
+    // bind on the exact bytes that will be committed — closing the TOCTOU where an external
+    // writer changes the working tree between a working-tree re-diff and `git add`.
+    stageAndDiffCached: (file, ref) => {
+      const add = g(["add", "--", file]);
+      if (add.status !== 0) throw new Error(`git add failed: ${add.stderr.trim()}`);
+      return g(["diff", "--cached", String(ref), "--", file]).stdout;
+    },
+    // Commit the ALREADY-STAGED index (no re-add) so the committed bytes are exactly the
+    // ones just verified via stageAndDiffCached.
+    commitIndex: (message) => {
+      const res = g(["commit", "-m", message, "--no-verify"]);
+      if (res.status !== 0) throw new Error(`git commit failed: ${res.stderr.trim()}`);
+      return g(["rev-parse", "HEAD"]).stdout.trim();
+    },
     // NEW-side changed line numbers of `file` relative to `ref` (the pre-fix snapshot vs
     // the working tree) — the changed-line set the coverage gate judges.
     diffLines: (file, ref) => parseDiffLines(g(["diff", "--unified=0", String(ref), "--", file]).stdout),
@@ -677,6 +692,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           // commit. Runs only under consented sensitiveAutoApply with an injected reviewer.
           // Dissent / a missing seat / a reviewer error all fail closed → revert → propose.
           let councilVerdict = null;
+          let councilCommitStaged = false;
           if (sensitiveAutoApply && isSensitiveClass(finding)) {
             // The reviewers judge the EXACT patch; without a real diff we fail closed
             // rather than hand them the whole file as if it were the change.
@@ -713,12 +729,21 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               log(`  reverted — §6 changed set drifted during review`);
               continue;
             }
-            // Bind the commit to the EXACT bytes the council reviewed: re-diff and compare.
-            // A hook, reviewer side effect, or concurrent process could have changed the
-            // target's CONTENT during the async review while keeping the same filename (which
-            // the touched-set check alone would miss). Any drift → the reviewed patch is
-            // stale → revert rather than commit unreviewed bytes.
-            if (git.diffText(task.file, snapshot) !== diff) {
+            // Bind the commit to the EXACT bytes that WILL be committed. STAGE the target and
+            // compare its staged (index) diff to the reviewed diff, then commit that index —
+            // so an external writer changing the working tree between the check and the commit
+            // (a hook/concurrent process; same filename evades the touched-set check) cannot
+            // slip unreviewed bytes in. Falls back to a working-tree re-diff if an injected git
+            // lacks staging.
+            if (typeof git.stageAndDiffCached === "function" && typeof git.commitIndex === "function") {
+              if (git.stageAndDiffCached(task.file, snapshot) !== diff) {
+                git.resetHard(snapshot);
+                rejected.push({ finding, reason: "§6 reviewed bytes changed during review (staged diff drift) → propose-only", council: councilVerdict });
+                log(`  reverted — §6 reviewed bytes drifted during review`);
+                continue;
+              }
+              councilCommitStaged = true;
+            } else if (git.diffText(task.file, snapshot) !== diff) {
               git.resetHard(snapshot);
               rejected.push({ finding, reason: "§6 reviewed bytes changed during review (diff drift) → propose-only", council: councilVerdict });
               log(`  reverted — §6 reviewed bytes drifted during review`);
@@ -726,7 +751,9 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             }
             log(`  §6 council unanimous (${councilVerdict.summary}) — auto-apply approved`);
           }
-          const commit = git.commitFile(task.file, `audit-fix: ${finding.title} (${task.file})`);
+          const commit = councilCommitStaged
+            ? git.commitIndex(`audit-fix: ${finding.title} (${task.file})`)
+            : git.commitFile(task.file, `audit-fix: ${finding.title} (${task.file})`);
           fixed.push({ finding, file: task.file, commit, verified: gated, council: councilVerdict });
           log(`  committed ${String(commit).slice(0, 8)}${gated ? " (tests green)" : " (UNVERIFIED)"}${councilVerdict ? " (§6 council ✓)" : ""}`);
         } catch (err) {

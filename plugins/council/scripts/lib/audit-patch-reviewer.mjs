@@ -18,6 +18,10 @@ export function buildClaudeReviewArgs(options = {}) {
     "-p",
     "--output-format",
     "text",
+    // --safe-mode disables the AUDITED repo's customizations — CLAUDE.md, skills, plugins,
+    // HOOKS, MCP servers, custom commands/agents — so a hostile repo can neither bias the
+    // verdict via instruction files nor execute code via lifecycle hooks during the review.
+    "--safe-mode",
     "--allowed-tools",
     ...CLAUDE_REVIEW_ALLOWED,
     "--disallowed-tools",
@@ -62,10 +66,13 @@ function textOf(res) {
  * no vote — evaluatePatchVerdicts then can't reach unanimity and the fix stays proposed.
  */
 export function makePatchReviewer(cwd, backends, options = {}, deps = {}) {
+  // The Grok seat runs under a read-only sandbox (filesystem + network) so a hostile repo
+  // can't exfiltrate via MCP/network during the review; unknown profile → fail-closed.
+  const grokOpts = { ...options, grokSandbox: options.grokSandbox ?? "read-only" };
   const runners = {
     claude: deps.runClaude ?? ((prompt) => realClaudeReview(cwd, backends, options, prompt)),
     codex: deps.runCodex ?? ((prompt) => runCodexStructured(cwd, backends, options, prompt, "patch-review")),
-    grok: deps.runGrok ?? ((prompt) => runGrokStructured(cwd, backends, options, prompt))
+    grok: deps.runGrok ?? ((prompt) => runGrokStructured(cwd, backends, grokOpts, prompt))
   };
   return async ({ file, finding, diff }) => {
     const votes = await Promise.all(
@@ -93,7 +100,10 @@ export function patchReviewerReady(backends) {
   // Boolean(bin) does NOT mean reachable. A false-positive would print ENABLED and then run
   // a gate that can never reach unanimity.
   const claude = Boolean(backends?.claude?.cli?.available);
-  const codex = Boolean(backends?.codex?.companionAvailable || backends?.codex?.cli?.available);
+  // The codex SEAT votes via runCodexStructured, which HARD-requires the companion (it
+  // returns skipped without it). Gating on cli.available would report ENABLED while codex
+  // can never cast a vote → the gate could never reach unanimity. Companion only.
+  const codex = Boolean(backends?.codex?.companionAvailable);
   const grok = Boolean(backends?.grok?.cli?.available);
   return { ready: claude && codex && grok, claude, codex, grok };
 }

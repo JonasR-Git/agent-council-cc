@@ -24,6 +24,22 @@ test("full-scope passes advance a WRAPPING window keyed to full passes, not the 
   assert.equal(calls[2].skipReduce, true, "and not again");
 });
 
+test("review surfaces a top-level `ran` from the REAL coverage shape (throttled = ran:false)", async () => {
+  // runAuditReview never returns a top-level `ran` — it reports coverage.{unitsReviewed,
+  // unitsAttempted}. The dep must translate "attempted units but ALL failed" into ran:false
+  // so the loop stops honestly instead of counting an unreviewed pass toward convergence.
+  const mk = (unitsReviewed, unitsAttempted) => async () => ({ findings: [], coverage: { unitsReviewed, unitsAttempted, budgetSpent: 1 } });
+
+  const throttled = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview: mk(0, 3) }); // 3 tried, all failed
+  assert.equal((await throttled.review({ budget: 5, changedFiles: null })).ran, false, "all units failed → ran:false");
+
+  const reviewed = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview: mk(2, 2) }); // 2 reviewed, found nothing
+  assert.equal((await reviewed.review({ budget: 5, changedFiles: null })).ran, true, "reviewed but empty is a real dry pass");
+
+  const nothing = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview: mk(0, 0) }); // nothing to review
+  assert.equal((await nothing.review({ budget: 5, changedFiles: null })).ran, true, "0 attempted is not a failure");
+});
+
 test("a scoped pass whose files aren't in the model falls back to full scope, never an empty review", async () => {
   let seen;
   const runAuditReview = async (cwd, m) => {

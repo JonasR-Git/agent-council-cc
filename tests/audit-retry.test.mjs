@@ -9,6 +9,9 @@ test("isRateLimitError recognizes the common shapes, ignores unrelated errors", 
   assert.equal(isRateLimitError({ status: 429 }), true);
   assert.equal(isRateLimitError({ status: 529 }), true);
   assert.equal(isRateLimitError({ status: 503 }), true);
+  assert.equal(isRateLimitError({ status: 502 }), true); // bad gateway — transient upstream
+  assert.equal(isRateLimitError({ status: 504 }), true); // gateway timeout — transient
+  assert.equal(isRateLimitError(new Error("502 Bad Gateway")), true);
   assert.equal(isRateLimitError("resource_exhausted"), true);
   assert.equal(isRateLimitError(529), true);
   assert.equal(isRateLimitError(new Error("ENOENT: no such file")), false);
@@ -17,6 +20,11 @@ test("isRateLimitError recognizes the common shapes, ignores unrelated errors", 
   // PERMANENT exhaustion must NOT be retried (would sleep for hours then fail)
   assert.equal(isRateLimitError({ code: "insufficient_quota" }), false);
   assert.equal(isRateLimitError(new Error("disk quota exceeded")), false);
+  // permanent quota carrying an HTTP 429 must STILL not be retried (permanent wins)
+  assert.equal(isRateLimitError({ status: 429, code: "insufficient_quota" }), false);
+  assert.equal(isRateLimitError(new Error("Error code: 429 - insufficient_quota")), false);
+  // a genuine 429, including a string statusCode, IS transient
+  assert.equal(isRateLimitError({ statusCode: "429" }), true);
   // a BARE numeric token must not trigger (e.g. a stack frame "line 429")
   assert.equal(isRateLimitError(new Error("error at line 429 in file")), false);
 });

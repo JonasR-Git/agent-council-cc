@@ -11,17 +11,24 @@
 // "quota exceeded" (billing or disk) is permanent and must NOT be retried (it would sleep
 // for hours then return the same error). Bare numeric "429" (e.g. "line 429") is excluded;
 // 429/529/503 count only with http/status context. 503 / service-unavailable is included.
-const RATE_LIMIT_RE = /rate[ _-]?limit|too many requests|resource[ _-]?exhausted|overloaded|service unavailable|temporarily unavailable|http[\s/]?(?:429|529|503)|(?:status|statuscode|code)[\s:=]*(?:429|529|503)/i;
+const TRANSIENT_STATUS = new Set([429, 529, 503, 502, 504]);
+const RATE_LIMIT_RE = /rate[ _-]?limit|too many requests|resource[ _-]?exhausted|overloaded|service unavailable|temporarily unavailable|bad gateway|gateway time-?out|http[\s/]?(?:429|529|503|502|504)|(?:status|statuscode|code)[\s:=]*(?:429|529|503|502|504)/i;
+// PERMANENT failures — billing/quota exhaustion, auth — must NEVER be retried, even when
+// they carry an HTTP 429 (a quota 429 is not transient: retrying sleeps for hours then
+// returns the same error). Checked FIRST, before any transient signal.
+const PERMANENT_RE = /insufficient[ _-]?quota|quota (?:exceeded|exhausted)|billing|payment required|permission denied|invalid[ _-]?api[ _-]?key|unauthor(?:ized|ised)/i;
 
 /** True if an error looks like a TRANSIENT rate-limit / overload the run can wait out. */
 export function isRateLimitError(err) {
   if (err == null) return false;
-  if (typeof err === "number") return err === 429 || err === 529 || err === 503;
+  const text = typeof err === "string" ? err : String(err?.message ?? err?.error ?? err?.reason ?? "");
+  const code = typeof err === "object" && err ? String(err.code ?? "") : "";
+  if (PERMANENT_RE.test(text) || PERMANENT_RE.test(code)) return false; // permanent → never retry
+  if (typeof err === "number") return TRANSIENT_STATUS.has(err);
   if (typeof err === "string") return RATE_LIMIT_RE.test(err);
   const status = err.status ?? err.statusCode ?? err.code;
-  if (status === 429 || status === 529 || status === 503 || status === "rate_limited") return true;
-  const msg = String(err.message ?? err.error ?? err.reason ?? "");
-  return RATE_LIMIT_RE.test(msg);
+  if (TRANSIENT_STATUS.has(Number(status)) || status === "rate_limited") return true; // Number() catches string "429"
+  return RATE_LIMIT_RE.test(text);
 }
 
 /**

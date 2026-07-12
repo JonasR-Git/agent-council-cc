@@ -12,6 +12,7 @@ test("buildClaudeReviewArgs is read-only: inspect tools allowed, edit/exec/netwo
   assert.ok(args.indexOf("Edit") > args.indexOf("--disallowed-tools"), "Edit only in the deny list");
   assert.ok(args.indexOf("Bash") > args.indexOf("--disallowed-tools"), "Bash only in the deny list");
   assert.ok(args.includes("--strict-mcp-config"));
+  assert.ok(args.includes("--safe-mode"), "safe-mode disables audited-repo CLAUDE.md/hooks/plugins/MCP");
   assert.equal(args[args.indexOf("--model") + 1], "claude-opus-4-8");
 });
 
@@ -77,4 +78,7 @@ test("patchReviewerReady requires all three seats reachable", () => {
   assert.equal(patchReviewerReady({ claude: { cli: { available: true } }, codex: { companionAvailable: false }, grok: { cli: { available: true } } }).ready, false);
   // a fallback bin name with a FAILED probe is NOT reachable
   assert.equal(patchReviewerReady({ claude: { bin: "claude", cli: { available: false } }, codex: { companionAvailable: true }, grok: { bin: "grok", cli: { available: false } } }).ready, false);
+  // codex CLI present but companion ABSENT is NOT ready — the codex seat votes only via the
+  // companion, so cli.available alone would print ENABLED yet never confirm.
+  assert.equal(patchReviewerReady({ claude: { cli: { available: true } }, codex: { companionAvailable: false, cli: { available: true } }, grok: { cli: { available: true } } }).ready, false);
 });

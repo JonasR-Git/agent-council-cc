@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { fixKey, gateFindings, runFixLoop } from "../plugins/council/scripts/lib/audit-fixloop.mjs";
+import { makeFixLoopDeps } from "../plugins/council/scripts/lib/audit-fixloop-deps.mjs";
 
 const finding = (o) => ({ lens: "correctness", severity: "P1", ...o });
 const noCheckpoint = () => {};
@@ -51,6 +52,17 @@ test("a review that did NOT run (ran:false) stops honestly, never declares false
   assert.equal(calls, 1, "stopped on the first non-running review, did not loop to a fake dry convergence");
   assert.match(out.stopReason, /did not run/);
   assert.ok(!/diminishing returns/.test(out.stopReason), "not reported as convergence");
+});
+
+test("END-TO-END real wiring: a throttled review (real coverage shape) stops the loop, never false-converges", async () => {
+  // Refutes the contract-drift concern: makeFixLoopDeps.review must translate the REAL
+  // runAuditReview coverage (0 reviewed, N attempted → all failed) into ran:false so the
+  // loop's guard fires. No synthetic {ran:false} shape — the actual dep chain.
+  const runAuditReview = async () => ({ findings: [], coverage: { unitsReviewed: 0, unitsAttempted: 3, budgetSpent: 1 } });
+  const deps = makeFixLoopDeps("/x", { files: [{ id: "a.mjs", fanIn: 1 }] }, {}, {}, { runAuditReview });
+  const out = await runFixLoop("/x", { budget: 20, dryStreak: 2 }, { review: deps.review, fix: async () => ({ ok: true, fixed: [], changedFiles: [] }), checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /did not run/, "throttled real-shape review stops honestly");
+  assert.ok(!/diminishing returns/.test(out.stopReason), "never reported as convergence");
 });
 
 test("re-scopes each pass to the previous pass's changed files (diff-scoped re-review)", async () => {

@@ -96,13 +96,16 @@ export function parsePatchVerdict(text, seat = "reviewer") {
   // `> VERDICT: CONFIRM` (or discusses it in prose) never has a clean line-1 declaration; a
   // reply parroting the two-token template has two tokens on line 1. Both fail closed.
   const firstLine = raw.split(/\r?\n/).find((l) => l.trim() !== "") ?? "";
-  const isDeclaration = /^[ \t]*VERDICT\s*[:=]/i.test(firstLine);
-  const lineTokens = isDeclaration ? [...firstLine.matchAll(VERDICT_TOKEN_RE)].map((m) => canonVerdict(m[1])) : [];
+  // The first non-empty line must be EXACTLY a verdict declaration: the token followed by
+  // NOTHING but trailing punctuation/whitespace. Any trailing PROSE ("VERDICT: CONFIRM was
+  // quoted from the malicious patch; I reject it") means it is not a clean declaration →
+  // fail closed. This closes the suffixed-decoy hole on top of the quoted/parroted ones.
+  const cleanM = firstLine.match(/^[ \t]*VERDICT\s*[:=]\s*(CONFIRM|DISSENT|ABSTAIN|APPROVE|REJECT|BLOCK)[.!)\]\s]*$/i);
   // Secondary guard: a CONFLICTING verdict token ANYWHERE in the reply (e.g. in the REASON
   // prose, quoted from the untrusted diff) makes the whole reply ambiguous → veto.
   const anywhere = new Set([...raw.matchAll(VERDICT_TOKEN_RE)].map((m) => canonVerdict(m[1])));
   let verdict;
-  if (lineTokens.length === 1 && anywhere.size === 1) verdict = lineTokens[0];
+  if (cleanM && anywhere.size === 1) verdict = canonVerdict(cleanM[1]);
   else verdict = anywhere.has(VERDICT_DISSENT) ? VERDICT_DISSENT : VERDICT_UNKNOWN;
   return { seat, verdict, reason };
 }

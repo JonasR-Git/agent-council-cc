@@ -13,7 +13,7 @@ import { runCommandAsync } from "./process.mjs";
 // tools are denied too so a prompt-injection in an untrusted diff can't exfiltrate repo
 // data or fetch remote instructions (unknown tool names are harmlessly ignored per CLI).
 export const READONLY_DISALLOWED_TOOLS =
-  "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal,web_search,web_fetch,WebSearch,WebFetch,browser,browser_search,fetch";
+  "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal,web_search,web_fetch,WebSearch,WebFetch,browser,browser_search,fetch,search_tool,use_tool,mcp,mcp_call";
 
 export const JSON_ONLY_REMINDER =
   "\n\nIMPORTANT: your previous reply could not be parsed. Reply with ONLY the raw JSON object specified above — no explanation, no markdown code fences, nothing before or after it.";
@@ -175,6 +175,10 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
     "--output-format",
     wantSession ? "json" : "plain"
   ];
+  // Optional sandbox profile (filesystem + NETWORK isolation). The §6 patch reviewer sets a
+  // read-only profile so a hostile repo can't reach the network via MCP integrations. An
+  // unknown profile just fails the call → the seat casts no vote (fail-closed), never unsafe.
+  if (options.grokSandbox) baseArgs.push("--sandbox", String(options.grokSandbox));
   if (options.resumeSessionId) baseArgs.push("--resume", String(options.resumeSessionId));
   const args = [...baseArgs];
   const hasOverrides = Boolean(options.grokModel || options.grokEffort);
