@@ -153,9 +153,11 @@ function sanitizeLabel(s) {
 }
 
 /** Prefix each source line with its ABSOLUTE file line number ("N| ") so the reviewer reports real
- *  line numbers instead of counting an unlabeled slice + offset (council grok-3). */
+ *  line numbers instead of counting an unlabeled slice + offset (council grok-3). Uses splitLines so
+ *  the numbering matches endLine's convention — a raw split("\n") numbered the PHANTOM trailing-newline
+ *  segment as a line beyond the stated START-END range (council G3). */
 function numberSourceLines(text, startLine) {
-  const lines = String(text).split("\n");
-  const width = String(startLine + lines.length - 1).length;
+  const lines = splitLines(text);
+  const width = String(startLine + Math.max(0, lines.length - 1)).length;
   return lines.map((line, k) => `${String(startLine + k).padStart(width)}| ${line}`).join("\n");
 }

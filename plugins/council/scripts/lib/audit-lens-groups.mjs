@@ -7,7 +7,7 @@
 //   tier   — the 4 audit tiers (Logical → Structure/SSOT → Correctness → Quality). A PARTITION:
 //            every lens in exactly one group. Coarsest; mirrors the fix-loop's tier ordering.
 //   lens   — one group per registered lens (13). Also a PARTITION.
-//   fine   — 26 aspect-focused groups: each narrows ONE parent lens to a specific sub-surface
+//   fine   — 30 aspect-focused groups: each narrows ONE parent lens to a specific sub-surface
 //            (e.g. security_secrets → authz | injection | secrets | crypto) via `focus`. A COVER
 //            (every lens in ≥1 group; high-value lenses split across several). The deepest preset.
 //   custom — a caller-supplied groups array, validated the same way.

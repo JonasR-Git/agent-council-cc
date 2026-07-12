@@ -64,6 +64,16 @@ test("buildGroupPrompt narrows the pass to the group focus + lenses and asks for
   assert.match(p, /1\| const q = /, "each source line is prefixed with its absolute line number");
 });
 
+test("buildGroupPrompt (council G3): line numbering matches endLine — no PHANTOM line past the range", () => {
+  // a chunk whose text ends with a trailing newline: the old raw split numbered an empty phantom line
+  // as endLine+1, exceeding the stated "lines 1-2" range. splitLines convention drops it.
+  const chunk = { text: "const a = 1;\nconst b = 2;\n", index: 0, total: 1, startLine: 1, endLine: 2 };
+  const p = buildGroupPrompt("x.mjs", GROUP, chunk);
+  assert.match(p, /1\| const a = 1;/);
+  assert.match(p, /2\| const b = 2;/);
+  assert.equal(/(^|\n)\s*3\| /.test(p), false, "no line 3 — the trailing-newline phantom is not numbered past endLine");
+});
+
 test("buildGroupPrompt labels a chunk of a multi-chunk file with its slice + line range", () => {
   const lines = Array.from({ length: 300 }, (_, k) => `line ${k} ${"xyz".repeat(8)}`);
   const chunks = chunkSource(lines.join("\n"), { maxChars: 2000, overlapLines: 10 });
