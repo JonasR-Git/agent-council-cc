@@ -1719,6 +1719,10 @@ async function handleWatch(argv) {
 // are external CLIs whose sandboxing this command cannot itself enforce. Reviewed
 // code is never auto-edited here. See docs/audit-design.md; the safe --fix agent
 // team is a later phase.
+// Conservative CLI cell cap for `audit review --groups` (the library backstop is 4000). A default
+// fine run is ~1080 cells; this caps an accidental fan-out while still covering a normal run — raise
+// it explicitly with --max-cells (a capped run reports PARTIAL coverage, never silently truncates).
+const GROUPED_CLI_DEFAULT_MAX_CELLS = 1500;
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells"],
@@ -1794,15 +1798,21 @@ async function handleAudit(argv) {
     // per-file path is unchanged. --max-cells bounds the matrix (overflow is reported, never silent).
     let out;
     if (options.groups) {
-      let maxCells;
+      // Grouped cost is bounded by CELLS, not the agent-call --budget. A default fine run is already
+      // ~1080 cells (12 files × 30 groups × 3 seats); the library backstop is 4000. Use a lower CLI
+      // default so an accidental run can't fan out thousands of paid spawns, and warn that --budget
+      // has no effect here (council 3/3: Grok/Codex P1, Claude nit).
+      let maxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
       if (options["max-cells"] != null) {
         const n = Number(options["max-cells"]);
         if (!Number.isFinite(n) || n < 1) throw new Error("--max-cells must be a positive number");
         maxCells = Math.floor(n);
       }
+      if (options.budget != null && !options.json) {
+        console.error("note: --budget does not bound --groups (grouped cost is bounded by --max-cells); ignoring --budget for this run");
+      }
       out = await runGroupedReview(cwd, model, backends, {
         ...merged,
-        budget,
         maxUnits,
         lensGroups: String(options.groups),
         maxCells,
@@ -2149,11 +2159,15 @@ function renderAuditReviewReport(out) {
   L.push("");
   const reviewers = c.reviewers ? Object.entries(c.reviewers).filter(([, on]) => on).map(([k]) => k).join("+") || "none" : "Codex+Grok";
   if (c.groupPreset) {
-    // M7 six-eyes GROUPED path — cell-granular coverage instead of per-file.
+    // M7 six-eyes GROUPED path — cell-granular coverage instead of per-file. Report cellsScheduled
+    // as the authoritative post-cap count (models × groups × files × CHUNKS, then capped), NOT a
+    // reviewers×groups×units equation which lies for multi-chunk or capped runs (council Grok P2).
     const gExtras = [];
-    if (c.capped) gExtras.push(`capped — ${c.cellsDropped} cell(s) dropped (raise --max-cells)`);
-    if (c.ran === false) gExtras.push("no reachable reviewer — nothing dispatched");
-    L.push(`Six-eyes GROUPED review (--groups ${c.groupPreset}): ${reviewers} × ${c.groups} lens-group(s) × ${c.unitsSelected} module(s) = ${c.cellsScheduled} cell(s). Coverage ${c.complete ? "COMPLETE (every scheduled cell reviewed by all seats)" : "PARTIAL"}.${gExtras.length ? ` ⚠ ${gExtras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);
+    if (c.capped) gExtras.push(`capped — ${c.cellsDropped} cell(s) deferred (raise --max-cells)`);
+    if (c.filesUnsupplied?.length) gExtras.push(`${c.filesUnsupplied.length} file(s) too large to review`);
+    if (c.unitsFailed) gExtras.push(`${c.unitsFailed} unit(s) had no successful cell`);
+    if (c.ran === false) gExtras.push(c.ranReason ?? "nothing dispatched");
+    L.push(`Six-eyes GROUPED review (--groups ${c.groupPreset}): ${reviewers} across ${c.groups} lens-group(s) over ${c.unitsReviewed ?? 0}/${c.unitsSelected} module(s), ${c.cellsScheduled} cell(s) scheduled. Coverage ${c.complete ? "COMPLETE (every scheduled cell reviewed by all seats)" : "PARTIAL"}.${gExtras.length ? ` ⚠ ${gExtras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);
   } else {
     const extras = [];
     if (c.reduceRan === false) extras.push("global SSOT/architecture reduce SKIPPED (budget/reviewers)");

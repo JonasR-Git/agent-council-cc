@@ -42,31 +42,59 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   const models = activeModels(backends, options);
   const groups = resolveLensGroups(options.lensGroups ?? "fine");
   const files = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
+  const progress = typeof options.onProgress === "function" ? options.onProgress : null;
 
   if (models.length === 0 || files.length === 0 || groups.length === 0) {
-    return { findings: [], refuted: [], reviewed: [], coverage: { complete: false, ran: false, reviewers: reviewerMap(backends, options), groupPreset: options.lensGroups ?? "fine", groups: groups.length, unitsSelected: files.length, cellsScheduled: 0 } };
+    // Distinguish WHY nothing ran so the report doesn't misdiagnose an empty scope as "no reviewer"
+    // (council Grok P2): no reachable seat vs no hotspot units vs no groups are different operator fixes.
+    const ranReason = models.length === 0 ? "no reachable reviewer — nothing dispatched" : files.length === 0 ? "no hotspot units selected" : "no lens groups resolved";
+    return { findings: [], refuted: [], reviewed: [], coverage: { complete: false, ran: false, ranReason, reviewers: reviewerMap(backends, options), groupPreset: options.lensGroups ?? "fine", groups: groups.length, unitsSelected: files.length, cellsScheduled: 0 } };
   }
 
-  // chunk each file ONCE (cache) so enumerateCells doesn't re-read; a file's chunk count drives its
-  // cell count. factsOf attaches the static facts per file.
+  // Read each file ONCE (cache). A file too large to slurp (> READ_MAX_BYTES) OR unreadable is
+  // recorded UNSUPPLIED and yields NO cells: an empty chunk would otherwise become a real cell that a
+  // reviewer marks "done" with zero findings → a SILENT false-clean that still counted toward
+  // six-eyes complete (council Grok P1 / Claude P2). Unsupplied files force complete:false and are
+  // surfaced. A genuinely 0-byte file is trivially clean (no cells, not unsupplied). statSize/readFile
+  // are injectable for deterministic tests.
+  const statSize = deps.statSize ?? ((p) => fs.statSync(p).size);
+  const readFile = deps.readFile ?? ((p) => fs.readFileSync(p, "utf8"));
   const chunkCache = new Map();
+  const unsupplied = [];
   const chunksOf = (file) => {
     if (chunkCache.has(file)) return chunkCache.get(file);
-    let text = "";
+    let chunks = [];
     try {
       const p = path.join(root, file);
-      if (fs.statSync(p).size <= READ_MAX_BYTES) text = fs.readFileSync(p, "utf8");
+      if (statSize(p) > READ_MAX_BYTES) unsupplied.push(file);
+      else {
+        const text = readFile(p);
+        chunks = text ? chunkSource(text) : []; // 0-byte file → trivially clean, no cells
+      }
     } catch {
-      /* unreadable → 0 chunks → still one visible cell per (group,model) */
+      unsupplied.push(file); // unreadable → surfaced + forces incomplete, never a fake-done empty cell
     }
-    const chunks = chunkSource(text);
     chunkCache.set(file, chunks);
     return chunks;
   };
   const factsOf = (file) => factsFor(model, file);
 
   const allCells = enumerateCells(files, groups, models, chunksOf, factsOf);
-  const { cells, dropped, capped } = capCells(allCells, options.maxCells ?? DEFAULT_MAX_CELLS);
+  // enumerateCells forces ≥1 chunk PER FILE, so an UNSUPPLIED file (0 chunks) would still get real
+  // null-source cells — wasted spawns that could mark a triple "done" with nothing reviewed. Drop
+  // them here; the file stays surfaced in filesUnsupplied and forces complete:false below.
+  const supplied = unsupplied.length ? allCells.filter((c) => !unsupplied.includes(c.file)) : allCells;
+  const { cells, dropped, capped } = capCells(supplied, options.maxCells ?? DEFAULT_MAX_CELLS);
+
+  // Surface the planned cost BEFORE spending it (council Grok P1 / Claude nit): a grouped run can
+  // dispatch ~1000+ paid spawns; the operator sees the count (and any cap / oversize skip) up front.
+  if (progress) {
+    progress(
+      `  grouped review: ${models.length} seat(s) × ${groups.length} group(s) × ${files.length - unsupplied.length} file(s) → ${supplied.length} cell(s)` +
+        `${capped ? `, capped to ${cells.length} (${dropped} deferred — raise --max-cells)` : ""}` +
+        `${unsupplied.length ? `; ${unsupplied.length} file(s) too large to review → coverage PARTIAL` : ""}`
+    );
+  }
 
   const reviewCell = deps.reviewCell ?? makeCellReviewer(cwd, backends, options);
   const runMatrix = deps.runMatrix ?? runCellMatrix;
@@ -75,37 +103,62 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
     maxInflight: options.maxInflight,
     retryOnLimit: options.retryOnLimit,
     sleep: deps.sleep,
-    onRetry: options.onProgress ? ({ attempt, ms }) => options.onProgress(`  cell rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt})…`) : undefined
+    onRetry: progress ? ({ attempt, ms }) => progress(`  cell rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt})…`) : undefined
   });
 
   // Merge + scope + ledger — the SAME post-processing the per-file path (runAuditReview) runs, so
-  // downstream (normalize → tierOfLens → fix eligibility) treats grouped findings identically. We do
-  // NOT normalize here: runAuditReview returns findings.mjs-shape and the consumer (fixloop-deps /
-  // one-shot audit) stamps lens/tier via normalizeFindings — mirroring that keeps the two paths
-  // interchangeable. Cell findings carry `.agent` (the model that raised them), so grouping them into
-  // one doc PER MODEL lets mergeFindings detect true six-eyes consensus (a defect seen by ≥2 seats).
+  // downstream (normalize → tierOfLens → fix eligibility) treats grouped findings identically. Cell
+  // findings carry `.agent` (the raising model), so grouping into one doc PER MODEL lets mergeFindings
+  // detect true six-eyes consensus (a defect seen by ≥2 seats).
+  const cellFindings = matrixOut.findings ?? [];
+  // The group-authoritative lens (B5-stamped on each cell finding) must survive merge: mergeFindings
+  // buckets do NOT carry `lens`, so without re-stamping the consumer's normalizeFindings would
+  // re-derive it from the model-supplied CATEGORY — discarding the group's deliberate attribution and
+  // mis-tiering e.g. a security-group finding the model labelled "bug" into Correctness (council
+  // Claude P2). Key by finding id (buckets keep `ids`) → exact, no title fuzz.
+  const lensById = new Map();
+  for (const f of cellFindings) if (f?.id && f?.lens) lensById.set(String(f.id), f.lens);
+  const relens = (f) => {
+    const lens = (f.ids ?? []).map((id) => lensById.get(String(id))).find(Boolean);
+    return lens ? { ...f, lens } : f;
+  };
+
   const byAgent = new Map();
-  for (const f of matrixOut.findings ?? []) {
+  for (const f of cellFindings) {
     const a = f?.agent ?? "grouped";
     if (!byAgent.has(a)) byAgent.set(a, []);
     byAgent.get(a).push(f);
   }
   const docs = [...byAgent.entries()].map(([agent, findings]) => ({ agent, findings, parseOk: true }));
   const merged = mergeFindings(docs);
-  let scoped = annotateScopes({ all: merged.all, consensus: merged.consensus, unique: merged.unique });
+  const relensedAll = merged.all.map(relens);
+  let scoped = annotateScopes({ all: relensedAll, consensus: relensedAll.filter((f) => f.consensus), unique: relensedAll.filter((f) => !f.consensus) });
   if (options.ledger !== false) scoped = recordAndAnnotate(cwd, options.jobId ?? "grouped-review", scoped, options.nowIso ?? nowIso());
 
-  const complete = capped ? false : Boolean(matrixOut.complete); // a capped run never claims full coverage
+  // Per-file review outcome from the matrix results (a file is REVIEWED when ≥1 of its cells
+  // succeeded) so coverage mirrors runAuditReview's unitsReviewed/unitsAttempted/unitsFailed keys —
+  // the loop's ran-detection keys on unitsReviewed (council Grok P2). Results are absent when
+  // runMatrix is injected in a test → fall back to "all attempted files reviewed".
+  const results = Array.isArray(matrixOut.results) ? matrixOut.results : [];
+  const reviewedSet = new Set(results.filter((r) => r?.ok === true).map((r) => r?.cell?.file).filter(Boolean));
+  const attempted = files.filter((f) => !unsupplied.includes(f));
+  const reviewedFiles = results.length ? attempted.filter((f) => reviewedSet.has(f)) : attempted;
+
+  const complete = capped || unsupplied.length > 0 ? false : Boolean(matrixOut.complete); // capped OR an unreviewed file → never full coverage
   return {
     findings: scoped.all,
     refuted: scoped.refuted ?? [],
-    reviewed: files,
+    reviewed: reviewedFiles,
     coverage: {
       complete,
       ran: true,
       groupPreset: options.lensGroups ?? "fine",
       reviewers: reviewerMap(backends, options),
       unitsSelected: files.length,
+      unitsReviewed: reviewedFiles.length,
+      unitsAttempted: attempted.length,
+      unitsFailed: attempted.length - reviewedFiles.length,
+      filesUnsupplied: unsupplied,
       groups: groups.length,
       cellsScheduled: cells.length,
       cellsDropped: dropped,
