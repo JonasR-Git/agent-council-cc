@@ -33,9 +33,9 @@ test("preset 'lens' is a valid PARTITION with one group per registered lens", ()
   for (const g of groups) assert.equal(g.lenses.length, 1);
 });
 
-test("preset 'fine' is a valid COVER of 20+ focused groups (every lens hunted by ≥1 group)", () => {
+test("preset 'fine' is a valid COVER of 30 focused groups (every lens hunted by ≥1 group)", () => {
   const groups = getLensGroups("fine");
-  assert.ok(groups.length >= 20, `expected ≥20 fine groups, got ${groups.length}`);
+  assert.equal(groups.length, 30, `fine group count is locked; got ${groups.length}`);
   const r = validateLensGroups(groups); // cover, not partition
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.deepEqual(r.uncovered, [], "no lens is left un-hunted");
@@ -52,13 +52,25 @@ test("fine groups have unique ids", () => {
   assert.equal(new Set(ids).size, ids.length, "fine group ids are unique");
 });
 
-test("high-value lenses are SPLIT across several fine groups (deeper than one broad sweep)", () => {
+test("high-value lenses are SPLIT into the LOCKED number of focused passes (deeper than one sweep)", () => {
   const groups = getLensGroups("fine");
   const perLens = new Map();
   for (const g of groups) perLens.set(g.lenses[0], (perLens.get(g.lenses[0]) ?? 0) + 1);
-  assert.ok(perLens.get("security_secrets") >= 3, "security is split into multiple focused passes");
-  assert.ok(perLens.get("concurrency_resources") >= 3);
-  assert.ok(perLens.get("architecture_ssot") >= 2, "SSOT/architecture (Prio 1) gets several passes");
+  // Exact counts (council grok-6: a loose >= threshold would let a split silently collapse).
+  assert.equal(perLens.get("security_secrets"), 5, "security → authz/injection/secrets/crypto/misconfig");
+  assert.equal(perLens.get("concurrency_resources"), 4, "concurrency → races/deadlock/leaks/exhaustion");
+  assert.equal(perLens.get("architecture_ssot"), 3, "SSOT/architecture (Prio 1) → duplication/coupling/graph");
+  assert.equal(perLens.get("data_integrity"), 3);
+  assert.equal(perLens.get("correctness"), 3);
+  assert.equal(perLens.get("performance"), 2, "performance split into complexity + memory");
+  assert.equal(perLens.get("reliability_observability"), 2, "reliability split from observability");
+});
+
+test("FINE_GROUPS is DEEP-frozen — an importer cannot mutate the shared singleton", () => {
+  assert.equal(Object.isFrozen(FINE_GROUPS), true);
+  assert.equal(Object.isFrozen(FINE_GROUPS[0]), true, "inner group objects are frozen");
+  assert.equal(Object.isFrozen(FINE_GROUPS[0].lenses), true, "inner lenses arrays are frozen");
+  assert.throws(() => { FINE_GROUPS[0].lenses.push("correctness"); }, TypeError);
 });
 
 test("validateLensGroups flags an uncovered lens", () => {
@@ -86,6 +98,52 @@ test("validateLensGroups flags over-coverage ONLY when a partition is required",
   ];
   assert.equal(validateLensGroups(groups).overCovered.length, 0, "a cover permits a lens in >1 group");
   assert.deepEqual(validateLensGroups(groups, { requireExactlyOne: true }).overCovered, ["correctness"]);
+});
+
+test("validateLensGroups (council claude-2/codex-1): a lens listed twice WITHIN one group is NOT over-coverage", () => {
+  // A copy-paste duplicate inside one group's array is one membership, flagged separately — it must
+  // NOT read as a partition violation (the pre-fix bug counted raw occurrences).
+  const r = validateLensGroups([{ id: "g", lenses: ["correctness", "correctness"] }], { requireExactlyOne: true, requireCover: false });
+  assert.deepEqual(r.overCovered, [], "same lens twice in ONE group is not 'in >1 group'");
+  assert.deepEqual(r.duplicateLensInGroup, ["g"], "the within-group duplicate is surfaced on its own signal");
+  assert.equal(r.ok, false, "a duplicate-lens-in-group still fails validation");
+});
+
+test("validateLensGroups tolerates a null/undefined group element without crashing (council claude-5)", () => {
+  const r = validateLensGroups([null, undefined, { id: "g", lenses: ["correctness"] }], { requireCover: false });
+  assert.equal(r.emptyGroups.includes(""), true, "a null element is treated as an empty, id-less group");
+  assert.ok(Array.isArray(r.uncovered));
+});
+
+test("validateLensGroups requireCover:false permits a scoped (incomplete) cover", () => {
+  const r = validateLensGroups([{ id: "sec", lenses: ["security_secrets"] }], { requireCover: false });
+  assert.equal(r.ok, true, "a deliberately-scoped run is valid when requireCover is off");
+  assert.ok(r.uncovered.length > 0, "uncovered lenses are still reported, just not failing");
+});
+
+test("resolveLensGroups('custom') supports a scoped run via requireCover:false, else demands a full cover", () => {
+  const scoped = [{ id: "sec", lenses: ["security_secrets"] }];
+  assert.throws(() => resolveLensGroups("custom", { customGroups: scoped }), /uncovered lenses/);
+  assert.equal(resolveLensGroups("custom", { customGroups: scoped, requireCover: false }).length, 1, "scoped custom resolves when requireCover is off");
+  // a full-cover custom resolves through the default (requireCover true)
+  const full = getLensGroups("lens"); // 13 single-lens groups = a full cover
+  assert.equal(resolveLensGroups("custom", { customGroups: full }).length, 13);
+});
+
+test("resolveLensGroups surfaces integrity failures end-to-end (duplicate id / unknown lens / empty group)", () => {
+  assert.throws(
+    () => resolveLensGroups("custom", { customGroups: [{ id: "d", lenses: ["not_a_lens"] }, { id: "d", lenses: [] }], requireCover: false }),
+    /unknown lenses.*|duplicate group ids.*|empty groups/
+  );
+});
+
+test("getLensGroups('tier') and ('lens') also return fresh clones (council codex-4)", () => {
+  for (const preset of ["tier", "lens"]) {
+    const a = getLensGroups(preset);
+    a[0].lenses.push("correctness");
+    const b = getLensGroups(preset);
+    assert.equal(b[0].lenses.includes("correctness") && b[0].lenses.length > 1, false, `${preset} result is not a shared reference`);
+  }
 });
 
 test("getLensGroups('custom') normalizes a caller list and throws on empty", () => {
