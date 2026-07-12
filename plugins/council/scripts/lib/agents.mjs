@@ -9,11 +9,19 @@ import { fileURLToPath } from "node:url";
 import { findGrokBinary } from "./discover.mjs";
 import { runCommandAsync } from "./process.mjs";
 
-// A read-only review never needs to write, execute, OR reach the network. Web/browser
-// tools are denied too so a prompt-injection in an untrusted diff can't exfiltrate repo
-// data or fetch remote instructions (unknown tool names are harmlessly ignored per CLI).
+// A read-only review never needs to write, execute, OR reach the network. This is the GROK
+// seat's built-in-tool DENY-list (passed to grok --disallowed-tools). It is FAIL-OPEN: any tool
+// grok exposes whose exact name is NOT enumerated stays allowed (unknown names are ignored per
+// CLI), so completeness matters — the list must cover grok's NATIVE mutation/exec/network tool
+// names, not only Claude-namespace names. Names span several CLIs deliberately (harmless breadth).
+// A6 (council grok-2): the write/exec/network names below now include grok's likely native tool
+// names (create_file/str_replace/apply_patch/python/open_url/…) in addition to the Claude-style
+// ones, and the grok seat ALSO passes --disable-web-search (a definitive grok flag) so web
+// exfiltration is killed even if a web tool were renamed out from under this list. NOTE: this is
+// NOT applied to the Codex seat — runCodexStructured passes no tool-gating flag; Codex containment
+// is the companion runtime's own sandbox/approval, outside this codebase's control.
 export const READONLY_DISALLOWED_TOOLS =
-  "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal,web_search,web_fetch,WebSearch,WebFetch,browser,browser_search,fetch,search_tool,use_tool,mcp,mcp_call";
+  "search_replace,str_replace,str_replace_editor,apply_patch,edit_file,create_file,write_file,delete_file,move_file,Write,Edit,MultiEdit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal,python,code_execution,web_search,web_fetch,WebSearch,WebFetch,browser,browser_search,browse_page,open_url,http_request,fetch,fetch_url,search_tool,use_tool,mcp,mcp_call";
 
 export const JSON_ONLY_REMINDER =
   "\n\nIMPORTANT: your previous reply could not be parsed. Reply with ONLY the raw JSON object specified above — no explanation, no markdown code fences, nothing before or after it.";
@@ -229,6 +237,10 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
     "--always-approve",
     "--disallowed-tools",
     READONLY_DISALLOWED_TOOLS,
+    // A6 (council grok-2): a definitive grok flag that removes the web-search AND web-fetch tools
+    // outright — the primary exfiltration vector — so a renamed web tool can't slip past the
+    // (fail-open) deny-list above. Belt-and-suspenders with the deny-list.
+    "--disable-web-search",
     "--max-turns",
     String(options.maxTurns ?? 40),
     "--output-format",

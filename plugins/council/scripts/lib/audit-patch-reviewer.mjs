@@ -90,18 +90,26 @@ function textOf(res) {
 // Claude seat votes independently of any repo instruction — so a codex/grok bias alone can never
 // manufacture a false approval.
 //
-// EXFILTRATION is blocked on all three by the TOOL DENY-LISTS, not the OS sandbox: Claude's
-// review allow-list is Read/Grep/Glob only (no Bash/web/MCP), and Codex/Grok run with
-// READONLY_DISALLOWED_TOOLS (write/exec/web/browser/mcp/fetch all denied). That tool-layer
-// control holds on EVERY platform. Grok's --sandbox is a best-effort OS extra that is a NO-OP on
-// native Windows (the primary platform) — so it hardens fs/network only where the OS honors it,
-// and is never the thing we rely on.
+// EXFILTRATION controls are NOT symmetric across the three seats (council A6: codex-1/claude-1):
+//   - CLAUDE seat: a fail-CLOSED ALLOW-list — only Read/Grep/Glob ever exist (no Bash/web/MCP).
+//     The strongest posture; nothing outside those three can run regardless of tool names.
+//   - GROK seat: a fail-OPEN DENY-list (READONLY_DISALLOWED_TOOLS) + --disable-web-search. Only as
+//     complete as the enumerated names — any grok tool NOT listed stays allowed — so it is
+//     best-effort, not a guarantee. --disable-web-search definitively removes the web vector.
+//   - CODEX seat: NO in-repo tool gating at all. runCodexStructured passes only the prompt file +
+//     model; Codex's read-only containment is the codex-companion runtime's OWN sandbox/approval
+//     policy — an OS/CLI-level control this codebase neither sets nor can verify (best-effort,
+//     exactly the OS-sandbox class that is unreliable on native Windows).
+// Grok's --sandbox is a further best-effort OS extra that is a NO-OP on native Windows. So the
+// only fail-closed seat is Claude; codex/grok containment is best-effort. The SAFETY INVARIANT
+// does not rest on exfil control anyway: approval requires UNANIMITY and the hard-isolated Claude
+// seat votes independently, so a codex/grok compromise alone cannot manufacture a false approval.
 export function makePatchReviewer(cwd, backends, options = {}, deps = {}) {
   // The Grok seat additionally requests grok's "read-only" sandbox profile (a verified-valid one:
   // off/workspace/devbox/read-only/strict) as defense-in-depth. This is BEST-EFFORT — a no-op on
-  // native Windows and grok does not error on an unknown profile — so the actual no-exfil
-  // guarantee is READONLY_DISALLOWED_TOOLS (MCP/web/fetch denied), not this profile. We still pin
-  // a known-valid value rather than trusting caller input for the platforms that do honor it.
+  // native Windows and grok does not error on an unknown profile — so the actual (best-effort)
+  // no-exfil control is the deny-list + --disable-web-search, not this profile. We still pin a
+  // known-valid value rather than trusting caller input for the platforms that do honor it.
   const grokOpts = { ...options, grokSandbox: options.grokSandbox ?? "read-only" };
   const runners = {
     claude: deps.runClaude ?? ((prompt) => realClaudeReview(cwd, backends, options, prompt)),
