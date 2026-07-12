@@ -36,8 +36,11 @@ function clampStr(s, max) {
  * CORRECTLY and SAFELY resolves the finding with a minimal change, and answer with a
  * strict machine-parseable verdict. Everything about the finding/diff is untrusted.
  */
-export function buildPatchReviewPrompt(file, finding, diff, seat = "reviewer") {
+const CONTEXT_MAX_CHARS = 14_000; // surrounding-source budget so the verdict isn't blind
+
+export function buildPatchReviewPrompt(file, finding, diff, seat = "reviewer", context = "") {
   const nonce = makeFenceNonce();
+  const ctx = String(context ?? "").slice(0, CONTEXT_MAX_CHARS);
   return [
     `You are the ${seat} seat on a code-review council. A candidate patch claims to fix ONE`,
     `verified defect in ONE file. Decide — independently — whether the patch is CORRECT,`,
@@ -66,6 +69,11 @@ export function buildPatchReviewPrompt(file, finding, diff, seat = "reviewer") {
     wrapMarkdownFence(String(diff ?? "")),
     `--- END DIFF ${file} ${nonce} ---`,
     ``,
+    // A3: the POST-PATCH surrounding source, so a seat judges the change IN CONTEXT (callers,
+    // the whole function) instead of blind on the diff alone. Same UNTRUSTED nonce framing.
+    ...(ctx
+      ? [`--- BEGIN PATCHED SOURCE ${file} ${nonce} ---`, wrapMarkdownFence(ctx), `--- END PATCHED SOURCE ${file} ${nonce} ---`, ``]
+      : []),
     `Answer with EXACTLY two lines, nothing else:`,
     `Line 1 — your verdict, formatted exactly as: VERDICT: <CONFIRM or DISSENT>`,
     `Line 2 — REASON: <one sentence>`

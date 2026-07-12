@@ -34,6 +34,34 @@ test("makePatchReviewer runs all three seats on the same patch and returns parse
   assert.match(seen.grok, /grok seat/);
 });
 
+test("A3: makePatchReviewer threads the post-patch source (after) into every seat's prompt", async () => {
+  const seen = {};
+  const review = makePatchReviewer("/x", {}, {}, {
+    runClaude: async (p) => { seen.claude = p; return "VERDICT: CONFIRM\nREASON: ok"; },
+    runCodex: async (p) => { seen.codex = p; return { stdout: "VERDICT: CONFIRM\nREASON: ok" }; },
+    runGrok: async (p) => { seen.grok = p; return { stdout: "VERDICT: CONFIRM\nREASON: ok" }; }
+  });
+  await review({ ...patch, after: "export function mutex(){ /* SENTINEL_CTX */ }" });
+  for (const seat of ["claude", "codex", "grok"]) {
+    assert.match(seen[seat], /BEGIN PATCHED SOURCE/, `${seat} got the source block`);
+    assert.ok(seen[seat].includes("SENTINEL_CTX"), `${seat} saw the post-patch source`);
+  }
+});
+
+test("A3: an explicit context arg overrides after; absent both, no source block is sent", async () => {
+  const seen = {};
+  const ok = "VERDICT: CONFIRM\nREASON: ok";
+  const review = makePatchReviewer("/x", {}, {}, {
+    runClaude: async (p) => { seen.claude = p; return ok; },
+    runCodex: async () => ok,
+    runGrok: async () => ok
+  });
+  await review({ ...patch, after: "AFTER_SRC", context: "OVERRIDE_SRC" });
+  assert.ok(seen.claude.includes("OVERRIDE_SRC") && !seen.claude.includes("AFTER_SRC"), "explicit context wins over after");
+  await review(patch); // neither after nor context
+  assert.equal(seen.claude.includes("PATCHED SOURCE"), false, "no source block when none supplied");
+});
+
 test("makePatchReviewer is fail-closed: an erroring or skipped seat casts NO vote", async () => {
   const review = makePatchReviewer("/x", {}, {}, {
     runClaude: async () => "VERDICT: CONFIRM\nREASON: ok",
