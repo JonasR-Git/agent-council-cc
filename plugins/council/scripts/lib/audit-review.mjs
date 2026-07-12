@@ -294,7 +294,11 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
   let refutedCount = 0;
   if (options.verifyAudit !== false && activeReviewerCount(backends, options) > 1) {
     try {
-      const vr = await verifyFindings(cwd, backends, options, scoped, buildEvidence, workspaceRoot(cwd));
+      // ANNOTATE-ONLY on the audit path (demote:false): a refuted finding stays VISIBLE in
+      // `.all` with a `verified` annotation and is only DEPRIORITIZED downstream (propose-
+      // only), never silently dropped — the refuter is a biased single-seat signal, so it
+      // must inform, not erase. Charges the review budget so refutation spend is counted.
+      const vr = await verifyFindings(cwd, backends, { ...options, demote: false, budget }, scoped, buildEvidence, workspaceRoot(cwd));
       scoped = vr.merged;
       refutedCount = vr.refutedCount ?? 0;
     } catch {

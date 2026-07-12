@@ -40,6 +40,12 @@ test("ineligibleReason rejects §6 sensitive classes (auth/crypto/concurrency/da
   assert.equal(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "correctness" }), null, "ordinary bugs stay fixable");
 });
 
+test("ineligibleReason keeps a refuted finding propose-only (annotate-only refuter never auto-fixes disputed)", () => {
+  assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", verified: { refuted: true } }), /refuted/);
+  // an un-refuted / verified-but-not-refuted finding stays fixable
+  assert.equal(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", verified: { refuted: false } }), null);
+});
+
 test("ineligibleReason lets §6 through ONLY under consented sensitiveAutoApply; other gates still hold", () => {
   const race = { severity: "P1", scope: "localized", file: "a.mjs", category: "concurrency" };
   assert.match(ineligibleReason(race), /sensitive/, "default: propose-only");

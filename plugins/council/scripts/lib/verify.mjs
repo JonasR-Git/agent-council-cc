@@ -79,10 +79,18 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
     maxTurns: options.maxTurnsR2,
     grokEffort: options.r2Effort ?? options.grokEffort
   };
+  const budget = options.budget ?? null;
   const targets = (merged.all ?? []).filter((f) => shouldVerify(f, severities));
   const results = await mapWithLimit(targets, options.verifyConcurrency ?? VERIFY_CONCURRENCY, async (finding) => {
     const agent = verifierFor(finding, options);
     if (!agent) return { finding, verdict: null };
+    // Charge the finite invocation budget so refutation spend is ACCOUNTED (it used to fan
+    // out uncounted). Reserve BEFORE the await; if the budget can't afford it, skip this
+    // refutation and KEEP the finding (a budget-starved verify must never drop a finding).
+    if (budget) {
+      if (!budget.canSpend(1)) return { finding, verdict: null };
+      budget.charge(1);
+    }
     const evidence = buildEvidence(repoRoot, [{ id: finding.ids?.[0], file: finding.file, line: finding.line }], "");
     const hadEvidence = Boolean(evidence) && evidence !== "(no file evidence available)";
     const prompt = interpolate(loadPrompt("r2-verify"), {
@@ -113,7 +121,7 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
       demotable: r.hadEvidence
     });
   }
-  return partitionByRefutation(merged, refutedKeys, targets.length);
+  return partitionByRefutation(merged, refutedKeys, targets.length, { demote: options.demote !== false });
 }
 
 /**
@@ -123,17 +131,21 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
  * verifier could not support are moved to the low-confidence bucket. Pure and
  * testable; `refutations` maps finding -> {by, refuted, reason}.
  */
-export function partitionByRefutation(merged, refutations, verifiedCount = 0) {
+export function partitionByRefutation(merged, refutations, verifiedCount = 0, { demote = true } = {}) {
   const kept = [];
   const refuted = [];
   for (const f of merged.all ?? []) {
     const v = refutations.get(f);
     const annotated = v ? { ...f, verified: v } : f;
-    // Demote only a refuted, single-agent finding whose refutation was
-    // evidence-based (demotable !== false). Consensus stays (annotated disputed);
-    // an evidence-less refutation annotates but never hides a finding.
-    if (v?.refuted && v.demotable !== false && !f.consensus) refuted.push(annotated);
-    else kept.push(annotated);
+    // A refuted, single-agent, evidence-based finding (demotable !== false) is a refutation
+    // candidate. Consensus is never a candidate (protected).
+    const isRefuted = Boolean(v?.refuted && v.demotable !== false && !f.consensus);
+    if (isRefuted) refuted.push(annotated);
+    // demote:true HIDES refuted candidates from `.all` (deliberate path, human-reviewed).
+    // demote:false (ANNOTATE-ONLY) keeps them VISIBLE in `.all` with their `verified`
+    // annotation — so on the autonomous audit path a wrongly-refuted REAL finding is never
+    // silently dropped; downstream only DEPRIORITIZES it (propose-only), never erases it.
+    if (!isRefuted || !demote) kept.push(annotated);
   }
   return {
     merged: {

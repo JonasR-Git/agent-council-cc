@@ -144,6 +144,9 @@ export function ineligibleReason(f, { maxRank = RANK.P2, protectedRe = PROTECTED
   // Fail CLOSED on scope: only an explicit "localized" is auto-fixable. Missing /
   // unknown scope (e.g. hand-edited --from findings) must never slip through.
   if (f.scope !== "localized") return f.scope === "cross-cutting" ? "cross-cutting → propose-only (never auto-patched)" : "scope not 'localized' (fail-closed)";
+  // An independent seat refuted this finding (annotate-only path) — deprioritize it to
+  // propose-only rather than auto-fix a disputed finding. Still visible in the report.
+  if (f.verified?.refuted) return "refuted by an independent seat → propose-only";
   if (!f.file) return "no target file";
   const file = toPosix(f.file);
   if (/[\r\n]/.test(file) || file.split("/").includes("..") || path.isAbsolute(f.file) || /^[a-zA-Z]:/.test(file)) return "unsafe file path";

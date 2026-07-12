@@ -40,6 +40,15 @@ test("partitionByRefutation demotes ONLY an evidence-based refutation of a singl
   assert.ok(out.merged.all.find((f) => f.id === "b").verified, "but annotates it as disputed");
 });
 
+test("partitionByRefutation demote:false is ANNOTATE-ONLY — refuted stays VISIBLE in .all", () => {
+  const f1 = { id: "a", consensus: false };
+  const refs = new Map([[f1, { by: "grok", refuted: true, reason: "x", demotable: true }]]);
+  const out = partitionByRefutation(merged([f1]), refs, 0, { demote: false });
+  assert.equal(out.refutedCount, 1, "still COUNTED as refuted");
+  assert.ok(out.merged.all.some((f) => f.id === "a"), "but never dropped from .all (no silent erasure)");
+  assert.ok(out.merged.all.find((f) => f.id === "a").verified?.refuted, "annotated so downstream can deprioritize");
+});
+
 test("partitionByRefutation NEVER demotes a consensus finding, even if refuted", () => {
   const c = { id: "c", consensus: true };
   const refs = new Map([[c, { by: "grok", refuted: true, reason: "x", demotable: true }]]);
