@@ -125,7 +125,10 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
         // Rate-limit resilience must reach the layer where the 429 is actually thrown
         // (applyFix / reviewPatch) — the loop-level wrapper never sees it because
         // runAuditFix records a per-fix failure instead of throwing.
-        retryOnLimit: options.retryOnLimit
+        retryOnLimit: options.retryOnLimit,
+        // Pin the ledger's baseBranch to the loop's TRUE base (not git.currentBranch(), which on a
+        // continuation pass is the integration branch → false durable promotion; council Opus O7).
+        ledgerBaseBranch: options.ledgerBaseBranch
       },
       options.reviewPatch ? { reviewPatch: options.reviewPatch } : {}
     );

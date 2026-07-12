@@ -1981,7 +1981,13 @@ async function handleAudit(argv) {
         claudeModel: merged["claude-model"] ?? merged.claudeModel,
         sensitiveAutoApply,
         reviewPatch,
-        retryOnLimit: options["retry-on-limit"]
+        retryOnLimit: options["retry-on-limit"],
+        // The TRUE base branch, captured before the loop. On pass 2+ the process is ON the
+        // integration branch, so runAuditFix's git.currentBranch() would ledger the fix's baseBranch
+        // as the integration branch — reconcilePendingFixes then trivially finds the commit an
+        // ancestor and falsely promotes it to durable 'fixed' though it was never merged to base
+        // (council Opus O7). Pin the real base for the ledger.
+        ledgerBaseBranch: baseBranch
       });
       const tLoop = Date.now();
       // B5: per-tier convergence (structure → correctness → quality) is ON by default so a
@@ -2042,6 +2048,15 @@ async function handleAudit(argv) {
       if (!Number.isFinite(n) || n < 1) throw new Error("--max-fixes must be a positive number");
       maxFixes = Math.floor(n);
     }
+    // runAuditFix reads camelCase retryOnLimit/retryLimit; mergeOptionsWithPolicy never converts the
+    // kebab CLI keys, so single-shot `audit fix --retry-on-limit` was silently ignored — only --loop
+    // translated them (council Opus O6). Thread them here too (validated like its numeric siblings).
+    let singleRetryLimit;
+    if (options["retry-limit"] != null) {
+      const n = Number(options["retry-limit"]);
+      if (!Number.isFinite(n) || n < 1) throw new Error("--retry-limit must be a positive number");
+      singleRetryLimit = Math.floor(n);
+    }
     const tFix = Date.now();
     const out = await runAuditFix(cwd, findings, backends, {
       ...merged,
@@ -2049,6 +2064,8 @@ async function handleAudit(argv) {
       allowUntested: options["allow-untested"],
       minSeverity: fixMinSeverity,
       maxFixes,
+      retryOnLimit: options["retry-on-limit"],
+      retryLimit: singleRetryLimit,
       onProgress: options.json ? undefined : (m) => console.error(m)
     });
     if (!options["dry-run"]) {

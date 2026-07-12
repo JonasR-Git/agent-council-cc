@@ -91,12 +91,13 @@ test("fix threads branch + stayOnBranch (and severity/max) to runAuditFix", asyn
     seen = opts;
     return { ok: true, fixed: [], changedFiles: [], spent: 0 };
   };
-  const deps = makeFixLoopDeps("/x", model, {}, { minSeverity: "P1", maxFixesPerPass: 3 }, { runAuditFix });
+  const deps = makeFixLoopDeps("/x", model, {}, { minSeverity: "P1", maxFixesPerPass: 3, ledgerBaseBranch: "main" }, { runAuditFix });
   await deps.fix([{ file: "a.mjs" }], { branch: "council/z", stayOnBranch: true });
   assert.equal(seen.branch, "council/z");
   assert.equal(seen.stayOnBranch, true);
   assert.equal(seen.minSeverity, "P1");
   assert.equal(seen.maxFixes, 3);
+  assert.equal(seen.ledgerBaseBranch, "main", "the TRUE base branch is pinned for the ledger (not the integration branch)");
 });
 
 test("fix threads §6 consent + reviewPatch to runAuditFix (options + deps)", async () => {

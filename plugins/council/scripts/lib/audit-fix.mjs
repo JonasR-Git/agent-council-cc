@@ -565,7 +565,10 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
   }
 
   const baseRef = git.head();
-  const baseBranch = git.currentBranch();
+  // The loop pins the TRUE base via options.ledgerBaseBranch: on pass 2+ the process is ON the
+  // integration branch, so git.currentBranch() would ledger fixes with the integration branch as
+  // their base — reconcilePendingFixes would then falsely promote them to durable 'fixed' (Opus O7).
+  const baseBranch = options.ledgerBaseBranch ?? git.currentBranch();
   const branch = options.branch ?? `council/audit-fix-${String(baseRef).slice(0, 8)}`;
   const fixed = [];
   const failed = [];

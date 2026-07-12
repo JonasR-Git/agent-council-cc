@@ -301,7 +301,12 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
   const units = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
   const concurrency = Math.max(1, Math.min(4, options.concurrency ?? 3));
   const costPerUnit = activeReviewerCount(backends, options);
-  const reduceReserve = costPerUnit > 0 ? 1 : 0; // keep 1 charge for the global reduce
+  // Reserve a charge for the global reduce ONLY when it will actually run: skipReduce (every pass
+  // after the first on the endless/fix loop) or a claude-only config (globalReduce needs codex/grok
+  // and early-returns otherwise) means the reduce never spends — reserving then STRANDS one charge,
+  // reviewing one fewer hotspot every such pass (council Opus O5). Match the reserve to the real spend.
+  const reduceWillRun = !options.skipReduce && (reviewerActive("codex", backends, options) || reviewerActive("grok", backends, options));
+  const reduceReserve = reduceWillRun ? 1 : 0;
 
   const results = [];
   const failed = [];
