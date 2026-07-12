@@ -12,6 +12,21 @@ test("categoryToLens maps raw categories onto the 12 lenses", () => {
   assert.equal(categoryToLens("nonsense"), "correctness", "unknown -> default");
 });
 
+test("evidenceState: a REFUTED finding is the WEAKEST state, never adversarial-verified (council Fable P1 — inversion)", () => {
+  // partitionByRefutation annotates BOTH outcomes with a truthy `verified` object; reading it as
+  // Boolean() promoted a REFUTED finding to the strongest evidence (floor 0.85, lifecycle confirmed,
+  // ranked first). The refuted flag must dominate.
+  const refuted = { verified: { by: "grok", refuted: true, reason: "not reachable" }, agents: ["codex"] };
+  assert.equal(evidenceState(refuted), "refuted", "a refuted finding is not 'verified'");
+  const canon = toCanonicalFinding({ ...refuted, severity: "P0", category: "security", file: "a.mjs" }, { unit: "a.mjs" });
+  assert.equal(canon.lifecycle, "refuted", "not 'confirmed'");
+  assert.ok(canon.confidence <= 0.2, `refuted confidence is capped low (got ${canon.confidence})`);
+  // a SUPPORTED verification still promotes normally
+  const supported = { verified: { by: "grok", refuted: false, reason: "reproduced the call path" }, agents: ["codex"] };
+  assert.equal(evidenceState(supported), "adversarial-verified");
+  assert.ok(toCanonicalFinding({ ...supported, severity: "P1", category: "bug", file: "a.mjs" }, { unit: "a.mjs" }).confidence >= 0.85);
+});
+
 test("evidenceState reflects verification / consensus / finder count", () => {
   assert.equal(evidenceState({ verified: true, reproduced: true }), "reproduced");
   assert.equal(evidenceState({ verified: true }), "adversarial-verified");
