@@ -161,6 +161,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       // Restore the scope so a resumed run doesn't jump straight to a stale full-scope
       // window offset (which would review off-the-end and falsely read "dry").
       if (Array.isArray(prior.changedFiles) && prior.changedFiles.length) changedFiles = prior.changedFiles;
+      // Restore the full-scope window cursor into the deps closure so a resumed FULL pass continues
+      // from where it left off instead of re-reviewing offset 0 and missing later units (Codex C2 P1).
+      if (deps.windowState && Number.isFinite(prior.windowPasses)) deps.windowState.set(prior.windowPasses);
       onProgress(`resumed: ${fixedAll.length} fixed, ${spent}/${totalBudget} spent, ${passNo} passes, dry ${dryStreak}/${dryStop}`);
     }
   }
@@ -310,9 +313,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
 
     passes.push({ pass: passNo, reviewed: findings.length, fresh: freshFindings.length, actionable: gated.actionable.length, fixed: freshFixed.length, failed: (fx?.failed ?? []).length, spent });
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
-    checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, stopReason: null, done: false });
+    checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason: null, done: false });
   }
 
-  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, stopReason, done: true });
+  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason, done: true });
   return { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak };
 }

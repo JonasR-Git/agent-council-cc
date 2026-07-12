@@ -112,6 +112,24 @@ test("council Codex C2: a recurring PROPOSE-ONLY finding does not pin its tier (
   assert.match(out.stopReason, /all tiers converged/);
 });
 
+test("council Codex C2: the full-scope window survives --resume (no offset-0 restart, later units reached)", async () => {
+  const bigModel = { files: Array.from({ length: 6 }, (_, i) => ({ id: `f${i}.mjs`, fanIn: 1 })) };
+  const offsets = [];
+  const runAuditReview = async (cwd, m, backends, opts) => { offsets.push(opts.unitOffset); return { findings: [], coverage: { budgetSpent: 1 } }; };
+  const runAuditFix = async () => ({ fixed: [], failed: [], spent: 0 });
+  let saved = null;
+  // run 1: two full passes (maxUnits 2 → offsets 0, 2), capture the checkpoint
+  const deps1 = makeFixLoopDeps("/x", bigModel, {}, { maxUnits: 2 }, { runAuditReview, runAuditFix });
+  await runFixLoop("/x", { budget: 10, dryStreak: 5, maxPasses: 2 }, { ...deps1, checkpoint: (s) => { saved = s; } });
+  assert.deepEqual(offsets, [0, 2], "run 1 advanced the window");
+  assert.ok(saved.windowPasses >= 2, "the window cursor is persisted in the checkpoint");
+  // run 2: resume → the window continues (offset (2*2)%6 = 4), NOT a stale offset-0 restart
+  offsets.length = 0;
+  const deps2 = makeFixLoopDeps("/x", bigModel, {}, { maxUnits: 2 }, { runAuditReview, runAuditFix });
+  await runFixLoop("/x", { budget: 10, dryStreak: 8, maxPasses: 5, resume: true }, { ...deps2, loadCheckpoint: () => saved, checkpoint: () => {} });
+  assert.equal(offsets[0], 4, "resumed run continues past the already-reviewed window, reaching later units");
+});
+
 test("B5 council (grok P2): per-tier position is checkpointed and restored on resume", async () => {
   // persistence: the checkpoint carries currentTier/tierDryStreak/stalledStreak
   let saved = null;

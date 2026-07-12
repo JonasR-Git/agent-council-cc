@@ -149,5 +149,11 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
 
   const verdictsFor = () => options.verdictMap ?? {};
 
-  return { review, fix, expandScope, verdictsFor };
+  // The full-scope window cursor (fullPasses) lives in this closure but must SURVIVE a --resume: it
+  // drives the progressive unitOffset, so a resumed run that reset it to 0 would re-review the first
+  // window and never reach later units (council Codex C2 P1). Expose it so runFixLoop persists it in
+  // the checkpoint and restores it here on resume.
+  const windowState = { get: () => fullPasses, set: (n) => { fullPasses = Math.max(0, Math.floor(Number(n) || 0)); } };
+
+  return { review, fix, expandScope, verdictsFor, windowState };
 }
