@@ -45,10 +45,14 @@ test("makeSeatRunners: a runner per built-in + per OR seat; injectable", async (
   assert.deepEqual(calls, ["or-x", "or-y"], "each OR runner passes its own seat id");
 });
 
-test("requiredPatchSeats: §6 unanimity = built-ins + active OR seats (raises the bar)", () => {
+test("requiredPatchSeats: §6 unanimity = built-ins + every CONFIGURED (non-skipped) OR seat", () => {
   assert.deepEqual(requiredPatchSeats(builtinBackends, {}), ["codex", "grok", "claude"], "no OR → the 3 built-ins");
   assert.deepEqual(requiredPatchSeats(withOR(), {}), ["codex", "grok", "claude", "or-x", "or-y"], "OR seats are also required to confirm");
-  assert.deepEqual(requiredPatchSeats(withOR({ available: false }), {}), ["codex", "grok", "claude"], "an unreachable OR seat is not required");
+  // a configured-but-down OR seat is STILL required — its missing vote vetoes, fail-closed (reachability
+  // is checked up front by patchReviewerReady, which keeps the class propose-only when a seat is down).
+  assert.deepEqual(requiredPatchSeats(withOR({ available: false }), {}), ["codex", "grok", "claude", "or-x", "or-y"], "a down configured OR seat still vetoes");
+  assert.deepEqual(requiredPatchSeats(withOR(), { skipOpenRouter: true }), ["codex", "grok", "claude"], "--skip-openrouter drops all OR seats");
+  assert.deepEqual(requiredPatchSeats(withOR(), { skipSeats: ["or-x"] }), ["codex", "grok", "claude", "or-y"], "a per-seat skip drops just that seat");
 });
 
 test("isOpenRouterSeat / BUILTIN_SEATS", () => {

@@ -28,7 +28,16 @@ export const DEFAULT_POLICY = {
   verify_findings: false,
   reviewers: ["claude", "codex", "grok"],
   claude_backend: "session", // session | spawn
-  claude_model: null
+  claude_model: null,
+  // OpenRouter multi-model seats (optional). `openrouter_models` is a flat list of "slug" /
+  // "id=slug" / "id=slug@effort" strings (parseSimpleYaml can't nest); a nested `openrouter: {…}`
+  // object is also accepted from .council.json. The key is read from the env var named by
+  // openrouter_api_key_env (default OPENROUTER_API_KEY); a literal openrouter_api_key in the file
+  // works but is discouraged (secret in VCS). openrouter_base_url points at an OpenAI-compatible proxy.
+  openrouter_models: [],
+  openrouter_api_key: null,
+  openrouter_api_key_env: "OPENROUTER_API_KEY",
+  openrouter_base_url: null
 };
 
 /**
@@ -214,6 +223,13 @@ export function mergeOptionsWithPolicy(options, policy) {
     forceBudget: options.forceBudget ?? false,
     resume: options.resume ?? false,
     verifyFindings: options.verifyFindings ?? policy.verify_findings === true,
+    // OpenRouter seats — resolved to NON-SECRET options here (openRouterBackend registers the key in
+    // module scope; the key is never stored on options, which are spread + serialized into checkpoints).
+    openrouterModels: options.openrouterModels ?? policy.openrouter?.models ?? policy.openrouter_models ?? [],
+    openrouterApiKey: options.openrouterApiKey ?? policy.openrouter?.apiKey ?? policy.openrouter_api_key ?? null,
+    openrouterApiKeyEnv: options.openrouterApiKeyEnv ?? policy.openrouter?.apiKeyEnv ?? policy.openrouter_api_key_env ?? "OPENROUTER_API_KEY",
+    openrouterBaseUrl: options.openrouterBaseUrl ?? policy.openrouter?.baseUrl ?? policy.openrouter_base_url ?? null,
+    skipOpenRouter: Boolean(options.skipOpenRouter),
     policySource: policy._source
   };
 }

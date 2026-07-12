@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { buildReformatPrompt, interpolate, makeFenceNonce, runCodexStructured, runGrokStructured, runStructuredWithRetry } from "./agents.mjs";
-import { runClaudeStructured } from "./claude-agent.mjs";
+import { activeSeatNames, allSeatNames, makeSeatRunners, seatActive } from "./seats.mjs";
 import { mergeFindings, parseAgentFindings } from "./findings.mjs";
 import { fingerprintFinding, recordAndAnnotate } from "./ledger.mjs";
 import { annotateScopes } from "./scope.mjs";
@@ -43,25 +43,17 @@ export function makeBudget(total) {
   };
 }
 
-/** True when a reviewer is both policy-enabled AND actually callable (probed). */
+/** True when a seat is both policy-enabled AND actually callable (probed). Delegates to the dynamic
+ *  seat registry so OpenRouter seats participate; the built-in branches are unchanged. Kept exported
+ *  (many callers import it) — a thin alias for seatActive. */
 export function reviewerActive(name, backends, options = {}) {
-  if (name === "codex") return !options.skipCodex && Boolean(backends?.codex?.companionAvailable);
-  if (name === "grok") return !options.skipGrok && Boolean(backends?.grok?.cli?.available);
-  // B2: Claude is a FIRST-CLASS finder (six-eyes: every model runs every lens itself, never a
-  // synthesizer-only). Gated on the ACTUAL cli probe — the audit path must probe Claude
-  // (probeClaude defaults on via bare probeBackends), else this stays false and only Codex+Grok
-  // find (silently four eyes, not six). skipClaude opts out symmetrically with skipCodex/skipGrok.
-  if (name === "claude") return !options.skipClaude && Boolean(backends?.claude?.cli?.available);
-  return false;
+  return seatActive(name, backends, options);
 }
 
-/** How many agent calls a single unit review will actually dispatch. */
+/** How many agent calls a single unit review will dispatch = the active seat count (built-ins + any
+ *  configured OpenRouter seats). With no openrouter config this is exactly the 3 built-ins. */
 export function activeReviewerCount(backends, options = {}) {
-  return (
-    (reviewerActive("codex", backends, options) ? 1 : 0) +
-    (reviewerActive("grok", backends, options) ? 1 : 0) +
-    (reviewerActive("claude", backends, options) ? 1 : 0)
-  );
+  return activeSeatNames(backends, options).length;
 }
 
 /**
@@ -203,23 +195,17 @@ export function reserveFloorBudget(budget, reserve) {
 export async function reviewUnit(cwd, backends, options, unitId, model, budget) {
   const root = workspaceRoot(cwd);
   const { prompt, suppliedChars, totalChars, split } = buildUnitPrompt(root, unitId, model);
+  // Every ACTIVE seat runs the SAME unit prompt independently (six-eyes: each model searches every lens
+  // itself, never a synthesizer-only). With no openrouter config this is exactly codex/grok/claude; a
+  // configured OpenRouter seat is one more independent finder. The seat runners are the same per-seat
+  // calls as before (codex → runCodexStructured "audit", etc.).
+  const runners = makeSeatRunners(cwd, backends, options);
   const jobs = [];
-  if (reviewerActive("codex", backends, options)) {
+  for (const seat of activeSeatNames(backends, options)) {
+    const run = runners[seat];
+    if (!run) continue;
     jobs.push(
-      runStructuredWithRetry((p) => runCodexStructured(cwd, backends, options, p, "audit"), prompt, (s) => parseAgentFindings(s, "codex"), { budget, ...AUDIT_REPAIR_OPTS }).then((r) => ({ ...r, agent: "codex" }))
-    );
-  }
-  if (reviewerActive("grok", backends, options)) {
-    jobs.push(
-      runStructuredWithRetry((p) => runGrokStructured(cwd, backends, options, p), prompt, (s) => parseAgentFindings(s, "grok"), { budget, ...AUDIT_REPAIR_OPTS }).then((r) => ({ ...r, agent: "grok" }))
-    );
-  }
-  // B2: Claude is the THIRD finder (six-eyes). It runs the SAME unit prompt independently, so every
-  // model searches every lens itself — never a synthesizer-only. A spawned `claude -p` (--safe-mode,
-  // read-only) separate from the orchestrating session, so its verdict is independent + isolated.
-  if (reviewerActive("claude", backends, options)) {
-    jobs.push(
-      runStructuredWithRetry((p) => runClaudeStructured(cwd, backends, options, p), prompt, (s) => parseAgentFindings(s, "claude"), { budget, ...AUDIT_REPAIR_OPTS }).then((r) => ({ ...r, agent: "claude" }))
+      runStructuredWithRetry(run, prompt, (s) => parseAgentFindings(s, seat), { budget, ...AUDIT_REPAIR_OPTS }).then((r) => ({ ...r, agent: seat }))
     );
   }
   const raw = await Promise.all(jobs);
@@ -399,11 +385,7 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
       unparsedReturns,
       reformatsUsed,
       reduceRan: reduce.ran,
-      reviewers: {
-        codex: reviewerActive("codex", backends, options),
-        grok: reviewerActive("grok", backends, options),
-        claude: reviewerActive("claude", backends, options)
-      },
+      reviewers: Object.fromEntries(allSeatNames(backends).map((s) => [s, reviewerActive(s, backends, options)])),
       failed,
       suppliedChars,
       totalCharsOfReviewed: totalChars,

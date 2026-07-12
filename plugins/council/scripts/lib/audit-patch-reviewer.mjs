@@ -3,8 +3,10 @@
 // to the three model CLIs directly (the same backends the review/deliberate path uses).
 // Each seat independently judges the SAME patch (the six-eyes rule); a seat that is
 // unreachable or errors casts NO vote, so evaluatePatchVerdicts fails closed.
-import { buildPatchReviewPrompt, parsePatchVerdict, PATCH_REVIEW_SEATS } from "./audit-council-gate.mjs";
+import { buildPatchReviewPrompt, parsePatchVerdict } from "./audit-council-gate.mjs";
 import { runCodexStructured, runGrokStructured } from "./agents.mjs";
+import { runOpenRouterStructured } from "./openrouter-agent.mjs";
+import { requiredPatchSeats, seatActive } from "./seats.mjs";
 import { findClaudeBinary } from "./discover.mjs";
 import { runCommandAsync } from "./process.mjs";
 import { REVIEWER_CHARTER } from "./reviewer-charter.mjs";
@@ -116,6 +118,12 @@ export function makePatchReviewer(cwd, backends, options = {}, deps = {}) {
     codex: deps.runCodex ?? ((prompt) => runCodexStructured(cwd, backends, options, prompt, "patch-review")),
     grok: deps.runGrok ?? ((prompt) => runGrokStructured(cwd, backends, grokOpts, prompt))
   };
+  // Each configured OpenRouter seat is also a §6 reviewer (API-only — no local tools, so strictly safer
+  // than the CLI seats). It votes on the SAME patch; a missing/erroring vote fails closed like any seat.
+  for (const s of backends?.openrouter?.seats ?? []) {
+    runners[s.id] = deps.runOpenRouter ? (prompt) => deps.runOpenRouter(cwd, backends, options, prompt, s.id) : (prompt) => runOpenRouterStructured(cwd, backends, options, prompt, s.id);
+  }
+  const seats = requiredPatchSeats(backends, options);
   return async ({ file, finding, diff, after, context }) => {
     // A3: hand each seat the POST-PATCH surrounding source so it judges the diff IN CONTEXT
     // (the whole function + callers), not blind on the hunk alone. `after` is the applied
@@ -126,9 +134,11 @@ export function makePatchReviewer(cwd, backends, options = {}, deps = {}) {
     // oversized file neither blinds the reviewer with a file head nor blows the context window.
     const ctx = context !== undefined ? context : (after ?? "");
     const votes = await Promise.all(
-      PATCH_REVIEW_SEATS.map(async (seat) => {
+      seats.map(async (seat) => {
+        const run = runners[seat];
+        if (!run) return null; // a required seat with no runner casts no vote → veto (fail-closed)
         try {
-          const text = textOf(await runners[seat](buildPatchReviewPrompt(file, finding, diff, seat, ctx)));
+          const text = textOf(await run(buildPatchReviewPrompt(file, finding, diff, seat, ctx)));
           return text ? parsePatchVerdict(text, seat) : null;
         } catch {
           return null; // fail-closed: an erroring/unreachable seat is a non-vote, never a confirm
@@ -144,7 +154,7 @@ export function makePatchReviewer(cwd, backends, options = {}, deps = {}) {
  * missing the gate can never reach unanimity, so the caller should warn + keep the
  * sensitive class propose-only rather than silently never-approve.
  */
-export function patchReviewerReady(backends) {
+export function patchReviewerReady(backends, options = {}) {
   // Use the ACTUAL availability probes, not fallback command-name strings: probeBackends
   // supplies default "claude"/"grok" bin names even when the reachability probe FAILED, so
   // Boolean(bin) does NOT mean reachable. A false-positive would print ENABLED and then run
@@ -155,5 +165,16 @@ export function patchReviewerReady(backends) {
   // can never cast a vote → the gate could never reach unanimity. Companion only.
   const codex = Boolean(backends?.codex?.companionAvailable);
   const grok = Boolean(backends?.grok?.cli?.available);
-  return { ready: claude && codex && grok, claude, codex, grok };
+  // Every CONFIGURED OpenRouter seat must ALSO be reachable up front, else §6 auto-apply would enable a
+  // gate that can never reach unanimity (a configured-but-down OR seat is a required veto). Report each
+  // so the caller can name the missing seat.
+  const perSeat = { claude, codex, grok };
+  const orReady = [];
+  for (const s of backends?.openrouter?.seats ?? []) {
+    if (options.skipOpenRouter || (options.skipSeats ?? []).includes(s.id)) continue;
+    const ok = seatActive(s.id, backends, options);
+    perSeat[s.id] = ok;
+    orReady.push(ok);
+  }
+  return { ready: claude && codex && grok && orReady.every(Boolean), ...perSeat };
 }

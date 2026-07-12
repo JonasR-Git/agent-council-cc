@@ -59,6 +59,7 @@ import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { writeFixReportHtml } from "./lib/fix-report-html.mjs";
 import { assembleFixMeta, changedFilesShape } from "./lib/fix-report-meta.mjs";
+import { openRouterBackend } from "./lib/openrouter-agent.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
 import {
@@ -1802,6 +1803,7 @@ async function handleAudit(argv) {
   if (positionals[0] === "run") {
     const backends = probeBackends(cwd, ROOT_DIR);
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    backends.openrouter = openRouterBackend(merged); // OpenRouter seats (if configured) join the six-eyes
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
     const tRun = Date.now();
     const report = await runAudit(cwd, model, backends, {
@@ -1840,6 +1842,7 @@ async function handleAudit(argv) {
   if (positionals[0] === "review") {
     const backends = probeBackends(cwd, ROOT_DIR);
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    backends.openrouter = openRouterBackend(merged); // OpenRouter seats (if configured) join the six-eyes
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
     const t0 = Date.now();
     // --groups <preset> (M7): opt into the six-eyes GROUPED path — every (module × lens-group ×
@@ -1897,6 +1900,7 @@ async function handleAudit(argv) {
   if (positionals[0] === "fix") {
     const backends = probeBackends(cwd, ROOT_DIR);
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    backends.openrouter = openRouterBackend(merged); // OpenRouter seats (if configured) join the six-eyes
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
 
     // Autonomy dial (M4): resolve the level -> commit/propose gate, shared by the loop
@@ -2023,7 +2027,7 @@ async function handleAudit(argv) {
       let sensitiveAutoApply = false;
       let reviewPatch;
       if (options["sensitive-auto-apply"]) {
-        const ready = patchReviewerReady(backends);
+        const ready = patchReviewerReady(backends, merged);
         if (ready.ready) {
           sensitiveAutoApply = true;
           reviewPatch = makePatchReviewer(cwd, backends, {
@@ -2177,6 +2181,7 @@ async function handleAudit(argv) {
   if (positionals[0] === "endless") {
     const backends = probeBackends(cwd, ROOT_DIR);
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    backends.openrouter = openRouterBackend(merged); // OpenRouter seats (if configured) join the six-eyes
     // No callable reviewer => every pass reviews nothing and would falsely report
     // "diminishing returns"; fail loud instead of looping over empty passes.
     if (activeReviewerCount(backends, merged) === 0) {

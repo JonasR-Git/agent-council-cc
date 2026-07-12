@@ -14,6 +14,7 @@ import { resolveLensGroups } from "./audit-lens-groups.mjs";
 import { chunkSource } from "./audit-group-prompt.mjs";
 import { DEFAULT_MAX_CELLS, capCells, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
 import { reviewerActive, selectUnits } from "./audit-review.mjs";
+import { activeSeatNames, allSeatNames } from "./seats.mjs";
 import { tierOfLens } from "./audit-tiers.mjs";
 import { mergeFindings } from "./findings.mjs";
 import { annotateScopes } from "./scope.mjs";
@@ -24,7 +25,7 @@ const READ_MAX_BYTES = 2_000_000; // don't slurp a giant file into a chunker
 
 /** The active finder models for this run (the three seats, minus any skipped/unavailable). */
 export function activeModels(backends, options = {}) {
-  return ["codex", "grok", "claude"].filter((m) => reviewerActive(m, backends, options));
+  return activeSeatNames(backends, options);
 }
 
 /** Static-facts string for a file, mirroring buildUnitPrompt's facts line (for the cell prompt). */
@@ -208,9 +209,5 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
 }
 
 function reviewerMap(backends, options) {
-  return {
-    codex: reviewerActive("codex", backends, options),
-    grok: reviewerActive("grok", backends, options),
-    claude: reviewerActive("claude", backends, options)
-  };
+  return Object.fromEntries(allSeatNames(backends).map((s) => [s, reviewerActive(s, backends, options)]));
 }

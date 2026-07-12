@@ -291,6 +291,19 @@ test("makeCellReviewer (multi-lens group): an unlensed finding DERIVES its lens 
   assert.equal(r.findings[0].lens, "security_secrets", "category security → security_secrets (in the group), not lenses[0]");
 });
 
+test("OpenRouter: a cell whose model is a configured OR seat routes to the OpenRouter runner", async () => {
+  const orBackends = { openrouter: { available: true, seats: [{ id: "or-x", model: "vendor/model" }] } };
+  let seenId = null;
+  const review = makeCellReviewer("/x", orBackends, {}, {
+    runOpenRouter: async (cwd, b, o, p, id) => { seenId = id; return { status: 0, stdout: '{"agent":"or-x","findings":[{"severity":"P1","title":"t","detail":"d"}]}' }; }
+  });
+  const cell = { model: "or-x", groupId: "g", group: { id: "g", lenses: ["correctness"] }, file: "a.mjs", chunk: 0, chunkData: { text: "x", index: 0, total: 1, startLine: 1, endLine: 1 } };
+  const r = await review(cell);
+  assert.equal(seenId, "or-x", "the OpenRouter seat runner was invoked for its cell");
+  assert.equal(r.ok, true);
+  assert.equal(r.findings[0].file, "a.mjs", "OR findings get the same cell stamping as built-in seats");
+});
+
 test("B4 (council grok-4): enumerateCells threads per-file static facts onto each cell + into the prompt", async () => {
   const cells = enumerateCells(
     ["a.mjs"],

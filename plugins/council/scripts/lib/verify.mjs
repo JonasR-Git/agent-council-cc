@@ -6,6 +6,8 @@ import {
   runGrokStructured
 } from "./agents.mjs";
 import { runClaudeStructured } from "./claude-agent.mjs";
+import { runOpenRouterStructured } from "./openrouter-agent.mjs";
+import { allSeatNames, isOpenRouterSeat, seatActive } from "./seats.mjs";
 import { extractJsonObject } from "./findings.mjs";
 import { skippedAgents } from "./policy.mjs";
 
@@ -30,15 +32,11 @@ const VERIFY_CONCURRENCY = 4;
 
 /** Which verifier seats are actually reachable (probed), computed inline to avoid a cycle with
  *  audit-review's reviewerActive. Claude's cli is probed on the audit path (bare probeBackends). */
-export function verifierAvailability(backends) {
-  return {
-    codex: Boolean(backends?.codex?.companionAvailable),
-    grok: Boolean(backends?.grok?.cli?.available),
-    claude: Boolean(backends?.claude?.cli?.available)
-  };
+export function verifierAvailability(backends, options = {}) {
+  return Object.fromEntries(allSeatNames(backends).map((s) => [s, seatActive(s, backends, options)]));
 }
 
-export function verifierFor(finding, options, available = null) {
+export function verifierFor(finding, options, available = null, backends = null) {
   // B2: Claude is now a first-class FINDER, so it must also be an eligible REFUTER — else a
   // codex-only P0 (grok skipped) ships UNVERIFIED even when Claude is a valid independent seat
   // (council codex-1). includeClaude:true so skipClaude drops it symmetrically.
@@ -48,7 +46,10 @@ export function verifierFor(finding, options, available = null) {
   // own author), and only one that is actually REACHABLE when availability is known — else we pick
   // a candidate whose spawn just fails, wasting a call and leaving the finding unverified anyway
   // (council claude-4). When `available` is null, availability is not gated (legacy callers).
-  for (const candidate of ["grok", "codex", "claude"]) {
+  // An OpenRouter seat can also refute (it did NOT raise a built-in-authored finding) — so a finding
+  // all three built-ins raised can still be independently checked. Built-ins first (cheapest), then OR.
+  const candidates = ["grok", "codex", "claude", ...(backends?.openrouter?.seats ?? []).map((s) => s.id)];
+  for (const candidate of candidates) {
     if (skip.has(candidate) || raisedBy.has(candidate)) continue;
     if (available && !available[candidate]) continue;
     return candidate;
@@ -82,6 +83,7 @@ async function mapWithLimit(items, limit, fn) {
 async function runVerifier(agent, cwd, backends, options, prompt) {
   if (agent === "codex") return runCodexStructured(cwd, backends, options, prompt, "verify");
   if (agent === "claude") return runClaudeStructured(cwd, backends, options, prompt);
+  if (isOpenRouterSeat(agent, backends)) return runOpenRouterStructured(cwd, backends, options, prompt, agent);
   return runGrokStructured(cwd, backends, options, prompt);
 }
 
@@ -98,10 +100,10 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
     grokEffort: options.r2Effort ?? options.grokEffort
   };
   const budget = options.budget ?? null;
-  const available = verifierAvailability(backends); // B2: only pick a reachable, non-authoring seat
+  const available = verifierAvailability(backends, options); // B2: only pick a reachable, non-authoring seat
   const targets = (merged.all ?? []).filter((f) => shouldVerify(f, severities));
   const results = await mapWithLimit(targets, options.verifyConcurrency ?? VERIFY_CONCURRENCY, async (finding) => {
-    const agent = verifierFor(finding, options, available);
+    const agent = verifierFor(finding, options, available, backends);
     if (!agent) return { finding, verdict: null };
     // Charge the finite invocation budget so refutation spend is ACCOUNTED (it used to fan
     // out uncounted). Reserve BEFORE the await; if the budget can't afford it, skip this

@@ -7,6 +7,7 @@ import { fingerprintFinding, resolveLedgerEntry } from "./ledger.mjs";
 import { runCommand, runCommandAsync } from "./process.mjs";
 import { snapshotViolation } from "./audit-snapshot.mjs";
 import { evaluatePatchVerdicts } from "./audit-council-gate.mjs";
+import { requiredPatchSeats } from "./seats.mjs";
 import { retryOnRateLimit } from "./audit-retry.mjs";
 import { coverageOfLines, ingestCoverage, parseDiffLines } from "./audit-coverage-ingest.mjs";
 import { ensureStateDir, nowIso, resolveStateDir, workspaceRoot } from "./state.mjs";
@@ -725,7 +726,9 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               log(`  reverted — §6 council review error`);
               continue;
             }
-            councilVerdict = evaluatePatchVerdicts(verdicts);
+            // §6 unanimity over the SAME required set the reviewer ran (built-ins + configured
+            // OpenRouter seats) — an OR seat RAISES the bar and a missing vote vetoes (fail-closed).
+            councilVerdict = evaluatePatchVerdicts(verdicts, { required: requiredPatchSeats(backends, options) });
             if (!councilVerdict.approved) {
               git.resetHard(snapshot);
               rejected.push({ finding, reason: `§6 council not unanimous (${councilVerdict.summary}) → propose-only`, council: councilVerdict });

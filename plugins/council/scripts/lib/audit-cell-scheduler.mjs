@@ -7,8 +7,7 @@
 // of concurrent CLI spawns), retries a rate-limited cell in isolation (one throttled cell can't
 // fail the run), and tracks completion in a coverage matrix. Convergence over the matrix is B5.
 import { buildGroupPrompt } from "./audit-group-prompt.mjs";
-import { runCodexStructured, runGrokStructured } from "./agents.mjs";
-import { runClaudeStructured } from "./claude-agent.mjs";
+import { makeSeatRunners } from "./seats.mjs";
 import { isRateLimitError, retryOnRateLimit } from "./audit-retry.mjs";
 import { parseAgentFindings } from "./findings.mjs";
 import { categoryToLens } from "./audit-normalize.mjs";
@@ -158,11 +157,9 @@ export function withCellRetry(runCell, { retryOnLimit = true, retries, sleep, on
  * non-rate-limit failure returns ok:false (recorded failed, not retried).
  */
 export function makeCellReviewer(cwd, backends, options = {}, deps = {}) {
-  const runners = {
-    codex: deps.runCodex ?? ((p) => runCodexStructured(cwd, backends, options, p, "audit")),
-    grok: deps.runGrok ?? ((p) => runGrokStructured(cwd, backends, options, p)),
-    claude: deps.runClaude ?? ((p) => runClaudeStructured(cwd, backends, options, p))
-  };
+  // Runner per seat (built-ins + any configured OpenRouter seats), via the dynamic registry. deps.run*
+  // overrides stay honored (existing cell-scheduler tests inject runCodex/runGrok/runClaude).
+  const runners = makeSeatRunners(cwd, backends, options, deps);
   return async (cell) => {
     const run = runners[cell.model];
     if (!run) return { ok: false, cell, reason: `no runner for model ${cell.model}` };

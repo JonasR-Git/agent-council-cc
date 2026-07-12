@@ -1,7 +1,39 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseSimpleYaml } from "../plugins/council/scripts/lib/policy.mjs";
+import { mergeOptionsWithPolicy, parseSimpleYaml } from "../plugins/council/scripts/lib/policy.mjs";
+import { openRouterBackend } from "../plugins/council/scripts/lib/openrouter-agent.mjs";
+
+test("OpenRouter config resolves from flat YAML (parseSimpleYaml) → backend seats", () => {
+  const policy = parseSimpleYaml(`
+version: 1
+openrouter_base_url: https://openrouter.ai/api/v1
+openrouter_models:
+  - gpt=openai/gpt-4o
+  - r1=deepseek/r1@high
+`);
+  const merged = mergeOptionsWithPolicy({}, policy);
+  assert.deepEqual(merged.openrouterModels, ["gpt=openai/gpt-4o", "r1=deepseek/r1@high"]);
+  const backend = openRouterBackend(merged, { OPENROUTER_API_KEY: "sk-test" });
+  assert.equal(backend.available, true);
+  assert.deepEqual(backend.seats.map((s) => s.id), ["or-gpt", "or-r1"]);
+  assert.equal(JSON.stringify(backend).includes("sk-test"), false, "key never in the descriptor");
+});
+
+test("OpenRouter config resolves from a nested object (.council.json)", () => {
+  const merged = mergeOptionsWithPolicy({}, { openrouter: { models: [{ id: "llama", model: "meta/llama-3.1" }], apiKeyEnv: "MY_KEY" } });
+  const backend = openRouterBackend(merged, { MY_KEY: "sk-y" });
+  assert.equal(backend.available, true);
+  assert.equal(backend.seats[0].id, "or-llama");
+  assert.equal(backend.apiKeyEnv, "MY_KEY");
+});
+
+test("OpenRouter unconfigured → backend unavailable, no seats (default 3-seat behavior preserved)", () => {
+  const merged = mergeOptionsWithPolicy({}, parseSimpleYaml("version: 1"));
+  const backend = openRouterBackend(merged, {});
+  assert.equal(backend.available, false);
+  assert.deepEqual(backend.seats, []);
+});
 
 test("parseSimpleYaml handles blocks, lists, inline lists, scalars, and comments", () => {
   const parsed = parseSimpleYaml(`

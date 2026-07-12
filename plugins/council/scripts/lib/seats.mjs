@@ -67,6 +67,12 @@ export function makeSeatRunners(cwd, backends, options = {}, deps = {}) {
  * PATCH_REVIEW_SEATS), so a mid-run unavailable built-in still blocks, exactly as today.
  */
 export function requiredPatchSeats(backends, options = {}) {
-  const or = (backends?.openrouter?.seats ?? []).map((s) => s.id).filter((id) => seatActive(id, backends, options));
+  if (options.skipOpenRouter) return [...BUILTIN_SEATS];
+  const skip = new Set(options.skipSeats ?? []);
+  // NOT filtered by availability: a CONFIGURED (non-skipped) OpenRouter seat is REQUIRED even if it is
+  // momentarily unreachable — its missing vote then vetoes (fail-closed), exactly as a mid-run built-in
+  // outage does. The CLI checks reachability UP FRONT (patchReviewerReady) and keeps the sensitive class
+  // propose-only when a configured seat is down, so §6 auto-apply only turns on with every seat present.
+  const or = (backends?.openrouter?.seats ?? []).map((s) => s.id).filter((id) => !skip.has(id));
   return [...BUILTIN_SEATS, ...or];
 }
