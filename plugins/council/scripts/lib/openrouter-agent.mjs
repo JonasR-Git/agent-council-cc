@@ -102,10 +102,14 @@ export function normalizeOpenRouterModels(list) {
  * ENV and a (possibly repo-supplied) config points at a remote host, which would ship the env key to
  * an attacker. A custom base must also be https (or http://localhost for a local proxy).
  */
-export function openRouterBackend(options = {}, env = process.env) {
+export function openRouterBackend(options = {}, env = process.env, explicitKeyArg = null) {
   const { seats, warnings } = normalizeOpenRouterModels(options.openrouterModels);
   const keyEnv = options.openrouterApiKeyEnv || "OPENROUTER_API_KEY";
-  const explicitKey = options.openrouterApiKey ? String(options.openrouterApiKey) : null;
+  // The EXPLICIT (config/CLI) key is passed TRANSIENTLY (explicitKeyArg) so it never has to live on
+  // the long-lived `options` object (which is spread + could be serialized/logged). options.openrouterApiKey
+  // is still read as a fallback for direct callers/tests, but the production flow (council-companion)
+  // passes it via the transient arg only.
+  const explicitKey = (explicitKeyArg ? String(explicitKeyArg) : null) ?? (options.openrouterApiKey ? String(options.openrouterApiKey) : null);
   const envKey = env[keyEnv] ? String(env[keyEnv]) : null;
   const key = explicitKey ?? envKey ?? null;
   const keySource = explicitKey ? "explicit" : envKey ? "env" : null;
@@ -113,7 +117,9 @@ export function openRouterBackend(options = {}, env = process.env) {
   let baseURL = DEFAULT_BASE_URL;
   const want = options.openrouterBaseUrl ? String(options.openrouterBaseUrl).trim().replace(/\/+$/, "") : null;
   if (want) {
-    const isLoopback = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(want);
+    // Loopback (http OR https) is exfil-safe. The pattern is anchored + requires a :port, / or end
+    // after the host, so a `http://127.0.0.1@evil.com` userinfo trick does NOT read as loopback.
+    const isLoopback = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(want);
     const isHttps = /^https:\/\//i.test(want);
     if (!isHttps && !isLoopback) warnings.push("openrouter_base_url must be https (or http://localhost) — ignored");
     else if (keySource === "env" && !isLoopback) warnings.push("openrouter_base_url ignored: a custom remote host is not honored with an ENV-sourced key (exfil guard) — set openrouter_api_key explicitly to use it");

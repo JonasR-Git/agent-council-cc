@@ -1734,6 +1734,17 @@ async function handleWatch(argv) {
 // it explicitly with --max-cells (a capped run reports PARTIAL coverage, never silently truncates).
 const GROUPED_CLI_DEFAULT_MAX_CELLS = 1500;
 
+// Attach the OpenRouter backend to a probed `backends`. The config-file API key (discouraged; the ENV
+// var is the recommended path) is passed TRANSIENTLY to openRouterBackend so it never lives on the
+// spread-widely `merged` options (council OpenRouter Grok P1). Any resolution warnings (a base_url
+// ignored by the exfil guard, a dropped/duplicate/over-cap model) are surfaced so the operator isn't
+// silently missing a seat.
+function attachOpenRouterSeats(backends, merged, policy, json) {
+  const configKey = policy?.openrouter_api_key ?? policy?.openrouter?.apiKey ?? null;
+  backends.openrouter = openRouterBackend(merged, process.env, configKey);
+  if (!json) for (const w of backends.openrouter.warnings ?? []) console.error(`⚠ openrouter: ${w}`);
+}
+
 // Assemble the fix-report telemetry meta (metrics + before→after codebase shape). FAIL-SOFT: any git
 // error just omits the shape — a telemetry report must never break a completed fix run. Only called on
 // --html. The before/after shape is bounded to the CHANGED files (a fix touches a small set).
@@ -1802,8 +1813,9 @@ async function handleAudit(argv) {
   // the project root). Reuses the review engine; does not touch the other subcommands.
   if (positionals[0] === "run") {
     const backends = probeBackends(cwd, ROOT_DIR);
-    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
-    backends.openrouter = openRouterBackend(merged); // OpenRouter seats (if configured) join the six-eyes
+    const _orPolicy = loadPolicy(cwd);
+    const merged = mergeOptionsWithPolicy(options, _orPolicy);
+    attachOpenRouterSeats(backends, merged, _orPolicy, options.json); // OpenRouter seats (if configured) join the six-eyes
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
     const tRun = Date.now();
     const report = await runAudit(cwd, model, backends, {
@@ -1841,8 +1853,9 @@ async function handleAudit(argv) {
 
   if (positionals[0] === "review") {
     const backends = probeBackends(cwd, ROOT_DIR);
-    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
-    backends.openrouter = openRouterBackend(merged); // OpenRouter seats (if configured) join the six-eyes
+    const _orPolicy = loadPolicy(cwd);
+    const merged = mergeOptionsWithPolicy(options, _orPolicy);
+    attachOpenRouterSeats(backends, merged, _orPolicy, options.json); // OpenRouter seats (if configured) join the six-eyes
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
     const t0 = Date.now();
     // --groups <preset> (M7): opt into the six-eyes GROUPED path — every (module × lens-group ×
@@ -1899,8 +1912,9 @@ async function handleAudit(argv) {
   // Findings come from --from <json> (a prior review) or a fresh review run.
   if (positionals[0] === "fix") {
     const backends = probeBackends(cwd, ROOT_DIR);
-    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
-    backends.openrouter = openRouterBackend(merged); // OpenRouter seats (if configured) join the six-eyes
+    const _orPolicy = loadPolicy(cwd);
+    const merged = mergeOptionsWithPolicy(options, _orPolicy);
+    attachOpenRouterSeats(backends, merged, _orPolicy, options.json); // OpenRouter seats (if configured) join the six-eyes
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
 
     // Autonomy dial (M4): resolve the level -> commit/propose gate, shared by the loop
@@ -2037,6 +2051,11 @@ async function handleAudit(argv) {
             codexModel: merged["codex-model"] ?? merged.codexModel,
             grokModel: merged["grok-model"] ?? merged.grokModel,
             agentTimeoutMs: merged.agentTimeoutMs
+            // NOTE (council OpenRouter Grok P2): deliberately no skip flags here → the reviewer runs the
+            // SUPERSET of configured seats. runAuditFix's gate computes requiredPatchSeats(backends,
+            // options) as a SUBSET (honoring --skip-openrouter). Superset-reviewer ⊇ subset-required
+            // means every required seat is always present in the votes → no false veto, and
+            // evaluatePatchVerdicts ignores votes from non-required seats → no false approve.
           });
           console.error("§6 council-gated auto-apply ENABLED — sensitive fixes require UNANIMOUS Claude+Codex+Grok confirmation of the patch.");
           console.error("⚠ SECURITY: the §6 reviewers run LLM CLIs inside this repository. Project hooks/settings still fire. Enable --sensitive-auto-apply ONLY on repositories you trust.");
@@ -2180,8 +2199,9 @@ async function handleAudit(argv) {
   // progress is checkpointed to the state dir.
   if (positionals[0] === "endless") {
     const backends = probeBackends(cwd, ROOT_DIR);
-    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
-    backends.openrouter = openRouterBackend(merged); // OpenRouter seats (if configured) join the six-eyes
+    const _orPolicy = loadPolicy(cwd);
+    const merged = mergeOptionsWithPolicy(options, _orPolicy);
+    attachOpenRouterSeats(backends, merged, _orPolicy, options.json); // OpenRouter seats (if configured) join the six-eyes
     // No callable reviewer => every pass reviews nothing and would falsely report
     // "diminishing returns"; fail loud instead of looping over empty passes.
     if (activeReviewerCount(backends, merged) === 0) {

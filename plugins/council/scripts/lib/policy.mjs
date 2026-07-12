@@ -223,10 +223,11 @@ export function mergeOptionsWithPolicy(options, policy) {
     forceBudget: options.forceBudget ?? false,
     resume: options.resume ?? false,
     verifyFindings: options.verifyFindings ?? policy.verify_findings === true,
-    // OpenRouter seats — resolved to NON-SECRET options here (openRouterBackend registers the key in
-    // module scope; the key is never stored on options, which are spread + serialized into checkpoints).
+    // OpenRouter seats — resolved to NON-SECRET options ONLY (council OpenRouter Grok P1): the API key
+    // is DELIBERATELY NOT put here. `merged` is spread widely and could be logged, so the key is passed
+    // TRANSIENTLY to openRouterBackend by the caller (council-companion), which registers it in module
+    // scope. Only the non-secret model list / key-ENV-name / base-url / skip flag live on options.
     openrouterModels: options.openrouterModels ?? policy.openrouter?.models ?? policy.openrouter_models ?? [],
-    openrouterApiKey: options.openrouterApiKey ?? policy.openrouter?.apiKey ?? policy.openrouter_api_key ?? null,
     openrouterApiKeyEnv: options.openrouterApiKeyEnv ?? policy.openrouter?.apiKeyEnv ?? policy.openrouter_api_key_env ?? "OPENROUTER_API_KEY",
     openrouterBaseUrl: options.openrouterBaseUrl ?? policy.openrouter?.baseUrl ?? policy.openrouter_base_url ?? null,
     skipOpenRouter: Boolean(options.skipOpenRouter),
