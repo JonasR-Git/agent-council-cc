@@ -129,6 +129,19 @@ test("R9: a --groups fix loop does NOT converge while grouped coverage is INCOMP
   assert.ok(pass >= 3, `the loop kept reviewing until the grouped matrix was complete (ran ${pass} passes, not a dry stop at pass 1)`);
 });
 
+test("R9 (council round-2): a --groups fix loop converges on passComplete despite a persistent cap (strict complete:false)", async () => {
+  const gModel = { files: [{ id: "a.mjs", fanIn: 1 }] };
+  let pass = 0;
+  // a capped grouped pass reports strict complete:false but passComplete:true (scheduled cells done);
+  // the loop must converge off passComplete, not burn to maxPasses re-hitting the cap every pass.
+  const runGroupedReview = async () => { pass += 1; return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, complete: false, passComplete: true, capped: true, budgetSpent: 1 } }; };
+  const runAuditFix = async () => ({ fixed: [], failed: [], spent: 0 });
+  const deps = makeFixLoopDeps("/x", gModel, {}, { lensGroups: "fine", maxCells: 50 }, { runGroupedReview, runAuditFix });
+  const out = await runFixLoop("/x", { budget: 100, dryStreak: 2, maxPasses: 20 }, { ...deps, checkpoint: noCheckpoint });
+  assert.ok(pass < 20, `converged off passComplete (ran ${pass} passes), did not burn to the ceiling on the cap`);
+  assert.match(out.stopReason, /diminishing|converged/, "a normal convergence stop, not a ceiling stop");
+});
+
 test("council Codex C2: 'all tiers converged' wins over the max-passes ceiling when they coincide", async () => {
   // dryStreak 1 → each empty pass advances a tier; starting tier 1, 3 passes reach tier 4 (converged)
   // exactly at maxPasses 3. The convergence reason must win over the generic "reached max passes".

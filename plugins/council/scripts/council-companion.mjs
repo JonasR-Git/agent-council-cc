@@ -1961,7 +1961,7 @@ async function handleAudit(argv) {
         loopBudget = Math.floor(n);
       }
       if (loopLensGroups && !options.json) {
-        console.error(`note: --groups makes each pass a ${loopMaxCells}-cell six-eyes review (each cell = one agent call); the loop budget is ${loopBudget} agent calls (≈${Math.max(1, Math.floor(loopBudget / loopMaxCells))} full grouped pass(es)). Raise --budget for more passes.`);
+        console.error(`note: --groups prices each review cell as one agent call; the loop budget is ${loopBudget} cells total (each pass reviews up to min(--max-cells ${loopMaxCells}, its per-pass budget)). Raise --budget for deeper coverage / more passes.`);
       }
 
       // Coverage gate (§5): produce coverage ONCE via a project script and ingest it, so
@@ -2169,7 +2169,7 @@ async function handleAudit(argv) {
       budget = Math.floor(n);
     }
     if (endlessLensGroups && !options.json) {
-      console.error(`note: --groups makes each pass a ${endlessMaxCells}-cell six-eyes review (each cell = one agent call); the loop budget is ${budget} agent calls (≈${Math.max(1, Math.floor(budget / endlessMaxCells))} full grouped pass(es)). Raise --budget for more passes.`);
+      console.error(`note: --groups prices each review cell as one agent call; the loop budget is ${budget} cells total (each pass reviews up to min(--max-cells ${endlessMaxCells}, its per-pass budget)). Raise --budget for deeper coverage / more passes.`);
     }
     let maxPasses = 10;
     if (options["max-passes"] != null) {

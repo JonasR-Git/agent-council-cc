@@ -2,10 +2,11 @@
 // with all lenses at once, runGroupedReview reviews each (file × lens-GROUP × chunk) CELL with all
 // three models (B1 groups + B3 chunks + B2 finders + B4 matrix), so every defect class gets its own
 // deep focused pass and coverage is measured cell-granularly. It is OPT-IN (--groups <preset>) and
-// self-contained — the existing per-file path is untouched. Produces coverage.complete (six-eyes)
-// which B5's loop-until-dry guard consumes. NOTE: today runGroupedReview is wired ONLY into one-shot
-// `audit review --groups`; the fix/endless loops still call runAuditReview (per-file), so a loop run
-// does NOT yet drive convergence off cell coverage — that loop wiring is future work (council O1).
+// self-contained — the existing per-file path is untouched. Produces `complete` (strict six-eyes, for
+// the one-shot report) + `passComplete` (scheduled cells reviewed, for the loop convergence guard).
+// Wired into BOTH the one-shot `audit review --groups` AND the fix/endless loops (R9): a
+// `audit fix --loop --groups` / `audit endless --groups` run drives its dry/tier convergence off
+// passComplete, with each pass's cells capped to its per-pass agent-call budget.
 import fs from "node:fs";
 import path from "node:path";
 
