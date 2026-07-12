@@ -7,6 +7,7 @@ import { buildPatchReviewPrompt, parsePatchVerdict, PATCH_REVIEW_SEATS } from ".
 import { runCodexStructured, runGrokStructured } from "./agents.mjs";
 import { findClaudeBinary } from "./discover.mjs";
 import { runCommandAsync } from "./process.mjs";
+import { REVIEWER_CHARTER } from "./reviewer-charter.mjs";
 
 // The Claude seat runs read-only: it may inspect the repo (Read/Grep/Glob) to judge the
 // patch against callers, but never edits, shells out, or reaches the network.
@@ -29,6 +30,12 @@ export function buildClaudeReviewArgs(options = {}) {
     "--strict-mcp-config",
     "--permission-mode",
     "default",
+    // A4: a STABLE reviewer charter (evidence-first, failure-scenario-required, severity-cap
+    // discipline). Identical across every review call, so Anthropic prompt caching reuses it
+    // (system-block cache hit → cheaper + faster). It sets reasoning discipline only; the
+    // user prompt still dictates the exact 2-line VERDICT reply, which the charter defers to.
+    "--append-system-prompt",
+    REVIEWER_CHARTER,
     // A2: reasoning effort defaults to xhigh (user pref: always xhigh, never max) so the §6
     // patch reviewer thinks as hard as possible. An unknown value warns + falls back to the
     // CLI default, so this can't break the seat. Valid: low|medium|high|xhigh|max.

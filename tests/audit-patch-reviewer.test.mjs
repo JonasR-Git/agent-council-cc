@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { buildClaudeReviewArgs, makePatchReviewer, patchReviewerReady } from "../plugins/council/scripts/lib/audit-patch-reviewer.mjs";
 import { evaluatePatchVerdicts } from "../plugins/council/scripts/lib/audit-council-gate.mjs";
+import { REVIEWER_CHARTER } from "../plugins/council/scripts/lib/reviewer-charter.mjs";
 
 const patch = { file: "a.mjs", finding: { severity: "P1", category: "concurrency", title: "race", detail: "d" }, diff: "@@ -1 +1 @@\n-x\n+y" };
 
@@ -16,6 +17,13 @@ test("buildClaudeReviewArgs is read-only: inspect tools allowed, edit/exec/netwo
   assert.equal(args[args.indexOf("--model") + 1], "claude-opus-4-8");
   assert.equal(args[args.indexOf("--effort") + 1], "xhigh", "A2: reviewer reasons at xhigh by default");
   assert.equal(buildClaudeReviewArgs({ claudeEffort: "high" })[buildClaudeReviewArgs({ claudeEffort: "high" }).indexOf("--effort") + 1], "high", "explicit effort wins");
+});
+
+test("A4: buildClaudeReviewArgs appends the stable reviewer charter as a cache-friendly system prompt", () => {
+  const args = buildClaudeReviewArgs({});
+  const i = args.indexOf("--append-system-prompt");
+  assert.ok(i >= 0, "the reviewer charter is appended to the system prompt");
+  assert.equal(args[i + 1], REVIEWER_CHARTER, "the appended value is the shared, byte-stable charter (prompt-cache hit)");
 });
 
 test("makePatchReviewer runs all three seats on the same patch and returns parsed verdicts", async () => {
