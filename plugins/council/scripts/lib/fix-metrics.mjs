@@ -73,12 +73,17 @@ export function gateFunnel(out) {
 /** Tally §6 verdicts across all council-reviewed findings. Pure. */
 export function councilTally(out) {
   const withCouncil = [...(out?.fixed ?? []), ...(out?.rejected ?? []), ...(out?.proposed ?? [])].filter((e) => e.council?.verdicts);
-  const tally = { reviewed: withCouncil.length, unanimous: 0, dissented: 0, perSeat: { claude: { confirm: 0, dissent: 0, abstain: 0 }, codex: { confirm: 0, dissent: 0, abstain: 0 }, grok: { confirm: 0, dissent: 0, abstain: 0 } } };
+  // Built-ins are ALWAYS present (stable shape); any OpenRouter seat that actually cast a §6 vote is
+  // ADDED dynamically (council Codex P2) — an or-* seat can veto the patch, so the persisted report
+  // must be able to explain that vote instead of silently dropping every dynamic seat.
+  const perSeat = { claude: { confirm: 0, dissent: 0, abstain: 0 }, codex: { confirm: 0, dissent: 0, abstain: 0 }, grok: { confirm: 0, dissent: 0, abstain: 0 } };
+  const tally = { reviewed: withCouncil.length, unanimous: 0, dissented: 0, perSeat };
   for (const e of withCouncil) {
     if (e.council.approved) tally.unanimous += 1; else tally.dissented += 1;
     for (const v of e.council.verdicts ?? []) {
-      const seat = tally.perSeat[v.seat];
-      if (seat && seat[v.verdict] != null) seat[v.verdict] += 1;
+      if (!v?.seat) continue;
+      if (!perSeat[v.seat]) perSeat[v.seat] = { confirm: 0, dissent: 0, abstain: 0 };
+      if (perSeat[v.seat][v.verdict] != null) perSeat[v.seat][v.verdict] += 1;
     }
   }
   return tally;
@@ -103,7 +108,10 @@ export function buildRunMetrics(out, ctx = {}) {
   const tokens = ctx.tokens ?? (ctx.tokensBefore && ctx.tokensAfter ? tokenDelta(ctx.tokensBefore, ctx.tokensAfter) : {});
   const seatCtx = ctx.seats ?? {};
   const seats = {};
-  for (const seat of SEAT_KEYS) {
+  // Built-ins are always emitted (stable shape); any extra seat the orchestrator recorded a context for
+  // — an OpenRouter or-* seat — is emitted too (council Codex P2), so its calls/verdicts are not dropped.
+  const seatList = [...SEAT_KEYS, ...Object.keys(seatCtx).filter((k) => !SEAT_KEYS.includes(k))];
+  for (const seat of seatList) {
     const s = seatCtx[seat] ?? {};
     const tk = tokens[seat] ?? {};
     seats[seat] = {
@@ -132,8 +140,8 @@ export function buildRunMetrics(out, ctx = {}) {
     gates: gateFunnel(out),
     council: councilTally(out),
     cost: {
-      inputTokens: SEAT_KEYS.reduce((n, s) => n + seats[s].inputTokens, 0),
-      outputTokens: SEAT_KEYS.reduce((n, s) => n + seats[s].outputTokens, 0),
+      inputTokens: seatList.reduce((n, s) => n + seats[s].inputTokens, 0),
+      outputTokens: seatList.reduce((n, s) => n + seats[s].outputTokens, 0),
       estUsd: estimateCost(tokens)
     }
   };

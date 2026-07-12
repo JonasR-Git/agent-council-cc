@@ -1740,8 +1740,12 @@ const GROUPED_CLI_DEFAULT_MAX_CELLS = 1500;
 // ignored by the exfil guard, a dropped/duplicate/over-cap model) are surfaced so the operator isn't
 // silently missing a seat.
 function attachOpenRouterSeats(backends, merged, policy, json) {
-  const configKey = policy?.openrouter_api_key ?? policy?.openrouter?.apiKey ?? null;
-  backends.openrouter = openRouterBackend(merged, process.env, configKey);
+  // SECURITY (council OpenRouter Claude P1): the policy comes from the AUDITED repo, so a repo-supplied
+  // API key must NEVER activate/redirect egress. Pass NO config key — the key comes only from the user's
+  // ENV var (or a future user-typed CLI flag). Warn loudly if a repo file tried to set one.
+  const repoKey = policy?.openrouter_api_key ?? policy?.openrouter?.apiKey ?? null;
+  if (repoKey && !json) console.error("⚠ openrouter: an API key in the repo policy file is IGNORED for security — set it via the OPENROUTER_API_KEY environment variable instead (a repo-supplied key would ship your source to that key's account).");
+  backends.openrouter = openRouterBackend(merged, process.env, null);
   if (!json) for (const w of backends.openrouter.warnings ?? []) console.error(`⚠ openrouter: ${w}`);
 }
 
@@ -2060,7 +2064,10 @@ async function handleAudit(argv) {
           console.error("§6 council-gated auto-apply ENABLED — sensitive fixes require UNANIMOUS Claude+Codex+Grok confirmation of the patch.");
           console.error("⚠ SECURITY: the §6 reviewers run LLM CLIs inside this repository. Project hooks/settings still fire. Enable --sensitive-auto-apply ONLY on repositories you trust.");
         } else {
-          const missing = ["claude", "codex", "grok"].filter((s) => !ready[s]);
+          // Name the ACTUAL unreachable seats, derived from every per-seat flag ready reports (built-ins
+          // AND any configured or-* seat) — not a hardcoded three (council Codex P2). Otherwise an
+          // OpenRouter seat being down prints "seats unreachable ()" and misdiagnoses the veto.
+          const missing = Object.keys(ready).filter((s) => s !== "ready" && !ready[s]);
           console.error(`⚠ --sensitive-auto-apply requested but seats unreachable (${missing.join(", ")}) — §6 stays propose-only.`);
         }
       }
@@ -2075,6 +2082,12 @@ async function handleAudit(argv) {
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
         skipClaude: merged.skipClaude, // B2 (grok-1): honor the Claude opt-out in the fix loop too
+        // Thread the OpenRouter opt-outs so the §6 gate's requiredPatchSeats HONORS --skip-openrouter /
+        // per-seat skips in the LOOP path too (council OpenRouter Claude P2) — else a skipped OR seat
+        // would still be REQUIRED and veto every patch. The reviewer stays a superset; only the required
+        // SET shrinks, and evaluatePatchVerdicts ignores the non-required OR votes.
+        skipOpenRouter: merged.skipOpenRouter,
+        skipSeats: merged.skipSeats ?? options.skipSeats,
         claudeModel: merged["claude-model"] ?? merged.claudeModel,
         sensitiveAutoApply,
         reviewPatch,

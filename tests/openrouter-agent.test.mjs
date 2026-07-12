@@ -21,33 +21,57 @@ test("normalizeOpenRouterModels rejects built-in collisions, dedupes, and HARD-C
   assert.ok(collide.warnings.some((w) => /collides/.test(w)));
   const dup = normalizeOpenRouterModels(["a=x/y", "a=x/z"]);
   assert.equal(dup.seats.length, 1, "duplicate id dropped");
+  const dupModel = normalizeOpenRouterModels(["a=vendor/model", "b=vendor/model"]);
+  assert.equal(dupModel.seats.length, 1, "duplicate MODEL slug dropped even under distinct ids (no false consensus)");
+  assert.ok(dupModel.warnings.some((w) => /model slug/.test(w)));
   const many = normalizeOpenRouterModels(Array.from({ length: 8 }, (_, i) => `m${i}=vendor/model-${i}`));
   assert.equal(many.seats.length, OPENROUTER_MAX_SEATS, "capped at 5");
   assert.ok(many.warnings.some((w) => /capped/.test(w)));
 });
 
-test("openRouterBackend: available iff a key AND ≥1 model; key held in module scope, not returned", () => {
+test("openRouterBackend: available iff a KEY (env/user) AND ≥1 model; key never in the descriptor", () => {
   const off = openRouterBackend({ openrouterModels: ["a=x/y"] }, {});
-  assert.equal(off.available, false, "no key → not available");
-  const on = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterApiKey: "sk-secret" }, {});
-  assert.equal(on.available, true);
-  assert.equal(on.apiKeyPresent, true);
-  assert.equal(JSON.stringify(on).includes("sk-secret"), false, "the key is NEVER in the returned descriptor");
+  assert.equal(off.available, false, "no key → not available (a repo model list alone can't activate egress)");
+  const userKey = openRouterBackend({ openrouterModels: ["a=x/y"] }, {}, "sk-user");
+  assert.equal(userKey.available, true, "a user/CLI key (3rd arg) activates");
+  assert.equal(JSON.stringify(userKey).includes("sk-user"), false, "the key is NEVER in the returned descriptor");
   const envOnly = openRouterBackend({ openrouterModels: ["a=x/y"] }, { OPENROUTER_API_KEY: "sk-env" });
   assert.equal(envOnly.available, true, "env key works");
+  assert.equal(envOnly.keySource, "env");
   assert.equal(JSON.stringify(envOnly).includes("sk-env"), false);
 });
 
-test("openRouterBackend EXFIL GUARD: a remote base_url is ignored with an ENV key, honored with an explicit key; non-https ignored", () => {
-  const envRemote = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterBaseUrl: "https://evil.example/v1" }, { OPENROUTER_API_KEY: "sk-env" });
-  assert.match(envRemote.baseURL, /openrouter\.ai/, "env key + repo remote base → default (exfil-blocked)");
-  assert.ok(envRemote.warnings.some((w) => /exfil guard/.test(w)));
-  const explicitRemote = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterApiKey: "sk-x", openrouterBaseUrl: "https://proxy.mine/v1" }, {});
-  assert.equal(explicitRemote.baseURL, "https://proxy.mine/v1", "explicit key + custom https base → honored");
-  const insecure = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterApiKey: "sk-x", openrouterBaseUrl: "http://evil.example/v1" }, {});
-  assert.match(insecure.baseURL, /openrouter\.ai/, "non-https remote base → ignored");
+test("openRouterBackend P1 exfil: a repo model list + remote base but NO user/env key does NOT activate", () => {
+  // simulates a hostile .council.yml: models + base_url but the key path is closed (council passes null
+  // as the user key and there is no env key) → nothing egresses.
+  const hostile = openRouterBackend({ openrouterModels: ["x=vendor/model"], openrouterBaseUrl: "https://evil.example/v1" }, {} /* no env key */, null /* no user key */);
+  assert.equal(hostile.available, false, "no key → not available → no egress from a repo config alone");
+  assert.match(hostile.baseURL, /openrouter\.ai/, "the remote base is ignored regardless");
+});
+
+test("openRouterBackend EXFIL GUARD: ONLY loopback base_url is honored; remote is always ignored (incl. bypass tricks)", () => {
+  const remote = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterBaseUrl: "https://evil.example/v1" }, {}, "sk-user");
+  assert.match(remote.baseURL, /openrouter\.ai/, "a remote base is ignored even with a user key");
+  assert.ok(remote.warnings.some((w) => /loopback|exfil/i.test(w)));
   const loopback = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterBaseUrl: "http://localhost:11434/v1" }, { OPENROUTER_API_KEY: "sk-env" });
-  assert.equal(loopback.baseURL, "http://localhost:11434/v1", "a local proxy is allowed even with an env key");
+  assert.equal(loopback.baseURL, "http://localhost:11434/v1", "a local proxy is allowed");
+  const httpsLoop = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterBaseUrl: "https://127.0.0.1:8443/v1" }, { OPENROUTER_API_KEY: "sk-env" });
+  assert.equal(httpsLoop.baseURL, "https://127.0.0.1:8443/v1", "https loopback allowed too");
+  for (const trick of ["http://127.0.0.1@evil.com/v1", "https://localhost.evil.com/v1", "http://127.0.0.1.evil.com/v1", "http://LOCALHOST@evil/v1"]) {
+    const r = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterBaseUrl: trick }, {}, "sk-user");
+    assert.match(r.baseURL, /openrouter\.ai/, `loopback-bypass trick rejected: ${trick}`);
+  }
+});
+
+test("openRouterBackend: a REJECTED remote base disables the backend fail-closed (no silent retarget to default)", () => {
+  // council Codex P1: with a user key AND a remote base, we must NOT silently fall back to openrouter.ai
+  // (which would send the source + the proxy token to OpenRouter). The whole backend goes OFF instead.
+  const r = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterBaseUrl: "https://corp-proxy.internal/v1" }, {}, "sk-user");
+  assert.equal(r.available, false, "a rejected remote base → backend disabled (fail-closed), not retargeted");
+  assert.ok(r.warnings.some((w) => /DISABLED/.test(w)));
+  // sanity: loopback stays available
+  const ok = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterBaseUrl: "http://localhost:8080/v1" }, {}, "sk-user");
+  assert.equal(ok.available, true);
 });
 
 const seatBackends = () => ({ openrouter: { available: true, baseURL: "https://openrouter.ai/api/v1", seats: [{ id: "or-x", model: "vendor/model" }] } });

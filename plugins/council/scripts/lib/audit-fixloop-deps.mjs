@@ -146,6 +146,12 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
         // §6: consented council-gated auto-apply. sensitiveAutoApply only takes effect in
         // runAuditFix when a reviewPatch is ALSO injected (both are threaded from the CLI).
         sensitiveAutoApply: options.sensitiveAutoApply,
+        // §6 required-seat set must honor the OpenRouter opt-outs (council OpenRouter Claude P2): without
+        // these, requiredPatchSeats(backends, options) inside runAuditFix would still REQUIRE a skipped
+        // OR seat → its (absent) vote vetoes every patch. Passing them shrinks the required set to match
+        // the reviewer's actual participation; the reviewer remains the superset (sound).
+        skipOpenRouter: options.skipOpenRouter,
+        skipSeats: options.skipSeats,
         // Rate-limit resilience must reach the layer where the 429 is actually thrown
         // (applyFix / reviewPatch) — the loop-level wrapper never sees it because
         // runAuditFix records a per-fix failure instead of throwing.

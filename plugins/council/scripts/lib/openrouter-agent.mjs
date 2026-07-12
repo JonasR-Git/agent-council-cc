@@ -39,6 +39,7 @@ export function normalizeOpenRouterModels(list) {
   const seats = [];
   const warnings = [];
   const seen = new Set();
+  const seenModels = new Set();
   const raws = Array.isArray(list) ? list : [];
   for (const raw of raws) {
     let id = "";
@@ -82,7 +83,16 @@ export function normalizeOpenRouterModels(list) {
       warnings.push(`duplicate openrouter seat id dropped: ${id}`);
       continue;
     }
+    // Deduplicate the canonical MODEL SLUG too (council Codex P2): two aliases for the identical model
+    // would masquerade as two INDEPENDENT agents — matching findings could reach ≥2-agent "consensus"
+    // and skip refutation, and §6/coverage would misreport duplicate calls as distinct seats.
+    const modelKey = model.toLowerCase();
+    if (seenModels.has(modelKey)) {
+      warnings.push(`duplicate openrouter model slug dropped (already has a seat): ${model}`);
+      continue;
+    }
     seen.add(id);
+    seenModels.add(modelKey);
     seats.push({ id, model, ...(effort ? { effort } : {}) });
     if (seats.length >= OPENROUTER_MAX_SEATS) {
       if (raws.length > OPENROUTER_MAX_SEATS) warnings.push(`openrouter seats hard-capped at ${OPENROUTER_MAX_SEATS} (extra entries dropped)`);
@@ -97,38 +107,52 @@ export function normalizeOpenRouterModels(list) {
  * availability = a key is present AND ≥1 configured model. There is NO network probe — a dead network
  * just yields failed runs, which every consumer already treats fail-closed.
  *
- * EXFIL GUARD (council Fable): a custom base URL is honored ONLY when the key was provided EXPLICITLY
- * (CLI/policy `openrouter_api_key`) or the host is loopback — never when the key comes from the user's
- * ENV and a (possibly repo-supplied) config points at a remote host, which would ship the env key to
- * an attacker. A custom base must also be https (or http://localhost for a local proxy).
+ * EXFIL GUARD (council Fable/Claude/Codex): a custom base URL is honored ONLY when the host is LOOPBACK
+ * (a local OpenAI-compatible proxy). A remote base_url is never honored — its only channel today is the
+ * untrusted repo policy file, so redirecting the user's key/source to a repo-chosen remote host is the
+ * exfil vector. A requested-but-rejected remote base DISABLES the backend fail-closed (available=false)
+ * rather than silently retargeting the default host with a token meant for the user's own proxy.
  */
-export function openRouterBackend(options = {}, env = process.env, explicitKeyArg = null) {
+export function openRouterBackend(options = {}, env = process.env, userKeyArg = null) {
   const { seats, warnings } = normalizeOpenRouterModels(options.openrouterModels);
   const keyEnv = options.openrouterApiKeyEnv || "OPENROUTER_API_KEY";
-  // The EXPLICIT (config/CLI) key is passed TRANSIENTLY (explicitKeyArg) so it never has to live on
-  // the long-lived `options` object (which is spread + could be serialized/logged). options.openrouterApiKey
-  // is still read as a fallback for direct callers/tests, but the production flow (council-companion)
-  // passes it via the transient arg only.
-  const explicitKey = (explicitKeyArg ? String(explicitKeyArg) : null) ?? (options.openrouterApiKey ? String(options.openrouterApiKey) : null);
+  // TRUST MODEL (council OpenRouter Claude P1): the .council.yml is read from the AUDITED (untrusted)
+  // repo, so a repo-supplied key/base could otherwise silently ship the working tree to an attacker's
+  // OpenRouter account/host. Therefore the KEY only ever comes from a USER-level source: the ENV var
+  // (recommended) or an explicit CLI flag threaded as userKeyArg — NEVER from the repo policy file.
+  // (options.openrouterApiKey is honored only for direct callers/tests, not the CLI flow.) Repo config
+  // can at most add MODEL SLUGS to an already-env-consented setup — egress needs the user's own key.
+  const userKey = (userKeyArg ? String(userKeyArg) : null) ?? (options.openrouterApiKey ? String(options.openrouterApiKey) : null);
   const envKey = env[keyEnv] ? String(env[keyEnv]) : null;
-  const key = explicitKey ?? envKey ?? null;
-  const keySource = explicitKey ? "explicit" : envKey ? "env" : null;
+  const key = userKey ?? envKey ?? null;
 
+  // BASE URL: honor a custom base ONLY when it is LOOPBACK (a local OpenAI-compatible proxy — no exfil
+  // risk). A REMOTE base_url is NEVER honored here, because the only channel for it today is the
+  // untrusted repo policy file; redirecting the user's key to a repo-chosen remote host is the exfil
+  // vector. The anchored loopback pattern rejects the `http://127.0.0.1@evil.com` userinfo trick.
   let baseURL = DEFAULT_BASE_URL;
+  let baseRejected = false;
   const want = options.openrouterBaseUrl ? String(options.openrouterBaseUrl).trim().replace(/\/+$/, "") : null;
   if (want) {
-    // Loopback (http OR https) is exfil-safe. The pattern is anchored + requires a :port, / or end
-    // after the host, so a `http://127.0.0.1@evil.com` userinfo trick does NOT read as loopback.
+    // Honor a custom base only when the host is LOOPBACK (a local proxy) or the canonical openrouter.ai
+    // service itself. Both anchored patterns require the host to be immediately followed by `/` or end,
+    // so the userinfo trick (…openrouter.ai@evil.com) and suffix trick (…openrouter.ai.evil.com) are
+    // rejected. ANY OTHER host is refused.
     const isLoopback = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(want);
-    const isHttps = /^https:\/\//i.test(want);
-    if (!isHttps && !isLoopback) warnings.push("openrouter_base_url must be https (or http://localhost) — ignored");
-    else if (keySource === "env" && !isLoopback) warnings.push("openrouter_base_url ignored: a custom remote host is not honored with an ENV-sourced key (exfil guard) — set openrouter_api_key explicitly to use it");
-    else baseURL = want;
+    const isOfficial = /^https:\/\/openrouter\.ai(:\d+)?(\/|$)/i.test(want);
+    if (isLoopback || isOfficial) baseURL = want;
+    else {
+      // A requested-but-rejected base DISABLES the backend fail-closed (council Codex P1): silently
+      // falling back to openrouter.ai would send the reviewed source — and the token the user meant for
+      // their own proxy — to OpenRouter instead. Never redirect a rejected destination to the default.
+      baseRejected = true;
+      warnings.push("openrouter DISABLED: openrouter_base_url must be a loopback (localhost) proxy or the openrouter.ai host — a different remote host is refused (would send your key/source off-machine); OpenRouter is OFF for this run rather than silently retargeting the default host");
+    }
   }
 
-  const available = Boolean(key) && seats.length > 0;
+  const available = Boolean(key) && seats.length > 0 && !baseRejected;
   registerOpenRouterKey(available ? key : null);
-  return { available, seats, baseURL, apiKeyEnv: keyEnv, apiKeyPresent: Boolean(key), keySource, warnings };
+  return { available, seats, baseURL, apiKeyEnv: keyEnv, apiKeyPresent: Boolean(key), keySource: key ? (userKey ? "user" : "env") : null, warnings };
 }
 
 /** Minimal node:https/http JSON POST → { status, body } (or throws on transport error). Injectable. */
@@ -143,6 +167,21 @@ function postJson(url, payload, headers, timeoutMs) {
     }
     const lib = u.protocol === "http:" ? http : https;
     const data = Buffer.from(JSON.stringify(payload), "utf8");
+    let settled = false;
+    // ABSOLUTE wall-clock deadline (council Codex P1): node's `timeout` option is only a SOCKET-INACTIVITY
+    // timeout — a hostile/broken endpoint that dribbles one byte per interval keeps the request pending
+    // forever and hangs the seat's Promise.all indefinitely. This hard deadline destroys the request no
+    // matter what, so every seat settles within timeoutMs.
+    const deadline = setTimeout(() => {
+      if (!settled) req.destroy(new Error("timeout"));
+    }, Math.max(1, Number(timeoutMs) || 300_000));
+    if (typeof deadline.unref === "function") deadline.unref();
+    const done = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      fn(arg);
+    };
     const req = lib.request(
       u,
       { method: "POST", headers: { "content-type": "application/json", "content-length": data.length, ...headers }, timeout: timeoutMs },
@@ -151,12 +190,19 @@ function postJson(url, payload, headers, timeoutMs) {
         let capped = false;
         res.on("data", (c) => {
           if (body.length < RESPONSE_CAP) body += c;
-          else capped = true;
+          else if (!capped) {
+            // response exceeds the cap → stop reading and abort immediately rather than draining an
+            // unbounded (possibly adversarial) body to 'end'.
+            capped = true;
+            res.destroy();
+            done(resolve, { status: res.statusCode ?? 0, body, capped });
+          }
         });
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, body, capped }));
+        res.on("error", (e) => done(reject, e));
+        res.on("end", () => done(resolve, { status: res.statusCode ?? 0, body, capped }));
       }
     );
-    req.on("error", (e) => reject(e));
+    req.on("error", (e) => done(reject, e));
     req.on("timeout", () => {
       req.destroy(new Error("timeout"));
     });
@@ -209,8 +255,10 @@ export async function runOpenRouterStructured(cwd, backends, options, prompt, se
       }
       return buildAgentResult(seatId, "openrouter", { status: 0, stdout: content, stderr: "", durationMs, truncated: Boolean(res.capped) }, { model: seat.model });
     }
-    // non-2xx: surface the code (status=<n> matches RATE_LIMIT_RE for transient; 401/quota → PERMANENT_RE)
-    return buildAgentResult(seatId, "openrouter", { status: res.status || 1, stdout: "", stderr: scrub(`openrouter ${seat.model}: status=${res.status} ${String(res.body ?? "").slice(0, 300)}`), durationMs }, { model: seat.model });
+    // non-2xx: surface the code (status=<n> matches RATE_LIMIT_RE for transient; 401/quota → PERMANENT_RE).
+    // SCRUB the FULL body BEFORE truncating (council Codex P2): slicing first could keep a partial key that
+    // then fails the exact-match redaction and leaks the prefix into stderr/logs.
+    return buildAgentResult(seatId, "openrouter", { status: res.status || 1, stdout: "", stderr: `openrouter ${seat.model}: status=${res.status} ${scrub(String(res.body ?? "")).slice(0, 300)}`, durationMs }, { model: seat.model });
   } catch (err) {
     const durationMs = deps.now ? deps.now() - started : null;
     const timedOut = /timeout/i.test(String(err?.message ?? ""));

@@ -59,6 +59,30 @@ test("councilTally counts unanimity, dissent, and per-seat verdicts", () => {
   assert.equal(c.perSeat.claude.confirm, 2);
 });
 
+test("councilTally records an OpenRouter seat's veto dynamically (built-ins stay present)", () => {
+  const withOr = {
+    rejected: [
+      { finding: { severity: "P1" }, reason: "§6 council not unanimous (dissent: or-gpt)", council: { approved: false, verdicts: [{ seat: "claude", verdict: "confirm" }, { seat: "codex", verdict: "confirm" }, { seat: "grok", verdict: "confirm" }, { seat: "or-gpt", verdict: "dissent" }] } }
+    ]
+  };
+  const c = councilTally(withOr);
+  assert.equal(c.dissented, 1);
+  assert.equal(c.perSeat["or-gpt"].dissent, 1, "the OpenRouter seat's veto is recorded, not dropped");
+  assert.ok(c.perSeat.claude && c.perSeat.codex && c.perSeat.grok, "built-in seats always present");
+});
+
+test("buildRunMetrics emits an OpenRouter seat when the orchestrator recorded a context for it", () => {
+  const m = buildRunMetrics({ fixed: [] }, {
+    seats: {
+      claude: { calls: 1 }, codex: { calls: 1 }, grok: { calls: 1 },
+      "or-gpt": { calls: 2, findingsRaised: 3, verdicts: { confirm: 1, dissent: 1, abstain: 0 } }
+    }
+  });
+  assert.equal(m.seats["or-gpt"].calls, 2, "the dynamic seat is emitted");
+  assert.equal(m.seats["or-gpt"].findingsRaised, 3);
+  assert.ok(m.seats.claude && m.seats.codex && m.seats.grok, "built-ins still present");
+});
+
 test("outcomeTotals separates fixed / council / proposed / gated / failed", () => {
   const t = outcomeTotals(out());
   assert.equal(t.found, 6);
