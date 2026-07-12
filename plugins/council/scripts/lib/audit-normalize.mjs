@@ -82,7 +82,14 @@ export function toCanonicalFinding(raw = {}, { unit, ordinal } = {}) {
   // nor read as confirmed (council Fable P1).
   const verified = isVerifiedSupported(raw);
   const severity = cappedSeverity(lens, raw.severity ?? "P2", { verified, regexOnly: state === "regex-only" });
-  const confidence = deriveConfidence(state, Number.isFinite(raw.confidence) ? raw.confidence : 0.6);
+  // A MERGED bucket (findings.mjs finalizeBuckets) carries the finders' averaged self-rating as
+  // `avgConfidence`; a single raw finding carries `confidence`. Reading only the latter scored every
+  // merged finding — i.e. every finding on the audit path — at the 0.6 default and threw the models'
+  // confidence signal away. deriveConfidence still clamps to the evidence-state CAP/FLOOR, so a
+  // self-rating can lower confidence but NEVER exceed what the evidence supports (a refuted finding
+  // stays at the 0.2 cap however loudly the model rated itself).
+  const selfRated = Number.isFinite(raw.avgConfidence) ? raw.avgConfidence : raw.confidence;
+  const confidence = deriveConfidence(state, Number.isFinite(selfRated) ? selfRated : 0.6);
   const L = clamp15(raw.likelihood);
   const B = clamp15(raw.blastRadius);
   const E = clamp15(raw.exploitability);

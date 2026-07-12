@@ -139,6 +139,116 @@ test("runOpenRouterStructured: a SYNCHRONOUS request failure (newline in the key
   registerOpenRouterKey("sk-secret"); // restore for later tests
 });
 
+test("runOpenRouterStructured: content as an ARRAY OF PARTS is joined (OpenAI-compatible multimodal shape)", async () => {
+  // a provider that replies with [{type:"text",text:"…"}] was treated as "no message content" → the seat
+  // looked permanently dead while staying §6-required, so its missing vote vetoed every sensitive patch.
+  registerOpenRouterKey("sk-secret");
+  const body = JSON.stringify({
+    choices: [{ message: { content: [{ type: "text", text: '{"agent":"or-x",' }, { type: "image_url", image_url: { url: "x" } }, { type: "text", text: '"findings":[]}' }] } }]
+  });
+  const r = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", { transport: async () => ({ status: 200, body }) });
+  assert.equal(r.status, 0, "array-of-parts content is accepted");
+  assert.equal(r.stdout, '{"agent":"or-x","findings":[]}', "text parts are concatenated with no separator (the JSON re-forms); non-text parts contribute nothing");
+});
+
+test("runOpenRouterStructured: a reasoning model with EMPTY content falls back to message.reasoning / reasoning_content", async () => {
+  registerOpenRouterKey("sk-secret");
+  const reasoning = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", {
+    transport: async () => ({ status: 200, body: JSON.stringify({ choices: [{ message: { content: "", reasoning: '{"agent":"or-x","findings":[]}' } }] }) })
+  });
+  assert.equal(reasoning.status, 0, "content:'' + reasoning → usable");
+  assert.match(reasoning.stdout, /findings/);
+
+  const rc = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", {
+    transport: async () => ({ status: 200, body: JSON.stringify({ choices: [{ message: { content: null, reasoning_content: [{ type: "text", text: "VERDICT: APPROVE" }] } }] }) })
+  });
+  assert.equal(rc.status, 0, "content:null + reasoning_content (as parts) → usable");
+  assert.equal(rc.stdout, "VERDICT: APPROVE");
+
+  const both = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", {
+    transport: async () => ({ status: 200, body: JSON.stringify({ choices: [{ message: { content: "THE ANSWER", reasoning: "just my thinking" } }] }) })
+  });
+  assert.equal(both.stdout, "THE ANSWER", "content WINS when present — reasoning is only a fallback");
+});
+
+test("runOpenRouterStructured stays FAIL-CLOSED: a 2xx with nothing usable is still an error naming the SEAT", async () => {
+  registerOpenRouterKey("sk-secret");
+  for (const body of [JSON.stringify({ choices: [{ message: { content: "   " } }] }), JSON.stringify({ choices: [{ message: {} }] }), JSON.stringify({ choices: [] }), "not json at all"]) {
+    const r = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", { transport: async () => ({ status: 200, body }) });
+    assert.notEqual(r.status, 0, `a 2xx with no usable content must NOT become a silent approval: ${body.slice(0, 30)}`);
+    assert.equal(r.stdout, "", "no stdout → no vote");
+    assert.match(r.stderr, /or-x/, "the DEAD SEAT is named in the error text (diagnosable)");
+    assert.match(r.stderr, /vendor\/model/, "the model slug is named too");
+  }
+});
+
+test("runOpenRouterStructured: finish_reason 'length' → truncated:true (a cut-off reply must not cast a full §6 vote)", async () => {
+  registerOpenRouterKey("sk-secret");
+  const cut = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", {
+    transport: async () => ({ status: 200, body: JSON.stringify({ choices: [{ finish_reason: "length", message: { content: "VERDICT: APPRO" } }] }) })
+  });
+  assert.equal(cut.truncated, true, "a model-truncated reply is marked truncated (the §6 reviewer then casts NO vote)");
+
+  const native = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", {
+    transport: async () => ({ status: 200, body: JSON.stringify({ choices: [{ finish_reason: null, native_finish_reason: "MAX_TOKENS", message: { content: "partial" } }] }) })
+  });
+  assert.equal(native.truncated, true, "a provider's native truncation signal counts too");
+
+  const complete = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", {
+    transport: async () => ({ status: 200, body: JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "VERDICT: APPROVE" } }] }) })
+  });
+  assert.equal(complete.truncated, false, "a normal 'stop' finish is NOT truncated");
+  assert.equal(complete.status, 0);
+});
+
+test("runOpenRouterStructured: a 400 rejecting `temperature` is retried WITHOUT it (o-series/gpt-5 class is not permanently dead)", async () => {
+  registerOpenRouterKey("sk-secret");
+  const payloads = [];
+  const transport = async (_url, payload) => {
+    payloads.push(payload);
+    if ("temperature" in payload) return { status: 400, body: JSON.stringify({ error: { message: "Unsupported value: 'temperature' does not support 0 with this model" } }) };
+    return { status: 200, body: JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+  };
+  const r = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", { transport });
+  assert.equal(r.status, 0, "the retry without temperature succeeds — the seat lives");
+  assert.equal(r.stdout, "ok");
+  assert.equal(payloads.length, 2);
+  assert.equal(payloads[0].temperature, 0, "the first attempt still sends temperature:0 (unchanged default)");
+  assert.equal("temperature" in payloads[1], false, "the offending field is dropped on the retry");
+});
+
+test("runOpenRouterStructured: the 400 fallback is PROGRESSIVE — reasoning first, then temperature", async () => {
+  registerOpenRouterKey("sk-secret");
+  const payloads = [];
+  // a model that rejects BOTH extras with a generic 'unsupported parameter' body naming neither field
+  const transport = async (_url, payload) => {
+    payloads.push(payload);
+    if ("reasoning" in payload || "temperature" in payload) return { status: 400, body: '{"error":{"message":"unsupported parameter"}}' };
+    return { status: 200, body: JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+  };
+  const backends = { openrouter: { available: true, baseURL: "https://openrouter.ai/api/v1", seats: [{ id: "or-x", model: "vendor/model", effort: "high" }] } };
+  const r = await runOpenRouterStructured("/x", backends, {}, "p", "or-x", { transport });
+  assert.equal(r.status, 0, "both offending fields are shed across ≤2 retries → the seat lives");
+  assert.equal(payloads.length, 3);
+  assert.deepEqual(payloads[0].reasoning, { effort: "high" });
+  assert.equal(payloads[0].temperature, 0);
+  assert.equal("reasoning" in payloads[1], false, "reasoning is dropped first");
+  assert.equal(payloads[1].temperature, 0);
+  assert.equal("temperature" in payloads[2], false, "then temperature");
+});
+
+test("runOpenRouterStructured: a 400 that is NOT a parameter rejection is surfaced as-is (no blind retry, classification intact)", async () => {
+  registerOpenRouterKey("sk-secret");
+  let calls = 0;
+  const r = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", {
+    transport: async () => { calls += 1; return { status: 400, body: "context length exceeded for this request" }; }
+  });
+  assert.equal(calls, 1, "a genuine 400 is not masked by a retry");
+  assert.equal(r.status, 400);
+  assert.match(r.stderr, /status=400/, "the code is still surfaced for the retry classifier");
+  assert.equal(isRateLimitError(`${r.stderr}`), false, "a 400 is not a transient rate-limit");
+});
+
 test("runOpenRouterStructured: a transport timeout → status 124 timedOut; a missing seat → skipped", async () => {
   registerOpenRouterKey("sk-secret");
   const r = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", { transport: async () => { throw new Error("timeout"); } });

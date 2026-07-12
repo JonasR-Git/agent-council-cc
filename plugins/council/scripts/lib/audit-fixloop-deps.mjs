@@ -39,6 +39,27 @@ function buildDupPeers(dupClusters = []) {
   return peers;
 }
 
+// A grouped pass spends its per-pass budget on THREE kinds of paid agent call: cells, the (optional)
+// completeness critic, and (A1) adversarial refutation of its single-agent P0/P1s. Cells are capped to
+// what remains AFTER the other two are reserved, so the pass's TOTAL spend stays within its allowance.
+const VERIFY_RESERVE_CAP = 24; // mirrors audit-grouped-review's VERIFY_MAX_CALLS ceiling
+
+/** Calls reserved for refutation this pass: at most a QUARTER of the budget, capped, ≥0. */
+function verifyReserve(options, budget) {
+  if (!options.lensGroups || options.verifyAudit === false) return 0;
+  const b = Math.max(0, Math.floor(budget));
+  return Math.max(0, Math.min(VERIFY_RESERVE_CAP, Math.floor(b / 4)));
+}
+
+/** Total non-cell reserve (critic + refutation), clamped so it can never consume the whole budget. */
+function groupedReserve(options, budget) {
+  const b = Math.max(0, Math.floor(budget));
+  const critic = options.completenessCritic ? 1 : 0;
+  const reserve = critic + verifyReserve(options, budget);
+  // never starve the cells: leave at least half the budget for actual review work
+  return Math.min(reserve, Math.max(0, Math.floor(b / 2)));
+}
+
 export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   // R9 wiring: when --groups is set, drive the loop off the cell-granular GROUPED six-eyes review
   // (runGroupedReview) instead of the per-file runAuditReview — its coverage.complete feeds the loop's
@@ -59,6 +80,25 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   const dupPeers = buildDupPeers(model?.dupClusters);
   let fullPasses = 0; // counts ONLY full-scope passes, so the window advance is honest
 
+  // A5: the model/effort/TIMEOUT pins (--codex-model/--grok-model/--claude-model, --agent-timeout and
+  // their .council.yml policy equivalents) must reach EVERY seat the loop spawns — the seat runners read
+  // them straight off the options object (seats.mjs → agents/claude-agent/openrouter-agent). The one-shot
+  // path spreads ...merged into runAuditReview/runGroupedReview/runAuditFix and honors them; the loop
+  // forwarded only budget + the skip flags, so every finder silently ran on the CLI-default model and the
+  // 300s default timeout, discarding the pins the user (or the policy) chose. Thread the same pin SET into
+  // BOTH the review and the fix call. An unset pin stays undefined → each agent keeps its own CLI default,
+  // so a run without pins behaves exactly as before.
+  const agentPins = {
+    codexModel: options.codexModel,
+    grokModel: options.grokModel,
+    claudeModel: options.claudeModel,
+    codexEffort: options.codexEffort,
+    grokEffort: options.grokEffort,
+    claudeEffort: options.claudeEffort,
+    openrouterEffort: options.openrouterEffort,
+    agentTimeoutMs: options.agentTimeoutMs
+  };
+
   const review = async ({ budget, changedFiles }) => {
     const scopedFiles = changedFiles && changedFiles.length ? files.filter((f) => changedFiles.includes(f.id)) : null;
     let reviewFiles;
@@ -74,6 +114,8 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     }
     const scopedModel = reviewFiles === files ? model : { ...model, files: reviewFiles };
     const rev = await doReview(cwd, scopedModel, backends, {
+      // A5: model/effort/timeout pins first — every explicit key below still wins.
+      ...agentPins,
       budget,
       maxUnits,
       unitOffset: offset,
@@ -91,15 +133,22 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       // loop budget → a 1-pass stop with under-reported spend (council Grok R9 P0/P1). budgetSpent then
       // stays ≤ budget and the loop iterates honestly.
       lensGroups: options.lensGroups,
-      // RESERVE one agent call for the completeness critic when it is on (council Codex/Claude P2): the
-      // grouped pass issues cells + 1 critic call, so cap the cells to budget-1 to keep the pass's TOTAL
-      // spend within its per-pass budget (else it dispatched budget cells + 1 critic = budget+1).
+      // RESERVE the pass's NON-CELL agent calls before capping the cells, so a grouped pass's TOTAL spend
+      // stays within its per-pass budget (council Codex/Claude P2 + A1 wiring):
+      //   - the completeness critic is 1 call when enabled;
+      //   - ADVERSARIAL REFUTATION (A1: the grouped path now refutes, like the per-file path) is up to
+      //     verifyMaxCalls paid calls, all charged into coverage.budgetSpent. Without this reserve a pass
+      //     could dispatch `budget` cells and THEN spend up to 24 more on refutation — over-running the
+      //     per-pass allowance and under-reporting nothing, but blowing the loop's pacing.
+      // The reserve is CLAMPED so it can never starve the cells below one whole pass of work.
       maxCells: options.lensGroups
-        ? Math.max(1, Math.min(options.maxCells ?? Infinity, Math.floor(budget) - (options.completenessCritic ? 1 : 0)))
+        ? Math.max(1, Math.min(options.maxCells ?? Infinity, Math.floor(budget) - groupedReserve(options, budget)))
         : options.maxCells,
       // M8: opt-in completeness critic. Only meaningful on the grouped path (runGroupedReview reads it);
       // runAuditReview ignores it. Its (charged, reserved) verdict gates the dry streak.
-      completenessCritic: options.completenessCritic
+      completenessCritic: options.completenessCritic,
+      // A1: bound the refutation fan-out to what this pass actually reserved for it.
+      verifyMaxCalls: verifyReserve(options, budget)
     });
     // Surface a top-level `ran` the loop can trust. runAuditReview swallows backend
     // failures (rate-limit / unreachable / undispatched) into 0 findings WITHOUT throwing,
@@ -144,13 +193,17 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       actionable,
       backends,
       {
+        // A5: the SAME pin set the review gets. runAuditFix's writer reads claudeModel/claudeEffort and
+        // bounds its spawn by agentTimeoutMs (?? 300_000) — without these the fixer ran on the CLI-default
+        // model and the default timeout even when the run was pinned. The codex/grok/openrouter pins ride
+        // along for the seats runAuditFix's §6 gate reaches; unset pins stay undefined (CLI defaults).
+        ...agentPins,
         branch: ctx.branch,
         stayOnBranch: ctx.stayOnBranch,
         minSeverity: options.minSeverity ?? "P2",
         maxFixes: options.maxFixesPerPass ?? 10,
         allowUntested: options.allowUntested,
         coverage: options.coverage, // §5 coverage gate (a fix on an unexecuted line -> propose-only)
-        claudeModel: options.claudeModel,
         // §6: consented council-gated auto-apply. sensitiveAutoApply only takes effect in
         // runAuditFix when a reviewPatch is ALSO injected (both are threaded from the CLI).
         sensitiveAutoApply: options.sensitiveAutoApply,

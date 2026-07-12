@@ -13,16 +13,24 @@ import path from "node:path";
 import { resolveLensGroups } from "./audit-lens-groups.mjs";
 import { chunkSource } from "./audit-group-prompt.mjs";
 import { DEFAULT_MAX_CELLS, capCells, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
-import { reviewerActive, selectUnits } from "./audit-review.mjs";
+import { makeBudget, reviewerActive, selectUnits } from "./audit-review.mjs";
 import { activeSeatNames, allSeatNames, makeSeatRunners } from "./seats.mjs";
 import { runCompletenessAssessment } from "./completeness-critic.mjs";
 import { tierOfLens } from "./audit-tiers.mjs";
 import { mergeFindings } from "./findings.mjs";
 import { annotateScopes } from "./scope.mjs";
 import { recordAndAnnotate } from "./ledger.mjs";
+import { buildEvidence } from "./deliberate.mjs";
+import { shouldVerify, verifyFindings } from "./verify.mjs";
 import { nowIso, workspaceRoot } from "./state.mjs";
 
 const READ_MAX_BYTES = 2_000_000; // don't slurp a giant file into a chunker
+// Ceiling on the refutation fan-out per pass. Each refutation is one PAID agent call ON TOP of the
+// cells (the grouped path prices its work in cells, and the caller's cell cap already claimed that
+// budget), so a pass surfacing a hundred single-agent P0/P1s must not silently double its bill. Any
+// target beyond the ceiling is simply left UNVERIFIED — verifyFindings KEEPS a budget-starved finding
+// (fail-closed: a missing verifier never erases a finding, it only leaves it unconfirmed).
+const VERIFY_MAX_CALLS = 24;
 
 /** The active finder models for this run (the three seats, minus any skipped/unavailable). */
 export function activeModels(backends, options = {}) {
@@ -38,10 +46,12 @@ function factsFor(model, unitId) {
 }
 
 /**
- * Run the grouped six-eyes review. `deps.runMatrix` is injectable for tests (defaults to the real
- * runCellMatrix + makeCellReviewer). Returns the same shape as runAuditReview: { findings, refuted,
- * reviewed, coverage } — coverage carries `complete` (six-eyes over every scheduled cell), the group
- * preset, cells scheduled/dropped, and the matrix summary, so the loop + report can consume it.
+ * Run the grouped six-eyes review. `deps.runMatrix` / `deps.verifyFindings` are injectable for tests
+ * (they default to the real runCellMatrix + makeCellReviewer / the real adversarial verifier). Returns
+ * the same shape as runAuditReview: { findings, refuted, reviewed, coverage } — `refuted` is the
+ * adversarial verifier's low-confidence bucket (those findings ALSO stay in `findings`, annotated), and
+ * coverage carries `complete` (six-eyes over every scheduled cell), the group preset, cells
+ * scheduled/dropped, refutedCount, and the matrix summary, so the loop + report can consume it.
  */
 export async function runGroupedReview(cwd, model, backends, options = {}, deps = {}) {
   const root = workspaceRoot(cwd);
@@ -156,6 +166,44 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   let scoped = annotateScopes({ all: relensedAll, consensus: relensedAll.filter((f) => f.consensus), unique: relensedAll.filter((f) => !f.consensus) });
   if (options.ledger !== false) scoped = recordAndAnnotate(cwd, options.jobId ?? "grouped-review", scoped, options.nowIso ?? nowIso());
 
+  // A1: adversarial REFUTATION — the SAME pass the per-file path runs (runAuditReview), which the
+  // grouped path never had: it returned `refuted: []` unconditionally, so no model ever challenged a
+  // grouped finding, every single-agent P0/P1 stayed lifecycle "verification_required" forever and the
+  // report gate could never settle. A P0/P1 SINGLE-agent finding is re-checked by a seat that did NOT
+  // raise it (consensus is protected — one refuter never overturns independent agreement).
+  // ANNOTATE-ONLY (demote:false), exactly like the audit path: a refuted finding stays VISIBLE in
+  // `.all` carrying its `verified` annotation and is only DEPRIORITIZED downstream (evidenceState
+  // "refuted" is the WEAKEST state, never the strongest) — the refuter is a biased single-seat signal,
+  // so it must inform, not erase. Default-on; disable with verifyAudit:false. Needs ≥2 reachable seats
+  // (a finding is never refuted by its own author). Best-effort: a verifier failure never drops the
+  // review. deps.verifyFindings/deps.buildEvidence are injectable so tests need no CLI.
+  let refutedCount = 0;
+  let verifySpent = 0;
+  if (options.verifyAudit !== false && models.length > 1) {
+    const targets = (scoped.all ?? []).filter((f) => shouldVerify(f, options.verifySeverities ?? ["P0", "P1"]));
+    if (targets.length) {
+      // Refutation spend gets its OWN finite budget: options.budget on this path is the loop's
+      // per-pass CELL allowance (a NUMBER, not a budget object — and `--budget` does not bound a
+      // grouped run at all; --max-cells does). Cap it at VERIFY_MAX_CALLS and CHARGE what it spends
+      // into coverage.budgetSpent, so the loop's accounting sees every paid call (council: the
+      // completeness critic is charged the same way).
+      const cap = Math.max(0, Math.floor(options.verifyMaxCalls ?? VERIFY_MAX_CALLS));
+      const verifyBudget = makeBudget(cap);
+      const verify = deps.verifyFindings ?? verifyFindings;
+      const evidenceOf = deps.buildEvidence ?? buildEvidence;
+      if (progress) progress(`  refutation: re-checking ${targets.length} single-agent P0/P1 finding(s) with an independent seat (≤${cap} call(s))…`);
+      try {
+        const vr = await verify(cwd, backends, { ...options, demote: false, budget: verifyBudget }, scoped, evidenceOf, root);
+        scoped = vr.merged ?? scoped;
+        refutedCount = vr.refutedCount ?? 0;
+      } catch {
+        /* refutation is best-effort — a verifier failure must never drop the review */
+      }
+      verifySpent = verifyBudget.spent;
+      if (progress) progress(`  refutation: ${refutedCount} refuted (${verifySpent} verifier call(s) charged)`);
+    }
+  }
+
   // Per-file review outcome from the matrix results (a file is REVIEWED when ≥1 of its cells
   // succeeded) so coverage mirrors runAuditReview's unitsReviewed/unitsAttempted/unitsFailed keys —
   // the loop's ran-detection keys on unitsReviewed (council Grok P2). Results are absent when
@@ -247,12 +295,17 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
       cellsScheduled: cells.length,
       cellsDropped: dropped,
       capped,
+      // How many single-agent P0/P1 findings an independent seat could NOT support (annotate-only: they
+      // stay in `findings`, deprioritized, and are also listed under `refuted`).
+      refutedCount,
+      verifySpent, // paid refutation calls (≤ VERIFY_MAX_CALLS) — surfaced so the extra spend is visible
       // budgetSpent = the cells actually dispatched (each cell is one paid agent call) PLUS the one
       // completeness-critic call when it ran (council Codex/Claude P2: it is a real agent call and must be
-      // charged, else the loop overspends its per-pass budget by one and under-reports total spend). The
-      // fix/endless loop charges this against its per-run agent-call budget; makeFixLoopDeps RESERVES one
-      // cell for the critic so cells + critic ≤ budget.
-      budgetSpent: cells.length + (completeness?.criticRan ? 1 : 0),
+      // charged, else the loop overspends its per-pass budget by one and under-reports total spend) PLUS
+      // the refutation calls (A1 — same reasoning: a verifier spawn is a paid call). The fix/endless loop
+      // charges this against its per-run agent-call budget; makeFixLoopDeps RESERVES one cell for the
+      // critic so cells + critic ≤ budget, and the refutation pass is bounded by VERIFY_MAX_CALLS.
+      budgetSpent: cells.length + (completeness?.criticRan ? 1 : 0) + verifySpent,
       // the grouped path bounds per-pass cost by the CELL count (maxCells); the matrix summary reports
       // how many of those cells actually completed vs failed.
       matrix: matrixOut.matrix?.summary?.() ?? null

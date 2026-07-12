@@ -1,7 +1,38 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { applyDebateOutcomes, normalizeStance } from "../plugins/council/scripts/lib/debate.mjs";
+import {
+  applyDebateOutcomes,
+  NO_REPLY_STANCE,
+  normalizeStance,
+  renderDebateSection,
+  runDebateRounds
+} from "../plugins/council/scripts/lib/debate.mjs";
+
+const SEAT_BACKENDS = {
+  codex: { companionAvailable: true },
+  grok: { cli: { available: true } },
+  claude: { cli: { available: true } },
+  openrouter: { available: true, seats: [{ id: "or-x", model: "vendor/model" }] }
+};
+
+function entry(id, author, critic = null) {
+  return { id, author, critic, payload: { title: `t-${id}`, severity: "P1", detail: "d" } };
+}
+
+/** Injectable per-seat runners; each records that IT was the one asked. */
+function seatDeps(calls, stdoutFor) {
+  const reply = (seat, prompt) => {
+    calls.push({ seat, prompt });
+    return { agent: seat, status: 0, stdout: stdoutFor(seat, prompt) };
+  };
+  return {
+    runCodex: async (p) => reply("codex", p),
+    runGrok: async (p) => reply("grok", p),
+    runClaude: async (p) => reply("claude", p),
+    runOpenRouter: async (_cwd, _b, _o, p, seatId) => reply(seatId, p)
+  };
+}
 
 test("normalizeStance defaults to defend", () => {
   assert.equal(normalizeStance("concede"), "concede");
@@ -50,6 +81,75 @@ test("applyDebateOutcomes applies valid revised severity and attaches counters",
   const next = applyDebateOutcomes(merged, debates);
   assert.equal(next.all[0].severity, "P2");
   assert.equal(next.all[0].debate.counter.upheld, true);
+});
+
+test("every debate agent argues on ITS OWN runner (no seat impersonates another)", async () => {
+  const calls = [];
+  const deps = seatDeps(calls, (seat) => JSON.stringify({ stance: "defend", note: `${seat} defends` }));
+  const results = await runDebateRounds(
+    "/x",
+    SEAT_BACKENDS,
+    { debateRounds: 1 },
+    [entry("c-1", "codex"), entry("cl-1", "claude"), entry("or-1", "or-x")],
+    deps
+  );
+  // Before the fix every non-codex author was routed to runGrok — grok wrote claude's/or-x's rebuttal
+  // and the report attributed it to them (a fabricated attribution).
+  assert.equal(calls.filter((c) => c.seat === "grok").length, 0, "grok never argues for another seat");
+  assert.deepEqual(calls.map((c) => c.seat).sort(), ["claude", "codex", "or-x"]);
+  const byId = Object.fromEntries(results.map((r) => [r.id, r]));
+  assert.equal(byId["cl-1"].agent, "claude");
+  assert.equal(byId["cl-1"].note, "claude defends", "the claude rebuttal really came from the claude seat");
+  assert.equal(byId["or-1"].agent, "or-x");
+  assert.equal(byId["or-1"].note, "or-x defends", "the OpenRouter seat argued for itself");
+});
+
+test("a seat with no runner is skipped honestly — never executed under another seat's name", async () => {
+  const calls = [];
+  const deps = seatDeps(calls, () => JSON.stringify({ stance: "concede", note: "n" }));
+  const [res] = await runDebateRounds("/x", SEAT_BACKENDS, { debateRounds: 1 }, [entry("u-1", "or-unconfigured")], deps);
+  assert.equal(calls.length, 0, "no other seat is called in its place");
+  assert.equal(res.skipped, true);
+  assert.equal(res.stance, NO_REPLY_STANCE, "no stance is fabricated for a seat that never replied");
+  assert.equal(res.parseOk, false);
+  assert.match(res.reason, /no runner/);
+});
+
+test("a parse failure does not fabricate a 'defend' stance and buys no round-2 counter", async () => {
+  const calls = [];
+  const deps = seatDeps(calls, (seat) => (seat === "codex" ? "sorry, I could not comply" : '{"upheld": true}'));
+  const results = await runDebateRounds("/x", SEAT_BACKENDS, { debateRounds: 2 }, [entry("c-9", "codex", "grok")], deps);
+  const rebuttal = results.find((r) => r.round === 1);
+  assert.equal(rebuttal.stance, NO_REPLY_STANCE, "an unparseable reply is NOT a defend");
+  assert.equal(rebuttal.parseOk, false);
+  assert.equal(rebuttal.failed, true);
+  assert.equal(results.filter((r) => r.round === 2).length, 0, "no counter is paid for an argument nobody made");
+  assert.equal(calls.filter((c) => c.seat === "grok").length, 0, "the critic seat is never called");
+
+  // Fail-closed + visibly distinct: no severity change, item stays contested, report says 'no reply'.
+  const merged = mergedWith({ ids: ["c-9"], agents: ["codex"], severity: "P1", consensus: false, contested: true });
+  const next = applyDebateOutcomes(merged, results);
+  assert.equal(next.all[0].severity, "P1");
+  assert.equal(next.all[0].contested, true);
+  assert.equal(next.all[0].debate.failed, true);
+  const section = renderDebateSection(results);
+  assert.match(section, /no reply/);
+  assert.doesNotMatch(section, /\*\*defend\*\*/, "a failed reply never renders like a real defend");
+});
+
+test("a failed round-2 counter renders as no-reply and the critique still stands (fail-closed)", async () => {
+  const calls = [];
+  const deps = seatDeps(calls, (seat) =>
+    seat === "codex" ? JSON.stringify({ stance: "defend", note: "holds" }) : "garbage, no json"
+  );
+  const results = await runDebateRounds("/x", SEAT_BACKENDS, { debateRounds: 2 }, [entry("c-2", "codex", "or-x")], deps);
+  const counter = results.find((r) => r.round === 2);
+  assert.equal(counter.agent, "or-x", "the counter ran on the critic's own runner");
+  assert.equal(counter.failed, true);
+  assert.equal(counter.upheld, true, "an unparseable counter never reads as a withdrawn critique");
+  const section = renderDebateSection(results);
+  assert.match(section, /counter by or-x: \*\*no reply\*\*/);
+  assert.doesNotMatch(section, /withdraws critique/);
 });
 
 test("applyDebateOutcomes ignores invalid revised severities and untouched items", () => {

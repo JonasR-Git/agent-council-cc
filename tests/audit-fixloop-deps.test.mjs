@@ -26,19 +26,49 @@ test("R9 (council Grok/Codex P1): a grouped pass's cells are CAPPED to the per-p
   // one pass blows the whole loop budget → a 1-pass stop with under-reported spend.
   let seen = null;
   const runGroupedReview = async (cwd, m, backends, opts) => { seen = opts; return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: true, budgetSpent: 0 } }; };
-  const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500 }, { runGroupedReview });
+  const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, verifyAudit: false }, { runGroupedReview });
   await deps.review({ budget: 40, changedFiles: null });
   assert.equal(seen.maxCells, 40, "cells capped to the per-pass budget (min(1500, 40))");
+  // with refutation ON (the default since A1) the pass also pays for verifier calls, so the CELL cap
+  // shrinks by that reserve — the invariant that matters is that the TOTAL never exceeds the budget.
+  const withVerify = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500 }, { runGroupedReview });
+  await withVerify.review({ budget: 40, changedFiles: null });
+  assert.ok(seen.maxCells + seen.verifyMaxCalls <= 40, "cells + refutation ≤ the per-pass budget");
 });
 
 test("M8 (council Codex/Claude P2): --completeness-critic RESERVES one cell so cells + critic ≤ budget", async () => {
   // the critic is one extra paid agent call; reserving a cell keeps the pass's TOTAL spend within budget.
   let seen = null;
   const runGroupedReview = async (cwd, m, backends, opts) => { seen = opts; return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: true, budgetSpent: 0 } }; };
-  const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, completenessCritic: true }, { runGroupedReview });
+  const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, completenessCritic: true, verifyAudit: false }, { runGroupedReview });
   await deps.review({ budget: 40, changedFiles: null });
   assert.equal(seen.maxCells, 39, "budget 40 → 39 cells + 1 critic call = 40 total (one reserved)");
   assert.equal(seen.completenessCritic, true, "the flag is threaded to the grouped review");
+});
+
+test("A1 wiring: a grouped pass RESERVES its refutation budget too (cells + critic + verify ≤ budget)", async () => {
+  // The grouped path now refutes (A1) and charges those paid calls into coverage.budgetSpent. Without a
+  // reserve a pass would dispatch `budget` cells and THEN spend up to 24 more on refutation, over-running
+  // its per-pass allowance. Cells must be capped to what remains after critic + verify are reserved.
+  let seen = null;
+  const runGroupedReview = async (cwd, m, backends, opts) => { seen = opts; return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: true, budgetSpent: 0 } }; };
+  const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500 }, { runGroupedReview });
+  await deps.review({ budget: 40, changedFiles: null });
+  assert.equal(seen.verifyMaxCalls, 10, "budget 40 → a quarter (10) reserved for refutation");
+  assert.equal(seen.maxCells, 30, "cells capped to budget - verify reserve (40 - 10)");
+  assert.ok(seen.maxCells + seen.verifyMaxCalls <= 40, "TOTAL pass spend stays within the per-pass budget");
+
+  // with the critic ON, its call is reserved too
+  const withCritic = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, completenessCritic: true }, { runGroupedReview });
+  await withCritic.review({ budget: 40, changedFiles: null });
+  assert.equal(seen.maxCells, 29, "40 - 10 (verify) - 1 (critic)");
+  assert.ok(seen.maxCells + seen.verifyMaxCalls + 1 <= 40, "cells + verify + critic ≤ budget");
+
+  // refutation off → nothing reserved for it (byte-identical to the pre-A1 cap)
+  const noVerify = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, verifyAudit: false }, { runGroupedReview });
+  await noVerify.review({ budget: 40, changedFiles: null });
+  assert.equal(seen.verifyMaxCalls, 0);
+  assert.equal(seen.maxCells, 40, "no refutation → the full budget stays available for cells");
 });
 
 test("R9: without --groups the loop still uses the per-file runAuditReview", async () => {
@@ -177,6 +207,84 @@ test("fix does NOT inject reviewPatch when none is configured (propose-only defa
   const deps = makeFixLoopDeps("/x", model, {}, {}, { runAuditFix });
   await deps.fix([{ file: "a.mjs" }], {});
   assert.equal(seenDeps.reviewPatch, undefined, "no reviewer → §6 stays propose-only in runAuditFix");
+});
+
+// --- A5: model / effort / timeout pins reach the loop's seats -----------------
+// Regression guard: the loop forwarded only budget + the skip flags, so --codex-model/--grok-model/
+// --claude-model, the effort pins and --agent-timeout were DROPPED — every finder ran on the CLI-default
+// model and the 300s default timeout while the one-shot path (which spreads ...merged) honored them.
+const PINS = {
+  codexModel: "gpt-5.4-codex",
+  grokModel: "grok-4.1",
+  claudeModel: "claude-opus-4-8",
+  codexEffort: "xhigh",
+  grokEffort: "xhigh",
+  claudeEffort: "xhigh",
+  openrouterEffort: "high",
+  agentTimeoutMs: 900_000
+};
+const assertPinned = (seen, where) => {
+  for (const [k, v] of Object.entries(PINS)) assert.equal(seen[k], v, `${k} reaches ${where}`);
+};
+
+test("A5: review threads the model/effort/timeout pins to the per-file review (seats honor the pins)", async () => {
+  let seen = null;
+  const runAuditReview = async (cwd, m, backends, opts) => {
+    seen = opts;
+    return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, budgetSpent: 1 } };
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, { ...PINS }, { runAuditReview });
+  await deps.review({ budget: 5, changedFiles: null });
+  assertPinned(seen, "runAuditReview");
+  assert.equal(seen.budget, 5, "the per-pass budget still rides along");
+});
+
+test("A5: review threads the pins to the GROUPED review too (six-eyes cells run on the pinned models)", async () => {
+  let seen = null;
+  const runGroupedReview = async (cwd, m, backends, opts) => {
+    seen = opts;
+    return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: true, budgetSpent: 1 } };
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, { ...PINS, lensGroups: "fine", maxCells: 100, verifyAudit: false }, { runGroupedReview });
+  await deps.review({ budget: 50, changedFiles: null });
+  assertPinned(seen, "runGroupedReview");
+  assert.equal(seen.lensGroups, "fine", "the grouped wiring is untouched by the pin spread");
+  assert.equal(seen.maxCells, 50, "the budget cap still wins over an explicit maxCells (pins never override it)");
+});
+
+test("A5: fix threads the pins to runAuditFix (writer model/effort + the agent timeout)", async () => {
+  let seen = null;
+  const runAuditFix = async (cwd, findings, backends, opts) => {
+    seen = opts;
+    return { ok: true, fixed: [], changedFiles: [], spent: 0 };
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, { ...PINS, minSeverity: "P1" }, { runAuditFix });
+  await deps.fix([{ file: "a.mjs" }], { branch: "council/z", stayOnBranch: true });
+  assertPinned(seen, "runAuditFix");
+  assert.equal(seen.branch, "council/z", "the existing fix wiring survives the pin spread");
+  assert.equal(seen.minSeverity, "P1");
+});
+
+test("A5: an unpinned run stays on the CLI defaults (no fabricated model/timeout)", async () => {
+  // backward compat: the pins must be pass-through only — inventing a default here would silently
+  // override the agents' own (and the policy's) defaults for every existing run.
+  let seenReview = null;
+  let seenFix = null;
+  const runAuditReview = async (cwd, m, backends, opts) => {
+    seenReview = opts;
+    return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, budgetSpent: 1 } };
+  };
+  const runAuditFix = async (cwd, findings, backends, opts) => {
+    seenFix = opts;
+    return { ok: true, fixed: [], changedFiles: [], spent: 0 };
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview, runAuditFix });
+  await deps.review({ budget: 5, changedFiles: null });
+  await deps.fix([{ file: "a.mjs" }], {});
+  for (const k of Object.keys(PINS)) {
+    assert.equal(seenReview[k], undefined, `${k} stays undefined in the review when unpinned`);
+    assert.equal(seenFix[k], undefined, `${k} stays undefined in the fix when unpinned`);
+  }
 });
 
 test("expandScope re-scopes to real dependents + dup-cluster peers; a hub-sized radius falls back to full", () => {

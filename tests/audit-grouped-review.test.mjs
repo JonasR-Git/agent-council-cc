@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { activeModels, runGroupedReview } from "../plugins/council/scripts/lib/audit-grouped-review.mjs";
 import { normalizeFindings } from "../plugins/council/scripts/lib/audit-normalize.mjs";
+import { partitionByRefutation, shouldVerify } from "../plugins/council/scripts/lib/verify.mjs";
 import { tierOfLens } from "../plugins/council/scripts/lib/audit-tiers.mjs";
 import { getLens } from "../plugins/council/scripts/lib/audit-lenses.mjs";
 
@@ -10,6 +11,37 @@ const MODEL = { files: [{ id: "a.mjs", loc: 10, branches: 2, maxNesting: 1, fanI
 const ALL_BACKENDS = { codex: { companionAvailable: true }, grok: { cli: { available: true } }, claude: { cli: { available: true } } };
 // Deterministic, filesystem-free file access: a small readable source → chunkSource yields one chunk.
 const FS = { readFile: () => "const x = 1;\nconst y = 2;\n", statSize: () => 40 };
+// Adversarial refutation is DEFAULT-ON (A1, mirroring the per-file audit path). Tests that are not
+// about refutation and DO surface a single-agent P0/P1 opt out, so they never reach a real CLI.
+const NO_VERIFY = { verifyAudit: false };
+
+/**
+ * A fake refutation verifier honoring the REAL verify.mjs contract: it only targets what
+ * shouldVerify() allows (P0/P1, non-consensus), CHARGES the injected budget per call, leaves a
+ * budget-starved target UNVERIFIED (never dropped), and partitions through the REAL
+ * partitionByRefutation with the caller's demote posture — so the annotate-only wiring is pinned
+ * end-to-end without a CLI.
+ */
+function fakeVerifier({ refute = () => true } = {}) {
+  const seen = { calls: [], options: null, repoRoot: null, evidence: null };
+  const fn = async (cwd, backends, options, merged, buildEvidence, repoRoot) => {
+    seen.options = options;
+    seen.repoRoot = repoRoot;
+    seen.evidence = buildEvidence;
+    const refutations = new Map();
+    let verified = 0;
+    for (const f of merged.all ?? []) {
+      if (!shouldVerify(f, options.verifySeverities ?? ["P0", "P1"])) continue;
+      if (options.budget && !options.budget.canSpend(1)) continue; // starved → keep it, unverified
+      options.budget?.charge(1);
+      seen.calls.push(f.title);
+      verified += 1;
+      refutations.set(f, { by: "grok", refuted: Boolean(refute(f)), reason: "no caller can reach this branch", demotable: true });
+    }
+    return partitionByRefutation(merged, refutations, verified, { demote: options.demote !== false });
+  };
+  return { fn, seen };
+}
 
 test("activeModels reflects reachable, non-skipped seats", () => {
   assert.deepEqual(activeModels(ALL_BACKENDS, {}), ["codex", "grok", "claude"]);
@@ -27,7 +59,7 @@ test("runGroupedReview: the cell-matrix path returns findings + six-eyes coverag
       complete: true
     };
   };
-  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false }, { runMatrix, ...FS });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, ...NO_VERIFY }, { runMatrix, ...FS });
   assert.ok(out.findings.length >= 1);
   assert.equal(out.coverage.complete, true);
   assert.equal(out.coverage.groupPreset, "lens");
@@ -65,7 +97,7 @@ test("runGroupedReview: the group-authoritative lens survives merge (not re-deri
     matrix: { summary: () => ({}) },
     complete: true
   });
-  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "tier", ledger: false }, { runMatrix, ...FS });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "tier", ledger: false, ...NO_VERIFY }, { runMatrix, ...FS });
   assert.equal(out.findings[0].lens, "security_secrets", "group lens re-stamped onto the merged finding");
   // and it survives the consumer's normalize with a real lens + tier (not the category fallback)
   const norm = normalizeFindings(out.findings, {});
@@ -132,7 +164,7 @@ test("runGroupedReview: ONE seat's duplicate across two cells is NOT false conse
     matrix: { summary: () => ({}) },
     complete: true
   });
-  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "tier", ledger: false }, { runMatrix, ...FS });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "tier", ledger: false, ...NO_VERIFY }, { runMatrix, ...FS });
   assert.equal(out.findings.length, 1, "the same seat's duplicate merges to one");
   assert.notEqual(out.findings[0].consensus, true, "one seat is never consensus");
   assert.deepEqual([...out.findings[0].agents], ["codex"]);
@@ -239,6 +271,99 @@ test("runGroupedReview: a CAPPED pass + critic-complete → completenessComplete
   const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "fine", ledger: false, maxCells: 5, completenessCritic: true }, { runMatrix, runCritic, ...FS });
   assert.equal(out.coverage.capped, true, "sanity: this pass IS capped");
   assert.equal(out.coverage.completenessComplete, true, "a cap is a surfaced caveat, not a convergence-blocking gap");
+});
+
+// ── A1: adversarial refutation on the GROUPED path (it used to return `refuted: []` unconditionally —
+// no model ever challenged a grouped finding, so every single-agent P0/P1 stayed "verification_required"
+// forever and the report gate was permanently indeterminate).
+const SINGLE_P1 = [{ id: "codex-1", agent: "codex", severity: "P1", category: "bug", title: "off-by-one drops the last row", detail: "d", file: "a.mjs", line: 4, lens: "correctness" }];
+const matrixWith = (findings) => async (cells) => ({ findings, results: cells.map((c) => ({ ok: true, cell: c })), matrix: { summary: () => ({}) }, complete: true });
+
+test("runGroupedReview: the grouped path REFUTES a single-agent P0/P1 (annotate-only, never dropped)", async () => {
+  const v = fakeVerifier({ refute: () => true });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false }, { runMatrix: matrixWith(SINGLE_P1), verifyFindings: v.fn, ...FS });
+
+  assert.deepEqual(v.seen.calls, ["off-by-one drops the last row"], "the single-agent P1 was adversarially re-checked");
+  assert.equal(v.seen.options.demote, false, "ANNOTATE-ONLY posture (same as the per-file audit path)");
+  assert.equal(typeof v.seen.options.budget?.charge, "function", "the verifier gets a real budget object, not the loop's raw cell number");
+  assert.equal(out.refuted.length, 1, "the refuted finding is surfaced in the low-confidence bucket (was ALWAYS [] before)");
+  assert.equal(out.coverage.refutedCount, 1);
+  // annotate-only: it STAYS visible in `findings`, carrying the verifier's verdict — a wrongly-refuted
+  // REAL defect must never be silently erased, only deprioritized.
+  assert.equal(out.findings.length, 1, "not dropped from .all");
+  assert.equal(out.findings[0].verified.refuted, true);
+  assert.equal(out.findings[0].verified.by, "grok");
+  // …and downstream it lands in the WEAKEST evidence state — never "confirmed"/"verification_required"
+  // (the inversion audit-normalize guards against).
+  const norm = normalizeFindings(out.findings, {});
+  assert.equal(norm[0].lifecycle, "refuted");
+});
+
+test("runGroupedReview: a SUPPORTED finding is confirmed, not refuted (no inversion)", async () => {
+  const v = fakeVerifier({ refute: () => false });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false }, { runMatrix: matrixWith(SINGLE_P1), verifyFindings: v.fn, ...FS });
+  assert.equal(out.refuted.length, 0);
+  assert.equal(out.coverage.refutedCount, 0);
+  assert.equal(out.findings[0].verified.refuted, false);
+  const norm = normalizeFindings(out.findings, {});
+  assert.equal(norm[0].lifecycle, "confirmed", "an independently SUPPORTED finding leaves verification_required limbo");
+});
+
+test("runGroupedReview: refutation calls are CHARGED to budgetSpent (a verifier spawn is a paid call)", async () => {
+  const v = fakeVerifier({ refute: () => true });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false }, { runMatrix: matrixWith(SINGLE_P1), verifyFindings: v.fn, ...FS });
+  assert.equal(out.coverage.cellsScheduled, 39); // lens preset = 13 groups × 1 file × 3 seats
+  assert.equal(out.coverage.verifySpent, 1);
+  assert.equal(out.coverage.budgetSpent, 40, "cells + the refutation call — the loop must see every paid call");
+});
+
+test("runGroupedReview: verifyAudit:false → nothing is verified and the budget is byte-identical", async () => {
+  const v = fakeVerifier({ refute: () => true });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, verifyAudit: false }, { runMatrix: matrixWith(SINGLE_P1), verifyFindings: v.fn, ...FS });
+  assert.deepEqual(v.seen.calls, [], "the verifier is never invoked when the option is off");
+  assert.deepEqual(out.refuted, []);
+  assert.equal(out.coverage.refutedCount, 0);
+  assert.equal(out.coverage.verifySpent, 0);
+  assert.equal(out.coverage.budgetSpent, 39, "cells only — no hidden spend");
+  assert.equal(out.findings.length, 1, "the finding is still surfaced, just unverified");
+});
+
+test("runGroupedReview: a CONSENSUS finding is never refuted — no verifier spawn is wasted on it", async () => {
+  const consensus = [
+    { id: "codex-1", agent: "codex", severity: "P0", category: "security", title: "unescaped shell arg", detail: "d", file: "a.mjs", line: 12, lens: "security_secrets" },
+    { id: "grok-1", agent: "grok", severity: "P0", category: "security", title: "unescaped shell arg", detail: "d", file: "a.mjs", line: 12, lens: "security_secrets" }
+  ];
+  const v = fakeVerifier({ refute: () => true });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false }, { runMatrix: matrixWith(consensus), verifyFindings: v.fn, ...FS });
+  assert.equal(out.findings[0].consensus, true);
+  assert.deepEqual(v.seen.calls, [], "independent agreement is protected — one refuter can't overturn it");
+  assert.deepEqual(out.refuted, []);
+  assert.equal(out.coverage.verifySpent, 0);
+});
+
+test("runGroupedReview: a single reachable seat → NO refutation (a finding is never refuted by its author)", async () => {
+  const only = { codex: { companionAvailable: true }, grok: { cli: { available: false } }, claude: { cli: { available: false } } };
+  const v = fakeVerifier({ refute: () => true });
+  const out = await runGroupedReview("/x", MODEL, only, { lensGroups: "lens", ledger: false }, { runMatrix: matrixWith(SINGLE_P1), verifyFindings: v.fn, ...FS });
+  assert.deepEqual(activeModels(only, {}), ["codex"]);
+  assert.deepEqual(v.seen.calls, [], "with one seat there is no independent refuter");
+  assert.deepEqual(out.refuted, []);
+  assert.equal(out.findings.length, 1, "and the finding is still surfaced — fail-closed, never dropped");
+});
+
+test("runGroupedReview: the refutation fan-out is BOUNDED — a starved target is kept UNVERIFIED, not dropped", async () => {
+  const two = [
+    SINGLE_P1[0],
+    { id: "codex-2", agent: "codex", severity: "P1", category: "bug", title: "null deref on empty input", detail: "d", file: "a.mjs", line: 9, lens: "correctness" }
+  ];
+  const v = fakeVerifier({ refute: () => true });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, verifyMaxCalls: 1 }, { runMatrix: matrixWith(two), verifyFindings: v.fn, ...FS });
+  assert.equal(v.seen.options.budget.total, 1, "the cap bounds the verifier's budget");
+  assert.equal(v.seen.calls.length, 1, "only what the budget affords is spawned");
+  assert.equal(out.coverage.verifySpent, 1);
+  assert.equal(out.coverage.budgetSpent, 40);
+  assert.equal(out.findings.length, 2, "the budget-starved finding is KEPT (unverified), never silently dropped");
+  assert.equal(out.findings.filter((f) => f.verified).length, 1);
 });
 
 test("runGroupedReview: onProgress surfaces the planned cell count BEFORE dispatch", async () => {

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { buildReformatPrompt, interpolate, makeFenceNonce, runCodexStructured, runGrokStructured, runStructuredWithRetry } from "./agents.mjs";
+import { buildReformatPrompt, interpolate, makeFenceNonce, runStructuredWithRetry } from "./agents.mjs";
 import { activeSeatNames, allSeatNames, makeSeatRunners, seatActive } from "./seats.mjs";
 import { mergeFindings, parseAgentFindings } from "./findings.mjs";
 import { fingerprintFinding, recordAndAnnotate } from "./ledger.mjs";
@@ -12,8 +12,9 @@ import { nowIso, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 
 // Audit v2 - deep, agent-driven review of the hotspots the static model
-// surfaced, plus a global SSOT/architecture reduce. The worker uses only the
-// callable CLIs (Codex + Grok); the orchestrating Claude synthesizes. Bounded by
+// surfaced, plus a global SSOT/architecture reduce. BOTH passes run on EVERY active
+// seat from the dynamic registry (codex/grok/claude + any configured OpenRouter
+// seat) — six eyes, never a lens partitioned across models. Bounded by
 // a FINITE invocation budget (every agent call is charged), so it never fans out
 // unbounded. Each module's source is read bounded to UNIT_MAX_CHARS; oversized
 // modules are TRUNCATED (not chunked) with an explicit note, and the untruncated
@@ -192,14 +193,35 @@ export function reserveFloorBudget(budget, reserve) {
   };
 }
 
-export async function reviewUnit(cwd, backends, options, unitId, model, budget) {
+/**
+ * Canonicalize a reviewer-supplied `file` to the reviewed unit id. A seat only ever sees ONE module,
+ * so a null file, a bare basename ("x.mjs"), a "./"-prefixed or backslashed path, or an absolute path
+ * ENDING in the unit id all denote that same unit — but mergeFindings matches on the normalized file
+ * FIRST, so an un-canonicalized peer never fuzzy-matches and the SAME defect stays two "unique"
+ * single-agent findings (this hurts weaker instruction-followers, i.e. OpenRouter seats, worst).
+ * A path that is genuinely a DIFFERENT file is kept verbatim — never laundered onto the unit.
+ */
+export function canonicalizeUnitFile(file, unitId) {
+  const raw = String(file ?? "").replace(/\\/g, "/").trim();
+  const norm = raw.replace(/^\.\//, "").replace(/^\/+/, "");
+  if (!norm) return unitId; // null/blank → the reviewed unit
+  if (norm === unitId) return unitId;
+  const a = norm.toLowerCase();
+  const b = String(unitId).toLowerCase();
+  // a suffix relation either way: "x.mjs"/"lib/x.mjs" for unit "plugins/lib/x.mjs" (a bare basename or
+  // a partial path), or "C:/repo/plugins/lib/x.mjs" (an absolute path carrying the unit id).
+  if (b.endsWith(`/${a}`) || a.endsWith(`/${b}`)) return unitId;
+  return norm;
+}
+
+export async function reviewUnit(cwd, backends, options, unitId, model, budget, deps = {}) {
   const root = workspaceRoot(cwd);
   const { prompt, suppliedChars, totalChars, split } = buildUnitPrompt(root, unitId, model);
   // Every ACTIVE seat runs the SAME unit prompt independently (six-eyes: each model searches every lens
   // itself, never a synthesizer-only). With no openrouter config this is exactly codex/grok/claude; a
   // configured OpenRouter seat is one more independent finder. The seat runners are the same per-seat
-  // calls as before (codex → runCodexStructured "audit", etc.).
-  const runners = makeSeatRunners(cwd, backends, options);
+  // calls as before (codex → runCodexStructured "audit", etc.); deps.* keeps them injectable for tests.
+  const runners = makeSeatRunners(cwd, backends, options, deps);
   const jobs = [];
   for (const seat of activeSeatNames(backends, options)) {
     const run = runners[seat];
@@ -225,24 +247,33 @@ export async function reviewUnit(cwd, backends, options, unitId, model, budget) 
       unparsed += 1;
     }
   }
-  const merged = mergeFindings(docs);
-  // stamp the unit + supplied coverage onto each finding
-  for (const finding of merged.all) {
-    finding.file = finding.file || unitId;
+  // Stamp/canonicalize the unit onto every finding BEFORE merging: mergeFindings keys and fuzzy-matches
+  // on the normalized file, so a seat that answered file:null or a bare basename would otherwise never
+  // match a peer's canonical path and the SAME defect would surface as two "unique" findings instead of
+  // one consensus one. Post-merge stamping (the old order) was too late to rescue that match.
+  for (const doc of docs) {
+    for (const finding of doc.findings) finding.file = canonicalizeUnitFile(finding.file, unitId);
   }
+  const merged = mergeFindings(docs);
   return { unitId, merged, suppliedChars, totalChars, split, reviewed: docs.length > 0, unparsed, reformatsUsed };
 }
 
 /**
- * Global SSOT/architecture reduce over the static map. Charges 1 to the budget.
- * Picks an explicitly-available reviewer (prefers Codex); returns empty WITHOUT
- * charging when no reviewer is callable. `ran` distinguishes a skipped reduce
- * from a successful reduce that simply found nothing.
+ * Global SSOT/architecture reduce over the static map. SIX-EYES, like reviewUnit: EVERY active seat
+ * (codex/grok/claude + any configured OpenRouter seat) runs the SAME map prompt itself and the results
+ * go through the SAME mergeFindings path, so a structural defect two seats see becomes ONE consensus
+ * finding. It used to hardcode codex/grok and dispatch a SINGLE reviewer, which meant a claude-only or
+ * or-*-only configuration silently skipped the reduce entirely, every pass.
+ *
+ * Costs 1 charge per DISPATCHED seat, claimed UP FRONT (before any await) so it can never over-spend.
+ * runAuditReview reserves exactly that; a caller whose remaining budget covers fewer seats dispatches
+ * the seats it CAN afford (registry order: built-ins first) rather than dropping the structural pass.
+ * Returns empty WITHOUT charging when no seat is callable or the budget is exhausted. `ran`
+ * distinguishes a skipped reduce from one that ran and simply found nothing.
  */
-export async function globalReduce(cwd, backends, options, model, budget) {
-  const codexOk = reviewerActive("codex", backends, options);
-  const grokOk = reviewerActive("grok", backends, options);
-  if (!codexOk && !grokOk) return { all: [], consensus: [], unique: [], ran: false };
+export async function globalReduce(cwd, backends, options, model, budget, deps = {}) {
+  const seats = activeSeatNames(backends, options);
+  if (!seats.length) return { all: [], consensus: [], unique: [], ran: false };
   if (!budget.canSpend(1)) return { all: [], consensus: [], unique: [], ran: false };
   const dupes =
     model.dupClusters.slice(0, 40).map((c) => `- ${c.lineCount} lines x${c.locations.length}: ${c.locations.map((l) => `${l.file}:${l.startLine}`).join(", ")}`).join("\n") || "(none)";
@@ -250,49 +281,68 @@ export async function globalReduce(cwd, backends, options, model, budget) {
   const orphans = model.graph.orphans.slice(0, 40).map((o) => `- ${o.id}`).join("\n") || "(none)";
   const nonce = makeFenceNonce();
   const prompt = interpolate(AUDIT_REDUCE_TEMPLATE, { DUPES: dupes, CYCLES: cycles, ORPHANS: orphans, NONCE: nonce });
-  budget.charge(1);
-  const useCodex = codexOk; // prefer Codex; fall back to Grok only when Codex is unavailable
-  const agent = useCodex ? "codex" : "grok";
-  const res = await runStructuredWithRetry(
-    useCodex ? (p) => runCodexStructured(cwd, backends, options, p, "audit-reduce") : (p) => runGrokStructured(cwd, backends, options, p),
-    prompt,
-    (s) => parseAgentFindings(s, agent),
-    { budget, ...AUDIT_REPAIR_OPTS }
-  );
-  const reformatsUsed = res.reformatAttempts ?? 0;
-  // A parse miss whose retry then failed still means the reduce RAN (it just
-  // yielded nothing parseable) — report ran:true + unparsed, not a "skipped".
-  if (res.skipped || (res.status !== 0 && !res.parseMissed)) return { all: [], consensus: [], unique: [], ran: false, reformatsUsed };
-  const doc = res.status === 0 ? parseAgentFindings(res.stdout, agent) : { parseOk: false };
-  if (!doc.parseOk) return { all: [], consensus: [], unique: [], ran: true, unparsed: 1, reformatsUsed };
-  return { ...mergeFindings([doc]), ran: true, reformatsUsed };
+  const dispatch = seats.slice(0, Math.min(seats.length, budget.remaining()));
+  budget.charge(dispatch.length);
+  const runners = makeSeatRunners(cwd, backends, options, deps);
+  const jobs = [];
+  for (const seat of dispatch) {
+    const run = runners[seat];
+    if (!run) continue;
+    jobs.push(
+      runStructuredWithRetry(run, prompt, (s) => parseAgentFindings(s, seat), { budget, ...AUDIT_REPAIR_OPTS }).then((r) => ({ ...r, agent: seat }))
+    );
+  }
+  const raw = await Promise.all(jobs);
+  const docs = [];
+  let unparsed = 0;
+  let reformatsUsed = 0;
+  let ran = false; // at least ONE seat actually returned — a skipped/erroring seat is never an "it ran"
+  for (const r of raw) {
+    reformatsUsed += r.reformatAttempts ?? 0;
+    if (r.skipped) continue;
+    if (r.status === 0) {
+      ran = true;
+      const doc = parseAgentFindings(r.stdout, r.agent);
+      if (doc.parseOk) docs.push(doc);
+      else unparsed += 1; // ran, status 0, still unparseable after retry
+    } else if (r.parseMissed) {
+      // A parse miss whose retry then failed still means the reduce RAN (it just
+      // yielded nothing parseable) — report ran:true + unparsed, not a "skipped".
+      ran = true;
+      unparsed += 1;
+    }
+  }
+  if (!ran) return { all: [], consensus: [], unique: [], ran: false, unparsed, reformatsUsed };
+  return { ...mergeFindings(docs), ran: true, unparsed, reformatsUsed };
 }
 
 /**
  * Orchestrate v2: select hotspots -> deep review each (bounded by budget, small
  * concurrency) -> global reduce -> merge + scope-annotate. Returns findings +
- * coverage. Agents are Codex/Grok; Claude (the caller) synthesizes.
+ * coverage. Every ACTIVE seat (codex/grok/claude + any configured OpenRouter seat)
+ * is an independent finder on BOTH the per-unit review and the global reduce.
  *
- * Budget accounting: the per-unit cost is the number of ACTIVE reviewers, and one
- * charge is reserved for the global reduce so the SSOT/architecture pass is never
- * silently starved. Each worker claims a unit's cost synchronously before awaiting
- * so concurrency cannot over-spend.
+ * Budget accounting: the per-unit cost is the number of ACTIVE reviewers, and the
+ * SAME cost is reserved for the (equally six-eyed) global reduce so the
+ * SSOT/architecture pass is never silently starved. Each worker claims a unit's
+ * cost synchronously before awaiting so concurrency cannot over-spend.
  *
  * The default budget is 30 (council B2 claude-2): with THREE finders (six-eyes) a unit costs 3,
  * so 30 keeps ~9 hotspot units/run — the same breadth two finders had at 20. Raise --budget for
  * more depth; the endless loop amortizes breadth across passes regardless.
  */
-export async function runAuditReview(cwd, model, backends, options = {}) {
+export async function runAuditReview(cwd, model, backends, options = {}, deps = {}) {
   const budget = makeBudget(options.budget ?? 30);
   const units = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
   const concurrency = Math.max(1, Math.min(4, options.concurrency ?? 3));
   const costPerUnit = activeReviewerCount(backends, options);
-  // Reserve a charge for the global reduce ONLY when it will actually run: skipReduce (every pass
-  // after the first on the endless/fix loop) or a claude-only config (globalReduce needs codex/grok
-  // and early-returns otherwise) means the reduce never spends — reserving then STRANDS one charge,
-  // reviewing one fewer hotspot every such pass (council Opus O5). Match the reserve to the real spend.
-  const reduceWillRun = !options.skipReduce && (reviewerActive("codex", backends, options) || reviewerActive("grok", backends, options));
-  const reduceReserve = reduceWillRun ? 1 : 0;
+  // Reserve for the global reduce ONLY when it will actually run: skipReduce (every pass after the
+  // first on the endless/fix loop) or NO callable seat means the reduce never spends — reserving then
+  // STRANDS the charges, reviewing fewer hotspots every such pass (council Opus O5). Match the reserve
+  // to the REAL spend: the reduce is now six-eyes (every active seat reduces), so it costs exactly one
+  // call per active seat — the same costPerUnit a unit review costs.
+  const reduceWillRun = !options.skipReduce && costPerUnit > 0;
+  const reduceReserve = reduceWillRun ? costPerUnit : 0;
 
   const results = [];
   const failed = [];
@@ -309,7 +359,7 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
       try {
         // Fence reviewUnit's dynamic repair spend below the reduce reserve so a reformat/retry
         // can't starve the SSOT/architecture pass (council A5: grok-2/claude-1).
-        results.push(await reviewUnit(cwd, backends, options, unitId, model, reserveFloorBudget(budget, reduceReserve)));
+        results.push(await reviewUnit(cwd, backends, options, unitId, model, reserveFloorBudget(budget, reduceReserve), deps));
       } catch (err) {
         failed.push({ unitId, error: String(err?.message ?? err) });
       }
@@ -320,7 +370,7 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
   // The global reduce is over the whole (static) map, so re-running it every pass
   // of an endless loop just re-charges budget for identical input; callers past
   // the first pass pass skipReduce to spend their budget on fresh unit coverage.
-  const reduce = options.skipReduce ? { all: [], consensus: [], unique: [], ran: false } : await globalReduce(cwd, backends, options, model, budget);
+  const reduce = options.skipReduce ? { all: [], consensus: [], unique: [], ran: false } : await globalReduce(cwd, backends, options, model, budget, deps);
 
   // Per-unit merges + the global reduce can each surface the same issue; dedupe by
   // ledger fingerprint before annotating/recording so one finding isn't counted (or

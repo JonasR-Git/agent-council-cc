@@ -6,12 +6,11 @@ import {
   interpolate,
   loadPrompt,
   makeFenceNonce,
-  runCodexStructured,
-  runGrokStructured,
   waitForFile
 } from "./agents.mjs";
 import { extractJsonObject } from "./findings.mjs";
 import { readJsonl, writeJsonlCapped } from "./jsonl.mjs";
+import { activeSeatNames, makeSeatRunners } from "./seats.mjs";
 import { resolveStateDir } from "./state.mjs";
 import { avg, clampScore } from "./stats.mjs";
 
@@ -59,26 +58,38 @@ export function parseJudgeScore(stdout) {
   return { score, rationale: String(doc.rationale ?? "").trim() };
 }
 
-function taskAnswer(cwd, backends, agent, options, prompt, label) {
-  if (agent === "codex") return runCodexStructured(cwd, backends, options, prompt, label);
-  return runGrokStructured(cwd, backends, options, prompt);
+/**
+ * The seats this benchmark runs itself: EVERY active seat (codex/grok/claude + every configured
+ * OpenRouter seat) via the dynamic registry. Benchmarking exists to COMPARE seat quality, so a
+ * hardcoded codex+grok pair silently hid the claude seat and every OpenRouter seat the user paid to
+ * configure. Claude drops out of the runner-driven set exactly when the ORCHESTRATOR supplies its
+ * entry as a file (--claude-answer/--claude-answer-wait for answers, --claude-judgements for
+ * scores): that file IS claude's contribution, so also spawning the claude CLI would double-bill and
+ * produce two conflicting "claude" entries.
+ */
+function benchmarkSeats(backends, options) {
+  const seats = activeSeatNames(backends, options);
+  const answerFromFile = Boolean(options.claudeAnswer || options.claudeAnswerWait);
+  const judgeFromFile = Boolean(options.claudeJudgements);
+  return {
+    answerSeats: seats.filter((seat) => !(seat === "claude" && answerFromFile)),
+    judgeSeats: seats.filter((seat) => !(seat === "claude" && judgeFromFile))
+  };
 }
 
 /**
- * Benchmark: every non-skipped agent answers the same task; each answer is then
- * blind-scored (1-10) by the OTHER agents. Returns per-agent aggregate scores and
- * appends a record to benchmarks.jsonl. Read-only tasks only.
+ * Benchmark: every ACTIVE seat answers the same task; each answer is then blind-scored (1-10) by the
+ * OTHER seats. Returns per-agent aggregate scores and appends a record to benchmarks.jsonl.
+ * Read-only tasks only. deps.run* stay injectable (tests need no CLI/network).
  */
-export async function runBenchmark(cwd, backends, options = {}) {
+export async function runBenchmark(cwd, backends, options = {}, deps = {}) {
   const onPhase = typeof options.onPhase === "function" ? options.onPhase : () => {};
   const task = options.taskFile ? fs.readFileSync(options.taskFile, "utf8") : String(options.focusText ?? "");
   if (!task.trim()) {
     throw new Error("Provide a benchmark task: --task-file <path> or positional text.");
   }
   const taskHash = createHash("sha256").update(task).digest("hex").slice(0, 12);
-  const agents = [];
-  if (!options.skipCodex) agents.push("codex");
-  if (!options.skipGrok) agents.push("grok");
+  const { answerSeats, judgeSeats } = benchmarkSeats(backends, options);
   const clampAnswer = (text) => {
     const t = String(text).trim();
     return t.length > MAX_ANSWER_CHARS ? `${t.slice(0, MAX_ANSWER_CHARS)}\n[... answer truncated ...]` : t;
@@ -96,9 +107,12 @@ export async function runBenchmark(cwd, backends, options = {}) {
   } else {
     onPhase("answers");
     const answerOpts = { ...options, maxTurns: options.maxTurnsR1 };
-    const answerJobs = agents.map(async (agent) => {
+    const answerRunners = makeSeatRunners(cwd, backends, answerOpts, deps);
+    const answerJobs = answerSeats.map(async (agent) => {
       const prompt = interpolate(loadPrompt("benchmark-task"), { AGENT: agent, TASK: task, NONCE: makeFenceNonce() });
-      const res = await taskAnswer(cwd, backends, agent, answerOpts, prompt, "benchmark-answer");
+      const run = answerRunners[agent];
+      // Fail-closed: a seat without a runner contributes NO answer — it is never answered for it.
+      const res = run ? await run(prompt) : { skipped: true, reason: `no runner for seat ${agent}` };
       return { agent, res };
     });
     for (const { agent, res } of await Promise.all(answerJobs)) {
@@ -120,14 +134,19 @@ export async function runBenchmark(cwd, backends, options = {}) {
 
   const answeredAgents = Object.keys(answers);
 
-  // Phase 2: each agent blind-scores every OTHER agent's answer.
+  // Phase 2: each seat blind-scores every OTHER seat's answer. Judges are the active seats (claude
+  // judges via --claude-judgements when the orchestrator supplies them, see benchmarkSeats).
   onPhase("judging");
-  const judges = agents; // codex/grok can run judge prompts; claude judges in synthesis
   const judgeOpts = { ...options, maxTurns: options.maxTurnsR2, grokEffort: options.r2Effort ?? options.grokEffort };
+  const judgeRunners = makeSeatRunners(cwd, backends, judgeOpts, deps);
   const judgeJobs = [];
   for (const target of answeredAgents) {
-    for (const judge of judges) {
+    for (const judge of judgeSeats) {
       if (judge === target) continue;
+      const run = judgeRunners[judge];
+      // Fail-closed: no runner -> no vote. A judgement is NEVER routed to another seat (it would be
+      // attributed to the seat that never cast it).
+      if (!run) continue;
       const prompt = interpolate(loadPrompt("benchmark-judge"), {
         AGENT: judge,
         TASK: task,
@@ -135,7 +154,7 @@ export async function runBenchmark(cwd, backends, options = {}) {
         NONCE: makeFenceNonce()
       });
       judgeJobs.push(
-        taskAnswer(cwd, backends, judge, judgeOpts, prompt, "benchmark-judge").then((res) => ({
+        run(prompt).then((res) => ({
           judge,
           target,
           score: res.skipped ? null : parseJudgeScore(res.stdout)

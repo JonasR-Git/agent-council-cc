@@ -9,30 +9,42 @@ import { firstLines, isObject } from "./util.mjs";
 
 export const SEVERITY_RANK = { P0: 0, P1: 1, P2: 2, nit: 3 };
 
-function parseJsonObject(text) {
+function parseJsonValue(text) {
   try {
     const parsed = JSON.parse(text);
-    return isObject(parsed) ? parsed : null;
+    // Objects AND top-level arrays are legitimate candidates: a model asked for a
+    // findings report routinely answers with the bare findings LIST.
+    return isObject(parsed) || Array.isArray(parsed) ? parsed : null;
   } catch {
     return null;
   }
 }
 
-export function extractJsonObject(text) {
+/**
+ * Yield EVERY parseable JSON value in `text` (fenced blocks first, then the whole text,
+ * then a brace/bracket scan) so a caller can take the first candidate that matches ITS
+ * shape. Committing to the first *parseable* candidate let a chatty preamble object
+ * ({"status":"analyzing"}) or a stray array shadow the real document - which silently
+ * zeroes out a whole seat's review.
+ */
+export function* extractJsonCandidates(text) {
   const raw = String(text ?? "").trim();
-  if (!raw) return null;
+  if (!raw) return;
 
   const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
   for (const match of raw.matchAll(fenceRe)) {
-    const parsed = parseJsonObject(match[1].trim());
-    if (parsed) return parsed;
+    const parsed = parseJsonValue(match[1].trim());
+    if (parsed) yield parsed;
   }
 
-  const whole = parseJsonObject(raw);
-  if (whole) return whole;
+  const whole = parseJsonValue(raw);
+  if (whole) yield whole;
 
+  const CLOSER = { "{": "}", "[": "]" };
   for (let start = 0; start < raw.length; start += 1) {
-    if (raw[start] !== "{") continue;
+    const open = raw[start];
+    const close = CLOSER[open];
+    if (!close) continue;
     let depth = 0;
     let inString = false;
     let escape = false;
@@ -52,27 +64,79 @@ export function extractJsonObject(text) {
 
       if (ch === '"') {
         inString = true;
-      } else if (ch === "{") {
+      } else if (ch === open) {
         depth += 1;
-      } else if (ch === "}") {
+      } else if (ch === close) {
         depth -= 1;
         if (depth === 0) {
-          const parsed = parseJsonObject(raw.slice(start, i + 1));
-          if (parsed) return parsed;
+          const parsed = parseJsonValue(raw.slice(start, i + 1));
+          if (parsed) yield parsed;
           break;
         }
       }
     }
   }
+}
 
+/** First parseable JSON OBJECT (unchanged contract for the non-findings callers). */
+export function extractJsonObject(text) {
+  for (const candidate of extractJsonCandidates(text)) {
+    if (isObject(candidate)) return candidate;
+  }
   return null;
 }
 
-function normalizeSeverity(value) {
-  const s = String(value ?? "P2").toUpperCase();
-  if (s === "P0" || s === "P1" || s === "P2") return s;
-  if (s === "NIT" || s === "NITS") return "nit";
-  return "P2";
+/**
+ * Coerce a model-supplied number. `null` / absent / non-numeric stays NULL - never 0:
+ * Number(null) === 0 is finite, so the old guard turned every `"line": null` (which is
+ * exactly what the prompt templates ask for on a whole-file finding) into "line 0".
+ */
+function toFiniteNumber(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value.trim());
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+/** A usable 1-based line, or null. 0/negative means "no line", not line zero. */
+function toLine(value) {
+  const n = toFiniteNumber(value);
+  return n != null && n >= 1 ? n : null;
+}
+
+const DEFAULT_CONFIDENCE = 0.6;
+
+/**
+ * Severity synonyms -> the P-scale. A user-configured seat (any OpenRouter model, or any
+ * model that ignores the P-scale) emits "critical"/"high"/"minor"/...; mapping all of them
+ * to P2 silently DEMOTED its P0 below the P0/P1 refutation gate and below §6 attention,
+ * with no unparsed signal at all. Tokens are compared lowercased and stripped of
+ * separators, so "SEV-0" / "sev 0" / "p0" all land on P0.
+ */
+const SEVERITY_ALIASES = new Map(
+  Object.entries({
+    p0: "P0", sev0: "P0", s0: "P0", critical: "P0", crit: "P0", blocker: "P0", blocking: "P0", fatal: "P0",
+    p1: "P1", sev1: "P1", s1: "P1", high: "P1", major: "P1", severe: "P1",
+    p2: "P2", sev2: "P2", s2: "P2", medium: "P2", moderate: "P2", normal: "P2", warning: "P2",
+    nit: "nit", nits: "nit", nitpick: "nit", sev3: "nit", s3: "nit",
+    low: "nit", minor: "nit", info: "nit", informational: "nit", trivial: "nit", style: "nit", cosmetic: "nit"
+  })
+);
+
+/**
+ * -> { severity, raw, unrecognized }. `raw` is set whenever the model's token was not
+ * already canonical (so a report can show what it actually said); `unrecognized` marks a
+ * token we could NOT map - it still falls back to P2, but never silently.
+ */
+function resolveSeverity(value) {
+  const raw = value == null ? "" : String(value).trim();
+  const token = raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (!token) return { severity: "P2", raw: null, unrecognized: false };
+  const mapped = SEVERITY_ALIASES.get(token);
+  if (mapped) return { severity: mapped, raw: mapped === raw ? null : raw, unrecognized: false };
+  return { severity: "P2", raw, unrecognized: true };
 }
 
 function normalizeFindingsDoc(doc, agentFallback = "unknown") {
@@ -94,26 +158,41 @@ function normalizeFindingsDoc(doc, agentFallback = "unknown") {
   // would drop it from agent===... lookups (R2/consensus). Only honor
   // doc.agent when the caller genuinely doesn't know who ran ("unknown").
   const agent = agentFallback !== "unknown" ? agentFallback : String(doc.agent ?? "unknown");
-  const normalized = findings.map((f, i) => ({
-    id: String(f?.id ?? `${agentFallback}-${i + 1}`),
-    severity: normalizeSeverity(f?.severity),
-    category: String(f?.category ?? "other"),
-    title: String(f?.title ?? f?.summary ?? "Untitled").trim(),
-    detail: String(f?.detail ?? f?.description ?? "").trim(),
-    file: f?.file != null ? String(f.file) : null,
-    line: Number.isFinite(Number(f?.line)) ? Number(f.line) : null,
-    confidence: Number.isFinite(Number(f?.confidence)) ? Number(f.confidence) : 0.6,
-    // Preserve a VALID model-supplied lens (a registered lens id) so a multi-lens group pass keeps
-    // each finding's real class — without it the lens is dropped and a security_secrets P0 surfaced
-    // under a multi-lens group would lose the tag the P0 live-hole override keys on (council B5
-    // codex P2). An unknown/absent lens stays undefined for downstream categoryToLens to fill.
-    lens: f?.lens && getLens(f.lens) ? String(f.lens) : undefined,
-    agent,
-    // Honor an explicit agent scope override ("localized"/"cross-cutting");
-    // anything else stays undefined so annotateScopes falls back to heuristics.
-    scope: f?.scope === "localized" || f?.scope === "cross-cutting" ? f.scope : undefined
-  }));
+  const normalized = findings.map((f, i) => {
+    const sev = resolveSeverity(f?.severity);
+    return {
+      id: String(f?.id ?? `${agentFallback}-${i + 1}`),
+      severity: sev.severity,
+      // Only present when the model's token was NOT canonical - a genuinely unknown token
+      // keeps the P2 fallback but is surfaced (never a silent demotion).
+      ...(sev.raw != null ? { severityRaw: sev.raw } : {}),
+      ...(sev.unrecognized ? { severityUnrecognized: true } : {}),
+      category: String(f?.category ?? "other"),
+      title: String(f?.title ?? f?.summary ?? "Untitled").trim(),
+      detail: String(f?.detail ?? f?.description ?? "").trim(),
+      file: f?.file != null ? String(f.file) : null,
+      // A whole-file finding ("line": null, what every prompt template asks for) stays
+      // UNLOCATED. Coercing it to 0 made two such findings look 0 lines apart, and the
+      // merge then fabricated cross-seat consensus off a single shared title token.
+      line: toLine(f?.line),
+      // "confidence": null means "unstated", exactly like an absent field - not "zero
+      // confidence" (which Number(null)===0 used to assert on the model's behalf).
+      confidence: toFiniteNumber(f?.confidence) ?? DEFAULT_CONFIDENCE,
+      // Preserve a VALID model-supplied lens (a registered lens id) so a multi-lens group pass keeps
+      // each finding's real class — without it the lens is dropped and a security_secrets P0 surfaced
+      // under a multi-lens group would lose the tag the P0 live-hole override keys on (council B5
+      // codex P2). An unknown/absent lens stays undefined for downstream categoryToLens to fill.
+      lens: f?.lens && getLens(f.lens) ? String(f.lens) : undefined,
+      agent,
+      // Honor an explicit agent scope override ("localized"/"cross-cutting");
+      // anything else stays undefined so annotateScopes falls back to heuristics.
+      scope: f?.scope === "localized" || f?.scope === "cross-cutting" ? f.scope : undefined
+    };
+  });
 
+  const unrecognizedSeverities = normalized
+    .filter((f) => f.severityUnrecognized)
+    .map((f) => ({ id: f.id, severity: f.severityRaw }));
   const VALID_VERDICTS = new Set(["approve", "approve_with_nits", "request_changes", "block"]);
   const verdict = String(doc.verdict ?? "").toLowerCase().trim();
   return {
@@ -121,36 +200,49 @@ function normalizeFindingsDoc(doc, agentFallback = "unknown") {
     summary: String(doc.summary ?? "").trim(),
     verdict: VALID_VERDICTS.has(verdict) ? verdict : "request_changes",
     findings: normalized,
+    // Absent when every token parsed - a canonical doc stays byte-identical.
+    ...(unrecognizedSeverities.length ? { unrecognizedSeverities } : {}),
     parseOk: true
   };
 }
 
+/**
+ * A findings DOCUMENT, or null. A bare top-level array is a doc too: models answer the
+ * "emit the findings" prompt with the list itself often enough that dropping it loses a
+ * whole seat's review.
+ */
+function asFindingsDoc(candidate) {
+  if (Array.isArray(candidate)) return { findings: candidate };
+  if (isObject(candidate) && Array.isArray(candidate.findings)) return candidate;
+  return null;
+}
+
 export function parseAgentFindings(stdout, agent) {
-  const parsed = extractJsonObject(stdout);
-  if (!parsed) {
-    return {
-      agent,
-      summary: firstLines(stdout, 8),
-      verdict: "request_changes",
-      findings: [],
-      parseOk: false,
-      validationErrors: ["$: no JSON object found"],
-      raw: String(stdout ?? "")
-    };
+  const raw = String(stdout ?? "");
+  // Take the first candidate that VALIDATES as a findings doc - not merely the first
+  // parseable JSON. A preamble object or an unrelated array earlier in the reply would
+  // otherwise shadow the real document and silently drop the seat to zero findings.
+  let shapedErrors = null;
+  let anyErrors = null;
+  for (const candidate of extractJsonCandidates(stdout)) {
+    const doc = asFindingsDoc(candidate);
+    if (!doc) {
+      anyErrors ??= validate(SCHEMAS.findings, candidate).errors;
+      continue;
+    }
+    const checked = validate(SCHEMAS.findings, doc);
+    if (checked.valid) return { ...normalizeFindingsDoc(doc, agent), raw };
+    shapedErrors ??= checked.errors;
   }
-  const checked = validate(SCHEMAS.findings, parsed);
-  if (!checked.valid) {
-    return {
-      agent,
-      summary: firstLines(stdout, 8),
-      verdict: "request_changes",
-      findings: [],
-      parseOk: false,
-      validationErrors: checked.errors,
-      raw: String(stdout ?? "")
-    };
-  }
-  return { ...normalizeFindingsDoc(parsed, agent), raw: String(stdout ?? "") };
+  return {
+    agent,
+    summary: firstLines(stdout, 8),
+    verdict: "request_changes",
+    findings: [],
+    parseOk: false,
+    validationErrors: shapedErrors ?? anyErrors ?? ["$: no JSON object found"],
+    raw
+  };
 }
 
 export function parseCritiqueVotes(stdout, agent, aboutAgent) {
@@ -245,8 +337,21 @@ export function titleSimilarity(a, b) {
   return intersection / union;
 }
 
+/** A real 1-based location, or null for "unlocated" (whole-file finding, 0, garbage). */
+function knownLine(f) {
+  const n = Number(f?.line);
+  return f?.line != null && Number.isFinite(n) && n >= 1 ? n : null;
+}
+
 function lineClose(a, b) {
-  return a.line != null && b.line != null && Math.abs(Number(a.line) - Number(b.line)) <= 10;
+  const left = knownLine(a);
+  const right = knownLine(b);
+  // An UNKNOWN line is not a location. Two whole-file findings are not "0 lines apart",
+  // they are simply unlocated - reading them as co-located (the old Number(null)===0
+  // path) let one shared 3-char title token fuse two unrelated findings from different
+  // seats into a FABRICATED consensus, which then also skipped refutation.
+  if (left == null || right == null) return false;
+  return Math.abs(left - right) <= 10;
 }
 
 function fuzzyMatch(a, b) {
@@ -256,7 +361,9 @@ function fuzzyMatch(a, b) {
   }
   // Line proximity alone must never merge: two unrelated findings a few lines
   // apart would fabricate consensus. Nearby lines only count with at least one
-  // shared title token; otherwise require strong title similarity.
+  // shared title token; otherwise require strong title similarity. With an unknown
+  // line on either side there is no proximity signal at all, so strong title
+  // similarity is the ONLY way in.
   const similarity = titleSimilarity(a.title, b.title);
   return (lineClose(a, b) && similarity > 0) || similarity >= 0.4;
 }

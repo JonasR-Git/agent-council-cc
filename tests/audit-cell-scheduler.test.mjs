@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_CELL_REPAIR_CALLS,
   DEFAULT_MAX_INFLIGHT,
   capCells,
   cellKey,
@@ -302,6 +303,179 @@ test("OpenRouter: a cell whose model is a configured OR seat routes to the OpenR
   assert.equal(seenId, "or-x", "the OpenRouter seat runner was invoked for its cell");
   assert.equal(r.ok, true);
   assert.equal(r.findings[0].file, "a.mjs", "OR findings get the same cell stamping as built-in seats");
+});
+
+// ---------------------------------------------------------------------------------------------
+// A4 — capCells must cap on TRIPLE boundaries (model is enumerateCells' INNERMOST dimension)
+// ---------------------------------------------------------------------------------------------
+
+const CHUNK = { text: "x", index: 0, total: 1, startLine: 1, endLine: 1 };
+const cellOf = (over = {}) => ({ model: "codex", groupId: "g", group: { id: "g", lenses: ["correctness"], focus: "f" }, file: "a.mjs", chunk: 0, chunkData: CHUNK, ...over });
+/** Every model that reviewed a given triple in `cells`. */
+const modelsOfTriple = (cells, t) => cells.filter((c) => c.groupId === t.groupId && c.file === t.file && c.chunk === t.chunk).map((c) => c.model).sort();
+
+test("A4: capCells caps on a TRIPLE boundary — a cap of 5 with 3 models schedules 3 cells (1 whole triple), not 5", () => {
+  const cells = enumerateCells(["a.mjs", "b.mjs"], GROUPS, MODELS, () => [{ index: 0 }]); // 2 files × 2 groups × 1 chunk × 3 models = 12
+  assert.equal(cells.length, 12);
+  const out = capCells(cells, 5);
+  assert.equal(out.cells.length, 3, "5 → 3: a partial triple (which can NEVER be six-eyes complete) is never scheduled");
+  assert.equal(out.capped, true);
+  assert.equal(out.dropped, 9, "the dropped count is HONEST — it includes the 2 cells the raw slice would have wasted");
+  // the one scheduled triple is COMPLETABLE: all three models are present for it
+  const triples = triplesOf(out.cells);
+  assert.equal(triples.length, 1);
+  assert.deepEqual(modelsOfTriple(out.cells, triples[0]), [...MODELS].sort());
+});
+
+test("A4: a cap BELOW the model count schedules ZERO cells (never burn paid calls on an uncompletable triple)", () => {
+  const cells = enumerateCells(["a.mjs"], [GROUPS[0]], MODELS, () => [{ index: 0 }]); // exactly 3 cells = 1 triple
+  const out = capCells(cells, 2);
+  assert.equal(out.cells.length, 0, "2 < 3 models → not even one whole triple fits → schedule nothing");
+  assert.equal(out.capped, true);
+  assert.equal(out.dropped, 3, "and say so honestly, rather than silently spending 2 calls on a triple that can never complete");
+});
+
+test("A4: the DEFAULT trigger (--completeness-critic maxCells = passBudget - 1) rounds down to whole triples", () => {
+  // 1499 % 3 = 2 → the old raw slice ALWAYS planned a partial triple on a default critic run.
+  const cells = enumerateCells(Array.from({ length: 600 }, (_, i) => `f${i}.mjs`), [GROUPS[0]], MODELS, () => [{ index: 0 }]); // 1800 cells
+  const out = capCells(cells, 1499);
+  assert.equal(out.cells.length, 1497, "floor(1499 / 3) * 3");
+  assert.equal(out.cells.length % MODELS.length, 0, "a scheduled pass is always a whole number of triples");
+  assert.equal(out.dropped, 1800 - 1497);
+  for (const t of triplesOf(out.cells)) assert.deepEqual(modelsOfTriple(out.cells, t), [...MODELS].sort());
+});
+
+test("A4: a CAPPED pass is six-eyes COMPLETABLE — else passComplete never flips and the fix/endless loop can't converge", async () => {
+  const cells = enumerateCells(["a.mjs", "b.mjs", "c.mjs"], GROUPS, MODELS, () => [CHUNK]); // 18 cells
+  const { cells: planned } = capCells(cells, 8); // 8 → 6 (2 whole triples); a raw slice(0,8) left a 2/3 triple
+  assert.equal(planned.length, 6);
+  const out = await runCellMatrix(planned, async (cell) => ({ ok: true, cell, findings: [] }), { models: MODELS, retryOnLimit: false });
+  assert.equal(out.complete, true, "every scheduled cell succeeded → the pass MUST reach six-eyes complete");
+  assert.equal(out.matrix.incompleteTriples(out.triples).length, 0);
+});
+
+test("A4: an explicit modelCount overrides the inferred one; an under-cap list is untouched", () => {
+  const cells = Array.from({ length: 10 }, (_, i) => ({ i })); // opaque cells (no .model) → inferred count 1
+  assert.deepEqual(capCells(cells, 10), { cells, dropped: 0, capped: false }, "at/below the cap nothing is dropped");
+  assert.equal(capCells(cells, 7).cells.length, 7, "inferred modelCount 1 → any cap is already a whole triple");
+  assert.equal(capCells(cells, 7, { modelCount: 3 }).cells.length, 6, "an explicit seat count rounds 7 down to 6");
+});
+
+// ---------------------------------------------------------------------------------------------
+// A4 — makeCellReviewer parse REPAIR (one garbled reply must not permanently lose a PAID cell)
+// ---------------------------------------------------------------------------------------------
+
+const GARBLED = "Sure! Here is what I found: 1. SQL injection in db.mjs (P0). Let me know if you want more detail.";
+const GOOD = '{"agent":"codex","findings":[{"severity":"P1","title":"t","detail":"d"}]}';
+
+test("A4: makeCellReviewer REPAIRS a garbled reply with a one-shot reformat (the paid cell is not lost)", async () => {
+  const prompts = [];
+  const review = makeCellReviewer("/x", {}, {}, {
+    runCodex: async (p) => {
+      prompts.push(p);
+      return { status: 0, stdout: prompts.length === 1 ? GARBLED : GOOD }; // garbled first, reformat repairs it
+    }
+  });
+  const r = await review(cellOf());
+  assert.equal(r.ok, true, "the reformat salvaged the cell instead of losing it (and its triple) forever");
+  assert.equal(r.findings.length, 1);
+  assert.equal(prompts.length, 2, "exactly ONE extra call — the cheap reformat, not a full re-analysis storm");
+  assert.match(prompts[1], /could not be parsed as JSON/i);
+  assert.match(prompts[1], /BEGIN UNPARSEABLE REPLY/, "the repair prompt nonce-fences the model's own garbled reply as UNTRUSTED");
+  assert.ok(prompts[1].includes(GARBLED), "and hands back the exact content to reshape (no re-analysis)");
+  assert.equal(r.repairCalls, 1, "the extra paid call is surfaced (budget-honest)");
+});
+
+test("A4: a repaired cell COMPLETES its triple — six-eyes, where one garbled seat used to block it forever", async () => {
+  const cells = enumerateCells(["a.mjs"], [GROUPS[0]], MODELS, () => [CHUNK]); // 1 triple × 3 seats
+  const calls = { codex: 0, grok: 0, claude: 0 };
+  const reply = (seat) => `{"agent":"${seat}","findings":[]}`;
+  const review = makeCellReviewer("/x", {}, {}, {
+    runCodex: async () => ({ status: 0, stdout: (calls.codex += 1) === 1 ? GARBLED : reply("codex") }), // garbles ONCE
+    runGrok: async () => ({ status: 0, stdout: ((calls.grok += 1), reply("grok")) }),
+    runClaude: async () => ({ status: 0, stdout: ((calls.claude += 1), reply("claude")) })
+  });
+  const out = await runCellMatrix(cells, review, { models: MODELS, retryOnLimit: false });
+  assert.equal(out.complete, true, "the repaired codex cell counts → the triple is six-eyes complete");
+  assert.equal(out.repairCalls, 1, "the matrix reports the EXTRA agent call the repair spent (honest cost, not hidden)");
+  assert.equal(calls.codex, 2, "one reformat for the garbled seat; the other seats pay nothing extra");
+  assert.equal(calls.grok, 1);
+});
+
+test("A4: a cell still garbled AFTER the repair stays ok:false (fail-closed) and spends at most ONE repair call", async () => {
+  let calls = 0;
+  const review = makeCellReviewer("/x", {}, {}, {
+    runCodex: async () => {
+      calls += 1;
+      return { status: 0, stdout: GARBLED }; // never repairs
+    }
+  });
+  const r = await review(cellOf());
+  assert.equal(r.ok, false, "an unrepairable reply is NEVER a manufactured clean cell");
+  assert.equal(r.unparsed, true);
+  assert.equal(calls, 2, "original + ONE reformat — the per-cell repair budget declines the full reminder re-run");
+  assert.equal(r.repairCalls, 1);
+});
+
+test("A4: repair NEVER fires for a dead/skipped/truncated backend (no paid call is wasted on an unrepairable run)", async () => {
+  const calls = { grok: 0, claude: 0, codex: 0 };
+  const review = makeCellReviewer("/x", {}, {}, {
+    runGrok: async () => {
+      calls.grok += 1;
+      return { skipped: true };
+    },
+    runClaude: async () => {
+      calls.claude += 1;
+      return { status: 1, stdout: "", stderr: "boom" };
+    },
+    // a truncated reply means the child was KILLED mid-output — reformatting it would launder a
+    // CLIPPED review into a "done" cell, so it must stay fail-closed and cost no repair call.
+    runCodex: async () => {
+      calls.codex += 1;
+      return { status: 0, stdout: GARBLED, truncated: true };
+    }
+  });
+  const skipped = await review(cellOf({ model: "grok" }));
+  assert.equal(skipped.ok, false);
+  assert.equal(skipped.repairCalls, 0, "a skipped backend cannot be reformatted — charge nothing");
+  assert.equal(calls.grok, 1, "and it is called exactly once");
+  const errored = await review(cellOf({ model: "claude" }));
+  assert.equal(errored.ok, false);
+  assert.equal(errored.repairCalls, 0, "a crashed backend cannot be reformatted either");
+  assert.equal(calls.claude, 1);
+  const clipped = await review(cellOf({ model: "codex" }));
+  assert.equal(clipped.ok, false, "a TRUNCATED reply stays fail-closed");
+  assert.equal(clipped.repairCalls, 0);
+  assert.equal(calls.codex, 1);
+});
+
+test("A4: maxCellRepairCalls:0 restores the old no-repair behaviour (byte-identical single call)", async () => {
+  let calls = 0;
+  const review = makeCellReviewer("/x", {}, { maxCellRepairCalls: 0 }, {
+    runCodex: async () => {
+      calls += 1;
+      return { status: 0, stdout: GARBLED };
+    }
+  });
+  const r = await review(cellOf());
+  assert.equal(calls, 1, "repair disabled → exactly one call");
+  assert.equal(r.ok, false);
+  assert.equal(r.unparsed, true);
+  assert.equal(r.repairCalls, 0);
+  assert.equal(DEFAULT_CELL_REPAIR_CALLS, 1, "the default is a ONE-shot repair");
+});
+
+test("A4: an injected SHARED repair budget bounds the reformat spend across the whole matrix", async () => {
+  // a systematically garbling seat must not silently double the paid cost of every one of its cells
+  let spent = 0;
+  const repairBudget = { canSpend: (n = 1) => spent + n <= 1, charge: (n = 1) => { spent += n; } };
+  let calls = 0;
+  const review = makeCellReviewer("/x", {}, {}, { runCodex: async () => ({ status: 0, stdout: (calls += 1) && GARBLED }), repairBudget });
+  const cells = enumerateCells(["a.mjs", "b.mjs"], [GROUPS[0]], ["codex"], () => [CHUNK]);
+  const out = await runCellMatrix(cells, review, { models: ["codex"], retryOnLimit: false });
+  assert.equal(out.repairCalls, 1, "the shared budget affords ONE reformat in total, not one per cell");
+  assert.equal(calls, 3, "2 cells + 1 affordable reformat (the 2nd cell's repair is DECLINED, not silently spent)");
+  assert.equal(out.complete, false, "and the unrepaired cell stays fail-closed → its triple is not complete");
 });
 
 test("B4 (council grok-4): enumerateCells threads per-file static facts onto each cell + into the prompt", async () => {

@@ -149,32 +149,63 @@ export function makePatchReviewer(cwd, backends, options = {}, deps = {}) {
   };
 }
 
+// A3: the operator flag that opts a BUILT-IN seat out. §6 unanimity ALWAYS requires all three
+// built-ins — requiredPatchSeats never shrinks for them, on purpose: a CLI flag must not be able
+// to silently weaken the unanimity gate (that is the security invariant). So a SKIPPED built-in
+// can never cast a vote yet is still required → the gate would veto every sensitive patch forever
+// with "missing: grok". patchReviewerReady therefore reports NOT ready with an honest reason, and
+// the caller keeps the sensitive class propose-only. (No entry is needed for an OpenRouter seat: a
+// skipped OR seat is simply NOT required — requiredPatchSeats drops it — so it never lands here.)
+const BUILTIN_SKIP_FLAG = Object.freeze({ codex: "--skip-codex", grok: "--skip-grok", claude: "--skip-claude" });
+
+function builtinSkipped(seat, options) {
+  if (seat === "codex") return Boolean(options.skipCodex);
+  if (seat === "grok") return Boolean(options.skipGrok);
+  if (seat === "claude") return Boolean(options.skipClaude);
+  return false;
+}
+
+/** Why a REQUIRED seat cannot vote — an honest, per-seat sentence the CLI can print verbatim. */
+function seatBlockedReason(seat, options) {
+  if (builtinSkipped(seat, options)) {
+    return `${BUILTIN_SKIP_FLAG[seat]} is incompatible with --sensitive-auto-apply: §6 needs all three built-in seats`;
+  }
+  if (seat === "codex") return "codex-companion unavailable (the codex seat votes only via the companion)";
+  if (seat === "grok") return "grok CLI unreachable";
+  if (seat === "claude") return "claude CLI unreachable";
+  return `OpenRouter seat ${seat} unreachable (no API key / no models configured)`;
+}
+
 /**
- * Which of the three seats are reachable. §6 auto-apply needs ALL three: if any is
- * missing the gate can never reach unanimity, so the caller should warn + keep the
- * sensitive class propose-only rather than silently never-approve.
+ * Which of the REQUIRED §6 seats can actually vote. Auto-apply needs every one of them: if any is
+ * missing the gate can never reach unanimity, so the caller should warn + keep the sensitive class
+ * propose-only rather than silently never-approve.
+ *
+ * Returns `{ ready, <seat>: boolean…, reasons: { <seat>: why } }` — one boolean per required seat
+ * (built-ins + every configured, non-skipped OpenRouter seat) plus a reason for each blocked seat.
  */
 export function patchReviewerReady(backends, options = {}) {
-  // Use the ACTUAL availability probes, not fallback command-name strings: probeBackends
-  // supplies default "claude"/"grok" bin names even when the reachability probe FAILED, so
-  // Boolean(bin) does NOT mean reachable. A false-positive would print ENABLED and then run
-  // a gate that can never reach unanimity.
-  const claude = Boolean(backends?.claude?.cli?.available);
-  // The codex SEAT votes via runCodexStructured, which HARD-requires the companion (it
-  // returns skipped without it). Gating on cli.available would report ENABLED while codex
-  // can never cast a vote → the gate could never reach unanimity. Companion only.
-  const codex = Boolean(backends?.codex?.companionAvailable);
-  const grok = Boolean(backends?.grok?.cli?.available);
-  // Every CONFIGURED OpenRouter seat must ALSO be reachable up front, else §6 auto-apply would enable a
-  // gate that can never reach unanimity (a configured-but-down OR seat is a required veto). Report each
-  // so the caller can name the missing seat.
-  const perSeat = { claude, codex, grok };
-  const orReady = [];
-  for (const s of backends?.openrouter?.seats ?? []) {
-    if (options.skipOpenRouter || (options.skipSeats ?? []).includes(s.id)) continue;
-    const ok = seatActive(s.id, backends, options);
-    perSeat[s.id] = ok;
-    orReady.push(ok);
+  // Ask the seat REGISTRY which seats §6 requires — never a hardcoded ["codex","grok"] triple, so
+  // every OpenRouter seat the operator configured is checked up front too (a configured-but-down OR
+  // seat is a required veto: enabling auto-apply would run a gate that can never reach unanimity).
+  const perSeat = {};
+  const reasons = {};
+  for (const seat of requiredPatchSeats(backends, options)) {
+    // seatActive() is the single source of truth for "can this seat cast a vote at all". It answers
+    // BOTH halves, which a bare availability probe misses:
+    //   - REACHABILITY from the ACTUAL probes, not fallback command-name strings: probeBackends
+    //     supplies default "claude"/"grok" bin names even when the reachability probe FAILED, so
+    //     Boolean(bin) does NOT mean reachable. A false-positive would print ENABLED and then run a
+    //     gate that can never reach unanimity. (And the codex SEAT votes via runCodexStructured,
+    //     which HARD-requires the companion — hence companionAvailable, never cli.available.)
+    //   - the operator SKIP flags (--skip-codex/--skip-grok/--skip-claude, also set by a policy
+    //     `reviewers` list that omits a seat). See BUILTIN_SKIP_FLAG above: a skipped built-in is
+    //     still REQUIRED, so it must fail the readiness check — fail-safe, never a silent veto.
+    const ok = seatActive(seat, backends, options);
+    perSeat[seat] = ok;
+    if (!ok) reasons[seat] = seatBlockedReason(seat, options);
   }
-  return { ready: claude && codex && grok && orReady.every(Boolean), ...perSeat };
+  // `reasons` is an object (always truthy), so callers that name the blocked seats by filtering the
+  // falsy keys of this result keep working unchanged.
+  return { ready: Object.values(perSeat).every(Boolean), ...perSeat, reasons };
 }

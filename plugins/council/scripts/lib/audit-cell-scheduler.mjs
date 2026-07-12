@@ -7,6 +7,7 @@
 // of concurrent CLI spawns), retries a rate-limited cell in isolation (one throttled cell can't
 // fail the run), and tracks completion in a coverage matrix. Convergence over the matrix is B5.
 import { buildGroupPrompt } from "./audit-group-prompt.mjs";
+import { buildReformatPrompt, runStructuredWithRetry } from "./agents.mjs";
 import { makeSeatRunners } from "./seats.mjs";
 import { isRateLimitError, retryOnRateLimit } from "./audit-retry.mjs";
 import { parseAgentFindings } from "./findings.mjs";
@@ -14,6 +15,7 @@ import { categoryToLens } from "./audit-normalize.mjs";
 
 export const DEFAULT_MAX_INFLIGHT = 6; // mandatory concurrency cap (target 4–8)
 export const DEFAULT_MAX_CELLS = 4000; // total-cell backstop for capCells (a cost guard; B5 sets policy)
+export const DEFAULT_CELL_REPAIR_CALLS = 1; // extra agent calls ONE garbled cell may spend (one-shot reformat)
 const MAX_INFLIGHT_CEILING = 16;
 
 // Cell/triple keys are a JSON array of their dimensions — unambiguous + collision-free (JSON
@@ -54,11 +56,23 @@ export function enumerateCells(files, groups, models, chunksOf, factsOf = null) 
  * models can reach thousands of paid model calls, so a run must have a total backstop the way the
  * fix loop caps total writes with maxFixes (council B4 grok-2). Truncation is EXPLICIT: returns
  * `{ cells, dropped, capped }` so the caller can log what was left for a later pass — never a silent cap.
+ *
+ * The cap lands on a TRIPLE BOUNDARY (council A4). MODEL is enumerateCells' INNERMOST dimension, so a
+ * raw slice(0, cap) whose cap is not a multiple of the active-seat count plans a PARTIAL triple: paid
+ * calls are spent on a (group,file,chunk) that can NEVER be six-eyes complete → tripleComplete never
+ * returns true → passComplete stays false → the fix/endless loop can never converge. That is the
+ * COMMON case, not a corner: --completeness-critic sets maxCells = passBudget - 1 (1499 % 3 = 2). So
+ * the cap is rounded DOWN to a whole number of triples. A cap BELOW the model count schedules ZERO
+ * cells: an honest "nothing could be planned" (dropped tells the caller how much) beats burning paid
+ * calls on a triple that can never complete. `modelCount` defaults to the distinct models in `cells`.
  */
-export function capCells(cells, maxCells = DEFAULT_MAX_CELLS) {
+export function capCells(cells, maxCells = DEFAULT_MAX_CELLS, { modelCount } = {}) {
   const cap = Number.isFinite(maxCells) && maxCells > 0 ? Math.floor(maxCells) : DEFAULT_MAX_CELLS;
   if (cells.length <= cap) return { cells, dropped: 0, capped: false };
-  return { cells: cells.slice(0, cap), dropped: cells.length - cap, capped: true };
+  const models =
+    Number.isFinite(modelCount) && modelCount > 0 ? Math.floor(modelCount) : new Set(cells.map((c) => c.model)).size || 1;
+  const keep = Math.floor(cap / models) * models; // whole triples only — never a partial, uncompletable one
+  return { cells: cells.slice(0, keep), dropped: cells.length - keep, capped: true };
 }
 
 /** Distinct (groupId, file, chunk) triples across a cell list — the units six-eyes is measured on. */
@@ -145,37 +159,115 @@ export function withCellRetry(runCell, { retryOnLimit = true, retries, sleep, on
   return (cell, idx) => retryOnRateLimit(() => runCell(cell, idx), { retries, sleep, onRetry });
 }
 
+// The cell reviewer's reformat schema hint. A reformat re-runs FRESH (the original task is no longer
+// in context), so the hint must carry the shape itself. Mirrors the per-file audit path's hint
+// (audit-review's FINDINGS_REFORMAT_HINT — module-private there); both parse with parseAgentFindings.
+const CELL_REFORMAT_HINT =
+  'a findings report JSON object: {"agent","summary","verdict","findings":[{severity,category,title,detail,file,line,confidence}]}';
+
+/**
+ * A FINITE repair budget for ONE cell: at most `max` extra agent calls, and only while an optional
+ * SHARED budget (deps.repairBudget — a whole-matrix cap) also affords them. runStructuredWithRetry
+ * asks canSpend() before every extra call and charge()s it, so with max=1 the cheap reformat is spent
+ * and the full reminder re-run is DECLINED: a genuinely one-shot repair, never a per-cell cost blow-up
+ * (a systematically garbling seat would otherwise silently triple the paid cost of every one of its
+ * cells, and the grouped path bounds cost by CELLS, not by an agent-call budget).
+ */
+function makeRepairBudget(max, shared = null) {
+  let spent = 0;
+  return {
+    canSpend: (n = 1) => spent + n <= max && (!shared || shared.canSpend(n)),
+    charge: (n = 1) => {
+      spent += n;
+      if (shared) shared.charge(n);
+    },
+    remaining: () => max - spent,
+    get total() {
+      return max;
+    },
+    get spent() {
+      return spent;
+    }
+  };
+}
+
+/**
+ * A run that can never become a review: absent, skipped, timed out, TRUNCATED (the child was killed
+ * mid-output, so the reply is clipped), or a non-zero exit. Fail-closed — and NOT repairable either:
+ * a reformat can only reshape content that is actually there.
+ */
+function failedRun(res) {
+  return !res || res.skipped || res.timedOut || res.truncated || (res.status != null && res.status !== 0);
+}
+
 /**
  * Build a `reviewCell(cell)` that assembles the group+chunk prompt (B3), runs the cell's MODEL as
  * an independent finder (B2), and parses its findings. Injectable per-model runners for tests.
- * Returns `{ ok, cell, findings? , unparsed?, res? }`: ok:false for a skipped/timed-out/errored/
- * unparseable run (fail-closed — a dead backend never manufactures an empty clean review).
+ * Returns `{ ok, cell, findings? , unparsed?, res?, repairCalls }`: ok:false for a skipped/timed-out/
+ * errored/unparseable run (fail-closed — a dead backend never manufactures an empty clean review).
  *
  * A THROTTLED backend signals 429/529 via a non-zero exit + stderr text, NOT by throwing, so a bare
  * return would make withCellRetry's retryOnRateLimit a no-op for the real CLIs (council B4 grok-1).
  * Here a rate-limit signal is re-THROWN so the retry actually backs off this cell; a permanent or
  * non-rate-limit failure returns ok:false (recorded failed, not retried).
+ *
+ * PARSE REPAIR (council A4): a reply that RAN fine but is merely GARBLED (prose preamble, stray fence,
+ * trailing comma) gets the same one-shot reformat the per-file path has long had via
+ * runStructuredWithRetry — hand the model its own unparseable reply and ask it to reshape THAT content
+ * (no re-analysis). Without it, one malformed reply permanently loses a PAID cell AND keeps its triple
+ * six-eyes-incomplete forever, so the loop can never converge. The repair goes through the SAME
+ * injected seat runner (tests need no CLI) and is charged to a finite per-cell budget (plus an optional
+ * shared deps.repairBudget), surfaced as `repairCalls` so cost accounting stays honest. Only a
+ * REPAIRABLE run earns it — a skipped/timed-out/truncated/errored run has no content to reshape, so it
+ * costs nothing extra and stays fail-closed. A cell still unparseable after the repair stays ok:false.
+ * maxCellRepairCalls:0 restores the old no-repair behaviour exactly.
  */
 export function makeCellReviewer(cwd, backends, options = {}, deps = {}) {
   // Runner per seat (built-ins + any configured OpenRouter seats), via the dynamic registry. deps.run*
   // overrides stay honored (existing cell-scheduler tests inject runCodex/runGrok/runClaude).
   const runners = makeSeatRunners(cwd, backends, options, deps);
+  const maxRepair =
+    Number.isFinite(options.maxCellRepairCalls) && options.maxCellRepairCalls >= 0
+      ? Math.floor(options.maxCellRepairCalls)
+      : DEFAULT_CELL_REPAIR_CALLS;
   return async (cell) => {
     const run = runners[cell.model];
-    if (!run) return { ok: false, cell, reason: `no runner for model ${cell.model}` };
+    if (!run) return { ok: false, cell, reason: `no runner for model ${cell.model}`, repairCalls: 0 };
     const prompt = buildGroupPrompt(cell.file, cell.group, cell.chunkData, cell.facts ?? "(no static facts)");
-    const res = await run(prompt);
-    const failedRun = !res || res.skipped || res.timedOut || res.truncated || (res.status != null && res.status !== 0);
-    if (failedRun) {
+    const parse = (stdout) => parseAgentFindings(stdout, cell.model);
+    let res = await run(prompt);
+    let repairCalls = 0;
+
+    if (maxRepair > 0 && !failedRun(res) && parse(res.stdout)?.parseOk === false) {
+      const budget = makeRepairBudget(maxRepair, deps.repairBudget ?? null);
+      // runStructuredWithRetry issues the task call ITSELF, so serve it the reply we already paid for
+      // (once) — the repair then costs exactly the reformat, and its budget declines the full reminder
+      // re-run (maxRetries:1 only opens the loop the reformat lives in).
+      let served = false;
+      const runFor = async (p) => {
+        if (served) return run(p);
+        served = true;
+        return res;
+      };
+      const out = await runStructuredWithRetry(runFor, prompt, parse, {
+        maxRetries: 1,
+        reformat: (garbled) => buildReformatPrompt(garbled, { schemaHint: CELL_REFORMAT_HINT }),
+        budget
+      });
+      repairCalls = budget.spent;
+      if (out) res = out; // the repaired reply when the reformat parsed, else the original (still fail-closed below)
+    }
+
+    if (failedRun(res)) {
       // A non-skipped run whose stderr/stdout carries a transient rate-limit signal is re-thrown so
       // withCellRetry backs off THIS cell (the CLI exits non-zero on a 429, it does not throw).
       if (res && !res.skipped && isRateLimitError(`${res.stderr ?? ""}\n${res.stdout ?? ""}`)) {
         throw new Error(`cell rate-limited (${cell.model}): ${String(res.stderr ?? "").slice(0, 160)}`);
       }
-      return { ok: false, cell, res };
+      return { ok: false, cell, res, repairCalls };
     }
-    const doc = parseAgentFindings(res.stdout, cell.model);
-    if (!doc.parseOk) return { ok: false, cell, res, unparsed: true };
+    const doc = parse(res.stdout);
+    if (!doc.parseOk) return { ok: false, cell, res, unparsed: true, repairCalls };
     // Stamp three authoritative facts from the CELL onto each finding (council fleet P1s):
     //  1. FILE: the cell reviewed a KNOWN file (cell.file). The model may omit/mis-state `file`, so
     //     forcing cell.file prevents lost/wrong targets downstream (Grok G2).
@@ -197,14 +289,16 @@ export function makeCellReviewer(cwd, backends, options = {}, deps = {}) {
       return f.lens ?? lenses[0] ?? null;
     };
     const findings = doc.findings.map((f, i) => ({ ...f, file: cell.file, id: `${cellKey(cell)}#${i}`, lens: pickLens(f) }));
-    return { ok: true, cell, findings };
+    return { ok: true, cell, findings, repairCalls };
   };
 }
 
 /**
  * Schedule the whole cell matrix: run each cell (with per-cell rate-limit retry) under the
  * semaphore, record outcomes into a coverage matrix, and collect the findings. Returns
- * `{ results, matrix, findings, complete, triples }`. A cell result with ok === true marks the
+ * `{ results, matrix, findings, complete, triples, repairCalls }` — `repairCalls` is the EXTRA
+ * (reformat) agent calls the parse repair spent across the matrix, so a caller that budgets one call
+ * per cell can account for them honestly instead of under-reporting spend. A cell result with ok === true marks the
  * matrix DONE; anything else (including an `ok`-less shape) marks it FAILED, symmetric with the
  * findings collection, so a triple is never wrongly reported complete with zero findings
  * (council B4 grok-3). An unreviewed/failed cell keeps its triple incomplete → B5's convergence
@@ -234,6 +328,7 @@ export async function runCellMatrix(cells, reviewCell, { models, maxInflight, re
     { maxInflight }
   );
   const findings = results.filter((r) => r && r.ok === true && Array.isArray(r.findings)).flatMap((r) => r.findings);
+  const repairCalls = results.reduce((n, r) => n + (Number.isFinite(r?.repairCalls) ? r.repairCalls : 0), 0);
   const triples = triplesOf(cells);
-  return { results, matrix, findings, complete: matrix.sixEyesComplete(triples), triples };
+  return { results, matrix, findings, complete: matrix.sixEyesComplete(triples), triples, repairCalls };
 }

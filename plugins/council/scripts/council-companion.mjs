@@ -1774,6 +1774,26 @@ function resolveCharTestGate(cwd, backends, merged, options) {
   return gate;
 }
 
+// A12: per-seat TOKEN telemetry. collectAllTokenUsage parses the CLIs' on-disk session logs, so a run's
+// own consumption is the DELTA of a snapshot taken before and after it (fix-metrics.tokenDelta). Two
+// invariants:
+//  - BOTH snapshots must use the SAME `sinceMs` bound. A Date.now()-relative window recomputed for the
+//    second call would shift, drop older sessions from one side only, and corrupt the delta — so the
+//    bound is computed ONCE per run and threaded through.
+//  - FAIL-SOFT + FAIL-CLOSED: an unreadable session log yields null, and a null snapshot makes the report
+//    say "not measured" (cost.tokensMeasured=false) instead of claiming the run cost $0.
+// The window bounds the scan (session logs accumulate forever); anything a fix run touches was written by
+// this run or by a recent session, so 30 days is generously wide.
+const TOKEN_SNAPSHOT_WINDOW_MS = 30 * 86_400_000;
+
+function tokenSnapshot(sinceMs) {
+  try {
+    return collectAllTokenUsage({ homeDir: os.homedir(), sinceMs });
+  } catch {
+    return null; // → tokensMeasured:false, never a false $0
+  }
+}
+
 // Assemble the fix-report telemetry meta (metrics + before→after codebase shape). FAIL-SOFT: any git
 // error just omits the shape — a telemetry report must never break a completed fix run. Only called on
 // --html. The before/after shape is bounded to the CHANGED files (a fix touches a small set).
@@ -2137,6 +2157,11 @@ async function handleAudit(argv) {
         ledgerBaseBranch: baseBranch
       });
       const tLoop = Date.now();
+      // A12: bracket the loop with a token snapshot so the --html report can diff it into per-seat tokens
+      // + an ≈cost. Only taken when a report will consume it (the scan reads session logs); the same
+      // `sinceMs` bound is reused for the AFTER snapshot below.
+      const loopTokenSince = Date.now() - TOKEN_SNAPSHOT_WINDOW_MS;
+      const loopTokensBefore = options.html ? tokenSnapshot(loopTokenSince) : null;
       // B5: per-tier convergence (structure → correctness → quality) is ON by default so a
       // Structure/SSOT consolidation lands before Correctness runs on the consolidated code; --flat
       // opts out (single flat convergence). --per-tier explicitly affirms the default; passing BOTH is
@@ -2168,7 +2193,21 @@ async function handleAudit(argv) {
       if (options.html) {
         // Use the RESOLVED consent flag (in scope), not out.sensitiveAutoApply which the loop never
         // returns — else the §6-council-gated report label always fell back to safe-auto (council F3).
-        const meta = await computeFixReportMeta(cwd, out, { wallClockMs: Date.now() - tLoop, finishedAt: nowIso(), autonomy: options.autonomy ?? "aggressive", sensitiveAutoApply });
+        const meta = await computeFixReportMeta(cwd, out, {
+          startedAt: new Date(tLoop).toISOString(),
+          wallClockMs: Date.now() - tLoop,
+          finishedAt: nowIso(),
+          autonomy: options.autonomy ?? "aggressive",
+          sensitiveAutoApply,
+          // A12: the AFTER snapshot closes the bracket → per-seat tokens + ≈cost actually render (the
+          // machinery was built but never fed). If the BEFORE snapshot failed there is nothing to diff:
+          // pass null on both sides so the report reports "not measured" rather than a fabricated $0.
+          tokensBefore: loopTokensBefore,
+          tokensAfter: loopTokensBefore ? tokenSnapshot(loopTokenSince) : null
+          // Per-seat findings + §6 verdicts are derived from `out` inside buildRunMetrics
+          // (seatContextFromResult) — including any or-* seat. Per-seat CALL counts/durations live inside
+          // the review engine and are not derivable here; they stay 0 until it reports them.
+        });
         const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply, generatedAt: nowIso(), metrics: meta.metrics, ...(meta.shape ? { shape: meta.shape } : {}) });
         console.log(renderFixLoopReport(out));
         console.log(`\nHTML report: ${file}`);
@@ -2216,6 +2255,10 @@ async function handleAudit(argv) {
       console.error("note: --sensitive-auto-apply has no effect on single-shot `audit fix` (§6 council review runs only in `audit fix --loop`); sensitive fixes stay propose-only");
     }
     const tFix = Date.now();
+    // A12: same token bracket as the loop path — snapshot before the run, diff after it, only when --html
+    // will consume it. Same `sinceMs` for both ends (see tokenSnapshot).
+    const fixTokenSince = Date.now() - TOKEN_SNAPSHOT_WINDOW_MS;
+    const fixTokensBefore = options.html ? tokenSnapshot(fixTokenSince) : null;
     // §5 char-test gate (opt-in --chartest) also on single-shot `audit fix`: a behaviour-preserving
     // refactor must keep its generated characterization test green across the change. null when off.
     const singleCharTestGate = options.chartest ? makeCharTestGate(cwd, backends, merged) : null;
@@ -2237,7 +2280,15 @@ async function handleAudit(argv) {
       return;
     }
     if (options.html) {
-      const meta = await computeFixReportMeta(cwd, out, { wallClockMs: Date.now() - tFix, finishedAt: nowIso(), autonomy: options.autonomy ?? "aggressive", sensitiveAutoApply: false });
+      const meta = await computeFixReportMeta(cwd, out, {
+        startedAt: new Date(tFix).toISOString(),
+        wallClockMs: Date.now() - tFix,
+        finishedAt: nowIso(),
+        autonomy: options.autonomy ?? "aggressive",
+        sensitiveAutoApply: false,
+        tokensBefore: fixTokensBefore,
+        tokensAfter: fixTokensBefore ? tokenSnapshot(fixTokenSince) : null
+      });
       const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply: Boolean(out.sensitiveAutoApply), generatedAt: nowIso(), metrics: meta.metrics, ...(meta.shape ? { shape: meta.shape } : {}) });
       console.log(renderAuditFixReport(out));
       console.log(`\nHTML report: ${file}`);

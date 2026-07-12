@@ -162,3 +162,66 @@ test("patchReviewerReady requires all three seats reachable", () => {
   // companion, so cli.available alone would print ENABLED yet never confirm.
   assert.equal(patchReviewerReady({ claude: { cli: { available: true } }, codex: { companionAvailable: false, cli: { available: true } }, grok: { cli: { available: true } } }).ready, false);
 });
+
+// ---- A3: patchReviewerReady must honor the operator SKIP flags, not just availability ----
+const allUp = () => ({ claude: { cli: { available: true } }, codex: { companionAvailable: true }, grok: { cli: { available: true } } });
+const withOR = (extra = {}) => ({
+  ...allUp(),
+  openrouter: { available: true, seats: [{ id: "or-x" }, { id: "or-y" }], ...extra }
+});
+
+test("A3: all built-ins reachable and none skipped → ready, with no blocked-seat reasons", () => {
+  const ready = patchReviewerReady(allUp(), {});
+  assert.equal(ready.ready, true);
+  assert.deepEqual([ready.codex, ready.grok, ready.claude], [true, true, true]);
+  assert.deepEqual(ready.reasons, {}, "nothing is blocked");
+});
+
+test("A3: a SKIPPED built-in seat is NOT ready — §6 still requires it, so auto-apply must stay off", () => {
+  // requiredPatchSeats never drops a built-in (a CLI flag must not weaken the unanimity gate), so a
+  // skipped built-in can never vote yet is still required → it would veto EVERY sensitive patch
+  // forever. Fail-SAFE: report not ready + say why, so the CLI keeps the class propose-only.
+  for (const [flag, seat] of [["skipCodex", "codex"], ["skipGrok", "grok"], ["skipClaude", "claude"]]) {
+    const ready = patchReviewerReady(allUp(), { [flag]: true });
+    assert.equal(ready.ready, false, `${flag} must block §6 auto-apply`);
+    assert.equal(ready[seat], false, `${seat} cannot vote when skipped, even though its CLI is up`);
+    assert.match(ready.reasons[seat], /--skip-(codex|grok|claude) is incompatible with --sensitive-auto-apply/);
+    assert.match(ready.reasons[seat], /all three built-in seats/);
+    // the OTHER two seats are up and un-blamed
+    for (const other of ["codex", "grok", "claude"].filter((s) => s !== seat)) {
+      assert.equal(ready[other], true, `${other} stays ready`);
+      assert.equal(ready.reasons[other], undefined);
+    }
+  }
+});
+
+test("A3: an UNAVAILABLE seat is still reported as blocked, with an availability reason (not a skip one)", () => {
+  const grokDown = patchReviewerReady({ ...allUp(), grok: { bin: "grok", cli: { available: false } } }, {});
+  assert.equal(grokDown.ready, false);
+  assert.match(grokDown.reasons.grok, /unreachable/);
+  assert.equal(/--skip-/.test(grokDown.reasons.grok), false, "an unreachable seat is not blamed on a skip flag");
+  const codexDown = patchReviewerReady({ ...allUp(), codex: { companionAvailable: false, cli: { available: true } } }, {});
+  assert.match(codexDown.reasons.codex, /companion/);
+});
+
+test("A3: a configured OpenRouter seat that is down still blocks, exactly as before", () => {
+  assert.equal(patchReviewerReady(withOR(), {}).ready, true, "every configured OR seat reachable → ready");
+  const down = patchReviewerReady(withOR({ available: false }), {});
+  assert.equal(down.ready, false, "a configured-but-down OR seat is a required veto → keep it propose-only");
+  assert.equal(down["or-x"], false);
+  assert.match(down.reasons["or-x"], /OpenRouter seat or-x unreachable/);
+  // a seat the operator OPTED OUT of is not required (requiredPatchSeats drops it) → it must not block
+  assert.equal(patchReviewerReady(withOR({ available: false }), { skipOpenRouter: true }).ready, true, "--skip-openrouter drops the OR seats entirely");
+  const perSeatSkip = patchReviewerReady(withOR({ available: false }), { skipSeats: ["or-x", "or-y"] });
+  assert.equal(perSeatSkip.ready, true, "--skip-seats drops just those seats");
+  assert.equal("or-x" in perSeatSkip, false, "a non-required seat is not even reported");
+});
+
+test("A3: the CLI's missing-seat list (falsy keys of the result) still names exactly the blocked seats", () => {
+  // council-companion derives `missing` as Object.keys(ready).filter(s => s !== "ready" && !ready[s]).
+  // The added `reasons` map is an object (truthy), so it must never show up as a "missing seat".
+  const ready = patchReviewerReady(withOR({ available: false }), { skipGrok: true });
+  const missing = Object.keys(ready).filter((s) => s !== "ready" && !ready[s]);
+  assert.deepEqual(missing.sort(), ["grok", "or-x", "or-y"], "skipped built-in + down OR seats, and nothing else");
+  assert.equal(missing.includes("reasons"), false, "the reasons map is not mistaken for a seat");
+});
