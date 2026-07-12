@@ -41,6 +41,7 @@ import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
 import { activeReviewerCount, runAuditReview } from "./lib/audit-review.mjs";
+import { runGroupedReview } from "./lib/audit-grouped-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
 import { runFixLoop } from "./lib/audit-fixloop.mjs";
@@ -85,7 +86,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
-      "  node scripts/council-companion.mjs audit [review] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
+      "  node scripts/council-companion.mjs audit [review] [--groups fine|tier|lens] [--max-cells <n>] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
       "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
@@ -1720,7 +1721,7 @@ async function handleWatch(argv) {
 // team is a later phase.
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit"],
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells"],
     booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "supervise"]
   });
   const cwd = process.cwd();
@@ -1788,13 +1789,36 @@ async function handleAudit(argv) {
     const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
     const t0 = Date.now();
-    const out = await runAuditReview(cwd, model, backends, {
-      ...merged,
-      budget,
-      maxUnits,
-      skipCodex: merged.skipCodex,
-      skipGrok: merged.skipGrok
-    });
+    // --groups <preset> (M7): opt into the six-eyes GROUPED path — every (module × lens-group ×
+    // chunk) CELL is reviewed by all reachable seats, coverage measured cell-granularly. The default
+    // per-file path is unchanged. --max-cells bounds the matrix (overflow is reported, never silent).
+    let out;
+    if (options.groups) {
+      let maxCells;
+      if (options["max-cells"] != null) {
+        const n = Number(options["max-cells"]);
+        if (!Number.isFinite(n) || n < 1) throw new Error("--max-cells must be a positive number");
+        maxCells = Math.floor(n);
+      }
+      out = await runGroupedReview(cwd, model, backends, {
+        ...merged,
+        budget,
+        maxUnits,
+        lensGroups: String(options.groups),
+        maxCells,
+        skipCodex: merged.skipCodex,
+        skipGrok: merged.skipGrok,
+        onProgress: options.json ? undefined : (m) => console.error(m)
+      });
+    } else {
+      out = await runAuditReview(cwd, model, backends, {
+        ...merged,
+        budget,
+        maxUnits,
+        skipCodex: merged.skipCodex,
+        skipGrok: merged.skipGrok
+      });
+    }
     recordAuditMetrics(cwd, "review", { wallClockMs: Date.now() - t0, findings: out.findings.length, coverage: out.coverage }, nowIso());
     if (options.doc) {
       const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: "deep review" }, { docPath: options["doc-path"] });
@@ -2124,12 +2148,20 @@ function renderAuditReviewReport(out) {
   L.push("# Council Audit — deep review (v2)");
   L.push("");
   const reviewers = c.reviewers ? Object.entries(c.reviewers).filter(([, on]) => on).map(([k]) => k).join("+") || "none" : "Codex+Grok";
-  const extras = [];
-  if (c.reduceRan === false) extras.push("global SSOT/architecture reduce SKIPPED (budget/reviewers)");
-  if (c.truncatedUnits) extras.push(`${c.truncatedUnits} module(s) truncated — tail unreviewed`);
-  if (c.unitsFailed) extras.push(`${c.unitsFailed} unit(s) failed`);
-  if (c.unparsedReturns) extras.push(`${c.unparsedReturns} unparseable reviewer return(s) after retry`);
-  L.push(`Reviewed ${c.unitsReviewed}/${c.unitsSelected} hotspot modules with ${reviewers} (budget ${c.budgetSpent}/${c.budgetTotal} agent calls). ${c.suppliedChars}/${c.totalCharsOfReviewed} chars of reviewed modules supplied.${extras.length ? ` ⚠ ${extras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);
+  if (c.groupPreset) {
+    // M7 six-eyes GROUPED path — cell-granular coverage instead of per-file.
+    const gExtras = [];
+    if (c.capped) gExtras.push(`capped — ${c.cellsDropped} cell(s) dropped (raise --max-cells)`);
+    if (c.ran === false) gExtras.push("no reachable reviewer — nothing dispatched");
+    L.push(`Six-eyes GROUPED review (--groups ${c.groupPreset}): ${reviewers} × ${c.groups} lens-group(s) × ${c.unitsSelected} module(s) = ${c.cellsScheduled} cell(s). Coverage ${c.complete ? "COMPLETE (every scheduled cell reviewed by all seats)" : "PARTIAL"}.${gExtras.length ? ` ⚠ ${gExtras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);
+  } else {
+    const extras = [];
+    if (c.reduceRan === false) extras.push("global SSOT/architecture reduce SKIPPED (budget/reviewers)");
+    if (c.truncatedUnits) extras.push(`${c.truncatedUnits} module(s) truncated — tail unreviewed`);
+    if (c.unitsFailed) extras.push(`${c.unitsFailed} unit(s) failed`);
+    if (c.unparsedReturns) extras.push(`${c.unparsedReturns} unparseable reviewer return(s) after retry`);
+    L.push(`Reviewed ${c.unitsReviewed}/${c.unitsSelected} hotspot modules with ${reviewers} (budget ${c.budgetSpent}/${c.budgetTotal} agent calls). ${c.suppliedChars}/${c.totalCharsOfReviewed} chars of reviewed modules supplied.${extras.length ? ` ⚠ ${extras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);
+  }
   L.push("");
   const rank = { P0: 0, P1: 1, P2: 2, nit: 3 };
   const sorted = [...out.findings].sort((a, b) => (rank[a.severity] ?? 2) - (rank[b.severity] ?? 2));
