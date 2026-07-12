@@ -110,18 +110,29 @@ function sleepSync(ms) {
  * lock directory). Serializes read-modify-write on a shared file across
  * concurrently-finishing council jobs. A stale lock (older than `staleMs`, e.g.
  * from a crashed process) is stolen; if the lock can't be taken within
- * `timeoutMs`, `fn` runs anyway (best-effort - never block a run on the lock).
+ * `timeoutMs`, withFileLock THROWS rather than run `fn` unlocked (callers that
+ * treat locking as best-effort wrap the call in try/catch).
  */
 export function withFileLock(lockPath, fn, { timeoutMs = 5000, staleMs = 30_000 } = {}) {
   const start = Date.now();
   let held = false;
   for (;;) {
+    // Timeout checked at the TOP so EVERY retry path — including the ENOENT-recovery and
+    // vanished-lock `continue`s below — is bounded by timeoutMs and can never spin forever.
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`Timed out acquiring file lock after ${timeoutMs}ms: ${lockPath}`); // never run the critical section unlocked
+    }
     try {
       fs.mkdirSync(lockPath); // atomic: throws EEXIST if another holder exists
       held = true;
       break;
     } catch (error) {
-      if (/** @type {NodeJS.ErrnoException} */ (error).code !== "EEXIST") break; // unexpected -> proceed unlocked
+      const code = /** @type {NodeJS.ErrnoException} */ (error).code;
+      if (code === "ENOENT") {
+        fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+        continue; // lock parent dir missing (e.g. first run) -> create it and retry so we hold the lock
+      }
+      if (code !== "EEXIST") throw error; // genuinely unexpected -> propagate, never run the critical section unlocked
       try {
         if (Date.now() - fs.statSync(lockPath).mtimeMs > staleMs) {
           fs.rmSync(lockPath, { recursive: true, force: true });
@@ -130,8 +141,7 @@ export function withFileLock(lockPath, fn, { timeoutMs = 5000, staleMs = 30_000 
       } catch {
         continue; // lock vanished between mkdir and stat; retry
       }
-      if (Date.now() - start > timeoutMs) break; // give up waiting -> proceed unlocked
-      sleepSync(25);
+      sleepSync(25); // contention: brief wait, then the top-of-loop timeout bound applies
     }
   }
   try {

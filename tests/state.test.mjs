@@ -39,6 +39,21 @@ test("withFileLock steals a stale lock and always releases even if fn throws", (
   assert.equal(fs.existsSync(lock), false, "lock released even when fn throws");
 });
 
+test("withFileLock throws (never runs fn unlocked) when the lock is held and the timeout expires", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-lock-"));
+  const lock = path.join(dir, "z.lock");
+  fs.mkdirSync(lock); // a live (non-stale) lock held by another holder
+  let ran = false;
+  // staleMs high so it is never stolen; tiny timeout so the bound fires quickly.
+  assert.throws(
+    () => withFileLock(lock, () => { ran = true; return "x"; }, { timeoutMs: 40, staleMs: 60_000 }),
+    /Timed out acquiring file lock/,
+    "must throw rather than run the critical section unlocked"
+  );
+  assert.equal(ran, false, "fn must NOT run when the lock could not be acquired");
+  assert.equal(fs.existsSync(lock), true, "the other holder's lock is left intact (not stolen, not released)");
+});
+
 function makeJob(id, patch = {}) {
   return {
     id,
