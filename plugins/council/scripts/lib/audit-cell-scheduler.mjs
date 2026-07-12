@@ -306,7 +306,15 @@ export function makeCellReviewer(cwd, backends, options = {}, deps = {}) {
  */
 export async function runCellMatrix(cells, reviewCell, { models, maxInflight, retryOnLimit = true, retries, sleep, onRetry } = {}) {
   const matrix = makeCoverageMatrix(models ?? [...new Set(cells.map((c) => c.model))]);
-  const runOne = withCellRetry(reviewCell, { retryOnLimit, retries, sleep, onRetry });
+  // A rate-limit RETRY re-invokes the seat runner — i.e. it is another PAID agent call (council Grok P2:
+  // these were invisible to the budget, so a throttled pass could spawn several times its allowance while
+  // reporting only the scheduled-cell count). Count them so the caller can charge them honestly.
+  let retryCalls = 0;
+  const countRetry = (info) => {
+    retryCalls += 1;
+    if (typeof onRetry === "function") onRetry(info);
+  };
+  const runOne = withCellRetry(reviewCell, { retryOnLimit, retries, sleep, onRetry: countRetry });
   const results = await scheduleCells(
     cells,
     async (cell, idx) => {
@@ -330,5 +338,8 @@ export async function runCellMatrix(cells, reviewCell, { models, maxInflight, re
   const findings = results.filter((r) => r && r.ok === true && Array.isArray(r.findings)).flatMap((r) => r.findings);
   const repairCalls = results.reduce((n, r) => n + (Number.isFinite(r?.repairCalls) ? r.repairCalls : 0), 0);
   const triples = triplesOf(cells);
-  return { results, matrix, findings, complete: matrix.sixEyesComplete(triples), triples, repairCalls };
+  // extraCalls = every PAID agent call beyond the one-per-scheduled-cell baseline (parse repairs +
+  // rate-limit retries). The caller charges these into coverage.budgetSpent so the loop's accounting sees
+  // the true spend (council Grok P1/P2).
+  return { results, matrix, findings, complete: matrix.sixEyesComplete(triples), triples, repairCalls, retryCalls, extraCalls: repairCalls + retryCalls };
 }

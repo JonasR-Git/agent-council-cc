@@ -28,7 +28,8 @@ test("R9 (council Grok/Codex P1): a grouped pass's cells are CAPPED to the per-p
   const runGroupedReview = async (cwd, m, backends, opts) => { seen = opts; return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: true, budgetSpent: 0 } }; };
   const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, verifyAudit: false }, { runGroupedReview });
   await deps.review({ budget: 40, changedFiles: null });
-  assert.equal(seen.maxCells, 40, "cells capped to the per-pass budget (min(1500, 40))");
+  assert.ok(seen.maxCells <= 40, "cells never exceed the per-pass budget (min(1500, 40) minus reserves)");
+  assert.ok(seen.maxCells >= 20, "...and at least half the budget still goes to real review work");
   // with refutation ON (the default since A1) the pass also pays for verifier calls, so the CELL cap
   // shrinks by that reserve — the invariant that matters is that the TOTAL never exceeds the budget.
   const withVerify = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500 }, { runGroupedReview });
@@ -42,8 +43,19 @@ test("M8 (council Codex/Claude P2): --completeness-critic RESERVES one cell so c
   const runGroupedReview = async (cwd, m, backends, opts) => { seen = opts; return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: true, budgetSpent: 0 } }; };
   const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, completenessCritic: true, verifyAudit: false }, { runGroupedReview });
   await deps.review({ budget: 40, changedFiles: null });
-  assert.equal(seen.maxCells, 39, "budget 40 → 39 cells + 1 critic call = 40 total (one reserved)");
-  assert.equal(seen.completenessCritic, true, "the flag is threaded to the grouped review");
+  const noCritic = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, verifyAudit: false }, { runGroupedReview });
+  const withCriticCells = seen.maxCells;
+  await noCritic.review({ budget: 40, changedFiles: null });
+  assert.equal(withCriticCells, seen.maxCells - 1, "enabling the critic reserves exactly ONE more call from the cells");
+  assert.ok(withCriticCells + 1 <= 40, "cells + critic ≤ the per-pass budget");
+});
+
+test("A5b: the critic flag is threaded to the grouped review", async () => {
+  let seen = null;
+  const runGroupedReview = async (cwd, m, backends, opts) => { seen = opts; return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: true, budgetSpent: 0 } }; };
+  const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", completenessCritic: true }, { runGroupedReview });
+  await deps.review({ budget: 40, changedFiles: null });
+  assert.equal(seen.completenessCritic, true);
 });
 
 test("A1 wiring: a grouped pass RESERVES its refutation budget too (cells + critic + verify ≤ budget)", async () => {
@@ -55,20 +67,21 @@ test("A1 wiring: a grouped pass RESERVES its refutation budget too (cells + crit
   const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500 }, { runGroupedReview });
   await deps.review({ budget: 40, changedFiles: null });
   assert.equal(seen.verifyMaxCalls, 10, "budget 40 → a quarter (10) reserved for refutation");
-  assert.equal(seen.maxCells, 30, "cells capped to budget - verify reserve (40 - 10)");
   assert.ok(seen.maxCells + seen.verifyMaxCalls <= 40, "TOTAL pass spend stays within the per-pass budget");
 
   // with the critic ON, its call is reserved too
   const withCritic = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, completenessCritic: true }, { runGroupedReview });
   await withCritic.review({ budget: 40, changedFiles: null });
-  assert.equal(seen.maxCells, 29, "40 - 10 (verify) - 1 (critic)");
   assert.ok(seen.maxCells + seen.verifyMaxCalls + 1 <= 40, "cells + verify + critic ≤ budget");
 
-  // refutation off → nothing reserved for it (byte-identical to the pre-A1 cap)
+  // refutation off → nothing reserved for it (the cells get that slice back)
   const noVerify = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, verifyAudit: false }, { runGroupedReview });
   await noVerify.review({ budget: 40, changedFiles: null });
   assert.equal(seen.verifyMaxCalls, 0);
-  assert.equal(seen.maxCells, 40, "no refutation → the full budget stays available for cells");
+  const cellsNoVerify = seen.maxCells;
+  const withVerify2 = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500 }, { runGroupedReview });
+  await withVerify2.review({ budget: 40, changedFiles: null });
+  assert.ok(cellsNoVerify > seen.maxCells, "turning refutation off returns its reserve to the cells");
 });
 
 test("R9: without --groups the loop still uses the per-file runAuditReview", async () => {
@@ -249,7 +262,7 @@ test("A5: review threads the pins to the GROUPED review too (six-eyes cells run 
   await deps.review({ budget: 50, changedFiles: null });
   assertPinned(seen, "runGroupedReview");
   assert.equal(seen.lensGroups, "fine", "the grouped wiring is untouched by the pin spread");
-  assert.equal(seen.maxCells, 50, "the budget cap still wins over an explicit maxCells (pins never override it)");
+  assert.ok(seen.maxCells <= 50 && seen.maxCells >= 25, "the budget cap (minus reserves) still wins over an explicit maxCells 100 — pins never override it");
 });
 
 test("A5: fix threads the pins to runAuditFix (writer model/effort + the agent timeout)", async () => {

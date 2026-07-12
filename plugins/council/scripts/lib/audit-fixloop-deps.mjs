@@ -51,11 +51,27 @@ function verifyReserve(options, budget) {
   return Math.max(0, Math.min(VERIFY_RESERVE_CAP, Math.floor(b / 4)));
 }
 
-/** Total non-cell reserve (critic + refutation), clamped so it can never consume the whole budget. */
+/**
+ * Total non-cell reserve, clamped so it can never consume the whole budget:
+ *   - the completeness critic (1 call when enabled),
+ *   - adversarial refutation (verifyReserve),
+ *   - a HEADROOM allowance for the matrix's EXTRA calls: a parse repair and a rate-limit retry each
+ *     re-invoke a seat runner, so they are paid calls too (council Grok P1/P2). They are now CHARGED to
+ *     coverage.budgetSpent; reserving a slice keeps a garbled/throttled pass from over-running its
+ *     allowance before the loop's total-budget clamp catches it.
+ */
+const EXTRA_RESERVE_FRACTION = 8; // ~12% of the pass budget held back for repairs/retries
+
+function extraReserve(options, budget) {
+  if (!options.lensGroups) return 0;
+  const b = Math.max(0, Math.floor(budget));
+  return Math.max(0, Math.floor(b / EXTRA_RESERVE_FRACTION));
+}
+
 function groupedReserve(options, budget) {
   const b = Math.max(0, Math.floor(budget));
   const critic = options.completenessCritic ? 1 : 0;
-  const reserve = critic + verifyReserve(options, budget);
+  const reserve = critic + verifyReserve(options, budget) + extraReserve(options, budget);
   // never starve the cells: leave at least half the budget for actual review work
   return Math.min(reserve, Math.max(0, Math.floor(b / 2)));
 }

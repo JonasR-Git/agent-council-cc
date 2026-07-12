@@ -103,7 +103,10 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   // does NOT force incomplete). Council round-2 (Grok): the earlier filter dropped only unsupplied.
   const noContent = new Set(files.filter((f) => (chunkCache.get(f)?.length ?? 0) === 0));
   const supplied = noContent.size ? allCells.filter((c) => !noContent.has(c.file)) : allCells;
-  const { cells, dropped, capped } = capCells(supplied, options.maxCells ?? DEFAULT_MAX_CELLS);
+  // Pass the ACTIVE seat count explicitly (council Grok P2): capCells caps on TRIPLE boundaries, and
+  // inferring the model count from the cell slice alone would mis-round if the enumeration order ever
+  // changed or a test injected a partial list — planning an uncompletable triple again.
+  const { cells, dropped, capped } = capCells(supplied, options.maxCells ?? DEFAULT_MAX_CELLS, { modelCount: models.length });
 
   // Surface the planned cost BEFORE spending it (council Grok P1 / Claude nit): a grouped run can
   // dispatch ~1000+ paid spawns; the operator sees the count (and any cap / oversize skip) up front.
@@ -305,7 +308,14 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
       // the refutation calls (A1 — same reasoning: a verifier spawn is a paid call). The fix/endless loop
       // charges this against its per-run agent-call budget; makeFixLoopDeps RESERVES one cell for the
       // critic so cells + critic ≤ budget, and the refutation pass is bounded by VERIFY_MAX_CALLS.
-      budgetSpent: cells.length + (completeness?.criticRan ? 1 : 0) + verifySpent,
+      // + EXTRA calls: a parse repair and a rate-limit retry each re-invoke a seat runner, i.e. each is
+      // another PAID agent call. Omitting them let a throttled/garbled pass spawn far more calls than it
+      // reported (council Grok P1/P2) — the loop then paced itself off a spend figure that was too low.
+      budgetSpent: cells.length + (completeness?.criticRan ? 1 : 0) + verifySpent + (Number(matrixOut.extraCalls) || 0),
+      // surfaced so the operator can see WHY a pass cost more than its cell count
+      extraCalls: Number(matrixOut.extraCalls) || 0,
+      repairCalls: Number(matrixOut.repairCalls) || 0,
+      retryCalls: Number(matrixOut.retryCalls) || 0,
       // the grouped path bounds per-pass cost by the CELL count (maxCells); the matrix summary reports
       // how many of those cells actually completed vs failed.
       matrix: matrixOut.matrix?.summary?.() ?? null

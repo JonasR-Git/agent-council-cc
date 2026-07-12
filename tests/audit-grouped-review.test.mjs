@@ -262,6 +262,27 @@ test("runGroupedReview: the completeness-critic call is CHARGED to budgetSpent (
   assert.equal(out.coverage.budgetSpent, 40, "the extra critic call is charged, not hidden");
 });
 
+test("runGroupedReview: matrix EXTRA calls (parse repairs + rate-limit retries) are CHARGED to budgetSpent (council Grok P1/P2)", async () => {
+  // A parse repair and a rate-limit retry each RE-INVOKE a seat runner — each is another PAID agent call.
+  // Omitting them let a garbled/throttled pass spawn far more calls than it reported, so the fix loop
+  // paced itself off a spend figure that was too low and could materially over-run its budget.
+  const runMatrix = async (cells) => ({
+    findings: [],
+    matrix: { summary: () => ({}), incompleteTriples: () => [] },
+    triples: [],
+    complete: true,
+    repairCalls: 4,
+    retryCalls: 3,
+    extraCalls: 7,
+    _n: cells.length
+  });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, ...NO_VERIFY }, { runMatrix, ...FS });
+  assert.equal(out.coverage.cellsScheduled, 39);
+  assert.equal(out.coverage.budgetSpent, 46, "39 cells + 7 extra (4 repairs + 3 retries) — every paid call is charged");
+  assert.equal(out.coverage.repairCalls, 4, "surfaced so the operator sees WHY the pass cost more than its cell count");
+  assert.equal(out.coverage.retryCalls, 3);
+});
+
 test("runGroupedReview: a CAPPED pass + critic-complete → completenessComplete TRUE (no persistent-false pin; council Codex/Claude P2)", async () => {
   // the pin bug: passing all-selected files as expected scope made a capped pass permanently 'missing' →
   // completenessComplete false every pass → the loop could never converge. The fix drops expected scope,
