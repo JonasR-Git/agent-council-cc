@@ -44,6 +44,19 @@ test("review surfaces a top-level `ran` from the REAL coverage shape (throttled 
   assert.equal((await nothing.review({ budget: 5, changedFiles: null })).ran, true, "0 selected is not a failure");
 });
 
+test("review assigns a canonical lens to every finding (repairs loop-path tier staging)", async () => {
+  // Regression guard: the loop path used to leave finding.lens undefined, so tierOfLens
+  // dropped everything into the Quality tier and structure-first --per-tier was inert.
+  const runAuditReview = async () => ({
+    findings: [{ category: "concurrency", title: "race", file: "a.mjs", severity: "P1" }],
+    coverage: { unitsReviewed: 1, unitsSelected: 1, budgetSpent: 1 }
+  });
+  const deps = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview });
+  const rev = await deps.review({ budget: 5, changedFiles: null });
+  assert.ok(rev.findings[0].lens, "finding carries a lens");
+  assert.equal(typeof rev.findings[0].lens, "string");
+});
+
 test("a scoped pass whose files aren't in the model falls back to full scope, never an empty review", async () => {
   let seen;
   const runAuditReview = async (cwd, m) => {

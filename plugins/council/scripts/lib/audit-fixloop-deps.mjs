@@ -21,6 +21,7 @@
 //   currently emits only observations, so this is honestly {}).
 
 import { runAuditFix } from "./audit-fix.mjs";
+import { normalizeFindings } from "./audit-normalize.mjs";
 import { runAuditReview } from "./audit-review.mjs";
 
 /** file -> Set(peer files that share a duplicate cluster with it). */
@@ -77,10 +78,15 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     // work) but none produced a review — whether they failed OR were never dispatched (no
     // reachable reviewer, budget-starved) — that is NOT convergence → ran:false. Only a
     // genuinely empty scope (0 selected) stays ran:true.
+    // Assign the canonical LENS to each finding. The one-shot `audit` path does this via
+    // normalizeFindings; the loop path did NOT — so downstream tierOfLens(f.lens) saw
+    // undefined and dropped EVERY loop finding into the Quality tier (id 3), silently
+    // disabling structure-first --per-tier staging. Normalizing here repairs tier gating.
+    const findings = normalizeFindings(rev?.findings ?? [], {});
     const cov = rev?.coverage ?? {};
     const selected = cov.unitsSelected ?? 0;
     const reviewed = cov.unitsReviewed ?? 0;
-    return { ...rev, ran: reviewed > 0 || selected === 0 };
+    return { ...rev, findings, ran: reviewed > 0 || selected === 0 };
   };
 
   const fix = async (actionable, ctx = {}) =>
