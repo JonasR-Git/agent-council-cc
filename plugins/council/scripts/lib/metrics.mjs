@@ -70,7 +70,10 @@ export function recordJobMetrics(cwd, job) {
       status: r.status ?? null,
       durationMs: Number.isFinite(Number(r.durationMs)) ? Number(r.durationMs) : null,
       timedOut: Boolean(r.timedOut),
-      retryAttempts: Number.isFinite(Number(r.retryAttempts)) ? Number(r.retryAttempts) : null
+      retryAttempts: Number.isFinite(Number(r.retryAttempts)) ? Number(r.retryAttempts) : null,
+      // A5: a reformat-repaired reply keeps retryAttempts=1, so without this the reformat call is
+      // invisible in per-agent repair stats — under-reporting real repair overhead (council grok-3).
+      reformatAttempts: Number.isFinite(Number(r.reformatAttempts)) ? Number(r.reformatAttempts) : null
     }));
   const wallClockMs = Date.parse(job.finishedAt ?? "") - Date.parse(job.createdAt ?? "");
   const entry = {
@@ -137,11 +140,12 @@ export function aggregateMetrics(entries) {
     kind.jobs += 1;
     if (Number.isFinite(Number(entry.wallClockMs))) kind.wallClockMs.push(Number(entry.wallClockMs));
     for (const a of entry.agents ?? []) {
-      const stats = (byAgent[a.agent] = byAgent[a.agent] ?? { calls: 0, failures: 0, timeouts: 0, retries: 0, durationsMs: [] });
+      const stats = (byAgent[a.agent] = byAgent[a.agent] ?? { calls: 0, failures: 0, timeouts: 0, retries: 0, reformats: 0, durationsMs: [] });
       stats.calls += 1;
       if (a.status !== 0 && a.status != null) stats.failures += 1;
       if (a.timedOut) stats.timeouts += 1;
       if (Number.isFinite(Number(a.retryAttempts)) && a.retryAttempts > 1) stats.retries += a.retryAttempts - 1;
+      if (Number.isFinite(Number(a.reformatAttempts))) stats.reformats += a.reformatAttempts; // A5: repair visibility
       if (Number.isFinite(Number(a.durationMs))) stats.durationsMs.push(Number(a.durationMs));
     }
     if (entry.review) {
@@ -159,7 +163,7 @@ export function aggregateMetrics(entries) {
   const agents = Object.fromEntries(
     Object.entries(byAgent).map(([k, v]) => [
       k,
-      { calls: v.calls, failures: v.failures, timeouts: v.timeouts, retries: v.retries, avgDurationMs: avg(v.durationsMs), medianDurationMs: median(v.durationsMs) }
+      { calls: v.calls, failures: v.failures, timeouts: v.timeouts, retries: v.retries, reformats: v.reformats, avgDurationMs: avg(v.durationsMs), medianDurationMs: median(v.durationsMs) }
     ])
   );
   const phases = Object.keys(phaseMs).length ? Object.fromEntries(Object.entries(phaseMs).map(([p, arr]) => [p, avg(arr)])) : null;

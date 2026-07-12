@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { interpolate, makeFenceNonce, runCodexStructured, runGrokStructured, runStructuredWithRetry } from "./agents.mjs";
+import { buildReformatPrompt, interpolate, makeFenceNonce, runCodexStructured, runGrokStructured, runStructuredWithRetry } from "./agents.mjs";
 import { mergeFindings, parseAgentFindings } from "./findings.mjs";
 import { fingerprintFinding, recordAndAnnotate } from "./ledger.mjs";
 import { annotateScopes } from "./scope.mjs";
@@ -155,24 +155,55 @@ ssot|architecture|dead-code|design, scope "cross-cutting" for structural items.`
  * skipped/unavailable backend is never charged. `reviewed` is true only when at
  * least one backend actually returned findings.
  */
+// A5: reformat-repair options shared by the audit reviewers. `maxRetries:2` is opted into
+// EXPLICITLY here (the runStructuredWithRetry default is 1) so only the budget-bounded audit
+// path pays the extra reminder retry, never the unbudgeted deliberate R1 path (council A5:
+// codex-3/claude-3). The reformat builder passes a concrete schema hint (the reply re-runs
+// fresh, so the generic "your task requires" default would give no shape cue) and inherits
+// buildReformatPrompt's one-time-nonce untrusted framing.
+const FINDINGS_REFORMAT_HINT =
+  'a findings report JSON object: {"agent","summary","verdict","findings":[{severity,category,title,detail,file,line,confidence}]}';
+const AUDIT_REPAIR_OPTS = {
+  maxRetries: 2,
+  reformat: (garbled) => buildReformatPrompt(garbled, { schemaHint: FINDINGS_REFORMAT_HINT })
+};
+
+// A budget VIEW that refuses to spend below a floor of `reserve` charges. reviewUnit's dynamic
+// repair spend (reformat/retry) is charged on the SHARED run budget; without a floor it can eat
+// the charge runAuditReview reserved for the global SSOT/architecture reduce, silently starving
+// it (council A5: grok-2/claude-1). charge() still passes through; the floor gates canSpend(),
+// which runStructuredWithRetry checks synchronously before every extra call.
+export function reserveFloorBudget(budget, reserve) {
+  if (!reserve) return budget;
+  return {
+    canSpend: (n = 1) => budget.canSpend(n) && budget.remaining() - n >= reserve,
+    charge: (n = 1) => budget.charge(n),
+    remaining: () => budget.remaining(),
+    get total() { return budget.total; },
+    get spent() { return budget.spent; }
+  };
+}
+
 export async function reviewUnit(cwd, backends, options, unitId, model, budget) {
   const root = workspaceRoot(cwd);
   const { prompt, suppliedChars, totalChars, split } = buildUnitPrompt(root, unitId, model);
   const jobs = [];
   if (reviewerActive("codex", backends, options)) {
     jobs.push(
-      runStructuredWithRetry((p) => runCodexStructured(cwd, backends, options, p, "audit"), prompt, (s) => parseAgentFindings(s, "codex"), { budget, reformat: true }).then((r) => ({ ...r, agent: "codex" }))
+      runStructuredWithRetry((p) => runCodexStructured(cwd, backends, options, p, "audit"), prompt, (s) => parseAgentFindings(s, "codex"), { budget, ...AUDIT_REPAIR_OPTS }).then((r) => ({ ...r, agent: "codex" }))
     );
   }
   if (reviewerActive("grok", backends, options)) {
     jobs.push(
-      runStructuredWithRetry((p) => runGrokStructured(cwd, backends, options, p), prompt, (s) => parseAgentFindings(s, "grok"), { budget, reformat: true }).then((r) => ({ ...r, agent: "grok" }))
+      runStructuredWithRetry((p) => runGrokStructured(cwd, backends, options, p), prompt, (s) => parseAgentFindings(s, "grok"), { budget, ...AUDIT_REPAIR_OPTS }).then((r) => ({ ...r, agent: "grok" }))
     );
   }
   const raw = await Promise.all(jobs);
   const docs = [];
   let unparsed = 0;
+  let reformatsUsed = 0; // A5: how many reviewer replies needed a reformat repair (visibility)
   for (const r of raw) {
+    reformatsUsed += r.reformatAttempts ?? 0;
     if (r.skipped) continue;
     if (r.status === 0) {
       const doc = parseAgentFindings(r.stdout, r.agent);
@@ -189,7 +220,7 @@ export async function reviewUnit(cwd, backends, options, unitId, model, budget) 
   for (const finding of merged.all) {
     finding.file = finding.file || unitId;
   }
-  return { unitId, merged, suppliedChars, totalChars, split, reviewed: docs.length > 0, unparsed };
+  return { unitId, merged, suppliedChars, totalChars, split, reviewed: docs.length > 0, unparsed, reformatsUsed };
 }
 
 /**
@@ -216,14 +247,15 @@ export async function globalReduce(cwd, backends, options, model, budget) {
     useCodex ? (p) => runCodexStructured(cwd, backends, options, p, "audit-reduce") : (p) => runGrokStructured(cwd, backends, options, p),
     prompt,
     (s) => parseAgentFindings(s, agent),
-    { budget, reformat: true }
+    { budget, ...AUDIT_REPAIR_OPTS }
   );
+  const reformatsUsed = res.reformatAttempts ?? 0;
   // A parse miss whose retry then failed still means the reduce RAN (it just
   // yielded nothing parseable) — report ran:true + unparsed, not a "skipped".
-  if (res.skipped || (res.status !== 0 && !res.parseMissed)) return { all: [], consensus: [], unique: [], ran: false };
+  if (res.skipped || (res.status !== 0 && !res.parseMissed)) return { all: [], consensus: [], unique: [], ran: false, reformatsUsed };
   const doc = res.status === 0 ? parseAgentFindings(res.stdout, agent) : { parseOk: false };
-  if (!doc.parseOk) return { all: [], consensus: [], unique: [], ran: true, unparsed: 1 };
-  return { ...mergeFindings([doc]), ran: true };
+  if (!doc.parseOk) return { all: [], consensus: [], unique: [], ran: true, unparsed: 1, reformatsUsed };
+  return { ...mergeFindings([doc]), ran: true, reformatsUsed };
 }
 
 /**
@@ -256,7 +288,9 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
       idx += 1;
       budget.charge(costPerUnit);
       try {
-        results.push(await reviewUnit(cwd, backends, options, unitId, model, budget));
+        // Fence reviewUnit's dynamic repair spend below the reduce reserve so a reformat/retry
+        // can't starve the SSOT/architecture pass (council A5: grok-2/claude-1).
+        results.push(await reviewUnit(cwd, backends, options, unitId, model, reserveFloorBudget(budget, reduceReserve)));
       } catch (err) {
         failed.push({ unitId, error: String(err?.message ?? err) });
       }
@@ -315,6 +349,9 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
   // backend reply), across all units + the reduce — surfaced so it is not mistaken
   // for "found nothing".
   const unparsedReturns = results.reduce((s, r) => s + (r.unparsed ?? 0), 0) + (reduce.unparsed ?? 0);
+  // A5: how many reviewer replies needed a reformat repair this run — surfaced so an operator can
+  // see repair overhead + tell a reformat-salvaged result apart from a first-pass-clean one.
+  const reformatsUsed = results.reduce((s, r) => s + (r.reformatsUsed ?? 0), 0) + (reduce.reformatsUsed ?? 0);
   return {
     findings: scoped.all,
     refuted: scoped.refuted ?? [],
@@ -327,6 +364,7 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
       unitsFailed: failed.length,
       truncatedUnits,
       unparsedReturns,
+      reformatsUsed,
       reduceRan: reduce.ran,
       reviewers: { codex: reviewerActive("codex", backends, options), grok: reviewerActive("grok", backends, options) },
       failed,
