@@ -34,6 +34,11 @@ export function buildClaudeReviewArgs(options = {}) {
     // discipline). Identical across every review call, so Anthropic prompt caching reuses it
     // (system-block cache hit → cheaper + faster). It sets reasoning discipline only; the
     // user prompt still dictates the exact 2-line VERDICT reply, which the charter defers to.
+    // ASYMMETRY (grok-2, acceptable for §6): only the Claude seat gets the charter — codex/grok
+    // are spawned via runCodex/runGrokStructured which expose no --append-system-prompt. Fine
+    // here: the §6 vote is binary (severity-cap is moot) and the load-bearing "when in doubt,
+    // DISSENT" lives in the SHARED user prompt every seat receives. Revisit before B2/M7 wires
+    // the severity-BEARING finder, where a Claude-only severity-cap would skew cross-seat calibration.
     "--append-system-prompt",
     REVIEWER_CHARTER,
     // A2: reasoning effort defaults to xhigh (user pref: always xhigh, never max) so the §6

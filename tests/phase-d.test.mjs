@@ -31,6 +31,18 @@ test("shell-bound arguments containing % are refused (cmd expansion guard)", (t)
   assert.match(result.stderr, /Refusing to pass '%'/);
 });
 
+test("shell-bound arguments containing a newline are refused (cmd truncation guard, A4 claude-1)", (t) => {
+  if (process.platform !== "win32") {
+    t.skip("cmd shell path is Windows-only");
+    return;
+  }
+  // A multi-line arg (e.g. a --append-system-prompt system charter) through cmd.exe would
+  // truncate silently or break the call; the guard must fail LOUD instead.
+  const result = runCommand("definitely-not-a-real-command", ["--append-system-prompt", "line one\nline two"]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Refusing to pass a newline/);
+});
+
 test("archiveJobResults writes sidecars, truncates inline copies; wait/usage subcommands work", async () => {
   const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-state-"));
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "council-work-"));

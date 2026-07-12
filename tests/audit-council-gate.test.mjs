@@ -259,6 +259,28 @@ test("windowContextToBudget falls back to a head slice when the diff has no pars
   assert.equal(r.text.length, 14_000);
 });
 
+test("A4 (codex-2): a charter-style evidence preamble before the VERDICT line fails closed (why the charter forces verdict-first)", () => {
+  // The A4 charter tells seats to cite evidence + a failure scenario. If a seat wrote that BEFORE
+  // its verdict, line 1 is prose → parsePatchVerdict fail-closes to UNKNOWN → a veto. The parser
+  // NEVER relaxes (its strict line-1 rule is the injection defense); the charter instead scopes the
+  // disciplines to private reasoning and forces the verdict onto line 1. This pins that tradeoff.
+  const preambleReply = "Based on a.mjs:42 I quote `lock.release()`; no new race is introduced.\nVERDICT: CONFIRM\nREASON: correct";
+  const v = parsePatchVerdict(preambleReply, "claude");
+  assert.equal(v.verdict, "unknown", "an evidence preamble makes line 1 not a clean verdict → fail-closed");
+  const gate = evaluatePatchVerdicts([
+    { seat: "claude", verdict: v.verdict },
+    { seat: "codex", verdict: "confirm" },
+    { seat: "grok", verdict: "confirm" }
+  ]);
+  assert.equal(gate.approved, false, "the UNKNOWN vote vetoes — a preamble can only lose a valid CONFIRM, never forge one");
+});
+
+test("A4 (grok-3): the reviewer charter is Claude-seat-only — absent from the shared user prompt all seats receive", () => {
+  const p = buildPatchReviewPrompt("a.mjs", { title: "t", detail: "" }, "d", "codex", "const x = 1;");
+  assert.equal(p.includes("EVIDENCE-FIRST"), false, "codex/grok get the shared prompt, not the Claude-only charter");
+  assert.equal(p.includes("SEVERITY-CAP DISCIPLINE"), false);
+});
+
 test("A3: buildPatchReviewPrompt shows the changed region (windowed) for a large file, and labels it", () => {
   const lines = [];
   for (let i = 1; i <= 600; i += 1) {

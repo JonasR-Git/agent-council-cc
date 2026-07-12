@@ -26,6 +26,14 @@ test("A4: buildClaudeReviewArgs appends the stable reviewer charter as a cache-f
   assert.equal(args[i + 1], REVIEWER_CHARTER, "the appended value is the shared, byte-stable charter (prompt-cache hit)");
 });
 
+test("A4 (claude-1/claude-3): NO buildClaudeReviewArgs argument contains a newline (safe through the cmd.exe shell path)", () => {
+  // On Windows a bare-name/.cmd claude spawns via cmd.exe (shell:true), where a newline in any
+  // quoted arg truncates it or breaks the invocation. Every review arg must be single-line.
+  for (const a of buildClaudeReviewArgs({ claudeModel: "claude-opus-4-8" })) {
+    assert.equal(/[\r\n]/.test(String(a)), false, `arg has a newline: ${JSON.stringify(String(a).slice(0, 30))}`);
+  }
+});
+
 test("makePatchReviewer runs all three seats on the same patch and returns parsed verdicts", async () => {
   const seen = {};
   const review = makePatchReviewer("/x", {}, {}, {

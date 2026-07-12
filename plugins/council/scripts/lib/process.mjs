@@ -32,6 +32,15 @@ function prepareSpawn(command, args = []) {
         `Refusing to pass '%' through cmd.exe (argument: ${token}); use an absolute executable path instead.`
       );
     }
+    // A newline inside a quoted cmd.exe arg is treated as a command separator: it TRUNCATES
+    // the arg (silent data loss, exit 0) or unbalances the quoting (invocation error). No
+    // quoteForCmd escape exists. Fail LOUD so a multi-line value (e.g. a system prompt) is
+    // routed via stdin/a file or an absolute .exe (needsCmdShell false) instead of corrupting.
+    if (/[\r\n]/.test(String(token))) {
+      throw new Error(
+        `Refusing to pass a newline through cmd.exe (argument starts: ${JSON.stringify(String(token).slice(0, 40))}); pass multi-line values via stdin or a file, or use an absolute executable path.`
+      );
+    }
   }
   return {
     command: [command, ...args].map(quoteForCmd).join(" "),
