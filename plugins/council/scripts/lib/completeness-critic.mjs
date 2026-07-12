@@ -1,5 +1,10 @@
 // M8/C1 — completeness critic: is the six-eyes find THOROUGH, or is something un-hunted?
 //
+// STATUS: STAGED — built + unit-tested but NOT yet wired into any live path (no production importer;
+// council fleet O2/G6/G10). The live loop derives coverage.complete from the STRUCTURAL six-eyes
+// matrix (audit-cell-scheduler sixEyesComplete) only; assessCompleteness + the model-critic pass
+// below do not run until runGroupedReview/the loop dispatch them. Wiring is the remaining M8 work.
+//
 // A run should keep finding until it is genuinely exhausted, not just until one dry pass. Two
 // independent signals decide that:
 //   1. STRUCTURAL (free, from B4's coverage matrix): which (group,file,chunk) triples no model

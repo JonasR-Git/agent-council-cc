@@ -33,7 +33,7 @@ import { wrapMarkdownFence } from "./markdown-fence.mjs";
 import { formatExit } from "./util.mjs";
 import { skippedAgents } from "./policy.mjs";
 
-export { READONLY_DISALLOWED_TOOLS, runCodexStructured, runGrokStructured };
+export { READONLY_DISALLOWED_TOOLS };
 
 const EVIDENCE_LINES = 25;
 const EVIDENCE_PER_FINDING_CHARS = 1500;

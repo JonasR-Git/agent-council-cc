@@ -246,7 +246,7 @@ export function renderFixReportHtml(out, meta = {}) {
   const stats = fixReportStats(rows);
   const red = out?.integrationFailed || out?.ok === false;
   const seats = meta.seats ?? "Claude · Codex · Grok";
-  const autonomy = meta.autonomy ?? (meta.sensitiveAutoApply ? "§6 council-gated" : "sicher-auto");
+  const autonomy = meta.autonomy ?? (meta.sensitiveAutoApply ? "§6 council-gated" : "safe-auto");
   const genAt = meta.generatedAt ?? "";
 
   const tableRows = rows.length ? rows.map(findingRow).join("\n") : `<tr><td colspan="5" class="tf">keine Funde</td></tr>`;

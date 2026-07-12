@@ -1717,8 +1717,9 @@ async function handleWatch(argv) {
 // proposal doc (both under the project root). `audit review` additionally runs
 // Codex/Grok over the hotspots — those reviewers are prompted read-only, but they
 // are external CLIs whose sandboxing this command cannot itself enforce. Reviewed
-// code is never auto-edited here. See docs/audit-design.md; the safe --fix agent
-// team is a later phase.
+// code is never auto-edited here. See docs/audit-design.md. NOTE: `audit fix` /
+// `audit fix --loop` (below, M3+) DO write gated fixes on an isolated integration
+// branch; only `audit` (static) and `audit review` are read-only.
 // Conservative CLI cell cap for `audit review --groups` (the library backstop is 4000). A default
 // fine run is ~1080 cells; this caps an accidental fan-out while still covering a normal run — raise
 // it explicitly with --max-cells (a capped run reports PARTIAL coverage, never silently truncates).

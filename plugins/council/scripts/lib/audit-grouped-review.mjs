@@ -3,14 +3,16 @@
 // three models (B1 groups + B3 chunks + B2 finders + B4 matrix), so every defect class gets its own
 // deep focused pass and coverage is measured cell-granularly. It is OPT-IN (--groups <preset>) and
 // self-contained — the existing per-file path is untouched. Produces coverage.complete (six-eyes)
-// which B5's loop-until-dry consumes, so an endless/fix run keeps going until the matrix is whole.
+// which B5's loop-until-dry guard consumes. NOTE: today runGroupedReview is wired ONLY into one-shot
+// `audit review --groups`; the fix/endless loops still call runAuditReview (per-file), so a loop run
+// does NOT yet drive convergence off cell coverage — that loop wiring is future work (council O1).
 import fs from "node:fs";
 import path from "node:path";
 
 import { resolveLensGroups } from "./audit-lens-groups.mjs";
 import { chunkSource } from "./audit-group-prompt.mjs";
 import { DEFAULT_MAX_CELLS, capCells, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
-import { activeReviewerCount, reviewerActive, selectUnits } from "./audit-review.mjs";
+import { reviewerActive, selectUnits } from "./audit-review.mjs";
 import { tierOfLens } from "./audit-tiers.mjs";
 import { mergeFindings } from "./findings.mjs";
 import { annotateScopes } from "./scope.mjs";
@@ -199,5 +201,3 @@ function reviewerMap(backends, options) {
     claude: reviewerActive("claude", backends, options)
   };
 }
-
-export { activeReviewerCount };
