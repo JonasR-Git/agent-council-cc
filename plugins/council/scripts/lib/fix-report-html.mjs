@@ -207,6 +207,39 @@ ${seatCard("Grok", seats.grok)}
 </div></div></section>`;
 }
 
+/**
+ * C3/M10: render the codebase-SHAPE delta (before → after) from codebase-shape.shapeDelta — files,
+ * functions, lines, complexity, plus git churn. A good structure/refactor run reduces duplication +
+ * complexity WITHOUT changing behaviour, so this makes the shape effect of the run visible. Pure;
+ * reuses the existing .stats/.stat styling (no new CSS).
+ */
+export function renderShapeSection(shape) {
+  if (!shape) return "";
+  const b = shape.before ?? {};
+  const a = shape.after ?? {};
+  const card = (label, before, after) => {
+    const bv = Number(before) || 0;
+    const av = Number(after) || 0;
+    const delta = av - bv;
+    const sign = delta > 0 ? "+" : "";
+    return `<div class="stat"><div class="n">${sign}${delta}</div><div class="l">${escapeHtml(label)} · ${bv} → ${av}</div></div>`;
+  };
+  const churn =
+    shape.linesAdded != null || shape.linesRemoved != null
+      ? `<p class="sub">Git-Churn diesen Lauf: +${Number(shape.linesAdded) || 0} / −${Number(shape.linesRemoved) || 0} Zeilen.</p>`
+      : "";
+  return `<section class="band"><div class="wrap"><div class="bi"><b>04b</b> / Code-Form</div>
+<h2>Wie sich die Codebase-Form verändert hat</h2>
+<p class="sub">Vorher → Nachher. Ein guter Struktur-/Refactor-Lauf senkt Duplikation und Komplexität, ohne Verhalten zu ändern (per §6/Struktur-Council abgesichert).</p>
+${churn}
+<div class="stats">
+${card("Dateien", b.files, a.files)}
+${card("Funktionen", b.functions, a.functions)}
+${card("Zeilen", b.lines, a.lines)}
+${card("Komplexität", b.complexity, a.complexity)}
+</div></div></section>`;
+}
+
 /** Render the full self-contained HTML report for a runAuditFix result. Pure. */
 export function renderFixReportHtml(out, meta = {}) {
   const rows = fixReportRows(out);
@@ -272,6 +305,8 @@ ${tableRows}
 ${councilCards(rows)}
 
 ${meta.metrics ? renderMetricsSection(meta.metrics) : ""}
+
+${meta.shape ? renderShapeSection(meta.shape) : ""}
 
 <section class="band"><div class="wrap"><div class="bi"><b>05</b> / Ehrlichkeit</div><h2>Verifiziert vs. nicht verifiziert</h2>
 <ul class="honesty">

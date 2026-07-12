@@ -50,7 +50,7 @@ export function backoffMs(attempt, { baseMs = 30_000, maxMs = 900_000, factor = 
   return Math.min(maxMs, Math.round(baseMs * factor ** (n - 1)));
 }
 
-function retryAfterFrom(err) {
+export function retryAfterFrom(err) {
   if (!err || typeof err !== "object") return null;
   const v = err.retryAfter ?? err.retry_after ?? err.retryAfterSeconds ?? err.headers?.["retry-after"];
   const n = Number(v);

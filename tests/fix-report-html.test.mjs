@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { fixReportRows, fixReportStats, renderFixReportHtml } from "../plugins/council/scripts/lib/fix-report-html.mjs";
+import { fixReportRows, fixReportStats, renderFixReportHtml, renderShapeSection } from "../plugins/council/scripts/lib/fix-report-html.mjs";
+import { shapeDelta } from "../plugins/council/scripts/lib/codebase-shape.mjs";
 
 const sampleOut = () => ({
   ok: true,
@@ -95,4 +96,21 @@ test("renderFixReportHtml renders a RED integration run distinctly", () => {
   const html = renderFixReportHtml(out);
   assert.match(html, /verdict-line red/);
   assert.match(html, /Integrationslauf ROT|rot/);
+});
+
+test("C3: renderShapeSection shows the codebase-shape before→after delta + git churn", () => {
+  const shape = shapeDelta(
+    { files: 20, functions: 120, lines: 4000, complexity: 300 },
+    { files: 18, functions: 110, lines: 3600, complexity: 260 },
+    { added: 40, removed: 480 }
+  );
+  const html = renderShapeSection(shape);
+  assert.match(html, /Code-Form/);
+  assert.match(html, /Dateien · 20 → 18/);
+  assert.match(html, /-2/); // files delta
+  assert.match(html, /Komplexität · 300 → 260/);
+  assert.match(html, /Git-Churn.*\+40.*−480/);
+  // wired into the full report only when meta.shape is present
+  assert.match(renderFixReportHtml(sampleOut(), { shape }), /Code-Form/);
+  assert.ok(!/Code-Form/.test(renderFixReportHtml(sampleOut(), {})));
 });
