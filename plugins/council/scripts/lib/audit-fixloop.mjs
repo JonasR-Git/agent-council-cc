@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { dedupeNew, endlessStopReason } from "./audit-endless.mjs";
+import { retryOnRateLimit } from "./audit-retry.mjs";
 import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
 import { resolveStateDir, writeFileAtomic } from "./state.mjs";
@@ -94,6 +95,16 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const gate = deps.gate ?? ((findings, ctx) => gateFindings(findings, verdictsFor(findings, ctx) ?? {}));
   const expandScope = typeof deps.expandScope === "function" ? deps.expandScope : (x) => x;
   const checkpoint = deps.checkpoint ?? ((state) => defaultCheckpoint(cwd, state));
+  // Rate-limit resilience for unattended runs: on a 429/overload from a review/fix
+  // phase, back off + retry instead of stopping the whole loop. Opt-in (--retry-on-limit);
+  // a non-rate-limit error still propagates immediately. Sleep is injectable for tests.
+  const withLimitRetry = options.retryOnLimit
+    ? (fn) => retryOnRateLimit(fn, {
+        retries: clamp(options.retryLimit ?? 5, 1, 20),
+        sleep: deps.sleep,
+        onRetry: ({ attempt, ms }) => onProgress(`rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt}/${clamp(options.retryLimit ?? 5, 1, 20)})…`)
+      })
+    : (fn) => fn();
 
   const fixedAll = [];
   const failedAll = [];
@@ -173,7 +184,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
 
     let rev;
     try {
-      rev = await review({ budget: passBudget, pass: passNo, changedFiles });
+      rev = await withLimitRetry(() => review({ budget: passBudget, pass: passNo, changedFiles }));
     } catch (err) {
       passes.push({ pass: passNo, error: String(err?.message ?? err) });
       stopReason = `review error on pass ${passNo}: ${String(err?.message ?? err)}`;
@@ -197,7 +208,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
 
     let fx;
     try {
-      fx = await fix(actionable, { budget: Math.max(1, Math.min(perPassBudget, totalBudget - spent)), pass: passNo, branch, stayOnBranch: true });
+      fx = await withLimitRetry(() => fix(actionable, { budget: Math.max(1, Math.min(perPassBudget, totalBudget - spent)), pass: passNo, branch, stayOnBranch: true }));
     } catch (err) {
       passes.push({ pass: passNo, error: String(err?.message ?? err) });
       stopReason = `fix error on pass ${passNo}: ${String(err?.message ?? err)}`;

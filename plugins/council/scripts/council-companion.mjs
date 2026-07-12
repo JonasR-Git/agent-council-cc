@@ -45,6 +45,7 @@ import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
 import { runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
+import { makePatchReviewer, patchReviewerReady } from "./lib/audit-patch-reviewer.mjs";
 import { detectLogical } from "./lib/audit-logical.mjs";
 import { nodesFromGraph } from "./lib/import-graph.mjs";
 import { resolveAutonomy } from "./lib/audit-autonomy.mjs";
@@ -1718,8 +1719,8 @@ async function handleWatch(argv) {
 // team is a later phase.
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "html"]
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit"],
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "html", "retry-on-limit", "sensitive-auto-apply"]
   });
   const cwd = process.cwd();
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
@@ -1909,6 +1910,27 @@ async function handleAudit(argv) {
       } catch {
         /* Tier-0 detection is best-effort */
       }
+      // §6 council-gated auto-apply (consented via --sensitive-auto-apply). Needs all
+      // three seats reachable so the gate can reach unanimity; otherwise warn + keep
+      // sensitive findings propose-only (fail-safe, never a silent never-approve).
+      let sensitiveAutoApply = false;
+      let reviewPatch;
+      if (options["sensitive-auto-apply"]) {
+        const ready = patchReviewerReady(backends);
+        if (ready.ready) {
+          sensitiveAutoApply = true;
+          reviewPatch = makePatchReviewer(cwd, backends, {
+            claudeModel: merged["claude-model"],
+            codexModel: merged["codex-model"],
+            grokModel: merged["grok-model"],
+            agentTimeoutMs: merged.agentTimeoutMs
+          });
+          console.error("§6 council-gated auto-apply ENABLED — sensitive fixes require UNANIMOUS Claude+Codex+Grok confirmation of the patch.");
+        } else {
+          const missing = ["claude", "codex", "grok"].filter((s) => !ready[s]);
+          console.error(`⚠ --sensitive-auto-apply requested but seats unreachable (${missing.join(", ")}) — §6 stays propose-only.`);
+        }
+      }
       const deps = makeFixLoopDeps(cwd, model, backends, {
         maxUnits,
         minSeverity: fixMinSeverity,
@@ -1917,10 +1939,12 @@ async function handleAudit(argv) {
         verdictMap: logical.verdictMap,
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
-        claudeModel: merged["claude-model"]
+        claudeModel: merged["claude-model"],
+        sensitiveAutoApply,
+        reviewPatch
       });
       const tLoop = Date.now();
-      const out = await runFixLoop(cwd, { budget: loopBudget, maxPasses, dryStreak, maxUnits, resume: options.resume, perTierConvergence: options["per-tier"], logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
+      const out = await runFixLoop(cwd, { budget: loopBudget, maxPasses, dryStreak, maxUnits, resume: options.resume, perTierConvergence: options["per-tier"], retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
       // Return to the base branch after the final pass (fix stayed on the integration
       // branch); report if the checkout couldn't complete so the user isn't stranded silently.
       out.baseBranch = baseBranch;

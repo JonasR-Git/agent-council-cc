@@ -16,6 +16,32 @@ test("runs review->fix passes until the dry streak, accumulating committed fixes
   assert.match(out.stopReason, /diminishing returns/);
 });
 
+test("--retry-on-limit backs off and retries a rate-limited review instead of stopping", async () => {
+  const sleeps = [];
+  let reviewCalls = 0;
+  const review = async () => {
+    reviewCalls += 1;
+    if (reviewCalls === 1) throw new Error("HTTP 429 rate limit exceeded"); // transient limit on the first attempt
+    return { findings: [finding({ file: "a.mjs", title: "bug" })], coverage: { budgetSpent: 2 } };
+  };
+  const fix = async (actionable) => ({ fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "abc" })), failed: [], branch: "council/x", changedFiles: ["a.mjs"], spent: 2 });
+  const out = await runFixLoop(
+    "/x",
+    { budget: 40, dryStreak: 1, retryOnLimit: true, retryLimit: 3 },
+    { review, fix, checkpoint: noCheckpoint, sleep: async (ms) => sleeps.push(ms) }
+  );
+  assert.equal(out.fixed.length, 1, "the loop survived the rate limit and still fixed the finding");
+  assert.equal(reviewCalls >= 2, true, "review was retried after the 429");
+  assert.equal(sleeps.length >= 1, true, "backed off before retrying");
+  assert.ok(!/rate limit/i.test(out.stopReason ?? ""), "a retried limit is not a stop reason");
+});
+
+test("without --retry-on-limit, a rate-limited review still stops the loop (opt-in only)", async () => {
+  const review = async () => { throw new Error("429 rate limit"); };
+  const out = await runFixLoop("/x", { budget: 10 }, { review, fix: async () => ({}), checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /review error/);
+});
+
 test("re-scopes each pass to the previous pass's changed files (diff-scoped re-review)", async () => {
   const scopes = [];
   let p = 0;

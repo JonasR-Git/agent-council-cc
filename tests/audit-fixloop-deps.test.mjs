@@ -49,6 +49,32 @@ test("fix threads branch + stayOnBranch (and severity/max) to runAuditFix", asyn
   assert.equal(seen.maxFixes, 3);
 });
 
+test("fix threads §6 consent + reviewPatch to runAuditFix (options + deps)", async () => {
+  let seenOpts;
+  let seenDeps;
+  const runAuditFix = async (cwd, findings, backends, opts, injected) => {
+    seenOpts = opts;
+    seenDeps = injected;
+    return { ok: true, fixed: [], changedFiles: [], spent: 0 };
+  };
+  const reviewPatch = async () => [];
+  const deps = makeFixLoopDeps("/x", model, {}, { sensitiveAutoApply: true, reviewPatch }, { runAuditFix });
+  await deps.fix([{ file: "a.mjs" }], {});
+  assert.equal(seenOpts.sensitiveAutoApply, true, "consent flag reaches runAuditFix");
+  assert.equal(seenDeps.reviewPatch, reviewPatch, "the §6 patch reviewer is injected as a dep");
+});
+
+test("fix does NOT inject reviewPatch when none is configured (propose-only default)", async () => {
+  let seenDeps;
+  const runAuditFix = async (cwd, findings, backends, opts, injected) => {
+    seenDeps = injected;
+    return { ok: true, fixed: [], changedFiles: [], spent: 0 };
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, {}, { runAuditFix });
+  await deps.fix([{ file: "a.mjs" }], {});
+  assert.equal(seenDeps.reviewPatch, undefined, "no reviewer → §6 stays propose-only in runAuditFix");
+});
+
 test("expandScope re-scopes to real dependents + dup-cluster peers; a hub-sized radius falls back to full", () => {
   const model2 = {
     files: Array.from({ length: 6 }, (_, i) => ({ id: `f${i}.mjs`, fanIn: 1, isTest: false })),

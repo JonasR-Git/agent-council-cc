@@ -73,15 +73,24 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   };
 
   const fix = async (actionable, ctx = {}) =>
-    doFix(cwd, actionable, backends, {
-      branch: ctx.branch,
-      stayOnBranch: ctx.stayOnBranch,
-      minSeverity: options.minSeverity ?? "P2",
-      maxFixes: options.maxFixesPerPass ?? 10,
-      allowUntested: options.allowUntested,
-      coverage: options.coverage, // §5 coverage gate (a fix on an unexecuted line -> propose-only)
-      claudeModel: options.claudeModel
-    });
+    doFix(
+      cwd,
+      actionable,
+      backends,
+      {
+        branch: ctx.branch,
+        stayOnBranch: ctx.stayOnBranch,
+        minSeverity: options.minSeverity ?? "P2",
+        maxFixes: options.maxFixesPerPass ?? 10,
+        allowUntested: options.allowUntested,
+        coverage: options.coverage, // §5 coverage gate (a fix on an unexecuted line -> propose-only)
+        claudeModel: options.claudeModel,
+        // §6: consented council-gated auto-apply. sensitiveAutoApply only takes effect in
+        // runAuditFix when a reviewPatch is ALSO injected (both are threaded from the CLI).
+        sensitiveAutoApply: options.sensitiveAutoApply
+      },
+      options.reviewPatch ? { reviewPatch: options.reviewPatch } : {}
+    );
 
   // Blast radius (§7): re-scope the next pass to the changed files PLUS their real
   // dependents (importers, from the graph) and dup-cluster peers (editing B can flip A's
