@@ -10,7 +10,7 @@ import path from "node:path";
 import { resolveLensGroups } from "./audit-lens-groups.mjs";
 import { chunkSource } from "./audit-group-prompt.mjs";
 import { DEFAULT_MAX_CELLS, capCells, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
-import { activeReviewerCount, makeBudget, reviewerActive, selectUnits } from "./audit-review.mjs";
+import { activeReviewerCount, reviewerActive, selectUnits } from "./audit-review.mjs";
 import { mergeFindings } from "./findings.mjs";
 import { annotateScopes } from "./scope.mjs";
 import { recordAndAnnotate } from "./ledger.mjs";
@@ -40,12 +40,11 @@ function factsFor(model, unitId) {
 export async function runGroupedReview(cwd, model, backends, options = {}, deps = {}) {
   const root = workspaceRoot(cwd);
   const models = activeModels(backends, options);
-  const budget = makeBudget(options.budget ?? 30);
   const groups = resolveLensGroups(options.lensGroups ?? "fine");
   const files = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
 
   if (models.length === 0 || files.length === 0 || groups.length === 0) {
-    return { findings: [], refuted: [], reviewed: [], coverage: { complete: false, ran: false, reviewers: reviewerMap(backends, options), groupPreset: options.lensGroups ?? "fine", cellsScheduled: 0, unitsSelected: files.length } };
+    return { findings: [], refuted: [], reviewed: [], coverage: { complete: false, ran: false, reviewers: reviewerMap(backends, options), groupPreset: options.lensGroups ?? "fine", groups: groups.length, unitsSelected: files.length, cellsScheduled: 0 } };
   }
 
   // chunk each file ONCE (cache) so enumerateCells doesn't re-read; a file's chunk count drives its
@@ -111,9 +110,9 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
       cellsScheduled: cells.length,
       cellsDropped: dropped,
       capped,
-      matrix: matrixOut.matrix?.summary?.() ?? null,
-      budgetTotal: budget.total,
-      budgetSpent: budget.spent
+      // the grouped path bounds cost by the CELL count (maxCells), not an agent-call budget — the
+      // matrix summary reports how many of those cells actually completed vs failed.
+      matrix: matrixOut.matrix?.summary?.() ?? null
     }
   };
 }
