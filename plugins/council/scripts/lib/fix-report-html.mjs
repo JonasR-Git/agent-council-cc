@@ -226,7 +226,7 @@ export function renderShapeSection(shape) {
   };
   const churn =
     shape.linesAdded != null || shape.linesRemoved != null
-      ? `<p class="sub">Git-Churn diesen Lauf: +${Number(shape.linesAdded) || 0} / −${Number(shape.linesRemoved) || 0} Zeilen.</p>`
+      ? `<p class="sub">Git-Churn diesen Lauf: +${Number(shape.linesAdded) || 0} / -${Number(shape.linesRemoved) || 0} Zeilen.</p>`
       : "";
   return `<section class="band"><div class="wrap"><div class="bi"><b>04b</b> / Code-Form</div>
 <h2>Wie sich die Codebase-Form verändert hat</h2>

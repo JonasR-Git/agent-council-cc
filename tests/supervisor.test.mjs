@@ -41,8 +41,16 @@ test("resetAwareWaitMs honors a retry-after hint over the plain attempt backoff,
   assert.ok(resetAwareWaitMs({ retryAfter: 10 ** 9 }, 1) <= 900_000 + 60_000);
 });
 
+test("runSupervised (council C3 codex P2): a null runPass result surfaces as an ANOMALY, not a silent terminal", async () => {
+  const out = await runSupervised(async () => null, { sleep: async () => {} });
+  assert.match(out.supervisorStop, /anomaly/, "a malformed pass is flagged, not mistaken for convergence");
+  assert.equal(out.stopReason, "runPass returned no result");
+});
+
 test("STAGED_PHASES / phaseOfTier map structure-first (0,1) then detail (2,3)", () => {
   assert.deepEqual(STAGED_PHASES.map((p) => p.id), ["structure", "detail"]);
+  // council C3 codex P2: the phase title reflects that tier 0 (Logical) is included, not tier 1's exact name
+  assert.match(STAGED_PHASES[0].title, /Logical/);
   assert.equal(phaseOfTier(0), "structure");
   assert.equal(phaseOfTier(1), "structure");
   assert.equal(phaseOfTier(2), "detail");

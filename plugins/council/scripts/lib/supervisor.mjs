@@ -41,8 +41,11 @@ export function resetAwareWaitMs(signal, attempt = 1, { baseMs, maxMs, factor } 
 // The staged whole-project phases: STRUCTURE first (tiers 0 Logical + 1 Structure/SSOT) so a
 // consolidation lands before DETAIL (tiers 2 Correctness + 3 Quality) runs on the consolidated code
 // — a bug is then found once, post-consolidation, not N times across copies (the B5 per-tier order).
+// Title reflects BOTH tiers it covers (council C3 codex P2): tier 0 (Logical-sense) is a
+// propose-only verdict tier the mechanical loop skips (FIRST_TIER=1), so borrowing tier 1's exact
+// "Structure / SSOT" title would mislabel propose-only design verdicts as mechanical structure fixes.
 export const STAGED_PHASES = Object.freeze([
-  { id: "structure", title: "Structure / SSOT", tiers: [0, 1] },
+  { id: "structure", title: "Logical + Structure / SSOT", tiers: [0, 1] },
   { id: "detail", title: "Detail (correctness → quality)", tiers: [2, 3] }
 ]);
 
@@ -77,6 +80,12 @@ export async function runSupervised(runPass, { maxAttempts = 100, maxWallClockMs
       last = await runPass({ resume, attempt });
     } catch (err) {
       last = { err, stopReason: `pass ${attempt} threw: ${String(err?.message ?? err)}` };
+    }
+    // A runPass that resolved to nothing (a wiring bug forgot to return) must surface as an ANOMALY,
+    // not a silent "terminal" that looks like ordinary convergence on an unattended run (council C3
+    // codex P2). Stop distinctly so an operator/report can flag it.
+    if (last == null || typeof last !== "object") {
+      return { attempts: attempt, stopReason: "runPass returned no result", supervisorStop: "aborted (runPass returned no result — anomaly)" };
     }
     const stop = last?.stopReason;
     // Explicit result flags WIN in both directions (council C3 grok P2): done OR an explicit

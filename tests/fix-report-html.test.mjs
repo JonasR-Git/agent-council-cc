@@ -109,7 +109,7 @@ test("C3: renderShapeSection shows the codebase-shape before→after delta + git
   assert.match(html, /Dateien · 20 → 18/);
   assert.match(html, /-2/); // files delta
   assert.match(html, /Komplexität · 300 → 260/);
-  assert.match(html, /Git-Churn.*\+40.*−480/);
+  assert.match(html, /Git-Churn.*\+40.*-480/);
   // wired into the full report only when meta.shape is present
   assert.match(renderFixReportHtml(sampleOut(), { shape }), /Code-Form/);
   assert.ok(!/Code-Form/.test(renderFixReportHtml(sampleOut(), {})));
