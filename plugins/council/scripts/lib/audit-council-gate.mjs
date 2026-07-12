@@ -58,6 +58,10 @@ function changedLineRanges(diff) {
 }
 
 const WINDOW_SEP = "\n…[omitted]…\n";
+// A NEUTRAL data marker (no instruction — it sits INSIDE the untrusted nonce fence, which seats are
+// told to obey nothing from; council Grok R4 P1. The "be conservative when the source is windowed"
+// guidance lives in the TRUSTED preamble instead).
+const TRUNCATED_MARK = "\n…[truncated: changed regions clipped to fit budget]";
 
 /**
  * Fit post-patch `context` (the whole file, as the fix engine passes it) into `maxChars` while keeping
@@ -65,8 +69,8 @@ const WINDOW_SEP = "\n…[omitted]…\n";
  * CONTEXT_PAD_LINES of padding, overlapping windows merged), NOT head-truncated. A multi-hunk patch that
  * changed line 100 AND line 1900 previously collapsed to one 100..1900 span and got front-sliced, so the
  * 1900 hunk's context vanished though the seat still confirmed it (council Codex C3). Now each region is
- * represented; padding is shrunk uniformly to fit, and if even the bare changed cores don't fit a
- * fail-closed marker is appended (never silently drop a hunk). Result text is always ≤ maxChars.
+ * represented; cores merged ONLY where the cores themselves overlap (never via padding). If even the
+ * bare cores don't fit, each is clipped PROPORTIONALLY + a neutral mark. Result text is always ≤ maxChars.
  */
 export function windowContextToBudget(context, diff, maxChars = CONTEXT_MAX_CHARS) {
   const ctx = String(context ?? "");
@@ -75,39 +79,46 @@ export function windowContextToBudget(context, diff, maxChars = CONTEXT_MAX_CHAR
   if (!ranges.length) return { text: ctx.slice(0, maxChars), windowed: true }; // no hunk info → head (best effort)
   const lines = ctx.split("\n");
   const n = lines.length;
-  // A padded window per hunk (0-based half-open [s,e)), keeping the changed CORE [cs,ce) that must never
-  // be padded away; sorted + merged where they overlap or touch.
-  const wins = ranges
-    .map((r) => ({ s: Math.max(0, r.min - 1 - CONTEXT_PAD_LINES), e: Math.min(n, r.max + CONTEXT_PAD_LINES), cs: Math.max(0, r.min - 1), ce: Math.min(n, r.max) }))
-    .sort((a, b) => a.s - b.s);
-  const merged = [];
-  for (const w of wins) {
-    const last = merged[merged.length - 1];
-    if (last && w.s <= last.e) {
-      last.e = Math.max(last.e, w.e);
-      last.ce = Math.max(last.ce, w.ce);
-      last.cs = Math.min(last.cs, w.cs);
-    } else merged.push({ ...w });
+  const slice = (s, e) => lines.slice(s, e).join("\n");
+  // DISJOINT changed cores (0-based half-open), merged ONLY where the cores overlap/touch — NOT via
+  // padding, which would fuse two distant hunks + the gap between them into one unshrinkable envelope
+  // (Grok R4 P1: the exact min..max problem this rewrite exists to kill).
+  const cores = ranges
+    .map((r) => ({ cs: Math.max(0, r.min - 1), ce: Math.min(n, r.max) }))
+    .sort((a, b) => a.cs - b.cs)
+    .reduce((acc, c) => {
+      const last = acc[acc.length - 1];
+      if (last && c.cs <= last.ce) last.ce = Math.max(last.ce, c.ce);
+      else acc.push({ ...c });
+      return acc;
+    }, []);
+  const renderWins = (ws) => ws.map((w) => slice(w.s, w.e)).join(WINDOW_SEP);
+
+  // Bare cores + separators already over budget → FAIL-CLOSED: clip EACH core to an equal share so
+  // every region is at least partly shown (never front-sliced, which would hide later hunks entirely,
+  // Grok R4 P1) + a neutral truncation mark. slice(0,maxChars) guards a pathologically small budget.
+  if (renderWins(cores.map((c) => ({ s: c.cs, e: c.ce }))).length > maxChars) {
+    const sepTotal = WINDOW_SEP.length * Math.max(0, cores.length - 1);
+    const per = Math.max(1, Math.floor((maxChars - sepTotal - TRUNCATED_MARK.length) / cores.length));
+    const clipped = cores.map((c) => slice(c.cs, c.ce).slice(0, per)).join(WINDOW_SEP) + TRUNCATED_MARK;
+    return { text: clipped.slice(0, maxChars), windowed: true };
   }
-  const render = () => merged.map((w) => lines.slice(w.s, w.e).join("\n")).join(WINDOW_SEP);
-  // Shrink padding UNIFORMLY across all windows (each keeps its changed core) until it fits.
-  let text = render();
-  while (text.length > maxChars) {
-    let shrunk = false;
-    for (const w of merged) {
-      if (w.s < w.cs) { w.s += 1; shrunk = true; }
-      if (w.e > w.ce) { w.e -= 1; shrunk = true; }
-    }
-    if (!shrunk) break; // all windows are down to their changed cores — can't shrink further
-    text = render();
-  }
-  if (text.length > maxChars) {
-    // Even the bare changed cores + separators exceed the budget: FAIL-CLOSED — slice + a loud marker
-    // so a seat never confirms a patch whose changed code it could not fully see.
-    const marker = "\n…[TRUNCATED — not all changed regions are shown; do not confirm what you cannot see]";
-    text = `${text.slice(0, Math.max(0, maxChars - marker.length))}${marker}`;
-  }
-  return { text, windowed: true };
+
+  // Cores fit → grow uniform padding around each core to the largest pad (≤ CONTEXT_PAD_LINES) that fits.
+  const winsAt = (p) => cores.map((c) => ({ s: Math.max(0, c.cs - p), e: Math.min(n, c.ce + p) }));
+  let pad = 0;
+  while (pad < CONTEXT_PAD_LINES && renderWins(winsAt(pad + 1)).length <= maxChars) pad += 1;
+  // RENDER-merge windows that padding brought into contact (contiguous code, no marker between them);
+  // the cores stayed disjoint for the fit checks above, so this can't recreate the envelope bug.
+  const mergedForRender = winsAt(pad)
+    .sort((a, b) => a.s - b.s)
+    .reduce((acc, w) => {
+      const last = acc[acc.length - 1];
+      if (last && w.s <= last.e) last.e = Math.max(last.e, w.e);
+      else acc.push({ ...w });
+      return acc;
+    }, []);
+  return { text: renderWins(mergedForRender), windowed: true };
 }
 
 export function buildPatchReviewPrompt(file, finding, diff, seat = "reviewer", context = "") {
@@ -149,7 +160,7 @@ export function buildPatchReviewPrompt(file, finding, diff, seat = "reviewer", c
     ...(ctx
       ? [
           windowed
-            ? `The patched source of ${file} is WINDOWED around the changed region (the full file exceeds the review budget):`
+            ? `The patched source of ${file} is WINDOWED around the changed region(s) (the full file exceeds the review budget). A region marked […omitted…] or […truncated…] is code you have NOT seen — DISSENT rather than confirm behaviour that depends on it:`
             : `The full patched source of ${file} is below, for judging the change in context:`,
           `--- BEGIN PATCHED SOURCE ${file} ${nonce} ---`,
           wrapMarkdownFence(ctx),

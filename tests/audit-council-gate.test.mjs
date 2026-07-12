@@ -270,6 +270,24 @@ test("windowContextToBudget (council Codex C3): a MULTI-hunk patch keeps EVERY c
   assert.ok(r.text.includes("omitted"), "the gap between the two windows is marked, not silently joined");
 });
 
+test("windowContextToBudget (council Grok R4): when cores exceed budget, EACH is clipped proportionally — no front-slice hides a hunk", () => {
+  const lines = [];
+  for (let i = 1; i <= 2000; i += 1) {
+    if (i === 10) lines.push("SENTINEL_CORE_A_START = 10;");
+    else if (i === 1000) lines.push("SENTINEL_CORE_B_START = 1000;");
+    else lines.push(`const filler_${i} = ${i}; // ${"pad".repeat(6)}`);
+  }
+  const src = lines.join("\n");
+  // two LARGE changed cores (10..400 and 1000..1400) whose combined text far exceeds a small budget
+  const diff = "@@ -10,390 +10,390 @@\n-x\n+y\n@@ -1000,400 +1000,400 @@\n-a\n+b";
+  const r = windowContextToBudget(src, diff, 3000);
+  assert.equal(r.windowed, true);
+  assert.ok(r.text.length <= 3000, "respects the budget even in the fail-closed path");
+  assert.ok(r.text.includes("SENTINEL_CORE_A_START"), "the FIRST core's start is shown");
+  assert.ok(r.text.includes("SENTINEL_CORE_B_START"), "the SECOND core's start is ALSO shown — not front-sliced away");
+  assert.match(r.text, /truncated/, "the clip is flagged (fail-closed)");
+});
+
 test("windowContextToBudget falls back to a head slice when the diff has no parseable hunk header", () => {
   const src = "x".repeat(50_000);
   const r = windowContextToBudget(src, "no hunk header here", 14_000);
