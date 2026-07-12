@@ -93,6 +93,34 @@ test("scheduleCells clamps maxInflight and never exceeds it in flight", async ()
   assert.ok(peak >= 1);
 });
 
+test("scheduleCells (council O10): an oversized maxInflight is CLAMPED to the 16 ceiling", async () => {
+  // the 16-spawn ceiling exists to stop N×30×3 fanning out thousands of concurrent CLI processes —
+  // exercise it with an out-of-band value (the prior test only passed 4, so the clamp was untested).
+  const cells = Array.from({ length: 60 }, (_, i) => ({ i }));
+  let inFlight = 0;
+  let peak = 0;
+  const runCell = async () => {
+    inFlight += 1;
+    peak = Math.max(peak, inFlight);
+    await new Promise((r) => setTimeout(r, 1));
+    inFlight -= 1;
+    return { ok: true };
+  };
+  await scheduleCells(cells, runCell, { maxInflight: 1000 });
+  assert.ok(peak <= 16, `peak in-flight ${peak} must be clamped to the 16 ceiling`);
+  assert.ok(peak > 4, "and it does run well above a trivial concurrency (proves the value was honored up to the cap)");
+});
+
+test("makeCellReviewer (council O10): a status-0 but UNPARSEABLE reply is fail-closed (ok:false, unparsed), not a clean cell", async () => {
+  // a dead/garbled backend that exits 0 with non-JSON must NOT count as a done cell with zero findings
+  // (that would be a silent false-clean marking the triple six-eyes complete).
+  const review = makeCellReviewer("/x", {}, {}, { runCodex: async () => ({ status: 0, stdout: "not json at all" }) });
+  const cell = { model: "codex", groupId: "g", group: { id: "g", lenses: ["correctness"] }, file: "a.mjs", chunk: 0, chunkData: { text: "x", index: 0, total: 1, startLine: 1, endLine: 1 } };
+  const r = await review(cell);
+  assert.equal(r.ok, false, "unparseable → not ok (never a manufactured clean review)");
+  assert.equal(r.unparsed, true);
+});
+
 test("scheduleCells preserves order and turns a throwing cell into ok:false (batch never rejects)", async () => {
   const cells = [{ n: 0 }, { n: 1 }, { n: 2 }];
   const results = await scheduleCells(
