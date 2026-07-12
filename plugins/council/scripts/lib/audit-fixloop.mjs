@@ -145,6 +145,12 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       spent = clamp(prior.spent ?? 0, 0, totalBudget);
       passNo = clamp(prior.passNo ?? 0, 0, maxPasses);
       dryStreak = clamp(prior.dryStreak ?? 0, 0, dryStop);
+      // Restore the per-tier staging position so a resume (the M10 supervisor path) continues at the
+      // tier it was fixing, not from tier 0 — which would re-walk structure every restart (council
+      // B5 grok P2/Claude). Clamped so a corrupt checkpoint can't push currentTier out of range.
+      currentTier = clamp(prior.currentTier ?? 0, 0, 4);
+      tierDryStreak = clamp(prior.tierDryStreak ?? 0, 0, dryStop);
+      stalledStreak = clamp(prior.stalledStreak ?? 0, 0, dryStop);
       branch = prior.branch ?? null;
       // Restore the scope so a resumed run doesn't jump straight to a stale full-scope
       // window offset (which would review off-the-end and falsely read "dry").
@@ -173,8 +179,14 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   };
 
   for (;;) {
-    stopReason = endlessStopReason({ passNo, spent, dryStreak }, { maxPasses, totalBudget, dryStop });
-    if (!stopReason && stalledStreak >= dryStop) stopReason = `stalled — actionable findings remain but none are auto-applicable (${stalledStreak} passes)`;
+    // Under per-tier staging the GLOBAL dry/stalled streaks are TIER-UNAWARE — they see findings
+    // from ALL tiers while `fix` is only offered the CURRENT tier's set, so recurring later-tier
+    // findings would make global dry/stalled trip and stop the loop BEFORE those tiers are ever
+    // fixed (council B5 grok P1). So while per-tier is staging, global dry/stalled must NOT stop the
+    // loop — tier advancement drives progress and the "all tiers converged" reason ends it. Global
+    // dry/stalled apply only in flat (non-per-tier) mode.
+    stopReason = endlessStopReason({ passNo, spent, dryStreak: perTier ? 0 : dryStreak }, { maxPasses, totalBudget, dryStop });
+    if (!stopReason && !perTier && stalledStreak >= dryStop) stopReason = `stalled — actionable findings remain but none are auto-applicable (${stalledStreak} passes)`;
     if (!stopReason && perTier && currentTier > 3) stopReason = "all tiers converged (structure -> correctness -> quality)";
     if (stopReason) break;
 
@@ -277,14 +289,15 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       else if ((tierDryStreak += 1) >= dryStop) {
         currentTier += 1;
         tierDryStreak = 0;
+        stalledStreak = 0; // a tier advance IS progress — never carry a stall from a done tier into the next (council B5 grok P1-b)
       }
     }
 
     passes.push({ pass: passNo, reviewed: findings.length, fresh: freshFindings.length, actionable: gated.actionable.length, fixed: freshFixed.length, failed: (fx?.failed ?? []).length, spent });
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
-    checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, stopReason: null, done: false });
+    checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, stopReason: null, done: false });
   }
 
-  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, stopReason, done: true });
+  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, stopReason, done: true });
   return { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak };
 }

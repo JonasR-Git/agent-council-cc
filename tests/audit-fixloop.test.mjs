@@ -68,6 +68,35 @@ test("B5: an INCOMPLETE six-eyes coverage does not let a zero-fresh pass declare
   assert.match(out.stopReason, /budget exhausted|max passes/);
 });
 
+test("B5 council (grok P1): per-tier does NOT global-dry-converge before a later tier is fixed", async () => {
+  // A recurring tier-2 (correctness) finding: pre-fix, empty tier-0/1 passes made global dry hit
+  // dryStop and stop with 'diminishing returns', fixed=[]. Now global dry is suppressed under
+  // per-tier, so staging reaches tier 2 and fixes it.
+  let done = false;
+  const review = async () => ({ findings: done ? [] : [finding({ file: "a.mjs", title: "correctness bug", lens: "correctness" })], coverage: { budgetSpent: 1 } });
+  const fix = async (actionable) => {
+    if (actionable.length > 0) done = true;
+    return { fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], changedFiles: ["a.mjs"], spent: 1 };
+  };
+  const out = await runFixLoop("/x", { budget: 60, maxPasses: 30, dryStreak: 2, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  assert.equal(out.fixed.length, 1, "the tier-2 finding was reached and fixed, not skipped by a premature global-dry stop");
+  assert.match(out.stopReason, /all tiers converged/);
+});
+
+test("B5 council (grok P2): per-tier position is checkpointed and restored on resume", async () => {
+  // persistence: the checkpoint carries currentTier/tierDryStreak/stalledStreak
+  let saved = null;
+  await runFixLoop("/x", { budget: 4, dryStreak: 1, perTierConvergence: true, maxPasses: 2 }, { review: async () => ({ findings: [], coverage: { budgetSpent: 1 } }), fix: async () => ({ fixed: [], failed: [], spent: 0 }), checkpoint: (s) => { saved = s; } });
+  assert.equal(typeof saved.currentTier, "number", "currentTier is persisted");
+  assert.equal(typeof saved.tierDryStreak, "number");
+  // restore: resuming PAST the last tier converges immediately (proves currentTier was restored, not reset to 0)
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: "x", lens: "correctness" })], coverage: { budgetSpent: 1 } });
+  const fix = async (a) => ({ fixed: a.map((f) => ({ file: f.file, finding: f })), failed: [], spent: 1 });
+  const out = await runFixLoop("/x", { budget: 20, resume: true, perTierConvergence: true }, { review, fix, loadCheckpoint: () => ({ fixed: [], currentTier: 4, passNo: 2, spent: 1 }), checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /all tiers converged/, "resumed at tier 4 (>3) → immediate convergence, not a tier-0 restart");
+  assert.equal(out.fixed.length, 0);
+});
+
 test("without --retry-on-limit, a rate-limited review still stops the loop (opt-in only)", async () => {
   const review = async () => { throw new Error("HTTP 429 rate limit"); };
   const out = await runFixLoop("/x", { budget: 10 }, { review, fix: async () => ({}), checkpoint: noCheckpoint });
