@@ -13,6 +13,21 @@ const RATE_PER_MTOK = {
 
 const SEAT_KEYS = ["claude", "codex", "grok"];
 
+/**
+ * Per-seat token fields. `tk` null → the seat's usage was NOT measured (no snapshot, or a seat the
+ * snapshot cannot see — an OpenRouter seat has no local session file). null, never 0: reporting 0 would
+ * claim the seat used nothing, which the run cannot know (council Fable nit).
+ */
+function tokenFields(tk) {
+  if (!tk) return { inputTokens: null, outputTokens: null, cacheReadTokens: null, totalTokens: null };
+  return {
+    inputTokens: Number(tk.inputTokens) || 0,
+    outputTokens: Number(tk.outputTokens) || 0,
+    cacheReadTokens: Number(tk.cacheReadTokens) || 0,
+    totalTokens: Number(tk.totalTokens) || 0
+  };
+}
+
 /** Diff two collectAllTokenUsage snapshots into per-model tokens consumed during a run. */
 export function tokenDelta(before = {}, after = {}) {
   const out = {};
@@ -174,11 +189,10 @@ export function buildRunMetrics(out, ctx = {}) {
       filesReviewed: [...new Set(s.filesReviewed ?? [])],
       findingsRaised: Number(s.findingsRaised) || 0,
       verdicts: s.verdicts ?? { confirm: 0, dissent: 0, abstain: 0 },
-      // null = not measured (no snapshot). 0 would be a claim ("used nothing") the run cannot make.
-      inputTokens: measured ? Number(tk.inputTokens) || 0 : null,
-      outputTokens: measured ? Number(tk.outputTokens) || 0 : null,
-      cacheReadTokens: measured ? Number(tk.cacheReadTokens) || 0 : null,
-      totalTokens: measured ? Number(tk.totalTokens) || 0 : null
+      // null = not measured. 0 would be a claim ("used nothing") the run cannot make. A snapshot only
+      // covers the seats collectAllTokenUsage can SEE (the local CLI seats) — an OpenRouter seat has no
+      // local session file, so even in a MEASURED run its usage is unknown, not zero (council Fable nit).
+      ...tokenFields(measured && Object.prototype.hasOwnProperty.call(tokens ?? {}, seat) ? tk : null)
     };
   }
   const sum = (key) => seatList.reduce((n, s) => n + (Number(seats[s][key]) || 0), 0);

@@ -217,7 +217,11 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   // real review target — exclude it from attempted so an empty file is not miscounted as unitsFailed
   // while coverage claims complete (council Opus O3).
   const attempted = files.filter((f) => !noContent.has(f));
-  const reviewedFiles = results.length ? attempted.filter((f) => reviewedSet.has(f)) : attempted;
+  // The results-absent fallback ("assume every attempted file was reviewed") exists ONLY for an injected
+  // test runMatrix. It must key on whether any CELL WAS SCHEDULED — not on results.length — else a pass
+  // that scheduled ZERO cells (a budget tail below the seat count → capCells keeps 0 whole triples)
+  // reports unitsReviewed = ALL files while nothing was reviewed (council Fable P1).
+  const reviewedFiles = cells.length === 0 ? [] : results.length ? attempted.filter((f) => reviewedSet.has(f)) : attempted;
 
   // TWO completeness signals (council R9 Codex/Claude P1):
   //  - `complete` (STRICT, for the one-shot report): capped OR an unsupplied file → never full six-eyes
@@ -228,8 +232,17 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   //    surfaced as caveats, not re-reviewable work) — else the loop could NEVER converge, re-hitting
   //    the same cap every pass and burning to max-passes. Pass-local by nature (this window's cells);
   //    whole-project cell coverage across passes is a deliberate future enhancement.
-  const passComplete = cells.length === 0 ? true : Boolean(matrixOut.complete);
+  // A ZERO-CELL pass is only vacuously complete when there was genuinely NOTHING to schedule. When cells
+  // were DROPPED (the budget tail fell below the active-seat count, so capCells could not keep even one
+  // whole triple), the work still exists and was simply not affordable — reporting passComplete:true then
+  // let the loop spin identical zero-review passes, charge 0 budget, and finally claim DRY CONVERGENCE
+  // over work it never looked at (council Fable P1). Fail-closed: unaffordable work is INCOMPLETE.
+  const nothingSchedulable = cells.length === 0 && dropped === 0;
+  const passComplete = cells.length === 0 ? nothingSchedulable : Boolean(matrixOut.complete);
   const complete = capped || unsupplied.length > 0 ? false : passComplete;
+  // Surface WHY a pass reviewed nothing so the operator (and the loop's stop reason) can tell an empty
+  // scope apart from a starved one.
+  const starved = cells.length === 0 && dropped > 0;
 
   // M8 completeness critic (OPT-IN via --completeness-critic): augment the STRUCTURAL passComplete with
   // a THOROUGHNESS judgement — the incomplete (failed/unreviewed) SCHEDULED triples + ONE model critic
@@ -286,7 +299,10 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
       // M8: the completeness-critic verdict (opt-in). undefined when off / infra-degraded → the loop
       // treats it as non-blocking; false (structural gap or critic-found gap) keeps the run hunting.
       ...(completeness ? { completenessComplete: completeness.coverageComplete, completenessGaps: completeness.gaps, completenessCriticRan: completeness.criticRan } : {}),
-      ran: true,
+      // A STARVED pass (work existed but the budget tail couldn't afford one whole triple) did NOT run —
+      // reporting ran:true let the loop count it toward the dry streak and stop as "converged" (Fable P1).
+      ran: !starved,
+      ...(starved ? { ranReason: `budget tail below the active-seat count — 0 whole triples affordable (${dropped} cell(s) deferred)`, starved: true } : {}),
       groupPreset: options.lensGroups ?? "fine",
       reviewers: reviewerMap(backends, options),
       unitsSelected: files.length,

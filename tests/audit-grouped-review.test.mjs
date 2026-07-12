@@ -262,6 +262,32 @@ test("runGroupedReview: the completeness-critic call is CHARGED to budgetSpent (
   assert.equal(out.coverage.budgetSpent, 40, "the extra critic call is charged, not hidden");
 });
 
+test("runGroupedReview: a STARVED pass (0 cells affordable, work deferred) is ran:false + NOT passComplete (council Fable P1)", async () => {
+  // capCells keeps only WHOLE triples, so a budget tail below the active-seat count schedules ZERO cells
+  // while the work still exists (dropped > 0). Reporting passComplete:true + ran:true + unitsReviewed=all
+  // let the loop spin identical zero-review passes, charge 0 budget, and finally claim DRY CONVERGENCE
+  // over work it never looked at.
+  let dispatched = null;
+  const runMatrix = async (cells) => { dispatched = cells.length; return { findings: [], results: [], matrix: { summary: () => ({}) }, complete: false }; };
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, maxCells: 2, ...NO_VERIFY }, { runMatrix, ...FS });
+  assert.equal(dispatched, 0, "3 seats + a cap of 2 → not one whole triple is affordable");
+  assert.ok(out.coverage.cellsDropped > 0, "the deferred work is surfaced");
+  assert.equal(out.coverage.passComplete, false, "unaffordable work is INCOMPLETE — never vacuously complete");
+  assert.equal(out.coverage.ran, false, "a starved pass did not run → the loop must not count it toward the dry streak");
+  assert.equal(out.coverage.unitsReviewed, 0, "nothing was reviewed — do not claim every unit was");
+  assert.match(out.coverage.ranReason, /budget tail|seat count/i);
+});
+
+test("runGroupedReview: a genuinely EMPTY scope (0 cells, nothing deferred) IS vacuously complete", async () => {
+  // the honest counterpart: an all-empty (0-byte) scope schedules no cells and defers nothing → complete.
+  const runMatrix = async () => ({ findings: [], results: [], matrix: { summary: () => ({}) }, complete: false });
+  const empty = { readFile: () => "", statSize: () => 0 };
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, ...NO_VERIFY }, { runMatrix, ...empty });
+  assert.equal(out.coverage.cellsScheduled, 0);
+  assert.equal(out.coverage.passComplete, true, "nothing to review → vacuously complete (not starved)");
+  assert.equal(out.coverage.ran, true);
+});
+
 test("runGroupedReview: matrix EXTRA calls (parse repairs + rate-limit retries) are CHARGED to budgetSpent (council Grok P1/P2)", async () => {
   // A parse repair and a rate-limit retry each RE-INVOKE a seat runner — each is another PAID agent call.
   // Omitting them let a garbled/throttled pass spawn far more calls than it reported, so the fix loop

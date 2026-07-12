@@ -163,6 +163,18 @@ test("canonicalizeUnitFile maps null/basename/./-prefixed/backslashed/absolute o
   assert.equal(canonicalizeUnitFile("utils/index.mjs", "lib/index.mjs"), "utils/index.mjs", "same basename, different module → kept apart");
 });
 
+test("canonicalizeUnitFile: a LONGER RELATIVE path sharing a path TAIL is a different file, not the unit (council Fable P2)", () => {
+  // The reverse-suffix rule was meant for ABSOLUTE paths carrying the repo prefix. A longer RELATIVE path
+  // that merely shares a tail is a DIFFERENT FILE (this repo has exactly such tails). Laundering it onto
+  // the unit pointed refutation evidence + the fix engine at the wrong file, and could fabricate
+  // cross-seat consensus about it.
+  assert.equal(canonicalizeUnitFile("scripts/lib/utils.mjs", "lib/utils.mjs"), "scripts/lib/utils.mjs", "a suffix-superset RELATIVE path is NOT the unit");
+  assert.equal(canonicalizeUnitFile("tests/lib/x.mjs", "lib/x.mjs"), "tests/lib/x.mjs");
+  // ...while an ABSOLUTE path carrying the unit id still canonicalizes (that was the rule's real purpose)
+  assert.equal(canonicalizeUnitFile("C:/repo/lib/utils.mjs", "lib/utils.mjs"), "lib/utils.mjs", "absolute (drive) path → the unit");
+  assert.equal(canonicalizeUnitFile("/home/u/repo/lib/utils.mjs", "lib/utils.mjs"), "lib/utils.mjs", "absolute (posix) path → the unit");
+});
+
 function unitFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-a2-"));
   fs.mkdirSync(path.join(dir, "lib", "deep"), { recursive: true });

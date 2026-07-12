@@ -208,9 +208,16 @@ export function canonicalizeUnitFile(file, unitId) {
   if (norm === unitId) return unitId;
   const a = norm.toLowerCase();
   const b = String(unitId).toLowerCase();
-  // a suffix relation either way: "x.mjs"/"lib/x.mjs" for unit "plugins/lib/x.mjs" (a bare basename or
-  // a partial path), or "C:/repo/plugins/lib/x.mjs" (an absolute path carrying the unit id).
-  if (b.endsWith(`/${a}`) || a.endsWith(`/${b}`)) return unitId;
+  // FORWARD suffix: the model gave a SHORTER path than the unit — a bare basename ("x.mjs") or a partial
+  // path ("lib/x.mjs") for unit "plugins/lib/x.mjs". Unambiguous: it can only mean the unit.
+  if (b.endsWith(`/${a}`)) return unitId;
+  // REVERSE suffix: the model gave a LONGER path ENDING in the unit id. This is only safe when that path
+  // is ABSOLUTE (it then carries the repo prefix, e.g. "C:/repo/plugins/lib/x.mjs"). For a RELATIVE longer
+  // path it is a DIFFERENT FILE that merely shares a path tail — "scripts/lib/x.mjs" is not "lib/x.mjs"
+  // (this repo has exactly such tails). Laundering it onto the unit would point refutation evidence and
+  // the fix engine at the wrong file, and could fabricate cross-seat consensus about it (council Fable P2).
+  const isAbsolute = /^[a-z]:\//i.test(raw) || raw.startsWith("/");
+  if (isAbsolute && a.endsWith(`/${b}`)) return unitId;
   return norm;
 }
 
