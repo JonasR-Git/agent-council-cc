@@ -71,6 +71,21 @@ test("R9 (council Codex/Claude): passComplete gates convergence — a capped gro
   assert.ok(out.passesRun < 20, "did not burn to the max-pass ceiling on a persistent cap");
 });
 
+test("M8 (council Grok P2): the completeness critic gates the ENDLESS dry streak too (parity with the fix loop)", async () => {
+  // completenessComplete:false → the critic judged coverage under-examined → a zero-fresh pass must NOT
+  // converge, even though the scheduled cells are all done (passComplete:true).
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 1, passComplete: true, completenessComplete: false } });
+  const out = await runEndless("/x", { maxPasses: 4, dryStreak: 2, budget: 100 }, { review, checkpoint: noCheckpoint });
+  assert.ok(!/diminishing/.test(out.stopReason ?? ""), "the critic's gap verdict blocks endless false-convergence");
+  assert.equal(out.dryStreak, 0, "the dry streak never advanced while the critic saw gaps");
+});
+
+test("M8: completenessComplete undefined (critic off) is non-blocking in endless — a dry pass still converges", async () => {
+  const review = async () => ({ findings: [f("a.mjs", "recurring token")], coverage: { budgetSpent: 1, passComplete: true } });
+  const out = await runEndless("/x", { maxPasses: 20, dryStreak: 2, budget: 100 }, { review, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /diminishing/, "no completeness signal → the passComplete dry path still converges");
+});
+
 test("runEndless respects the finite total budget", async () => {
   // each pass charges exactly the budget it is handed
   const review = async ({ pass, budget }) => ({ findings: [f(`b${pass}.mjs`, `unique budget token ${pass} beta`)], coverage: { budgetSpent: budget } });

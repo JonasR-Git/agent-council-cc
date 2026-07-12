@@ -91,7 +91,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs audit run|review|fix|endless [flags] (see below)",
       "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
       "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
-      "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--html] [--retry-on-limit] [--dry-run]",
+      "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
       "    audit fix --loop [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume] [--allow-untested]   (autonomous fix-until-dry on an isolated branch)",
       "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume]   (bounded review/propose loop)",
       "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
@@ -1734,19 +1734,32 @@ async function handleWatch(argv) {
 // it explicitly with --max-cells (a capped run reports PARTIAL coverage, never silently truncates).
 const GROUPED_CLI_DEFAULT_MAX_CELLS = 1500;
 
-// Attach the OpenRouter backend to a probed `backends`. The config-file API key (discouraged; the ENV
-// var is the recommended path) is passed TRANSIENTLY to openRouterBackend so it never lives on the
-// spread-widely `merged` options (council OpenRouter Grok P1). Any resolution warnings (a base_url
-// ignored by the exfil guard, a dropped/duplicate/over-cap model) are surfaced so the operator isn't
-// silently missing a seat.
+// Attach the OpenRouter backend to a probed `backends`. The API key is NEVER taken from the repo policy
+// file: openRouterBackend is called with a null user-key arg, so the key can come ONLY from the user's
+// ENV var (council OpenRouter Claude/Grok P1). A repo-supplied openrouter_api_key is ignored + warned.
+// Any resolution warnings (a base_url refused by the exfil guard, a dropped/duplicate/over-cap model)
+// are surfaced so the operator isn't silently missing a seat.
 function attachOpenRouterSeats(backends, merged, policy, json) {
+  // --skip-openrouter is a TRUE opt-out (council Codex/Claude P1): zero out the backend so the OR seats
+  // participate NOWHERE — not as finders, not as §6 reviewers, not as refuters. Merely reducing the §6
+  // required-vote SUBSET would still POST the patch + reviewed source to every configured OR seat during
+  // patch review (the reviewer is a superset), so a security opt-out MUST remove the seats at the source.
+  if (merged.skipOpenRouter) {
+    backends.openrouter = { available: false, seats: [], baseURL: null, apiKeyEnv: null, apiKeyPresent: false, keySource: null, warnings: [] };
+    return;
+  }
   // SECURITY (council OpenRouter Claude P1): the policy comes from the AUDITED repo, so a repo-supplied
   // API key must NEVER activate/redirect egress. Pass NO config key — the key comes only from the user's
   // ENV var (or a future user-typed CLI flag). Warn loudly if a repo file tried to set one.
   const repoKey = policy?.openrouter_api_key ?? policy?.openrouter?.apiKey ?? null;
   if (repoKey && !json) console.error("⚠ openrouter: an API key in the repo policy file is IGNORED for security — set it via the OPENROUTER_API_KEY environment variable instead (a repo-supplied key would ship your source to that key's account).");
-  backends.openrouter = openRouterBackend(merged, process.env, null);
-  if (!json) for (const w of backends.openrouter.warnings ?? []) console.error(`⚠ openrouter: ${w}`);
+  const backend = openRouterBackend(merged, process.env, null);
+  // A per-seat skip list (--skip-seats or policy skip_seats) also removes those seats from the backend so
+  // they egress nowhere, matching --skip-openrouter's guarantee at seat granularity.
+  const skip = new Set(merged.skipSeats ?? []);
+  if (skip.size) backend.seats = backend.seats.filter((s) => !skip.has(s.id));
+  backends.openrouter = backend;
+  if (!json) for (const w of backend.warnings ?? []) console.error(`⚠ openrouter: ${w}`);
 }
 
 // Assemble the fix-report telemetry meta (metrics + before→after codebase shape). FAIL-SOFT: any git
@@ -1782,8 +1795,8 @@ async function computeFixReportMeta(cwd, out, ctx = {}) {
 
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "supervise", "completeness-critic"]
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats"],
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "supervise", "completeness-critic", "skip-openrouter"]
   });
   const cwd = process.cwd();
   // Validate the grouped-review preset + cap ONCE, up front — before any preflight/coverage/spend, for

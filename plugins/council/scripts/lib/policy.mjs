@@ -31,9 +31,13 @@ export const DEFAULT_POLICY = {
   claude_model: null,
   // OpenRouter multi-model seats (optional). `openrouter_models` is a flat list of "slug" /
   // "id=slug" / "id=slug@effort" strings (parseSimpleYaml can't nest); a nested `openrouter: {…}`
-  // object is also accepted from .council.json. The key is read from the env var named by
-  // openrouter_api_key_env (default OPENROUTER_API_KEY); a literal openrouter_api_key in the file
-  // works but is discouraged (secret in VCS). openrouter_base_url points at an OpenAI-compatible proxy.
+  // object is also accepted from .council.json. SECURITY: the API key is read ONLY from the env var
+  // named by openrouter_api_key_env (default OPENROUTER_API_KEY). A literal openrouter_api_key in the
+  // policy file is IGNORED for activation — the file is read from the audited (untrusted) repo, so a
+  // repo-supplied key must never ship your source to that key's account (council OpenRouter Claude/Grok
+  // P1). The field is retained only so a stray value is parsed + warned, not silently honored.
+  // openrouter_base_url may point at a LOOPBACK proxy or the openrouter.ai host only; any other remote
+  // host disables the backend fail-closed.
   openrouter_models: [],
   openrouter_api_key: null,
   openrouter_api_key_env: "OPENROUTER_API_KEY",
@@ -230,9 +234,22 @@ export function mergeOptionsWithPolicy(options, policy) {
     openrouterModels: options.openrouterModels ?? policy.openrouter?.models ?? policy.openrouter_models ?? [],
     openrouterApiKeyEnv: options.openrouterApiKeyEnv ?? policy.openrouter?.apiKeyEnv ?? policy.openrouter_api_key_env ?? "OPENROUTER_API_KEY",
     openrouterBaseUrl: options.openrouterBaseUrl ?? policy.openrouter?.baseUrl ?? policy.openrouter_base_url ?? null,
-    skipOpenRouter: Boolean(options.skipOpenRouter),
+    // Read BOTH the camelCase (programmatic) and the kebab CLI flag (council Codex/Claude P1): parseArgs
+    // stores --skip-openrouter under its kebab name WITHOUT camelCasing, so reading only options.skipOpenRouter
+    // left the flag inert — the documented kebab-not-converted trap (cf. retry-on-limit). A policy
+    // `skip_openrouter: true` also opts out. skipSeats is a per-seat id list from the same sources.
+    skipOpenRouter: Boolean(options.skipOpenRouter ?? options["skip-openrouter"] ?? policy.skip_openrouter),
+    skipSeats: normalizeStringList(options.skipSeats ?? options["skip-seats"] ?? policy.skip_seats),
     policySource: policy._source
   };
+}
+
+/** Normalize a seat-id skip list to a string[]: an array as-is, a comma string split, else []. Keeps
+ *  seatActive/attachOpenRouterSeats' `.includes(id)` correct (a raw string would match char-wise). */
+function normalizeStringList(value) {
+  if (Array.isArray(value)) return value.map((s) => String(s).trim()).filter(Boolean);
+  if (typeof value === "string") return value.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
 }
 
 function clampPercent(value) {

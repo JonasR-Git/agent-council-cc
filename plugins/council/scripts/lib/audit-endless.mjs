@@ -141,7 +141,11 @@ export async function runEndless(cwd, options = {}, deps = {}) {
     // scheduled cells were all reviewed. Prefer the grouped path's passComplete (transient-completable)
     // over the strict `complete` — capped/unsupplied force `complete` false PERSISTENTLY, which would
     // stop the streak from ever advancing (council R9). Absent info (per-file path) counts as complete.
-    const coverageComplete = (res?.coverage?.passComplete ?? res?.coverage?.complete) !== false;
+    // M8 parity with the fix loop (council Grok P2): the completeness critic (--completeness-critic) also
+    // gates the endless dry streak — a pass it judges under-examined (completenessComplete === false) must
+    // not converge. undefined (critic off / infra-degraded) stays non-blocking → default path unchanged.
+    const coverageComplete =
+      (res?.coverage?.passComplete ?? res?.coverage?.complete) !== false && res?.coverage?.completenessComplete !== false;
     dryStreak = fresh.length === 0 && coverageComplete ? dryStreak + 1 : 0;
     passes.push({ pass: passNo, found: passFindings.length, fresh: fresh.length, spent });
     onProgress(`  pass ${passNo}: +${fresh.length} new (total ${all.length}); dry ${dryStreak}/${dryStop}`);

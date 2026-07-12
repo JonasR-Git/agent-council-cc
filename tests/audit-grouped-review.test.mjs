@@ -221,6 +221,26 @@ test("runGroupedReview: --completeness-critic ON, critic finds a gap → coverag
   assert.ok(out.coverage.completenessGaps.includes("concurrency"));
 });
 
+test("runGroupedReview: the completeness-critic call is CHARGED to budgetSpent (cells + 1; council Codex/Claude P2)", async () => {
+  const runMatrix = async (cells) => ({ findings: [], matrix: { summary: () => ({}), incompleteTriples: () => [] }, triples: [], complete: true, _n: cells.length });
+  const runCritic = async () => '{"complete": true, "gaps": []}';
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, completenessCritic: true }, { runMatrix, runCritic, ...FS });
+  // lens preset = 39 cells; the critic adds one paid call
+  assert.equal(out.coverage.cellsScheduled, 39);
+  assert.equal(out.coverage.budgetSpent, 40, "the extra critic call is charged, not hidden");
+});
+
+test("runGroupedReview: a CAPPED pass + critic-complete → completenessComplete TRUE (no persistent-false pin; council Codex/Claude P2)", async () => {
+  // the pin bug: passing all-selected files as expected scope made a capped pass permanently 'missing' →
+  // completenessComplete false every pass → the loop could never converge. The fix drops expected scope,
+  // so a capped pass whose scheduled cells are done + critic says complete is completenessComplete:true.
+  const runMatrix = async () => ({ findings: [], matrix: { summary: () => ({}), incompleteTriples: () => [] }, triples: [], complete: true });
+  const runCritic = async () => '{"complete": true, "gaps": []}';
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "fine", ledger: false, maxCells: 5, completenessCritic: true }, { runMatrix, runCritic, ...FS });
+  assert.equal(out.coverage.capped, true, "sanity: this pass IS capped");
+  assert.equal(out.coverage.completenessComplete, true, "a cap is a surfaced caveat, not a convergence-blocking gap");
+});
+
 test("runGroupedReview: onProgress surfaces the planned cell count BEFORE dispatch", async () => {
   const msgs = [];
   const runMatrix = async () => ({ findings: [], matrix: { summary: () => ({}) }, complete: true });

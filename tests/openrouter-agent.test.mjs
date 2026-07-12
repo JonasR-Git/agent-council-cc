@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import http from "node:http";
 
 import { normalizeOpenRouterModels, openRouterBackend, registerOpenRouterKey, runOpenRouterStructured, OPENROUTER_MAX_SEATS } from "../plugins/council/scripts/lib/openrouter-agent.mjs";
 import { isRateLimitError } from "../plugins/council/scripts/lib/audit-retry.mjs";
@@ -41,6 +42,13 @@ test("openRouterBackend: available iff a KEY (env/user) AND ≥1 model; key neve
   assert.equal(JSON.stringify(envOnly).includes("sk-env"), false);
 });
 
+test("openRouterBackend footgun closed: options.openrouterApiKey is NOT read (a spread-in repo key can't activate; council Grok P2)", () => {
+  // a future caller that spreads repo-parsed policy into options must NOT re-open egress — only the
+  // userKeyArg (CLI) or the ENV var can activate. options carrying a key is inert.
+  const r = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterApiKey: "sk-repo-leaked" }, {} /* no env */, null /* no user key */);
+  assert.equal(r.available, false, "a key on options is ignored → no activation, no egress");
+});
+
 test("openRouterBackend P1 exfil: a repo model list + remote base but NO user/env key does NOT activate", () => {
   // simulates a hostile .council.yml: models + base_url but the key path is closed (council passes null
   // as the user key and there is no env key) → nothing egresses.
@@ -52,7 +60,8 @@ test("openRouterBackend P1 exfil: a repo model list + remote base but NO user/en
 test("openRouterBackend EXFIL GUARD: ONLY loopback base_url is honored; remote is always ignored (incl. bypass tricks)", () => {
   const remote = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterBaseUrl: "https://evil.example/v1" }, {}, "sk-user");
   assert.match(remote.baseURL, /openrouter\.ai/, "a remote base is ignored even with a user key");
-  assert.ok(remote.warnings.some((w) => /loopback|exfil/i.test(w)));
+  assert.equal(remote.available, false, "a refused remote base disables the backend — never egress to the default host with the user key (council Grok P2)");
+  assert.ok(remote.warnings.some((w) => /loopback|exfil|DISABLED/i.test(w)));
   const loopback = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterBaseUrl: "http://localhost:11434/v1" }, { OPENROUTER_API_KEY: "sk-env" });
   assert.equal(loopback.baseURL, "http://localhost:11434/v1", "a local proxy is allowed");
   const httpsLoop = openRouterBackend({ openrouterModels: ["a=x/y"], openrouterBaseUrl: "https://127.0.0.1:8443/v1" }, { OPENROUTER_API_KEY: "sk-env" });
@@ -95,6 +104,39 @@ test("runOpenRouterStructured: a 429 → rate-limit signal; a 401 → permanent;
   assert.match(r429.stderr, /\[redacted\]/);
   const r401 = await runOpenRouterStructured("/x", b, {}, "p", "or-x", { transport: async () => ({ status: 401, body: "invalid api key" }) });
   assert.equal(isRateLimitError(`${r401.stderr}`), false, "401/invalid-key is PERMANENT — never retried");
+});
+
+test("runOpenRouterStructured: the REAL postJson honors an absolute wall-clock deadline (a hung endpoint → 124, no infinite hang)", async () => {
+  // council Grok P2 (#4): node's socket `timeout` is inactivity-only — a server that accepts the
+  // connection but never responds must still settle via the absolute deadline. Exercise the real
+  // postJson (no injected transport) against a loopback server that hangs forever.
+  const server = http.createServer(() => { /* accept, never respond */ });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  try {
+    registerOpenRouterKey("sk-secret");
+    const backends = { openrouter: { available: true, baseURL: `http://127.0.0.1:${port}`, seats: [{ id: "or-x", model: "vendor/model" }] } };
+    const started = Date.now();
+    const r = await runOpenRouterStructured("/x", backends, { agentTimeoutMs: 300 }, "p", "or-x", { now: () => Date.now() });
+    assert.equal(r.status, 124, "the wall-clock deadline fires → timedOut status");
+    assert.equal(r.timedOut, true);
+    assert.ok(Date.now() - started < 5000, "settled promptly via the deadline, did not hang");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("runOpenRouterStructured: a SYNCHRONOUS request failure (newline in the key → bad header) is caught, not a process crash (council Codex P1)", async () => {
+  // a key containing a newline makes lib.request throw ERR_INVALID_CHAR synchronously; postJson must
+  // catch it, clear the deadline (no leaked timer that later dereferences an un-initialized req), and
+  // surface an error result — never crash the audit.
+  registerOpenRouterKey("sk-bad\nInjected: header");
+  const backends = { openrouter: { available: true, baseURL: "http://127.0.0.1:1", seats: [{ id: "or-x", model: "vendor/model" }] } };
+  const r = await runOpenRouterStructured("/x", backends, { agentTimeoutMs: 500 }, "p", "or-x", {});
+  assert.notEqual(r.status, 0, "a bad-header sync throw yields an error result");
+  assert.notEqual(r.status, 124, "it is a synchronous transport error, not a wall-clock timeout");
+  assert.ok(r.stderr && r.stderr.length > 0, "the error is surfaced");
+  registerOpenRouterKey("sk-secret"); // restore for later tests
 });
 
 test("runOpenRouterStructured: a transport timeout → status 124 timedOut; a missing seat → skipped", async () => {

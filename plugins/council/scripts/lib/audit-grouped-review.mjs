@@ -181,16 +181,22 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   const complete = capped || unsupplied.length > 0 ? false : passComplete;
 
   // M8 completeness critic (OPT-IN via --completeness-critic): augment the STRUCTURAL passComplete with
-  // a THOROUGHNESS judgement — free structural gaps (unscheduled group/file, incomplete triple) + ONE
-  // model critic call ("what defect class looks under-examined?"). Its coverageComplete ANDs into the
-  // loop's dry-streak gate so a pass judged incomplete keeps the run hunting. Deadlock-safe: it uses
-  // runCompletenessAssessment's coverageComplete (structure+critic, NO dry streak), and an infra failure
-  // degrades to undefined (unknown → does not block). Reserves ONE agent call; skipped entirely when off
-  // or when nothing ran. deps.runCritic is injectable for tests.
+  // a THOROUGHNESS judgement — the incomplete (failed/unreviewed) SCHEDULED triples + ONE model critic
+  // call ("what defect class looks under-examined?"). Its coverageComplete ANDs into the loop's dry-streak
+  // gate so a pass judged incomplete keeps the run hunting. Deadlock-safe: it uses runCompletenessAssessment's
+  // coverageComplete (structure+critic, NO dry streak), and an infra failure degrades to undefined
+  // (unknown → does not block).
+  //
+  // We DELIBERATELY do NOT pass expectedGroups/expectedFiles here (council Codex/Claude P2): the structural
+  // gap check is PER-PASS, and a capped pass (capCells drops tail files) or a selected 0-byte file would
+  // then be flagged "missing" PERSISTENTLY → completenessComplete=false every pass → the loop could never
+  // converge (re-opening exactly the persistent-false the R9 passComplete design avoids). The cap/unsupplied
+  // are surfaced as caveats elsewhere (capped/filesUnsupplied), not treated as re-reviewable gaps. So the
+  // structural signal is just the incomplete SCHEDULED triples (failed cells) — the same set passComplete
+  // keys on — plus the critic. Whole-project "class never hunted" detection belongs to a future
+  // whole-project matrix, not this per-pass window. Reserves ONE agent call; skipped when off / nothing ran.
   let completeness = null;
   if (options.completenessCritic && cells.length > 0 && models.length > 0) {
-    const scheduledFilesSet = [...new Set(cells.map((c) => c.file))];
-    const scheduledGroupSet = [...new Set(cells.map((c) => c.groupId))];
     const incompleteN = matrixOut.matrix?.incompleteTriples?.(matrixOut.triples ?? [])?.length ?? "?";
     const coverageSummary = [
       `groups=${groups.length} files=${files.length - noContent.size} seats=${models.length} cells=${cells.length}${capped ? ` (capped, ${dropped} deferred)` : ""}`,
@@ -209,10 +215,6 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
     completeness = await runCompletenessAssessment({
       matrix: matrixOut.matrix,
       triples: matrixOut.triples ?? [],
-      expectedGroups: groups,
-      expectedFiles: files,
-      scheduledGroupIds: scheduledGroupSet,
-      scheduledFiles: scheduledFilesSet,
       findings: scoped.all,
       coverageSummary,
       runCritic: typeof runCritic === "function" ? runCritic : undefined
@@ -245,10 +247,12 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
       cellsScheduled: cells.length,
       cellsDropped: dropped,
       capped,
-      // budgetSpent = the cells actually dispatched (each cell is one paid agent call). The fix/endless
-      // loop charges this against its per-run agent-call budget so a grouped loop's total spend is
-      // bounded the same way the per-file path's is (council R9 wiring).
-      budgetSpent: cells.length,
+      // budgetSpent = the cells actually dispatched (each cell is one paid agent call) PLUS the one
+      // completeness-critic call when it ran (council Codex/Claude P2: it is a real agent call and must be
+      // charged, else the loop overspends its per-pass budget by one and under-reports total spend). The
+      // fix/endless loop charges this against its per-run agent-call budget; makeFixLoopDeps RESERVES one
+      // cell for the critic so cells + critic ≤ budget.
+      budgetSpent: cells.length + (completeness?.criticRan ? 1 : 0),
       // the grouped path bounds per-pass cost by the CELL count (maxCells); the matrix summary reports
       // how many of those cells actually completed vs failed.
       matrix: matrixOut.matrix?.summary?.() ?? null

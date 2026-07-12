@@ -91,9 +91,14 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       // loop budget → a 1-pass stop with under-reported spend (council Grok R9 P0/P1). budgetSpent then
       // stays ≤ budget and the loop iterates honestly.
       lensGroups: options.lensGroups,
-      maxCells: options.lensGroups ? Math.max(1, Math.min(options.maxCells ?? Infinity, Math.floor(budget))) : options.maxCells,
+      // RESERVE one agent call for the completeness critic when it is on (council Codex/Claude P2): the
+      // grouped pass issues cells + 1 critic call, so cap the cells to budget-1 to keep the pass's TOTAL
+      // spend within its per-pass budget (else it dispatched budget cells + 1 critic = budget+1).
+      maxCells: options.lensGroups
+        ? Math.max(1, Math.min(options.maxCells ?? Infinity, Math.floor(budget) - (options.completenessCritic ? 1 : 0)))
+        : options.maxCells,
       // M8: opt-in completeness critic. Only meaningful on the grouped path (runGroupedReview reads it);
-      // runAuditReview ignores it. Reserves ONE agent call per pass; its verdict gates the dry streak.
+      // runAuditReview ignores it. Its (charged, reserved) verdict gates the dry streak.
       completenessCritic: options.completenessCritic
     });
     // Surface a top-level `ran` the loop can trust. runAuditReview swallows backend

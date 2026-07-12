@@ -31,6 +31,16 @@ test("R9 (council Grok/Codex P1): a grouped pass's cells are CAPPED to the per-p
   assert.equal(seen.maxCells, 40, "cells capped to the per-pass budget (min(1500, 40))");
 });
 
+test("M8 (council Codex/Claude P2): --completeness-critic RESERVES one cell so cells + critic ≤ budget", async () => {
+  // the critic is one extra paid agent call; reserving a cell keeps the pass's TOTAL spend within budget.
+  let seen = null;
+  const runGroupedReview = async (cwd, m, backends, opts) => { seen = opts; return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: true, budgetSpent: 0 } }; };
+  const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500, completenessCritic: true }, { runGroupedReview });
+  await deps.review({ budget: 40, changedFiles: null });
+  assert.equal(seen.maxCells, 39, "budget 40 → 39 cells + 1 critic call = 40 total (one reserved)");
+  assert.equal(seen.completenessCritic, true, "the flag is threaded to the grouped review");
+});
+
 test("R9: without --groups the loop still uses the per-file runAuditReview", async () => {
   let usedGrouped = false;
   const runGroupedReview = async () => { usedGrouped = true; return { findings: [], coverage: {} }; };

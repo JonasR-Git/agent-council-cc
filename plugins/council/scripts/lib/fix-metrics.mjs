@@ -31,7 +31,10 @@ export function tokenDelta(before = {}, after = {}) {
   return out;
 }
 
-/** Estimate USD cost from a per-model token delta. Approximate. */
+/** Estimate USD cost from a per-model token delta. Approximate. Prices the built-in CLI seats only:
+ *  OpenRouter seats have no local token snapshot (their usage isn't collected into collectAllTokenUsage)
+ *  and pricing varies per third-party model, so estUsd covers claude/codex/grok and excludes or-* seats
+ *  (council Claude nit). cost.inputTokens/outputTokens still SUM any recorded OR volume for transparency. */
 export function estimateCost(tokens = {}) {
   let usd = 0;
   for (const seat of SEAT_KEYS) {

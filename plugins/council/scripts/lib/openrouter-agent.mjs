@@ -115,14 +115,22 @@ export function normalizeOpenRouterModels(list) {
  */
 export function openRouterBackend(options = {}, env = process.env, userKeyArg = null) {
   const { seats, warnings } = normalizeOpenRouterModels(options.openrouterModels);
-  const keyEnv = options.openrouterApiKeyEnv || "OPENROUTER_API_KEY";
-  // TRUST MODEL (council OpenRouter Claude P1): the .council.yml is read from the AUDITED (untrusted)
+  // The env-var NAME is repo-policy-controlled, so a hostile .council.yml could point it at an UNRELATED
+  // secret (openrouter_api_key_env: AWS_SECRET_ACCESS_KEY) to exfiltrate THAT secret as the Bearer token
+  // to OpenRouter alongside the reviewed source (council Codex P1). Restrict the selectable name to an
+  // OpenRouter-specific pattern; a non-conforming name is refused + warned and falls back to the default.
+  // (A user wanting a custom var names it OPENROUTER_KEY_2 etc. — the prefix still can't select AWS_*/etc.)
+  const rawKeyEnv = options.openrouterApiKeyEnv || "OPENROUTER_API_KEY";
+  const keyEnv = /^OPENROUTER[A-Z0-9_]*$/i.test(rawKeyEnv) ? rawKeyEnv : "OPENROUTER_API_KEY";
+  if (keyEnv !== rawKeyEnv) warnings.push(`openrouter_api_key_env '${rawKeyEnv}' refused — it must name an OPENROUTER* variable so a repo policy cannot select an arbitrary environment secret; using OPENROUTER_API_KEY`);
+  // TRUST MODEL (council OpenRouter Claude/Grok P1): the .council.yml is read from the AUDITED (untrusted)
   // repo, so a repo-supplied key/base could otherwise silently ship the working tree to an attacker's
   // OpenRouter account/host. Therefore the KEY only ever comes from a USER-level source: the ENV var
-  // (recommended) or an explicit CLI flag threaded as userKeyArg — NEVER from the repo policy file.
-  // (options.openrouterApiKey is honored only for direct callers/tests, not the CLI flow.) Repo config
-  // can at most add MODEL SLUGS to an already-env-consented setup — egress needs the user's own key.
-  const userKey = (userKeyArg ? String(userKeyArg) : null) ?? (options.openrouterApiKey ? String(options.openrouterApiKey) : null);
+  // (recommended) or an explicit CLI flag threaded as userKeyArg — NEVER from `options`. We deliberately
+  // do NOT read options.openrouterApiKey: `options` is the merged policy+CLI bag that a future caller
+  // could spread repo-parsed config into, which would silently re-open the egress path (council Grok P2
+  // latent footgun). Repo config can at most add MODEL SLUGS to an already-env-consented setup.
+  const userKey = userKeyArg ? String(userKeyArg) : null;
   const envKey = env[keyEnv] ? String(env[keyEnv]) : null;
   const key = userKey ?? envKey ?? null;
 
@@ -172,41 +180,55 @@ function postJson(url, payload, headers, timeoutMs) {
     // timeout — a hostile/broken endpoint that dribbles one byte per interval keeps the request pending
     // forever and hangs the seat's Promise.all indefinitely. This hard deadline destroys the request no
     // matter what, so every seat settles within timeoutMs.
-    const deadline = setTimeout(() => {
-      if (!settled) req.destroy(new Error("timeout"));
-    }, Math.max(1, Number(timeoutMs) || 300_000));
-    if (typeof deadline.unref === "function") deadline.unref();
+    // `req` is HOISTED and the deadline callback GUARDS on it (council Codex P1): lib.request can throw
+    // SYNCHRONOUSLY (an env key with a newline -> ERR_INVALID_CHAR). A deadline that closed over an
+    // un-initialized `const req` would, on firing, raise an uncaught ReferenceError and crash a
+    // long-running audit minutes after the handled error. `let req = null` + a null-guard prevents that.
+    let req = null;
     const done = (fn, arg) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
       fn(arg);
     };
-    const req = lib.request(
+    const deadline = setTimeout(() => {
+      if (!settled && req) {
+        try { req.destroy(new Error("timeout")); } catch { /* already torn down */ }
+      }
+    }, Math.max(1, Number(timeoutMs) || 300_000));
+    if (typeof deadline.unref === "function") deadline.unref();
+    try {
+      req = lib.request(
       u,
       { method: "POST", headers: { "content-type": "application/json", "content-length": data.length, ...headers }, timeout: timeoutMs },
       (res) => {
         let body = "";
         let capped = false;
         res.on("data", (c) => {
-          if (body.length < RESPONSE_CAP) body += c;
-          else if (!capped) {
-            // response exceeds the cap → stop reading and abort immediately rather than draining an
-            // unbounded (possibly adversarial) body to 'end'.
+          if (capped) return;
+          // Append THEN check (council Codex P2): checking before appending let a large final chunk land
+          // fully past the cap. Keep a bounded slice, stop reading, and abort. (length is UTF-16 units, a
+          // deliberate over-approximation for a backstop, not a byte-exact limit.)
+          body += c;
+          if (body.length >= RESPONSE_CAP) {
             capped = true;
             res.destroy();
-            done(resolve, { status: res.statusCode ?? 0, body, capped });
+            done(resolve, { status: res.statusCode ?? 0, body: body.slice(0, RESPONSE_CAP), capped });
           }
         });
         res.on("error", (e) => done(reject, e));
         res.on("end", () => done(resolve, { status: res.statusCode ?? 0, body, capped }));
       }
     );
-    req.on("error", (e) => done(reject, e));
-    req.on("timeout", () => {
-      req.destroy(new Error("timeout"));
-    });
-    req.end(data);
+      req.on("error", (e) => done(reject, e));
+      req.on("timeout", () => {
+        try { req.destroy(new Error("timeout")); } catch { /* already torn down */ }
+      });
+      req.end(data);
+    } catch (e) {
+      // a SYNCHRONOUS failure of lib.request/req.end (bad header char, etc.) -> settle + clear the deadline
+      done(reject, e instanceof Error ? e : new Error(String(e)));
+    }
   });
 }
 
