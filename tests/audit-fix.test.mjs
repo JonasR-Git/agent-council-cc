@@ -509,6 +509,18 @@ test("coverage gate: a fix whose changed lines ARE covered commits normally", as
   assert.equal(out.fixed.length, 1);
 });
 
+test("coverage gate: a pure DELETION (no changed lines) is EXEMPT, not reverted (council audit — sibling-gate parity)", async () => {
+  // git --unified=0 emits a 0-new-side hunk for a deletion → diffLines returns []; coverageOfLines([]) is
+  // fail-closed allCovered:false, which previously reverted EVERY deletion-only fix with a "(0 uncovered)"
+  // reason. A deletion has no new line to execute → the coverage gate must not apply.
+  const git = fakeGit();
+  git.diffLines = () => []; // pure deletion
+  const coverage = new Map([["a.mjs", new Set([1, 2])]]);
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "remove dead code", lens: "dead_code" })], {}, { coverage }, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]) }));
+  assert.equal(out.fixed.length, 1, "the deletion-only fix commits (coverage gate exempts it)");
+  assert.equal(out.rejected.length, 0, "not reverted with a nonsensical (0 uncovered) reason");
+});
+
 test("runAuditFix reverts + fails a fix when tests go red", async () => {
   const git = fakeGit();
   const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix" })], {}, {}, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]), runTests: async () => ({ ok: false, output: "1 failing" }) }));

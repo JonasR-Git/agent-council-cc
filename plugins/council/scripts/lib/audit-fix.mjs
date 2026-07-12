@@ -692,7 +692,12 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           // actually exercised. Uses coverage produced once before the run (options.coverage).
           if (options.coverage) {
             const changedLines = typeof git.diffLines === "function" ? git.diffLines(task.file, snapshot) : [];
-            const cov = coverageOfLines(options.coverage, task.file, changedLines);
+            // A pure DELETION has NO new/modified lines (git --unified=0 emits a 0-new-side hunk →
+            // parseDiffLines returns []). coverageOfLines([]) is fail-closed allCovered:false, which would
+            // revert EVERY deletion-only fix to propose-only with a self-contradictory "(0 uncovered)"
+            // reason. The sibling gates deliberately exempt deletions (audit-multifix guards `lines.length`,
+            // chartest only enforces coverage when new lines exist) — mirror them here (council audit P1/P2).
+            const cov = changedLines.length === 0 ? { allCovered: true, uncovered: [] } : coverageOfLines(options.coverage, task.file, changedLines);
             if (!cov.allCovered) {
               git.resetHard(snapshot);
               rejected.push({ finding, reason: `changed lines not executed by any test (${cov.uncovered.length} uncovered) → propose-only` });
