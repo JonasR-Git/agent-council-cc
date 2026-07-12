@@ -8,17 +8,24 @@ import path from "node:path";
 
 import { acceptCharTestForTarget, isRefactorClass, verifyCharTestAfterFix } from "./chartest-gate.mjs";
 import { makeNodeCharHarness } from "./chartest-node-harness.mjs";
-import { makeSeatRunners } from "./seats.mjs";
+import { activeSeatNames, makeSeatRunners } from "./seats.mjs";
 import { runCommandAsync } from "./process.mjs";
 
 // The transient test file lives BESIDE the target (so a "./basename" import resolves) with a clear,
-// council-owned, dotfile name — it is created, run, and DELETED within each phase, never committed. The
-// dot prefix + `node --test <specific file>` (not a glob) keep it out of the user's own test discovery.
-function transientTestPath(root, file) {
+// council-owned, dotfile name — created, run, and DELETED within each phase, never committed. Two guards:
+//  - the derived base STRIPS any .test/.spec marker AND the extension, so the name can NEVER match node's
+//    default `**/*.test.?(c|m)js` discovery even when the TARGET is itself a test file (council Claude P2);
+//  - a UNIQUIFIER + existence check picks a free `.i` slot, so we never overwrite/delete a pre-existing
+//    (gitignored) file of the same name — git rollback can't restore ignored data (council Codex P2).
+function transientTestPath(root, file, exists) {
   const abs = path.join(root, file);
   const dir = path.dirname(abs);
-  const base = path.basename(abs).replace(/\.[cm]?[jt]sx?$/i, "");
-  return path.join(dir, `.council-chartest.${base}.mjs`);
+  const base = path.basename(abs).replace(/\.[cm]?[jt]sx?$/i, "").replace(/[._-](test|spec)$/i, "") || "target";
+  for (let i = 0; i < 1000; i += 1) {
+    const p = path.join(dir, `.council-chartest-${i}.${base}.mjs`);
+    if (!exists(p)) return p;
+  }
+  return null; // 1000 collisions is absurd → caller fails closed (propose-only)
 }
 
 /**
@@ -42,15 +49,21 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
   // this run's executesChanged check (council Grok P2 — stale coverage false-pass); rmDir tears it down.
   const freshDir = deps.freshDir ?? ((d) => { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* */ } try { fs.mkdirSync(d, { recursive: true }); } catch { /* */ } return d; });
   const rmDir = deps.rmDir ?? ((d) => { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } });
+  const exists = deps.exists ?? ((p) => fs.existsSync(p));
   const timeoutMs = Number(options.charTestTimeoutMs) || 60_000;
 
-  // The generator seat: default to the first active seat (model-agnostic — the critic writes a test, not
-  // code). Returns a generate(prompt)->stdout, or null when no seat is reachable.
+  // The generator seat: the first ACTIVE seat (availability + skips honoured), model-agnostic — the critic
+  // writes a test, not code. Returns a generate(prompt)->stdout, or NULL when no seat is active (council
+  // Codex/Claude P2: the old Object.keys(runners)[0] was ALWAYS 'codex' regardless of availability, so a
+  // --skip-codex / codex-down run silently produced empty tests + a dead null-return path). resolveCharTestGate
+  // then fails loud on null rather than running the gate silently disabled.
   const generate = deps.generate ?? (() => {
+    const active = activeSeatNames(backends, options);
+    if (!active.length) return null;
     const runners = makeSeatRunners(cwd, backends, options);
-    const first = Object.keys(runners)[0];
-    if (!first) return null;
-    return (prompt) => runners[first](prompt).then((r) => (r && !r.skipped && r.status === 0 ? String(r.stdout ?? "") : ""));
+    const seat = active.find((s) => typeof runners[s] === "function");
+    if (!seat) return null;
+    return (prompt) => runners[seat](prompt).then((r) => (r && !r.skipped && r.status === 0 ? String(r.stdout ?? "") : ""));
   })();
   if (typeof generate !== "function") return null;
 
@@ -65,7 +78,8 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
     // executesTarget maps to executesModule here. The transient test + coverage dir are deleted before
     // returning so the tree is clean for applyFix.
     accept: async ({ file, source }) => {
-      const testFile = transientTestPath(root, file);
+      const testFile = transientTestPath(root, file, exists);
+      if (!testFile) return { accepted: false, reason: "could not allocate a transient char-test path (collisions) → propose-only" };
       const coverageDir = freshDir(mkCoverageDir(testFile));
       const h = makeNodeCharHarness({ cwd: root, testFile, targetFile: file, source, runCommand, readCoverage, coverageDir, timeoutMs });
       const acceptHarness = { ...h, executesTarget: h.executesModule };
@@ -82,24 +96,28 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
         removeFile(testFile);
         rmDir(coverageDir);
       }
-      // carry the generated code forward so verify can re-materialise the SAME test post-apply
-      return { accepted: res.accepted, reason: res.reason, code: res.code, testFile };
+      // carry the generated code + the baseline observable forward so verify can re-materialise the SAME
+      // test post-apply and compare the observable (the load-bearing behaviour-preservation check)
+      return { accepted: res.accepted, reason: res.reason, code: res.code, baseline: res.baseline, testFile };
     },
 
     // VERIFY (post-apply tree): re-materialise the accepted test, require it STILL passes AND — for an
     // addition/modification — covers the changed lines, then delete it. A pure DELETION has no new lines
     // to cover (council Grok P2: dead_code deletions), so the changed-line bar is skipped there; the
     // still-green check alone attests behaviour preservation. Mutation gate stays OPTIONAL.
-    verify: async ({ file, source, code, changedLines }) => {
-      const testFile = transientTestPath(root, file);
+    verify: async ({ file, source, code, baseline, changedLines }) => {
       if (!code) return { pass: false, reason: "no accepted char-test to verify" };
+      const testFile = transientTestPath(root, file, exists);
+      if (!testFile) return { pass: false, reason: "could not allocate a transient char-test path (collisions) → propose-only" };
       writeFile(testFile, code);
       const coverageDir = freshDir(mkCoverageDir(testFile));
       const harness = makeNodeCharHarness({ cwd: root, testFile, targetFile: file, changedLines, source, runCommand, readCoverage, coverageDir, timeoutMs });
       const hasNewLines = Array.isArray(changedLines) && changedLines.length > 0;
       try {
-        return await verifyCharTestAfterFix({ accepted: true, testPath: testFile }, {
+        return await verifyCharTestAfterFix({ accepted: true, testPath: testFile, baseline }, {
           runAccepted: harness.passesOnUnmodified, // "passes on the CURRENT (post-refactor) tree" = behaviour preserved
+          // the LOAD-BEARING check: the observable must match the accepted baseline (harness = oracle)
+          observe: async () => { const o = await harness.runs(1); return Array.isArray(o) && o.length ? o[0] : null; },
           // only require changed-line coverage when the refactor ADDED/MODIFIED lines; a pure deletion has none
           executesChanged: hasNewLines ? harness.executesTarget : undefined
         });

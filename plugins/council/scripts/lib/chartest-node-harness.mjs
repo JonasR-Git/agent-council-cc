@@ -8,6 +8,26 @@
 // duration_ms. Pure helpers (captureObservable, changedLinesCovered) are exported + unit-tested; the
 // subprocess/fs orchestration is injected (runCommand/readCoverage) so it stays testable and fail-closed.
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Normalize a coverage script URL / a path to a comparable absolute form. Uses fileURLToPath so a
+// percent-encoded file:// URL (e.g. a repo path with a space → %20) DECODES to the real path (council
+// Codex/Claude P2 — otherwise the target is never found and every refactor silently fails closed). On
+// win32 the compare is case-insensitive (V8 `/c:/…` vs a `C:\…` cwd).
+function normPath(u) {
+  let p = String(u ?? "");
+  try {
+    if (p.startsWith("file:")) p = fileURLToPath(p);
+  } catch {
+    /* fall through with the raw string */
+  }
+  try {
+    p = path.resolve(p);
+  } catch {
+    /* keep p */
+  }
+  return process.platform === "win32" ? p.toLowerCase() : p;
+}
 
 /**
  * Isolate the characterization OBSERVABLE from a `node --test` run's stdout: the lines the test printed
@@ -32,42 +52,45 @@ export function captureObservable(stdout) {
   return out.join("\n");
 }
 
-/** Convert a character OFFSET in `source` to a 1-based line number (for V8 range → line mapping). */
-function offsetToLine(source, offset) {
-  let line = 1;
-  const end = Math.min(offset, source.length);
-  for (let i = 0; i < end; i += 1) if (source[i] === "\n") line += 1;
-  return line;
+/** 0-based line index → the character OFFSET at which that line starts, for `source`. */
+function lineStartOffsets(source) {
+  const starts = [0];
+  for (let i = 0; i < source.length; i += 1) if (source[i] === "\n") starts.push(i + 1);
+  return starts;
 }
 
 /**
- * Best-effort check that the test EXECUTED the target's changed lines, from a V8 coverage document
- * (NODE_V8_COVERAGE). For the target file's script, every function range with count>0 marks its
- * [startLine,endLine] covered; the changed lines must all fall in a covered range. Fail-CLOSED: if the
- * target script is absent from the coverage (the test never loaded it) or NO changed line is covered, it
- * returns false. An EMPTY changedLines list can't be verified → returns false (the caller must supply the
- * diff lines; a refactor with no known changed lines shouldn't pass the "executes the change" bar blind).
+ * Check that the test EXECUTED the target's changed lines, from a V8 coverage document (NODE_V8_COVERAGE),
+ * with INNERMOST-RANGE-WINS semantics (council Codex/Claude P1): V8 ranges are NESTED — a called function's
+ * outer range has count>0 and spans its whole body, while count:0 sub-ranges carve out its never-taken
+ * branches. Unioning only count>0 ranges wrongly marks a changed line inside an unexecuted branch covered
+ * (→ a behaviour change there false-greens). So for each changed line we find the SMALLEST range that
+ * contains its start offset and honour THAT range's count. Fail-CLOSED: target absent, empty changedLines,
+ * or any changed line whose innermost range is count:0 (or uncovered) → false.
  */
 export function changedLinesCovered(coverageDoc, absTargetPath, source, changedLines) {
   const changed = (Array.isArray(changedLines) ? changedLines : []).filter((n) => Number.isFinite(n));
   if (changed.length === 0) return false;
-  const results = coverageDoc?.result ?? [];
-  const norm = (u) => {
-    try { return path.resolve(u.startsWith("file:") ? new URL(u).pathname.replace(/^\/([A-Za-z]:)/, "$1") : u); } catch { return u; }
-  };
-  const target = norm(absTargetPath);
-  const script = results.find((r) => norm(String(r.url ?? "")) === target);
+  const target = normPath(absTargetPath);
+  const script = (coverageDoc?.result ?? []).find((r) => normPath(String(r.url ?? "")) === target);
   if (!script) return false;
-  const coveredLines = new Set();
-  for (const fn of script.functions ?? []) {
-    for (const range of fn.ranges ?? []) {
-      if ((range.count ?? 0) <= 0) continue;
-      const from = offsetToLine(source, range.startOffset ?? 0);
-      const to = offsetToLine(source, range.endOffset ?? 0);
-      for (let l = from; l <= to; l += 1) coveredLines.add(l);
-    }
+  const ranges = [];
+  for (const fn of script.functions ?? []) for (const rg of fn.ranges ?? []) {
+    if (Number.isFinite(rg.startOffset) && Number.isFinite(rg.endOffset)) ranges.push(rg);
   }
-  return changed.every((l) => coveredLines.has(l));
+  if (ranges.length === 0) return false;
+  const starts = lineStartOffsets(String(source ?? ""));
+  const covered = (line) => {
+    const off = starts[line - 1];
+    if (off == null) return false;
+    let best = null; // the innermost (smallest-width) range containing this offset
+    for (const rg of ranges) {
+      if (off < rg.startOffset || off >= rg.endOffset) continue;
+      if (!best || rg.endOffset - rg.startOffset < best.endOffset - best.startOffset) best = rg;
+    }
+    return best != null && (best.count ?? 0) > 0;
+  };
+  return changed.every(covered);
 }
 
 /**
@@ -105,7 +128,11 @@ export function makeNodeCharHarness({ cwd, testFile, targetFile, changedLines = 
       return outs;
     },
     perturbedRun: async () => {
-      // Vary clock/locale so a hidden TZ/locale dependence the same-process repeat can't see surfaces.
+      // Vary LOCALE + TIMEZONE so a hidden TZ/locale dependence the same-process repeat can't see
+      // surfaces. NOTE (council nit): this does NOT seed the RNG or fake the wall clock — Math.random()
+      // and Date.now() dependence are instead caught by the N-run DETERMINISM check (they differ across
+      // separate-process repeats). So the guarantee is "locale/TZ-perturbed + cross-run deterministic",
+      // not a fixed-seed harness.
       const r = await runOnce({ TZ: "Pacific/Kiritimati", LANG: "de_DE.UTF-8", LC_ALL: "de_DE.UTF-8" });
       if (r.timedOut || r.status !== 0) return null; // differs from a captured string → acceptCharTest rejects
       return captureObservable(r.stdout);
@@ -129,9 +156,10 @@ export function makeNodeCharHarness({ cwd, testFile, targetFile, changedLines = 
       if (!r || r.timedOut || r.status !== 0) return false;
       const doc = readCoverage(coverageDir);
       const abs = path.isAbsolute(targetFile) ? targetFile : path.join(cwd, targetFile);
-      const norm = (u) => { try { return path.resolve(u.startsWith("file:") ? new URL(u).pathname.replace(/^\/([A-Za-z]:)/, "$1") : u); } catch { return u; } };
-      const script = (doc?.result ?? []).find((s) => norm(String(s.url ?? "")) === path.resolve(abs));
+      const script = (doc?.result ?? []).find((s) => normPath(String(s.url ?? "")) === normPath(abs));
       if (!script) return false;
+      // ≥1 target function actually ran (a count>0 range that is NOT the whole-script outer wrapper) —
+      // "imported unused" leaves only the outer count and count:0 function bodies.
       return (script.functions ?? []).some((fn) => (fn.ranges ?? []).some((rg) => (rg.count ?? 0) > 0));
     }
   };

@@ -72,17 +72,39 @@ export function buildCharTestPrompt(file, source, { runtime = "node", importPath
  * body that neither imports node:test nor asserts, yields null (the gate then refuses to run — a
  * missing/garbage test can never authorise a refactor). Returns { code } or null.
  */
+// Modules the generated test may import: the test runner, the assert lib, and the target itself
+// (a relative ./ or ../ specifier). ANYTHING else is refused (council Claude P1 — defence in depth over
+// the runtime sandbox: statically deny child_process/fs/net/etc. before the code is ever executed).
+const ALLOWED_IMPORT = /^(node:test|node:assert(?:\/strict)?|\.\.?\/)/;
+// Constructs a characterization test never needs, and a prompt-injected one would use to run/exfil.
+const DANGEROUS_CODE = /\b(child_process|node:(fs|net|http|https|dgram|dns|tls|worker_threads|vm|module|cluster|inspector|repl|process)\b|process\.binding|require\s*\(\s*['"]node:(?!test|assert))|\beval\s*\(|new\s+Function\s*\(|\bimport\s*\(/;
+// A DISCRIMINATING assertion: a value comparison, not a tautology. `assert.ok(true)` / `assert(1)` do NOT
+// tie the pinned observable to a check, so they are rejected (council Claude P1 — assertion strength).
+const COMPARE_ASSERT = /\bassert\s*\.\s*(equal|strictEqual|deepEqual|deepStrictEqual|notEqual|notStrictEqual|notDeepEqual|match)\b/;
+
+/**
+ * Extract the generated test body from a fenced reply. Fail-CLOSED — returns null (the gate then refuses
+ * to run; a missing/garbage/unsafe test can never authorise a refactor) when the reply:
+ *   - has no code, or is not a node:test file;
+ *   - imports anything beyond node:test / node:assert / the relative target (a static import denylist,
+ *     complementing the runtime permission sandbox), or uses eval/Function/dynamic-import/process.binding;
+ *   - lacks a DISCRIMINATING (value-comparison) assertion — a bare assert.ok(true) pins nothing.
+ */
 export function parseCharTest(stdout) {
   const text = String(stdout ?? "");
   const fence = text.match(/```(?:js|javascript|mjs)?\s*\n([\s\S]*?)```/i);
   const code = (fence ? fence[1] : text).trim();
   if (!code) return null;
-  // Must look like a real node:test file with at least one assertion — a body that imports nothing or
-  // asserts nothing is not a characterization test (anti-vacuity at the STATIC level; acceptCharTest's
-  // runtime anti-vacuity catches a test that runs but emits nothing).
   const hasTest = /node:test|require\(['"]node:test['"]\)|\btest\s*\(/.test(code);
-  const hasAssert = /node:assert|\bassert\b/.test(code);
-  if (!hasTest || !hasAssert) return null;
+  if (!hasTest) return null;
+  if (DANGEROUS_CODE.test(code)) return null; // child_process/fs/net/eval/dynamic-import → reject
+  // every static import/require specifier must be on the allowlist
+  const specRe = /(?:\bfrom\s*|\brequire\s*\(\s*)['"]([^'"]+)['"]/g;
+  let m;
+  while ((m = specRe.exec(code))) {
+    if (!ALLOWED_IMPORT.test(m[1])) return null; // an import outside {node:test, node:assert, ./target}
+  }
+  if (!COMPARE_ASSERT.test(code)) return null; // no value-comparison assertion → not discriminating
   return { code };
 }
 
@@ -111,7 +133,7 @@ export async function acceptCharTestForTarget(file, source, deps = {}) {
     return { accepted: false, reason: `char-test generator failed: ${String(err?.message ?? err)}` };
   }
   const parsed = parseCharTest(stdout);
-  if (!parsed) return { accepted: false, reason: "generated char-test was empty / not a real node:test with an assertion → propose-only" };
+  if (!parsed) return { accepted: false, reason: "generated char-test was empty / unsafe / not a discriminating node:test → propose-only" };
   let testPath;
   try {
     testPath = await writeTest(parsed.code);
@@ -119,7 +141,21 @@ export async function acceptCharTestForTarget(file, source, deps = {}) {
     return { accepted: false, reason: `could not write the generated char-test: ${String(err?.message ?? err)}` };
   }
   const verdict = await acceptCharTest(harness, { reruns });
-  return { accepted: verdict.accept, reason: verdict.reason, testPath, code: parsed.code };
+  if (!verdict.accept) return { accepted: false, reason: verdict.reason, testPath, code: parsed.code };
+  // CAPTURE the accepted BASELINE observable (council Codex/Claude P1): verify will re-capture it after
+  // the refactor and require it to be IDENTICAL. This makes the harness itself the behaviour oracle — a
+  // change the target produces is caught even if the model's own assertion is tautological (assert.equal
+  // (x,x)). The determinism check already proved the observable is stable, so any single run is the
+  // baseline; a fault capturing it is fail-closed (empty baseline → verify's compare will reject).
+  let baseline = null;
+  try {
+    const one = await harness.runs(1);
+    baseline = Array.isArray(one) && one.length ? one[0] : null;
+  } catch {
+    baseline = null;
+  }
+  if (baseline == null || baseline === "") return { accepted: false, reason: "could not capture a baseline observable to pin behaviour → propose-only", testPath, code: parsed.code };
+  return { accepted: verdict.accept, reason: verdict.reason, testPath, code: parsed.code, baseline };
 }
 
 /**
@@ -131,6 +167,9 @@ export async function acceptCharTestForTarget(file, source, deps = {}) {
  *      AND — when a mutation harness is supplied — the changed lines + callers must survive mutation.
  * `verifyDeps`:
  *   - runAccepted() -> bool                 (run the accepted test against the POST-refactor code)
+ *   - observe?() -> string                  (re-capture the observable post-refactor; MUST equal the
+ *                                            accepted baseline — the harness, not the model's assertion,
+ *                                            is the behaviour oracle, so a tautological test can't false-green)
  *   - executesChanged?() -> bool            (the accepted test covers the now-known CHANGED lines; the
  *                                            diff is only known post-apply, so this coverage check lives
  *                                            here, not in the pre-apply accept — when supplied it MUST pass)
@@ -139,7 +178,7 @@ export async function acceptCharTestForTarget(file, source, deps = {}) {
  */
 export async function verifyCharTestAfterFix(accepted, verifyDeps = {}) {
   if (!accepted?.accepted) return { pass: false, reason: accepted?.reason ?? "char-test not accepted", testPath: accepted?.testPath };
-  const { runAccepted, executesChanged, mutation } = verifyDeps;
+  const { runAccepted, observe, executesChanged, mutation } = verifyDeps;
   if (typeof runAccepted !== "function") return { pass: false, reason: "char-test verify harness incomplete (missing runAccepted)", testPath: accepted.testPath };
   let stillGreen;
   try {
@@ -148,6 +187,19 @@ export async function verifyCharTestAfterFix(accepted, verifyDeps = {}) {
     return { pass: false, reason: `char-test re-run failed: ${String(err?.message ?? err)}`, testPath: accepted.testPath };
   }
   if (!stillGreen) return { pass: false, reason: "the characterization test went RED after the refactor — behaviour changed → revert to propose-only", testPath: accepted.testPath };
+  // OBSERVABLE COMPARISON (council Codex/Claude P1 — the load-bearing behaviour check): the post-refactor
+  // observable must be byte-identical to the accepted baseline. This catches a behaviour change the
+  // model's (possibly tautological) assertion would miss. Requires a baseline was captured at accept.
+  if (typeof observe === "function") {
+    if (accepted.baseline == null) return { pass: false, reason: "no baseline observable captured at accept → cannot attest preservation → propose-only", testPath: accepted.testPath };
+    let now;
+    try {
+      now = await observe();
+    } catch (err) {
+      return { pass: false, reason: `char-test observable re-capture failed: ${String(err?.message ?? err)}`, testPath: accepted.testPath };
+    }
+    if (now !== accepted.baseline) return { pass: false, reason: "the target's observable changed across the refactor (baseline != post-fix) — behaviour NOT preserved → propose-only", testPath: accepted.testPath };
+  }
   if (typeof executesChanged === "function") {
     let covers;
     try {

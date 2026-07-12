@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { makeCharTestGate } from "../plugins/council/scripts/lib/chartest-wiring.mjs";
+
+const TARGET_URL = pathToFileURL(path.resolve("/r/m.mjs")).href; // a real file:// URL (correct slashes/drive)
 
 const GEN_OK = '```js\nimport test from "node:test";\nimport assert from "node:assert";\ntest("f", () => { console.log(JSON.stringify(42)); assert.equal(42, 42); });\n```';
 
@@ -18,11 +21,12 @@ function baseDeps(overrides = {}) {
     removeFile: (p) => files.delete(p),
     // covered target module (a count>0 function range for /r/m.mjs) so accept's executesModule + verify's
     // executesChanged pass; the url matches path.resolve("/r/m.mjs") after normalization
-    readCoverage: () => ({ result: [{ url: `file://${path.resolve("/r/m.mjs").replace(/\\/g, "/")}`, functions: [{ ranges: [{ startOffset: 0, endOffset: 9999, count: 1 }] }] }] }),
+    readCoverage: () => ({ result: [{ url: TARGET_URL, functions: [{ ranges: [{ startOffset: 0, endOffset: 9999, count: 1 }] }] }] }),
     // no-op fs: keep the test off the real filesystem
     freshDir: (d) => d,
     rmDir: () => {},
     mkCoverageDir: () => "/covdir",
+    exists: () => false, // transient path slot .0 is always free
     _files: files,
     ...overrides
   };
@@ -40,6 +44,7 @@ test("makeCharTestGate.accept generates + pins behaviour, then DELETES the trans
   const res = await g.accept({ file: "m.mjs", source: "export const f = () => 42;" });
   assert.equal(res.accepted, true, "a deterministic, non-vacuous test is accepted");
   assert.ok(res.code && /node:test/.test(res.code), "the generated test code is carried forward");
+  assert.equal(res.baseline, '{"v":42}', "the accepted BASELINE observable is captured for the verify-phase compare");
   assert.equal(deps._files.size, 0, "the transient test file is removed → the tree is clean for applyFix");
 });
 
@@ -56,27 +61,37 @@ test("makeCharTestGate.accept rejects a NON-deterministic target (observable dif
   assert.equal(res.accepted, false, "flaky observable → not accepted");
 });
 
-test("makeCharTestGate.verify passes when the test stays green + covers the changed lines; deletes the test", async () => {
+test("makeCharTestGate.verify passes when the test stays green, the observable matches the baseline + covers the changed lines", async () => {
   const deps = baseDeps();
   const g = makeCharTestGate("/r", {}, {}, deps);
-  const res = await g.verify({ file: "m.mjs", source: "export const f = () => 42;", code: "import test from 'node:test';", changedLines: [1] });
+  const res = await g.verify({ file: "m.mjs", source: "export const f = () => 42;", code: "import test from 'node:test';", baseline: '{"v":42}', changedLines: [1] });
   assert.equal(res.pass, true);
   assert.equal(deps._files.size, 0, "the transient test file is removed after verify");
 });
 
-test("makeCharTestGate.verify: a pure DELETION (empty changedLines) skips the changed-line bar (dead_code; council Grok P2)", async () => {
+test("makeCharTestGate.verify REVERTS when the OBSERVABLE changed even though the test stays green (council Codex/Claude P1 — tautology-proof)", async () => {
+  // runPass emits {"v":42}; the accepted baseline was {"v":7} → the target's observable changed across the
+  // refactor. The test still exits 0 (a tautological assertion), but the harness-captured observable is
+  // the behaviour oracle → revert.
+  const g = makeCharTestGate("/r", {}, {}, baseDeps());
+  const res = await g.verify({ file: "m.mjs", source: "x", code: "import test from 'node:test';", baseline: '{"v":7}', changedLines: [1] });
+  assert.equal(res.pass, false, "observable != baseline → behaviour not preserved → revert");
+  assert.match(res.reason, /observable changed/);
+});
+
+test("makeCharTestGate.verify: a pure DELETION (empty changedLines) skips the changed-line bar (dead_code; council Grok/Codex P2)", async () => {
   // a dead-code deletion has no NEW lines to cover; requiring changed-line coverage would ALWAYS revert
-  // it. The still-green check alone attests behaviour preservation. Force coverage to FAIL to prove it is
-  // not consulted for a deletion.
-  const deps = baseDeps({ readCoverage: () => ({ result: [] }) }); // executesChanged would be false if consulted
+  // it. The still-green + observable-match checks attest preservation. Force coverage to FAIL to prove the
+  // changed-line bar is not consulted for a deletion.
+  const deps = baseDeps({ readCoverage: () => ({ result: [] }) });
   const g = makeCharTestGate("/r", {}, {}, deps);
-  const res = await g.verify({ file: "m.mjs", source: "x", code: "import test from 'node:test';", changedLines: [] });
-  assert.equal(res.pass, true, "deletion-only: green test is enough; the changed-line bar is skipped");
+  const res = await g.verify({ file: "m.mjs", source: "x", code: "import test from 'node:test';", baseline: '{"v":42}', changedLines: [] });
+  assert.equal(res.pass, true, "deletion-only: green + observable-match is enough; the changed-line bar is skipped");
 });
 
 test("makeCharTestGate.verify FAILS (revert) when the test goes red after the refactor", async () => {
   const g = makeCharTestGate("/r", {}, {}, baseDeps({ runCommand: async () => ({ status: 1, stdout: "not ok 1", timedOut: false }) }));
-  const res = await g.verify({ file: "m.mjs", source: "x", code: "import test from 'node:test';", changedLines: [1] });
+  const res = await g.verify({ file: "m.mjs", source: "x", code: "import test from 'node:test';", baseline: '{"v":42}', changedLines: [1] });
   assert.equal(res.pass, false, "a red test after the refactor → behaviour changed → revert");
 });
 

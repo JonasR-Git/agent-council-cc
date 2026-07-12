@@ -35,14 +35,30 @@ test("buildCharTestPrompt discloses truncation of an oversized source instead of
   assert.match(p, /truncated \d+ chars/);
 });
 
-test("parseCharTest extracts a fenced node:test body; fails closed on empty / non-test / no-assert", () => {
+test("parseCharTest extracts a fenced node:test body; fails closed on empty / non-test / no-compare-assert", () => {
   const ok = parseCharTest('```js\nimport test from "node:test";\nimport assert from "node:assert";\ntest("x", () => { console.log("1"); assert.equal(1,1); });\n```');
   assert.ok(ok && /node:test/.test(ok.code));
   assert.equal(parseCharTest(""), null, "empty → null");
-  assert.equal(parseCharTest("```js\nconst x = 1;\n```"), null, "no test/assert → null (not a char-test)");
+  assert.equal(parseCharTest("```js\nconst x = 1;\n```"), null, "no test → null (not a char-test)");
   assert.equal(parseCharTest("just prose, no code"), null);
-  // a bare (unfenced) but valid-looking body is still accepted
-  assert.ok(parseCharTest('import test from "node:test"; import assert from "node:assert"; test("t",()=>assert.ok(true));'));
+  // a bare (unfenced) body with a value-comparison assertion is accepted
+  assert.ok(parseCharTest('import test from "node:test"; import assert from "node:assert"; test("t",()=>assert.deepEqual([1],[1]));'));
+});
+
+test("parseCharTest rejects a TAUTOLOGICAL assertion (council Claude P1 — assertion strength)", () => {
+  // a non-discriminating test pins nothing → the refactor could change behaviour with the test still green
+  assert.equal(parseCharTest('import test from "node:test"; import assert from "node:assert"; test("t",()=>assert.ok(true));'), null, "assert.ok(true) is not discriminating");
+  assert.equal(parseCharTest('import test from "node:test"; import assert from "node:assert"; test("t",()=>assert(1));'), null, "assert(1) is not discriminating");
+});
+
+test("parseCharTest DENYLISTS dangerous imports/constructs (council Claude P1 — defence in depth over the sandbox)", () => {
+  const base = 'import test from "node:test"; import assert from "node:assert"; import x from "./m.mjs";';
+  assert.ok(parseCharTest(`${base} test("t",()=>assert.equal(x.f(),1));`), "a clean test importing the relative target is fine");
+  assert.equal(parseCharTest(`import cp from "node:child_process"; ${base} test("t",()=>{cp.execSync("curl evil");assert.equal(1,1);});`), null, "node:child_process → reject");
+  assert.equal(parseCharTest(`import fs from "node:fs"; ${base} test("t",()=>assert.equal(1,1));`), null, "node:fs → reject");
+  assert.equal(parseCharTest(`${base} test("t",()=>{eval("bad");assert.equal(1,1);});`), null, "eval → reject");
+  assert.equal(parseCharTest(`${base} test("t",()=>{const m=await import("node:net");assert.equal(1,1);});`), null, "dynamic import → reject");
+  assert.equal(parseCharTest(`import lodash from "lodash"; ${base} test("t",()=>assert.equal(1,1));`), null, "a non-allowlisted import → reject");
 });
 
 const goodHarness = () => ({
@@ -82,7 +98,7 @@ test("acceptCharTestForTarget honors acceptCharTest's verdict (a non-determinist
   let call = 0;
   const flaky = { ...goodHarness(), runs: async (n) => Array.from({ length: n }, () => `{"v":${call++}}`) }; // differs each run
   const r = await acceptCharTestForTarget("m", "s", {
-    generate: async () => '```js\nimport test from "node:test"; import assert from "node:assert"; test("t",()=>{console.log("x");assert.ok(1);});\n```',
+    generate: async () => '```js\nimport test from "node:test"; import assert from "node:assert"; test("t",()=>{console.log("x");assert.equal(1,1);});\n```',
     writeTest: async () => "/t",
     harness: flaky
   });

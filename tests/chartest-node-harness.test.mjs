@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { captureObservable, changedLinesCovered, makeNodeCharHarness } from "../plugins/council/scripts/lib/chartest-node-harness.mjs";
+
+const fileUrl = (p) => pathToFileURL(path.resolve(p)).href; // a correct file:// URL for any platform
 
 test("captureObservable isolates JSON observable lines from TAP + volatile timing noise", () => {
   const stdout = [
@@ -28,12 +31,12 @@ test("captureObservable isolates JSON observable lines from TAP + volatile timin
 test("changedLinesCovered: true only when the target's CHANGED lines fall in a covered function range", () => {
   const source = "line1\nline2\nline3\nline4\nline5\n"; // offsets: L1=0-5, L2=6-11, L3=12-17, L4=18-23, L5=24-29
   const abs = path.resolve("/repo/lib/m.mjs");
-  const doc = { result: [{ url: `file://${abs.replace(/\\/g, "/")}`, functions: [{ ranges: [{ startOffset: 6, endOffset: 17, count: 3 }] }] }] };
+  const doc = { result: [{ url: fileUrl(abs), functions: [{ ranges: [{ startOffset: 6, endOffset: 17, count: 3 }] }] }] };
   assert.equal(changedLinesCovered(doc, abs, source, [2, 3]), true, "lines 2-3 are in the covered range");
   assert.equal(changedLinesCovered(doc, abs, source, [5]), false, "line 5 is outside every count>0 range");
   assert.equal(changedLinesCovered(doc, abs, source, []), false, "no changed lines → can't verify → fail closed");
   assert.equal(changedLinesCovered({ result: [] }, abs, source, [2]), false, "target absent from coverage → fail closed");
-  const uncovered = { result: [{ url: `file://${abs.replace(/\\/g, "/")}`, functions: [{ ranges: [{ startOffset: 6, endOffset: 17, count: 0 }] }] }] };
+  const uncovered = { result: [{ url: fileUrl(abs), functions: [{ ranges: [{ startOffset: 6, endOffset: 17, count: 0 }] }] }] };
   assert.equal(changedLinesCovered(uncovered, abs, source, [2]), false, "a count:0 range does not cover");
 });
 
@@ -60,7 +63,7 @@ test("makeNodeCharHarness.runs captures n deterministic observables; a mid-run f
 test("makeNodeCharHarness.executesTarget fails closed without a coverage reader, passes when changed lines covered", async () => {
   const source = "a\nb\nc\n";
   const abs = path.resolve("/r/m.mjs");
-  const doc = { result: [{ url: `file://${abs.replace(/\\/g, "/")}`, functions: [{ ranges: [{ startOffset: 0, endOffset: 5, count: 1 }] }] }] };
+  const doc = { result: [{ url: fileUrl(abs), functions: [{ ranges: [{ startOffset: 0, endOffset: 5, count: 1 }] }] }] };
   const noReader = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [1], source, runCommand: okRun("ok 1") });
   assert.equal(await noReader.executesTarget(), false, "no readCoverage/coverageDir → can't verify → false");
   const withCov = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [1, 2], source, coverageDir: "/cov", readCoverage: () => doc, runCommand: okRun("ok 1") });
@@ -78,8 +81,8 @@ test("makeNodeCharHarness SANDBOXES the test run with the Node permission model 
 
 test("makeNodeCharHarness.executesModule is true only when the target actually ran a function (not import-unused)", async () => {
   const abs = path.resolve("/r/m.mjs");
-  const ran = { result: [{ url: `file://${abs.replace(/\\/g, "/")}`, functions: [{ ranges: [{ startOffset: 0, endOffset: 20, count: 2 }] }] }] };
-  const importedOnly = { result: [{ url: `file://${abs.replace(/\\/g, "/")}`, functions: [{ ranges: [{ startOffset: 0, endOffset: 20, count: 0 }] }] }] };
+  const ran = { result: [{ url: fileUrl(abs), functions: [{ ranges: [{ startOffset: 0, endOffset: 20, count: 2 }] }] }] };
+  const importedOnly = { result: [{ url: fileUrl(abs), functions: [{ ranges: [{ startOffset: 0, endOffset: 20, count: 0 }] }] }] };
   const hRan = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", coverageDir: "/c", readCoverage: () => ran, runCommand: async () => ({ status: 0, stdout: "ok 1", timedOut: false }) });
   assert.equal(await hRan.executesModule(), true, "a count>0 target function → the test exercised the module");
   const hImp = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", coverageDir: "/c", readCoverage: () => importedOnly, runCommand: async () => ({ status: 0, stdout: "ok 1", timedOut: false }) });
