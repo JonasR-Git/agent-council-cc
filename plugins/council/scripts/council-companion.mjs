@@ -2018,7 +2018,9 @@ async function handleAudit(argv) {
         return;
       }
       if (options.html) {
-        const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply: Boolean(out.sensitiveAutoApply), generatedAt: nowIso() });
+        // Use the RESOLVED consent flag (in scope), not out.sensitiveAutoApply which the loop never
+        // returns — else the §6-council-gated report label always fell back to safe-auto (council F3).
+        const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply, generatedAt: nowIso() });
         console.log(renderFixLoopReport(out));
         console.log(`\nHTML report: ${file}`);
         return;
