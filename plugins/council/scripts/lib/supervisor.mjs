@@ -9,17 +9,25 @@
 // module just names the phases for the report + supervises the reset-aware resume.
 import { backoffMs, isRateLimitError, retryAfterFrom } from "./audit-retry.mjs";
 
-// Loop stopReasons that mean "work remains but is BLOCKED right now" (retry after a wait) vs a
-// terminal convergence. Kept conservative: only known transient/throttle/did-not-run phrasings.
-const RESUMABLE_RE = /rate.?limit|throttl|\b429\b|\b529\b|overload|quota|did not run|backends? unavailable|interrupted/i;
-// A TERMINAL convergence must never be mistaken for resumable, even if its text brushes a keyword.
-const TERMINAL_RE = /diminishing returns|all tiers converged|budget exhausted|max passes|nothing/i;
+// A TERMINAL convergence must NEVER be mistaken for resumable. Narrow to the real loop phrases only
+// (council C3 grok P1): a bare `nothing` here over-matched resumable stops like "rate-limited —
+// nothing left in window" and gave up with work remaining.
+const TERMINAL_RE = /diminishing returns|all tiers converged|budget exhausted|max passes/i;
+// "The review couldn't run this pass" (backends down / rate-limited-past-retries) — a resumable stop
+// that isn't itself rate-limit ERROR text.
+const DID_NOT_RUN_RE = /did not run|backends? unavailable|interrupted/i;
 
-/** True when a loop stopReason means "resume after a wait" rather than "done". Terminal wins. */
+/**
+ * True when a loop stopReason means "resume after a wait" rather than "done". Terminal wins. For
+ * the rate-limit classification it DELEGATES to isRateLimitError (council C3 grok P1) so the
+ * supervisor shares audit-retry's exact policy: PERMANENT quota/billing exhaustion is NOT resumable
+ * (no ~24h unattended thrash on an insufficient_quota), and a bare "429" needs real status context
+ * (not a stray line number). Only did-not-run + genuine transient rate limits resume.
+ */
 export function isResumableStop(stopReason) {
   if (typeof stopReason !== "string" || !stopReason) return false;
   if (TERMINAL_RE.test(stopReason)) return false;
-  return RESUMABLE_RE.test(stopReason);
+  return DID_NOT_RUN_RE.test(stopReason) || isRateLimitError(stopReason);
 }
 
 /**
@@ -63,11 +71,19 @@ export async function runSupervised(runPass, { maxAttempts = 100, maxWallClockMs
   let resume = false;
   while (attempt < Math.max(1, maxAttempts)) {
     attempt += 1;
-    last = await runPass({ resume, attempt });
+    // A runPass that THROWS must never crash the unattended run (council C3 grok P2): a thrown
+    // rate-limit error becomes a resumable stop (wait + resume); anything else a recorded terminal.
+    try {
+      last = await runPass({ resume, attempt });
+    } catch (err) {
+      last = { err, stopReason: `pass ${attempt} threw: ${String(err?.message ?? err)}` };
+    }
     const stop = last?.stopReason;
-    // Explicit result flags win; else infer from the stopReason text or a rate-limit error.
+    // Explicit result flags WIN in both directions (council C3 grok P2): done OR an explicit
+    // resumable:false forces a terminal stop; explicit resumable:true forces resume; otherwise infer
+    // from the stopReason text / a rate-limit error.
     const resumable =
-      last?.done === true
+      last?.done === true || last?.resumable === false
         ? false
         : last?.resumable === true || isResumableStop(stop) || Boolean(last?.err && isRateLimitError(last.err));
     if (!resumable) return { ...last, attempts: attempt, supervisorStop: last?.done ? "done" : "terminal" };

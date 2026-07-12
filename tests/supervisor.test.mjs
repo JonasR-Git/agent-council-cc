@@ -22,6 +22,16 @@ test("isResumableStop: rate-limit / did-not-run resume; terminal convergence doe
   assert.equal(isResumableStop(null), false);
 });
 
+test("isResumableStop (council C3 grok P1): PERMANENT quota is NOT resumable; a 429 needs real context", () => {
+  // permanent billing/quota exhaustion → give up, never a 24h unattended retry thrash
+  assert.equal(isResumableStop("review error on pass 1: insufficient_quota"), false);
+  assert.equal(isResumableStop("fix error on pass 2: exceeded your current quota, please add billing"), false);
+  // a bare line number that happens to be 429 is not a rate limit
+  assert.equal(isResumableStop("review error on pass 1: Expected token at line 429"), false);
+  // a genuinely transient rate limit still resumes, even with the word "nothing" in it
+  assert.equal(isResumableStop("rate-limited — nothing left in this window, backing off"), true);
+});
+
 test("resetAwareWaitMs honors a retry-after hint over the plain attempt backoff, bounded", () => {
   const base = resetAwareWaitMs(null, 1);
   assert.ok(base > 0 && Number.isFinite(base));
@@ -70,15 +80,35 @@ test("runSupervised is bounded by a wall-clock cap (never infinite on a stuck li
   let clock = 0;
   const out = await runSupervised(
     async () => ({ stopReason: "rate-limited" }), // never terminal
-    { sleep: async () => {}, now: () => clock, maxWallClockMs: 1000 }
+    { sleep: async (ms) => { clock += ms; }, now: () => clock, maxWallClockMs: 100_000, baseMs: 60_000, maxAttempts: 1000 }
   );
-  // first pass runs (clock 0 < 1000), waits; before the 2nd resume the clock check trips once advanced
-  // advance the clock via a stateful now
-  assert.match(out.supervisorStop, /wall-clock cap|max attempts/);
+  assert.equal(out.supervisorStop, "wall-clock cap reached", "the 24h-style wall-clock branch is actually exercised");
+});
+
+test("runSupervised: an explicit resumable:false forces a terminal stop even with a rate-limit stopReason", async () => {
+  let calls = 0;
+  const out = await runSupervised(async () => { calls += 1; return { stopReason: "rate-limited", resumable: false }; }, { sleep: async () => { throw new Error("must not wait"); } });
+  assert.equal(calls, 1, "a hard-stop wins over the rate-limit text");
+  assert.equal(out.supervisorStop, "terminal");
+});
+
+test("runSupervised: a thrown rate-limit error resumes; a non-rate-limit throw stops terminally (no crash)", async () => {
+  // rate-limit throw → wait + resume, then succeed
+  let n = 0;
+  const okAfterLimit = await runSupervised(
+    async () => { n += 1; if (n < 2) throw Object.assign(new Error("HTTP 429 rate limit"), { status: 429 }); return { done: true, stopReason: "all tiers converged" }; },
+    { sleep: async () => {} }
+  );
+  assert.equal(okAfterLimit.supervisorStop, "done");
+  assert.equal(n, 2, "the rate-limit throw was retried");
+  // a non-rate-limit throw is recorded terminally, never crashes the unattended run
+  const crashed = await runSupervised(async () => { throw new Error("null deref in the loop"); }, { sleep: async () => {} });
+  assert.equal(crashed.supervisorStop, "terminal");
+  assert.match(crashed.stopReason, /threw: .*null deref/);
 });
 
 test("runSupervised is bounded by maxAttempts", async () => {
-  const out = await runSupervised(async () => ({ stopReason: "throttled" }), { sleep: async () => {}, maxAttempts: 4 });
+  const out = await runSupervised(async () => ({ stopReason: "rate-limited — still throttled" }), { sleep: async () => {}, maxAttempts: 4 });
   assert.equal(out.attempts, 4);
   assert.equal(out.supervisorStop, "max attempts reached");
 });
