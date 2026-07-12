@@ -89,7 +89,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
       "  node scripts/council-companion.mjs audit run|review|fix|endless [flags] (see below)",
-      "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
+      "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
       "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
       "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--html] [--retry-on-limit] [--dry-run]",
       "    audit fix --loop [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume] [--allow-untested]   (autonomous fix-until-dry on an isolated branch)",
@@ -1783,7 +1783,7 @@ async function computeFixReportMeta(cwd, out, ctx = {}) {
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "supervise"]
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "supervise", "completeness-critic"]
   });
   const cwd = process.cwd();
   // Validate the grouped-review preset + cap ONCE, up front — before any preflight/coverage/spend, for
@@ -1793,6 +1793,12 @@ async function handleAudit(argv) {
   if (options["max-cells"] != null) {
     const nmc = Number(options["max-cells"]);
     if (!Number.isFinite(nmc) || nmc < 1) throw new Error("--max-cells must be a positive number");
+  }
+  // M8 completeness critic (opt-in): only the GROUPED path (--groups) runs a cell matrix the critic can
+  // judge, so the flag is inert without it — warn rather than silently ignore (council fail-loud habit).
+  const completenessCritic = Boolean(options["completeness-critic"]);
+  if (completenessCritic && !options.groups && !options.json) {
+    console.error("note: --completeness-critic has no effect without --groups (it augments the grouped six-eyes matrix); ignoring for this run");
   }
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
   let churnDays = 90;
@@ -1885,6 +1891,7 @@ async function handleAudit(argv) {
         maxUnits,
         lensGroups: String(options.groups),
         maxCells,
+        completenessCritic, // M8: opt-in thoroughness critic (adds 1 call; surfaces coverage gaps)
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
         onProgress: options.json ? undefined : (m) => console.error(m)
@@ -2079,6 +2086,7 @@ async function handleAudit(argv) {
         verdictMap: logical.verdictMap,
         lensGroups: loopLensGroups,
         maxCells: loopMaxCells,
+        completenessCritic: completenessCritic && Boolean(loopLensGroups), // M8: only on the grouped loop
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
         skipClaude: merged.skipClaude, // B2 (grok-1): honor the Claude opt-out in the fix loop too
@@ -2273,6 +2281,7 @@ async function handleAudit(argv) {
         skipReduce: pass > 1,
         lensGroups: endlessLensGroups,
         maxCells: endlessLensGroups ? Math.max(1, Math.min(endlessMaxCells, Math.floor(passBudget))) : undefined,
+        completenessCritic: completenessCritic && Boolean(endlessLensGroups), // M8: only on the grouped endless path
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok
       });

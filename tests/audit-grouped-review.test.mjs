@@ -197,6 +197,30 @@ test("runGroupedReview: a file whose every cell failed is NOT counted reviewed",
   assert.deepEqual(out.reviewed, []);
 });
 
+test("runGroupedReview: --completeness-critic OFF → no completeness keys on coverage (byte-identical default)", async () => {
+  const runMatrix = async () => ({ findings: [], matrix: { summary: () => ({}) }, complete: true });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false }, { runMatrix, ...FS });
+  assert.equal("completenessComplete" in out.coverage, false, "the critic is opt-in — no signal, no key");
+});
+
+test("runGroupedReview: --completeness-critic ON, critic says thorough → coverage.completenessComplete true (1 critic call)", async () => {
+  let criticCalls = 0;
+  const runMatrix = async () => ({ findings: [], matrix: { summary: () => ({}) }, complete: true });
+  const runCritic = async () => { criticCalls += 1; return '{"complete": true, "gaps": []}'; };
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, completenessCritic: true }, { runMatrix, runCritic, ...FS });
+  assert.equal(out.coverage.completenessComplete, true);
+  assert.equal(out.coverage.completenessCriticRan, true);
+  assert.equal(criticCalls, 1, "exactly one completeness-critic call per pass");
+});
+
+test("runGroupedReview: --completeness-critic ON, critic finds a gap → coverage.completenessComplete false + gaps surfaced", async () => {
+  const runMatrix = async () => ({ findings: [], matrix: { summary: () => ({}) }, complete: true });
+  const runCritic = async () => '{"complete": false, "gaps": [{"class":"concurrency","where":"pool.mjs","why":"no race findings"}]}';
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, completenessCritic: true }, { runMatrix, runCritic, ...FS });
+  assert.equal(out.coverage.completenessComplete, false);
+  assert.ok(out.coverage.completenessGaps.includes("concurrency"));
+});
+
 test("runGroupedReview: onProgress surfaces the planned cell count BEFORE dispatch", async () => {
   const msgs = [];
   const runMatrix = async () => ({ findings: [], matrix: { summary: () => ({}) }, complete: true });

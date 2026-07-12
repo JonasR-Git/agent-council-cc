@@ -14,7 +14,8 @@ import { resolveLensGroups } from "./audit-lens-groups.mjs";
 import { chunkSource } from "./audit-group-prompt.mjs";
 import { DEFAULT_MAX_CELLS, capCells, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
 import { reviewerActive, selectUnits } from "./audit-review.mjs";
-import { activeSeatNames, allSeatNames } from "./seats.mjs";
+import { activeSeatNames, allSeatNames, makeSeatRunners } from "./seats.mjs";
+import { runCompletenessAssessment } from "./completeness-critic.mjs";
 import { tierOfLens } from "./audit-tiers.mjs";
 import { mergeFindings } from "./findings.mjs";
 import { annotateScopes } from "./scope.mjs";
@@ -178,6 +179,50 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   //    whole-project cell coverage across passes is a deliberate future enhancement.
   const passComplete = cells.length === 0 ? true : Boolean(matrixOut.complete);
   const complete = capped || unsupplied.length > 0 ? false : passComplete;
+
+  // M8 completeness critic (OPT-IN via --completeness-critic): augment the STRUCTURAL passComplete with
+  // a THOROUGHNESS judgement — free structural gaps (unscheduled group/file, incomplete triple) + ONE
+  // model critic call ("what defect class looks under-examined?"). Its coverageComplete ANDs into the
+  // loop's dry-streak gate so a pass judged incomplete keeps the run hunting. Deadlock-safe: it uses
+  // runCompletenessAssessment's coverageComplete (structure+critic, NO dry streak), and an infra failure
+  // degrades to undefined (unknown → does not block). Reserves ONE agent call; skipped entirely when off
+  // or when nothing ran. deps.runCritic is injectable for tests.
+  let completeness = null;
+  if (options.completenessCritic && cells.length > 0 && models.length > 0) {
+    const scheduledFilesSet = [...new Set(cells.map((c) => c.file))];
+    const scheduledGroupSet = [...new Set(cells.map((c) => c.groupId))];
+    const incompleteN = matrixOut.matrix?.incompleteTriples?.(matrixOut.triples ?? [])?.length ?? "?";
+    const coverageSummary = [
+      `groups=${groups.length} files=${files.length - noContent.size} seats=${models.length} cells=${cells.length}${capped ? ` (capped, ${dropped} deferred)` : ""}`,
+      unsupplied.length ? `filesUnsupplied=${unsupplied.length}` : "",
+      `incompleteTriples=${incompleteN}`,
+      `findings=${scoped.all.length}`
+    ].filter(Boolean).join("; ");
+    // One critic call, routed through the first active seat's runner (model-agnostic; the critic judges
+    // coverage, not code). Injectable so tests need no CLI.
+    const runCritic = deps.runCritic ?? (() => {
+      const runners = makeSeatRunners(cwd, backends, options);
+      const run = runners[models[0]];
+      return run ? (prompt) => run(prompt).then((r) => (r && !r.skipped && r.status === 0 ? r.stdout : "")) : null;
+    })();
+    if (progress) progress("  completeness critic: judging coverage thoroughness (1 call)…");
+    completeness = await runCompletenessAssessment({
+      matrix: matrixOut.matrix,
+      triples: matrixOut.triples ?? [],
+      expectedGroups: groups,
+      expectedFiles: files,
+      scheduledGroupIds: scheduledGroupSet,
+      scheduledFiles: scheduledFilesSet,
+      findings: scoped.all,
+      coverageSummary,
+      runCritic: typeof runCritic === "function" ? runCritic : undefined
+    });
+    if (progress && completeness) {
+      const verdict = completeness.coverageComplete === true ? "thorough" : completeness.coverageComplete === false ? `gaps (${completeness.gaps.length})` : "unknown (critic unavailable)";
+      progress(`  completeness: ${verdict}`);
+    }
+  }
+
   return {
     findings: scoped.all,
     refuted: scoped.refuted ?? [],
@@ -185,6 +230,9 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
     coverage: {
       complete,
       passComplete, // the loop convergence signal (scheduled cells done; capped/unsupplied don't block it)
+      // M8: the completeness-critic verdict (opt-in). undefined when off / infra-degraded → the loop
+      // treats it as non-blocking; false (structural gap or critic-found gap) keeps the run hunting.
+      ...(completeness ? { completenessComplete: completeness.coverageComplete, completenessGaps: completeness.gaps, completenessCriticRan: completeness.criticRan } : {}),
       ran: true,
       groupPreset: options.lensGroups ?? "fine",
       reviewers: reviewerMap(backends, options),

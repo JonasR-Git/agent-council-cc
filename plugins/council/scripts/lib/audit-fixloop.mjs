@@ -294,7 +294,12 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // Prefer the grouped path's passComplete (scheduled cells reviewed — transient-completable) over
     // the strict `complete` (which capped/unsupplied force false PERSISTENTLY → the loop could never
     // converge; council R9 Codex/Claude P1). Per-file path sets neither → undefined → treated complete.
-    const coverageComplete = (rev?.coverage?.passComplete ?? rev?.coverage?.complete) !== false;
+    // M8: when the completeness critic ran (--completeness-critic), a pass it judges under-examined
+    // (completenessComplete === false: a structural gap OR a critic-found gap) does NOT count toward the
+    // dry streak — the run keeps hunting. undefined (critic off or infra-degraded) is non-blocking, so
+    // the default path is byte-identical to before.
+    const coverageComplete =
+      (rev?.coverage?.passComplete ?? rev?.coverage?.complete) !== false && rev?.coverage?.completenessComplete !== false;
     // AUTO-FIXABLE = a localized finding the fixer can actually apply. A propose-only / cross-cutting
     // finding (architecture/SSOT/logical) is offered to fix() only to be surfaced as a proposal — it
     // NEVER auto-applies, so counting it as live work would (a) falsely read as a stall and (b) pin a

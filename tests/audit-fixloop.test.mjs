@@ -68,6 +68,24 @@ test("B5: an INCOMPLETE six-eyes coverage does not let a zero-fresh pass declare
   assert.match(out.stopReason, /budget exhausted|max passes/);
 });
 
+test("M8: the completeness critic (completenessComplete:false) blocks a zero-fresh pass from converging dry", async () => {
+  // 0 fresh findings AND the scheduled cells are all done (passComplete:true), but the completeness
+  // critic judged coverage under-examined → the run must keep hunting, not declare diminishing returns.
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 1, passComplete: true, completenessComplete: false } });
+  const fix = async (actionable) => ({ fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], spent: 1 });
+  const out = await runFixLoop("/x", { budget: 5, dryStreak: 2 }, { review, fix, checkpoint: noCheckpoint });
+  assert.ok(!/diminishing returns/.test(out.stopReason ?? ""), "the critic's gap verdict blocks false convergence");
+  assert.match(out.stopReason, /budget exhausted|max passes/);
+});
+
+test("M8: completenessComplete UNDEFINED (critic off / infra-degraded) is non-blocking — a dry pass still converges", async () => {
+  // graceful degrade: an absent completeness signal must NOT deadlock — a genuinely dry pass converges.
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 1, passComplete: true } });
+  const fix = async () => ({ fixed: [], failed: [], spent: 1 });
+  const out = await runFixLoop("/x", { budget: 40, dryStreak: 2 }, { review, fix, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /diminishing returns/, "no completeness signal → the passComplete dry path still converges");
+});
+
 test("B5 council (grok P1): per-tier does NOT global-dry-converge before a later tier is fixed", async () => {
   // A recurring tier-2 (correctness) finding: pre-fix, empty tier-0/1 passes made global dry hit
   // dryStop and stop with 'diminishing returns', fixed=[]. Now global dry is suppressed under

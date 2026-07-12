@@ -1,9 +1,10 @@
 // M8/C1 — completeness critic: is the six-eyes find THOROUGH, or is something un-hunted?
 //
-// STATUS: STAGED — built + unit-tested but NOT yet wired into any live path (no production importer;
-// council fleet O2/G6/G10). The live loop derives coverage.complete from the STRUCTURAL six-eyes
-// matrix (audit-cell-scheduler sixEyesComplete) only; assessCompleteness + the model-critic pass
-// below do not run until runGroupedReview/the loop dispatch them. Wiring is the remaining M8 work.
+// STATUS: WIRED (opt-in) — runGroupedReview calls runCompletenessAssessment when --completeness-critic
+// is set, exposing coverage.completenessComplete; audit-fixloop ANDs it into the dry-streak gate so a
+// pass the critic judges under-examined does NOT count toward convergence. Default OFF → the loop keeps
+// its byte-identical passComplete/complete behaviour. Wiring is deadlock-safe: coverage consumes
+// runCompletenessAssessment's coverageComplete (structure + critic, NO dry streak), never .complete.
 //
 // A run should keep finding until it is genuinely exhausted, not just until one dry pass. Two
 // independent signals decide that:
@@ -135,6 +136,54 @@ export function parseCompleteness(stdout) {
  * `nextTargets` is the concrete extra work an incomplete verdict should schedule (un-scheduled
  * groups + FILES + incomplete cells + the critic's flagged classes) so a loop acts, not spins.
  */
+/**
+ * Orchestrate ONE completeness assessment for a grouped pass: the FREE structural gaps + ONE model
+ * CRITIC call, folded via assessCompleteness. `runCritic(prompt) -> stdout` is injectable (a single
+ * seat runner). Returns { coverageComplete, criticRan, structural, critic, gaps }.
+ *
+ * coverageComplete contract for the LOOP convergence gate (deadlock-safe — council C1):
+ *  - structural gaps present (a free, always-computable signal) → false: KNOWN un-hunted scope, block.
+ *  - clean structure + the critic REPLIED (parseable or not) → assessment.coverageComplete (a malformed
+ *    reply or one reporting gaps → false; a clean complete:true → true).
+ *  - clean structure + the critic call could NOT run (threw / empty / no runner) → UNDEFINED: unknown,
+ *    so the caller must NOT block convergence — a rate-limited critic degrades gracefully instead of
+ *    deadlocking the loop to max-passes every run. Never feed assessCompleteness().complete to coverage
+ *    (it folds the dry streak, which coverage.complete gates → deadlock); use coverageComplete only.
+ */
+export async function runCompletenessAssessment({
+  matrix = null,
+  triples = [],
+  expectedGroups = [],
+  expectedFiles = [],
+  scheduledGroupIds = null,
+  scheduledFiles = null,
+  findings = [],
+  coverageSummary = "",
+  runCritic
+} = {}) {
+  const structural = structuralGaps({ matrix, triples, expectedGroups, expectedFiles, scheduledGroupIds, scheduledFiles });
+  let critic = null;
+  let criticRan = false;
+  if (typeof runCritic === "function") {
+    try {
+      const stdout = await runCritic(buildCompletenessPrompt(findings, coverageSummary));
+      if (stdout != null && String(stdout).trim() !== "") {
+        critic = parseCompleteness(stdout);
+        criticRan = true; // we got a REPLY and assessed it (malformed → fail-closed via assessCompleteness)
+      }
+    } catch {
+      critic = null;
+      criticRan = false; // an INFRA failure (throw) is "couldn't assess", distinct from a bad reply
+    }
+  }
+  const assessment = assessCompleteness({ structural, critic, dryStreak: 0 });
+  let coverageComplete;
+  if (structural.ok === false) coverageComplete = false;
+  else if (criticRan) coverageComplete = assessment.coverageComplete;
+  else coverageComplete = undefined;
+  return { coverageComplete, criticRan, structural, critic, gaps: assessment.nextTargets };
+}
+
 export function assessCompleteness({ structural = null, critic = null, dryStreak = 0, dryStop = 2 } = {}) {
   const structuralOk = Boolean(structural) && structural.ok !== false;
   const criticOk = Boolean(critic) && critic.complete === true;

@@ -6,6 +6,7 @@ import {
   assessCompleteness,
   buildCompletenessPrompt,
   parseCompleteness,
+  runCompletenessAssessment,
   structuralGaps
 } from "../plugins/council/scripts/lib/completeness-critic.mjs";
 
@@ -118,6 +119,65 @@ test("buildCompletenessPrompt discloses a >cap truncation instead of silently dr
   const many = Array.from({ length: 250 }, (_, i) => ({ severity: "P2", title: `f${i}`, file: "a.mjs" }));
   const p = buildCompletenessPrompt(many, "cov");
   assert.match(p, /showing first 200 of 250 findings/);
+});
+
+const fullTriple = { groupId: "g", file: "a.mjs", chunk: 0 };
+function completeMatrix() {
+  const m = makeCoverageMatrix(["codex"]);
+  m.markDone({ model: "codex", ...fullTriple });
+  return m;
+}
+const cleanScope = {
+  matrix: completeMatrix(),
+  triples: [fullTriple],
+  expectedGroups: [{ id: "g" }],
+  expectedFiles: ["a.mjs"],
+  scheduledGroupIds: ["g"],
+  scheduledFiles: ["a.mjs"]
+};
+
+test("runCompletenessAssessment: clean structure + critic says complete → coverageComplete true", async () => {
+  const r = await runCompletenessAssessment({ ...cleanScope, findings: [], runCritic: async () => '{"complete": true, "gaps": []}' });
+  assert.equal(r.coverageComplete, true);
+  assert.equal(r.criticRan, true);
+});
+
+test("runCompletenessAssessment: a STRUCTURAL gap forces false WITHOUT even needing the critic", async () => {
+  const r = await runCompletenessAssessment({
+    matrix: completeMatrix(),
+    triples: [fullTriple],
+    expectedGroups: [{ id: "g" }, { id: "never-scheduled" }],
+    expectedFiles: ["a.mjs"],
+    scheduledGroupIds: ["g"],
+    scheduledFiles: ["a.mjs"],
+    runCritic: async () => '{"complete": true, "gaps": []}' // critic even says OK — structure still vetoes
+  });
+  assert.equal(r.coverageComplete, false, "a never-scheduled group is a known gap → keep hunting");
+  assert.ok(r.gaps.includes("never-scheduled"));
+});
+
+test("runCompletenessAssessment: critic reports a gap → coverageComplete false", async () => {
+  const r = await runCompletenessAssessment({ ...cleanScope, runCritic: async () => '{"complete": false, "gaps": [{"class":"concurrency","where":"pool.mjs","why":"x"}]}' });
+  assert.equal(r.coverageComplete, false);
+  assert.ok(r.gaps.includes("concurrency"));
+});
+
+test("runCompletenessAssessment: an INFRA failure (critic throws) → coverageComplete UNDEFINED (graceful, no deadlock)", async () => {
+  const r = await runCompletenessAssessment({ ...cleanScope, runCritic: async () => { throw new Error("rate limited"); } });
+  assert.equal(r.coverageComplete, undefined, "a critic that can't run must NOT block the loop → unknown, not false");
+  assert.equal(r.criticRan, false);
+});
+
+test("runCompletenessAssessment: a MALFORMED reply (we DID get an answer) fails closed → coverageComplete false", async () => {
+  const r = await runCompletenessAssessment({ ...cleanScope, runCritic: async () => "garbage not json" });
+  assert.equal(r.coverageComplete, false, "a bad reply is distinct from infra failure — fail-closed, keep hunting");
+  assert.equal(r.criticRan, true);
+});
+
+test("runCompletenessAssessment: no runner (critic omitted) + clean structure → undefined (non-blocking)", async () => {
+  const r = await runCompletenessAssessment({ ...cleanScope });
+  assert.equal(r.coverageComplete, undefined);
+  assert.equal(r.criticRan, false);
 });
 
 test("assessCompleteness surfaces concrete nextTargets from gaps + missing groups (loop can act, not spin)", () => {
