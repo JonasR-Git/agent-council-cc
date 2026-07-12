@@ -86,7 +86,14 @@ function printUsage() {
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
-      "  node scripts/council-companion.mjs audit [review] [--groups fine|tier|lens] [--max-cells <n>] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
+      "  node scripts/council-companion.mjs audit run|review|fix|endless [flags] (see below)",
+      "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
+      "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
+      "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--html] [--retry-on-limit] [--dry-run]",
+      "    audit fix --loop [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume] [--allow-untested]   (autonomous fix-until-dry on an isolated branch)",
+      "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume]   (bounded review/propose loop)",
+      "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
+      "  node scripts/council-companion.mjs cancel [job-id]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
       "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
@@ -1993,7 +2000,9 @@ async function handleAudit(argv) {
       const tLoop = Date.now();
       // B5: per-tier convergence (structure → correctness → quality) is ON by default so a
       // Structure/SSOT consolidation lands before Correctness runs on the consolidated code; --flat
-      // opts out (single flat convergence). --per-tier remains as a redundant affirmation.
+      // opts out (single flat convergence). --per-tier explicitly affirms the default; passing BOTH is
+      // a contradiction, so reject it loudly instead of silently letting one win (council F2).
+      if (options["per-tier"] && options.flat) throw new Error("--per-tier and --flat are contradictory (per-tier staging vs one flat convergence) — pass at most one");
       const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) };
       // C3/M10: --supervise wraps the loop in the endless supervisor so a multi-hour autonomous run
       // survives rate-limit resets — a resumable stop (throttled/backends-down/did-not-run) waits
@@ -2398,7 +2407,7 @@ function renderAuditEndlessReport(out) {
 async function handleUsage(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["days"],
-    booleanOptions: ["json", "all", "tokens", "limits"]
+    booleanOptions: ["json", "tokens", "limits"] // (dropped dead "all" — handleUsage never read it; F2)
   });
   const cwd = process.cwd();
   const root = workspaceRoot(cwd);

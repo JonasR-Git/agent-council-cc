@@ -1,6 +1,6 @@
 ---
 description: Whole-project audit — static candidates + deep agent review + safe test-gated auto-fix + endless review loop
-argument-hint: "[review|fix|endless] [--areas dir1,dir2] [--budget <n>] [--max-units <n>] [--doc] [--from <json>] [--dry-run] [--max-passes <n>] [--dry-streak <n>] [--json]"
+argument-hint: "[run|review|fix|endless] [--groups fine|tier|lens] [--loop] [--supervise] [--autonomy <lvl>] [--areas dir1,dir2] [--budget <n>] [--max-units <n>] [--sarif] [--html] [--doc] [--from <json>] [--dry-run] [--max-passes <n>] [--dry-streak <n>] [--json]"
 allowed-tools: Bash(node:*)
 ---
 
@@ -12,9 +12,16 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" audit $ARGUMENTS
 
 - **Static (default)** — no agents, read-only except `--write-map`. Emits candidate
   findings + hotspots + coverage.
-- **`review`** — deep agent review (Codex + Grok) of the top `--max-units` hotspot
-  modules, bounded by `--budget <n>` agent calls (default 20), plus a global
-  SSOT/architecture reduce over the map. Findings are candidates; you synthesize.
+- **`run`** — the self-driving audit: inventory → mandatory surface → the review
+  engine → canonical findings → a ranked risk register → a pass/fail gate, as one
+  schema-valid report. `--sarif [--sarif-path <p>]` also writes a SARIF 2.1.0 log;
+  `--base <ref>` scopes to a diff.
+- **`review`** — deep agent review of the top `--max-units` hotspot modules by all
+  three finders (**Codex + Grok + Claude — six-eyes**), bounded by `--budget <n>`
+  agent calls, plus a global SSOT/architecture reduce. `--groups fine|tier|lens`
+  opts into the GROUPED path: every (module × lens-group × chunk) cell is reviewed
+  by all seats for cell-granular coverage (`--max-cells <n>` bounds the matrix).
+  Findings are candidates; you synthesize.
 - **`fix`** — **safe auto-fix (v3)**. Fixes ONLY **localized** findings with an
   explicit scope (fail-closed), one writer per file, on an isolated
   `council/audit-fix-<sha>` branch. Each fix must touch only its target file (else
@@ -29,7 +36,16 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" audit $ARGUMENTS
   or a fresh review. `--dry-run` previews the plan without editing; `--min-severity
   <P0|P1|P2>` sets the gate (default P2); `--max-fixes <n>` caps the number of fixes
   (default 50); `--allow-untested` fixes without a test gate (**not recommended** —
-  commits are then flagged unverified).
+  commits are then flagged unverified). `--autonomy <lvl>` sets the commit/propose
+  dial; `--sensitive-auto-apply` enables §6 council-gated auto-apply of sensitive
+  fixes (**only in `--loop`**, gated by unanimous 3-seat patch review); `--html`
+  writes a self-contained report; `--retry-on-limit` rides out rate limits.
+- **`fix --loop`** — the autonomous **fix-until-dry** loop (M3): review → tier-gate
+  (structure → correctness → quality; `--flat` for one flat pass) → fix the localized
+  set on ONE isolated branch → re-scope to the blast radius → repeat until dry /
+  budget / `--max-passes`. `--resume` continues a checkpointed run. **`--supervise`**
+  (M10) wraps it in the endless supervisor so a multi-hour run survives rate-limit
+  resets (reset-aware wait + `--resume`). Nothing is auto-merged; you review the branch.
 - **`endless`** — **bounded review loop (v4)**. Each pass advances the reviewed
   hotspot window (progressive coverage — pass N reviews the next band, not the same
   top-N), and keeps going until returns diminish (`--dry-streak <n>` consecutive
@@ -38,8 +54,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" audit $ARGUMENTS
   first. Findings are deduplicated across passes with a tight key (file + category +
   title). Progress is checkpointed atomically to the state dir; `--resume` continues
   an interrupted run instead of re-spending the budget. This is a **review/propose**
-  loop — it never auto-fixes in a loop (use the explicit `fix` for that). `--doc`
-  writes the accumulated proposals.
+  loop that never edits code (`--supervise` also available); looped AUTO-fix lives in
+  the separately-gated **`fix --loop`** above. `--doc` writes the accumulated proposals.
 - `--areas a,b` limits the scan to those path prefixes; `--churn-days <n>` sets the
   git-churn window (default 90).
 - `--doc` writes findings as **proposals** to `docs/AUDIT.md` (cross-cutting items
