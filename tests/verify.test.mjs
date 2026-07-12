@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseRefutation, partitionByRefutation, shouldVerify, verifierFor } from "../plugins/council/scripts/lib/verify.mjs";
+import { parseRefutation, partitionByRefutation, shouldVerify, verifierAvailability, verifierFor } from "../plugins/council/scripts/lib/verify.mjs";
 
 test("shouldVerify targets P0/P1 single-agent findings, protects consensus + lower severities", () => {
   assert.equal(shouldVerify({ severity: "P0", consensus: false }), true);
@@ -14,8 +14,25 @@ test("shouldVerify targets P0/P1 single-agent findings, protects consensus + low
 test("verifierFor picks a seat that did NOT raise the finding; null when none independent", () => {
   assert.equal(verifierFor({ agents: ["codex"] }, {}), "grok", "grok verifies a codex-only finding");
   assert.equal(verifierFor({ agents: ["grok"] }, {}), "codex");
-  assert.equal(verifierFor({ agents: ["grok", "codex"] }, {}), null, "both raised it → no independent verifier");
-  assert.equal(verifierFor({ agents: ["codex"] }, { skipGrok: true }), null, "the only independent seat is skipped");
+  // B2: Claude is now a THIRD candidate — so a codex-only finding with grok skipped is verified by
+  // Claude (was null in the two-finder world; council codex-1 flagged that stale assumption).
+  assert.equal(verifierFor({ agents: ["codex"] }, { skipGrok: true }), "claude", "Claude is an independent verifier");
+  assert.equal(verifierFor({ agents: ["codex"] }, { skipGrok: true, skipClaude: true }), null, "no independent seat left");
+  assert.equal(verifierFor({ agents: ["grok", "codex", "claude"] }, {}), null, "all three raised it → no independent verifier");
+});
+
+test("B2: verifierFor only picks a REACHABLE seat when availability is known (council claude-4)", () => {
+  const onlyClaude = { codex: false, grok: false, claude: true };
+  // grok is the first candidate, but unavailable → skip to codex (unavailable) → claude (available)
+  assert.equal(verifierFor({ agents: ["codex"] }, {}, onlyClaude), "claude");
+  // a codex-only finding with grok+claude unavailable → no reachable independent verifier (was a
+  // wasted spawn before: it returned 'grok'/'claude' that then failed to launch).
+  assert.equal(verifierFor({ agents: ["codex"] }, {}, { codex: true, grok: false, claude: false }), null);
+});
+
+test("verifierAvailability reflects the probed backends", () => {
+  const a = verifierAvailability({ codex: { companionAvailable: true }, grok: { cli: { available: false } }, claude: { cli: { available: true } } });
+  assert.deepEqual(a, { codex: true, grok: false, claude: true });
 });
 
 test("parseRefutation reads a strict {refuted,reason} JSON, rejects malformed", () => {

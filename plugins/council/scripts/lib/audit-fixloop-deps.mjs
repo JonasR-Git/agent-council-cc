@@ -69,6 +69,9 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       skipReduce: fullPasses > 1, // the SSOT reduce is over static input — run it once
       skipCodex: options.skipCodex,
       skipGrok: options.skipGrok,
+      // B2 (council grok-1): thread skipClaude too, else the fix loop spawns the Claude finder
+      // even when the user opted out (reviewers:[codex,grok] / --skip-claude), inflating cost.
+      skipClaude: options.skipClaude,
       ledger: options.ledger
     });
     // Surface a top-level `ran` the loop can trust. runAuditReview swallows backend

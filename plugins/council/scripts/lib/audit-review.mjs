@@ -120,6 +120,12 @@ report concrete, verifiable findings (bugs, security, concurrency, data-loss,
 error handling, correctness, missing tests, dead code). The static facts point at
 risk; verify against the code - findings are hypotheses.
 
+Severity discipline (applies to EVERY finding, so all reviewers calibrate alike):
+reserve P0/P1 for a defect with a concrete, demonstrable failure - an exploit, data
+loss, crash, hang, or race with a stated trigger. Style, naming, and unproven "looks
+risky" concerns are nit/P2 at most. Base each finding on code you actually read and
+give a concrete trigger; do not inflate severity.
+
 Module: {{UNIT}}
 Static facts: {{FACTS}}{{SPLIT}}
 
@@ -285,9 +291,13 @@ export async function globalReduce(cwd, backends, options, model, budget) {
  * charge is reserved for the global reduce so the SSOT/architecture pass is never
  * silently starved. Each worker claims a unit's cost synchronously before awaiting
  * so concurrency cannot over-spend.
+ *
+ * The default budget is 30 (council B2 claude-2): with THREE finders (six-eyes) a unit costs 3,
+ * so 30 keeps ~9 hotspot units/run — the same breadth two finders had at 20. Raise --budget for
+ * more depth; the endless loop amortizes breadth across passes regardless.
  */
 export async function runAuditReview(cwd, model, backends, options = {}) {
-  const budget = makeBudget(options.budget ?? 20);
+  const budget = makeBudget(options.budget ?? 30);
   const units = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
   const concurrency = Math.max(1, Math.min(4, options.concurrency ?? 3));
   const costPerUnit = activeReviewerCount(backends, options);

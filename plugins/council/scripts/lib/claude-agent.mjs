@@ -37,6 +37,14 @@ const READONLY_DISALLOWED = [
  * Build the argv for a read-only headless Claude reviewer. Kept pure and
  * exported so the flag wiring (allowlist, strict MCP, model pin) is testable
  * without spawning the real CLI.
+ *
+ * SHARED (council B2 claude-3/grok-3): this is used by BOTH the M7 audit finder and the
+ * deliberate spawn-mode R1 reviewer. The B2 additions (--safe-mode, REVIEWER_CHARTER, --effort
+ * xhigh) therefore apply to deliberate's spawned Claude too — INTENTIONALLY: --safe-mode is a
+ * strict isolation win, xhigh matches the user's standing preference, and the charter's
+ * evidence-first/severity discipline is right for any reviewer. The audit finder's peers (codex/
+ * grok) get the matching severity rubric via the shared unit prompt, so cross-seat calibration
+ * stays aligned. Pass claudeEffort to override the effort per call.
  */
 export function buildClaudeArgs(options = {}) {
   const args = [

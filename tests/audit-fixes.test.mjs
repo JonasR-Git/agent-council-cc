@@ -53,10 +53,13 @@ test("severity takeover keeps a known line when the higher-severity dup has none
 
 // --- #2 verify never lets a finding's own author refute it ------------------
 
-test("verifierFor returns null rather than the raiser when the peer is skipped", () => {
-  // grok raised it; codex is skipped -> no independent verifier -> null.
-  assert.equal(verifierFor({ agents: ["grok"] }, { skipCodex: true }), null);
-  // both available, grok raised -> codex verifies.
+test("verifierFor returns null rather than the raiser when every independent peer is skipped", () => {
+  // grok raised it; codex is skipped, and Claude (B2's third seat) skipped too -> no independent
+  // verifier -> null. (In the two-finder world skipCodex alone sufficed; Claude is now a candidate.)
+  assert.equal(verifierFor({ agents: ["grok"] }, { skipCodex: true, skipClaude: true }), null);
+  // grok raised, codex skipped, Claude available -> Claude is the independent verifier.
+  assert.equal(verifierFor({ agents: ["grok"] }, { skipCodex: true }), "claude");
+  // both available, grok raised -> codex verifies (first non-author candidate).
   assert.equal(verifierFor({ agents: ["grok"] }, {}), "codex");
   // codex raised -> grok verifies.
   assert.equal(verifierFor({ agents: ["codex"] }, {}), "grok");

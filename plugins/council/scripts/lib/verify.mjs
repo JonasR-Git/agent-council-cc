@@ -5,6 +5,7 @@ import {
   runCodexStructured,
   runGrokStructured
 } from "./agents.mjs";
+import { runClaudeStructured } from "./claude-agent.mjs";
 import { extractJsonObject } from "./findings.mjs";
 import { skippedAgents } from "./policy.mjs";
 
@@ -27,14 +28,30 @@ export function parseRefutation(stdout) {
 // subprocesses at once and exhaust process/API limits.
 const VERIFY_CONCURRENCY = 4;
 
-export function verifierFor(finding, options) {
-  const skip = new Set(skippedAgents(options));
+/** Which verifier seats are actually reachable (probed), computed inline to avoid a cycle with
+ *  audit-review's reviewerActive. Claude's cli is probed on the audit path (bare probeBackends). */
+export function verifierAvailability(backends) {
+  return {
+    codex: Boolean(backends?.codex?.companionAvailable),
+    grok: Boolean(backends?.grok?.cli?.available),
+    claude: Boolean(backends?.claude?.cli?.available)
+  };
+}
+
+export function verifierFor(finding, options, available = null) {
+  // B2: Claude is now a first-class FINDER, so it must also be an eligible REFUTER — else a
+  // codex-only P0 (grok skipped) ships UNVERIFIED even when Claude is a valid independent seat
+  // (council codex-1). includeClaude:true so skipClaude drops it symmetrically.
+  const skip = new Set(skippedAgents(options, { includeClaude: true }));
   const raisedBy = new Set(finding.agents ?? []);
-  // ONLY an agent that did not raise the finding may verify it. If no such
-  // independent agent is available (peers skipped), do not verify at all - a
-  // finding must never be demoted by its own author.
-  for (const candidate of ["grok", "codex"]) {
-    if (!skip.has(candidate) && !raisedBy.has(candidate)) return candidate;
+  // ONLY an agent that did not raise the finding may verify it (a finding is never demoted by its
+  // own author), and only one that is actually REACHABLE when availability is known — else we pick
+  // a candidate whose spawn just fails, wasting a call and leaving the finding unverified anyway
+  // (council claude-4). When `available` is null, availability is not gated (legacy callers).
+  for (const candidate of ["grok", "codex", "claude"]) {
+    if (skip.has(candidate) || raisedBy.has(candidate)) continue;
+    if (available && !available[candidate]) continue;
+    return candidate;
   }
   return null;
 }
@@ -64,6 +81,7 @@ async function mapWithLimit(items, limit, fn) {
 
 async function runVerifier(agent, cwd, backends, options, prompt) {
   if (agent === "codex") return runCodexStructured(cwd, backends, options, prompt, "verify");
+  if (agent === "claude") return runClaudeStructured(cwd, backends, options, prompt);
   return runGrokStructured(cwd, backends, options, prompt);
 }
 
@@ -80,9 +98,10 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
     grokEffort: options.r2Effort ?? options.grokEffort
   };
   const budget = options.budget ?? null;
+  const available = verifierAvailability(backends); // B2: only pick a reachable, non-authoring seat
   const targets = (merged.all ?? []).filter((f) => shouldVerify(f, severities));
   const results = await mapWithLimit(targets, options.verifyConcurrency ?? VERIFY_CONCURRENCY, async (finding) => {
-    const agent = verifierFor(finding, options);
+    const agent = verifierFor(finding, options, available);
     if (!agent) return { finding, verdict: null };
     // Charge the finite invocation budget so refutation spend is ACCOUNTED (it used to fan
     // out uncounted). Reserve BEFORE the await; if the budget can't afford it, skip this

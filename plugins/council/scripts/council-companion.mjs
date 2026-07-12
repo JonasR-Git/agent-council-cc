@@ -1942,6 +1942,7 @@ async function handleAudit(argv) {
         verdictMap: logical.verdictMap,
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
+        skipClaude: merged.skipClaude, // B2 (grok-1): honor the Claude opt-out in the fix loop too
         claudeModel: merged["claude-model"] ?? merged.claudeModel,
         sensitiveAutoApply,
         reviewPatch,
@@ -2029,7 +2030,7 @@ async function handleAudit(argv) {
     // No callable reviewer => every pass reviews nothing and would falsely report
     // "diminishing returns"; fail loud instead of looping over empty passes.
     if (activeReviewerCount(backends, merged) === 0) {
-      throw new Error("no callable reviewers (Codex/Grok unavailable or skipped) — endless review needs at least one");
+      throw new Error("no callable reviewers (Codex/Grok/Claude all unavailable or skipped) — endless review needs at least one");
     }
     const { maxUnits } = parseAuditBudgetOptions(options);
     let budget = 60;

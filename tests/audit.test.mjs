@@ -174,6 +174,18 @@ test("buildUnitPrompt bounds oversized source and flags the split", () => {
   assert.match(p.prompt, /truncated to 20 of 50/);
 });
 
+test("B2 (council grok-2): the shared unit prompt carries severity discipline so all 3 finders calibrate alike", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-unit-"));
+  fs.writeFileSync(path.join(dir, "m.mjs"), "export const x = 1;");
+  const model = { files: [{ id: "m.mjs", loc: 1, branches: 0, maxNesting: 0, fanIn: 0, fanOut: 0, churn: 0, smellCount: 0, tested: false, hotspot: 1 }] };
+  const { prompt } = buildUnitPrompt(dir, "m.mjs", model);
+  // Codex/Grok get NO system charter — so the severity rubric MUST live in the shared prompt, else
+  // only the (charter-bearing) Claude finder self-caps and cross-seat calibration skews.
+  assert.match(prompt, /Severity discipline/);
+  assert.match(prompt, /reserve P0\/P1 for a defect with a concrete, demonstrable failure/i);
+  assert.match(prompt, /do not inflate severity/i);
+});
+
 test("reviewerActive/activeReviewerCount reflect policy AND probed availability", () => {
   const both = { codex: { companionAvailable: true }, grok: { cli: { available: true } } };
   assert.equal(activeReviewerCount(both, {}), 2);
