@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   DEFAULT_MAX_INFLIGHT,
+  capCells,
   cellKey,
   enumerateCells,
   makeCellReviewer,
@@ -164,4 +165,67 @@ test("DEFAULT_MAX_INFLIGHT is in the 4–8 target band, and cellKey is collision
     cellKey({ model: "codex", groupId: "g", file: "a", chunk: 0 }),
     cellKey({ model: "codex", groupId: "g", file: "a", chunk: 1 })
   );
+});
+
+test("B4 (council Claude seat): cellKey is printable JSON — stays a text .mjs (no NUL → git binary)", () => {
+  const k = cellKey({ model: "codex", groupId: "security-injection", file: "a b/c.mjs", chunk: 3 });
+  assert.equal(k, '["codex","security-injection","a b/c.mjs",3]');
+  assert.equal(/\x00/.test(k), false, "no NUL byte");
+  // collision-free even when a value contains what could be a separator
+  assert.notEqual(cellKey({ model: "m", groupId: "a", file: "b", chunk: 0 }), cellKey({ model: "m", groupId: "a,b", file: "", chunk: 0 }));
+});
+
+test("B4 (council grok-2): capCells bounds total cells EXPLICITLY, reporting what was dropped", () => {
+  const cells = Array.from({ length: 100 }, (_, i) => ({ i }));
+  const under = capCells(cells, 200);
+  assert.equal(under.capped, false);
+  assert.equal(under.cells.length, 100);
+  const over = capCells(cells, 30);
+  assert.equal(over.capped, true);
+  assert.equal(over.cells.length, 30);
+  assert.equal(over.dropped, 70, "the overflow count is surfaced, never silently cut");
+});
+
+test("B4 (council grok-1): a rate-limited cell run is re-thrown so withCellRetry backs it off", async () => {
+  let calls = 0;
+  const review = makeCellReviewer("/x", {}, {}, {
+    runCodex: async () => {
+      calls += 1;
+      if (calls < 2) return { status: 1, stderr: "Error: 429 rate limit exceeded", stdout: "" };
+      return { status: 0, stdout: '{"agent":"codex","findings":[]}' };
+    }
+  });
+  const cell = { model: "codex", groupId: "g", group: { id: "g", lenses: [], focus: "f" }, file: "a.mjs", chunk: 0, chunkData: { text: "x", index: 0, total: 1, startLine: 1, endLine: 1 } };
+  // WITHOUT retry, the throttled run THROWS (not a silent {ok:false} the retry can't see)
+  await assert.rejects(() => review(cell), /rate-limited/);
+  calls = 0;
+  // WITH the per-cell retry (injected sleep) it backs off then succeeds
+  const wrapped = withCellRetry(review, { sleep: async () => {} });
+  const r = await wrapped(cell, 0);
+  assert.equal(r.ok, true);
+  assert.equal(calls, 2, "retried once after the 429");
+});
+
+test("B4 (council grok-3): an ok-less reviewer result is marked FAILED, not done (no false completeness)", async () => {
+  const cells = enumerateCells(["a.mjs"], [{ id: "g", lenses: [], focus: "f" }], ["codex"], () => [{ index: 0 }]);
+  // returns findings WITHOUT an ok:true — must NOT complete the triple, and its findings are dropped (symmetric)
+  const out = await runCellMatrix(cells, async () => ({ findings: [{ severity: "P2", title: "x" }] }), { models: ["codex"], retryOnLimit: false });
+  assert.equal(out.complete, false);
+  assert.equal(out.findings.length, 0);
+  assert.equal(out.matrix.summary().done, 0);
+});
+
+test("B4 (council grok-4): enumerateCells threads per-file static facts onto each cell + into the prompt", async () => {
+  const cells = enumerateCells(
+    ["a.mjs"],
+    [{ id: "g", lenses: ["correctness"], focus: "logic" }],
+    ["codex"],
+    () => [{ text: "x", index: 0, total: 1, startLine: 1, endLine: 1 }],
+    (f) => `loc=42 hotspot=9 for ${f}`
+  );
+  assert.equal(cells[0].facts, "loc=42 hotspot=9 for a.mjs");
+  let seen = "";
+  const review = makeCellReviewer("/x", {}, {}, { runCodex: async (p) => { seen = p; return { status: 0, stdout: '{"agent":"codex","findings":[]}' }; } });
+  await review(cells[0]);
+  assert.match(seen, /loc=42 hotspot=9/, "the static facts reach the group prompt");
 });
