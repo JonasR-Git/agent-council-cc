@@ -90,7 +90,9 @@ test("behaviourEquivalent needs tests green AND no public-API change (fail-close
 });
 
 test("evaluateStructureGate approves ONLY on consent + plan + no-drift + behaviour + unanimous council", () => {
-  const base = { plan, actualChanged: ["a.mjs", "b.mjs"], verdicts: okVerdicts, testsGreen: true, publicApiChanged: false, structureAutoApply: true };
+  // a NON-sensitive structural finding (architecture/design) needs only structureAutoApply
+  const nonSensitive = { lens: "architecture_ssot", category: "design" };
+  const base = { plan, actualChanged: ["a.mjs", "b.mjs"], verdicts: okVerdicts, testsGreen: true, publicApiChanged: false, structureAutoApply: true, finding: nonSensitive };
   assert.equal(evaluateStructureGate(base).approved, true, evaluateStructureGate(base).summary);
 
   // each gate independently blocks
@@ -107,9 +109,38 @@ test("evaluateStructureGate approves ONLY on consent + plan + no-drift + behavio
   assert.match(evaluateStructureGate({ ...base, plan: { type: "consolidate-ssot", rationale: "x", plannedTouched: [] } }).summary, /plan:/);
 });
 
+test("evaluateStructureGate (council C5): a SENSITIVE structural finding needs BOTH consents; absent finding fails closed", () => {
+  const sensitive = { lens: "architecture_ssot", category: "security" }; // SSOT-dedup of auth code
+  const base = { plan, actualChanged: ["a.mjs", "b.mjs"], verdicts: okVerdicts, testsGreen: true, publicApiChanged: false, finding: sensitive };
+  // structureAutoApply alone is NOT enough for a sensitive structural transform
+  assert.equal(evaluateStructureGate({ ...base, structureAutoApply: true }).approved, false, "sensitive → also needs sensitiveAutoApply");
+  assert.match(evaluateStructureGate({ ...base, structureAutoApply: true }).summary, /sensitiveAutoApply/);
+  // both consents → approved
+  assert.equal(evaluateStructureGate({ ...base, structureAutoApply: true, sensitiveAutoApply: true }).approved, true);
+  // fail-closed: no finding supplied → treated as sensitive → both required
+  const noFinding = { plan, actualChanged: ["a.mjs", "b.mjs"], verdicts: okVerdicts, testsGreen: true, publicApiChanged: false, structureAutoApply: true };
+  assert.equal(evaluateStructureGate(noFinding).approved, false, "absent finding → assume sensitive → blocked without sensitiveAutoApply");
+});
+
+test("evaluateStructureGate (council C5): strict testsGreen + widened path protection + identity-exact touched set", () => {
+  const nonSensitive = { lens: "architecture_ssot", category: "design" };
+  const base = { plan, actualChanged: ["a.mjs", "b.mjs"], verdicts: okVerdicts, publicApiChanged: false, structureAutoApply: true, finding: nonSensitive };
+  // testsGreen must be === true (a truthy string must not pass)
+  assert.equal(evaluateStructureGate({ ...base, testsGreen: "false" }).approved, false, "string 'false' is not green");
+  assert.equal(evaluateStructureGate({ ...base, testsGreen: true }).approved, true);
+  // widened protected classes + drive-relative
+  assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: [".gitlab-ci.yml"] }).ok, false, "CI config protected");
+  assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: ["secrets/key.pem"] }).ok, false, "key material protected");
+  assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: ["C:outside.mjs"] }).ok, false, "drive-relative path is repo-escape");
+  // a control-char / edge-whitespace path is a malformed plan, and does NOT collapse to a clean name
+  assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: ["a.mjs\n"] }).ok, false, "control char → malformed plan");
+  assert.equal(enforcePlannedTouched(["a.mjs\n"], ["a.mjs"]).ok, false, "a weird-named actual file is NOT the planned clean name");
+});
+
 test("evaluateStructureGate is fail-closed on a missing seat (council not unanimous)", () => {
-  const twoSeats = evaluateStructureGate({ plan, actualChanged: ["a.mjs", "b.mjs"], verdicts: [{ seat: "claude", verdict: "confirm" }, { seat: "codex", verdict: "confirm" }], testsGreen: true, publicApiChanged: false, structureAutoApply: true });
+  const twoSeats = evaluateStructureGate({ plan, actualChanged: ["a.mjs", "b.mjs"], verdicts: [{ seat: "claude", verdict: "confirm" }, { seat: "codex", verdict: "confirm" }], testsGreen: true, publicApiChanged: false, structureAutoApply: true, finding: { lens: "architecture_ssot", category: "design" } });
   assert.equal(twoSeats.approved, false, "3 seats required — a missing grok blocks");
+  assert.match(twoSeats.summary, /council/, "the block reason is the non-unanimous council, not consent");
 });
 
 test("buildStructureReviewPrompt nonce-fences the plan + multi-file diff; planned files live INSIDE the fence", () => {
