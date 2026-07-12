@@ -38,7 +38,19 @@ const SENSITIVE_LENSES = new Set(["security_secrets", "concurrency_resources", "
 
 /** True if a finding is also in a §6 sensitive class (by category or lens). */
 export function isSensitiveStructureClass(f) {
-  return SENSITIVE_CATEGORIES.has(String(f?.category ?? "").toLowerCase()) || SENSITIVE_LENSES.has(String(f?.lens ?? ""));
+  // TRIM + lowercase BOTH sides (council C5 codex/claude): category was case-folded but NOT trimmed and
+  // lens was exact, so "security " (trailing space) or "Security_Secrets" mis-classified as
+  // non-sensitive → a normalized-adapter slip defeated the §6 consent gate.
+  const cat = String(f?.category ?? "").trim().toLowerCase();
+  const lens = String(f?.lens ?? "").trim().toLowerCase();
+  return SENSITIVE_CATEGORIES.has(cat) || SENSITIVE_LENSES.has(lens);
+}
+
+// Sensitive OR unclassified → fail-closed as sensitive (council C5 codex/claude P1): a structural
+// finding whose sensitivity can't be established (no/blank category, structure lenses are never
+// themselves sensitive) must require the §6 sensitiveAutoApply consent, not skip it.
+function sensitiveOrUnclassified(f) {
+  return isSensitiveStructureClass(f) || !String(f?.category ?? "").trim();
 }
 
 // Paths a structure transform must NEVER touch: repo-escape (traversal/absolute/drive) or a protected
@@ -49,14 +61,31 @@ const STRUCTURE_PROTECTED_RE = [
   /(^|\/)\.git(\/|$)/i,
   /(^|\/)node_modules(\/|$)/i,
   /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i,
+  /(^|\/)(Cargo\.lock|go\.sum|poetry\.lock|composer\.lock|Gemfile\.lock)$/i,
   /(^|\/)\.env(\.|$)/i,
-  // CI/CD beyond GitHub (council C5): a wrong rewrite of a pipeline is an escalation vector.
-  /(^|\/)(\.gitlab-ci\.yml|\.travis\.yml|azure-pipelines\.yml|bitbucket-pipelines\.yml|Jenkinsfile|\.drone\.yml)$/i,
+  /(^|\/)\.council/,
+  // TEST files are OFF-LIMITS (council C5 grok P1): a structural transform that rewrites a test could
+  // gut the very assertions behaviourEquivalent's testsGreen relies on → the suite goes green on a
+  // weakened check. Mirrors audit-fix's test ban.
+  /(^|\/)[^/]*\.(test|spec)\.[cm]?[jt]sx?$/i,
+  /(^|\/)(tests?|__tests__|specs?)\//i,
+  // CI/CD beyond GitHub — a wrong pipeline rewrite is an escalation vector (.yml AND .yaml; C5 grok P2).
   /(^|\/)\.circleci(\/|$)/i,
-  // Secrets / key material — never structurally rewritten.
+  /(^|\/)\.buildkite(\/|$)/i,
+  /(^|\/)\.teamcity(\/|$)/i,
+  /(^|\/)(azure-pipelines|bitbucket-pipelines|appveyor)\.ya?ml$/i,
+  /(^|\/)\.gitlab-ci\.ya?ml$/i,
+  /(^|\/)\.travis\.ya?ml$/i,
+  /(^|\/)(Jenkinsfile|\.drone\.ya?ml)$/i,
+  // Credential stores (council C5 codex P1): never structurally rewritten (.aws/credentials,
+  // .docker/config.json live under these dirs).
+  /(^|\/)\.aws(\/|$)/i,
+  /(^|\/)\.docker(\/|$)/i,
+  /(^|\/)\.dockercfg$/i,
+  // Secrets / key material — never structurally rewritten (council C5 claude: widen formats).
   /(^|\/)(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\.|$)/i,
-  /\.(pem|key|p12|pfx|keystore|jks)$/i,
-  /(^|\/)(\.npmrc|\.pypirc|\.netrc)$/i
+  /\.(pem|key|p12|pfx|keystore|jks|p8|gpg|pgp|asc)$/i,
+  /(^|\/)(\.npmrc|\.pypirc|\.netrc|\.envrc)$/i
 ];
 function isUnsafePath(posix) {
   // Reject repo-escape: empty, traversal, leading /, OR any DRIVE-QUALIFIED path — including the
@@ -112,7 +141,7 @@ export function structureFixDisposition(finding, { structureAutoApply = false, s
   // SSOT-dedup of duplicated auth-check code — lens architecture_ssot, category security) must ALSO
   // clear the operator's SEPARATE sensitiveAutoApply gate, or an operator who withheld §6 consent
   // would get sensitive code auto-rewritten via the structure path. Never granted by consent alone.
-  const alsoSensitive = isSensitiveStructureClass(finding);
+  const alsoSensitive = sensitiveOrUnclassified(finding);
   const sensConsent = !alsoSensitive || sensitiveAutoApply === true;
   const eligible = structConsent && sensConsent;
   return {
@@ -205,7 +234,12 @@ export function evaluateStructureGate({ plan, actualChanged, verdicts, finding =
   // of auth code) must clear sensitiveAutoApply too — evaluateStructureGate previously ignored
   // sensitivity, so an operator who withheld §6 consent could get sensitive code auto-rewritten via
   // the structure path. Fail-closed: an ABSENT finding is treated as sensitive (requires both).
-  const alsoSensitive = finding ? isSensitiveStructureClass(finding) : true;
+  // Fail-closed when sensitivity CANNOT be established, not only when the finding is absent (council
+  // C5 claude P2): a present-but-unclassified finding ({} or one with no category — a realistic
+  // partial parse of an LLM finding) previously read as non-sensitive and skipped the §6 gate. Treat a
+  // finding lacking a category as sensitive too (structure lenses are never themselves sensitive, so
+  // sensitivity rides on category here).
+  const alsoSensitive = finding ? sensitiveOrUnclassified(finding) : true;
   const consented = structureAutoApply === true && (!alsoSensitive || sensitiveAutoApply === true);
   const planCheck = validateTransformPlan(plan);
   const touched = enforcePlannedTouched(actualChanged, planCheck.plannedTouched);

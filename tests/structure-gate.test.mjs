@@ -27,13 +27,17 @@ test("STRUCTURE_LENSES / isStructureClass cover architecture_ssot + logical_sens
 });
 
 test("structureFixDisposition is propose-only WITHOUT consent, council-gated auto WITH it", () => {
-  const f = { lens: "architecture_ssot" };
+  // a well-CLASSIFIED non-sensitive structural finding (architecture/design) → structureAutoApply alone
+  const f = { lens: "architecture_ssot", category: "design" };
   assert.equal(structureFixDisposition(f, {}).eligible, false);
   assert.match(structureFixDisposition(f, {}).reason, /propose-only/);
   assert.equal(structureFixDisposition(f, { structureAutoApply: true }).eligible, true);
   // council C2 grok P1: STRICT === true — a truthy non-boolean (env string "false") is NOT consent
   assert.equal(structureFixDisposition(f, { structureAutoApply: "false" }).eligible, false, "a stray truthy value must not grant consent");
   assert.equal(structureFixDisposition(f, { structureAutoApply: 1 }).eligible, false);
+  // council C5 codex/claude: an UNCLASSIFIED structural finding (no category) fails closed as sensitive
+  assert.equal(structureFixDisposition({ lens: "architecture_ssot" }, { structureAutoApply: true }).eligible, false, "no category → fail-closed sensitive → needs §6 consent too");
+  assert.equal(structureFixDisposition({ lens: "architecture_ssot" }, { structureAutoApply: true, sensitiveAutoApply: true }).eligible, true, "both consents unblock the unclassified finding");
   // a non-structural finding is not this gate's concern
   assert.equal(structureFixDisposition({ lens: "correctness" }, { structureAutoApply: true }).structural, false);
 });
@@ -117,9 +121,18 @@ test("evaluateStructureGate (council C5): a SENSITIVE structural finding needs B
   assert.match(evaluateStructureGate({ ...base, structureAutoApply: true }).summary, /sensitiveAutoApply/);
   // both consents → approved
   assert.equal(evaluateStructureGate({ ...base, structureAutoApply: true, sensitiveAutoApply: true }).approved, true);
+  // sensitiveAutoApply WITHOUT structureAutoApply still blocks (both are required)
+  assert.equal(evaluateStructureGate({ ...base, structureAutoApply: false, sensitiveAutoApply: true }).approved, false, "sensitiveAutoApply alone is not enough");
   // fail-closed: no finding supplied → treated as sensitive → both required
   const noFinding = { plan, actualChanged: ["a.mjs", "b.mjs"], verdicts: okVerdicts, testsGreen: true, publicApiChanged: false, structureAutoApply: true };
   assert.equal(evaluateStructureGate(noFinding).approved, false, "absent finding → assume sensitive → blocked without sensitiveAutoApply");
+  assert.match(evaluateStructureGate(noFinding).summary, /sensitiveAutoApply/, "the block reason cites the missing sensitive consent");
+  // council C5 codex/claude P1: malformed/unclassified finding metadata must NOT bypass double consent
+  const whitespace = { lens: "architecture_ssot", category: "security " }; // trailing space
+  assert.equal(evaluateStructureGate({ ...base, finding: whitespace, structureAutoApply: true }).approved, false, "trailing-whitespace sensitive category still requires §6 consent");
+  const unclassified = { lens: "architecture_ssot" }; // present, no category
+  assert.equal(evaluateStructureGate({ ...base, finding: unclassified, structureAutoApply: true }).approved, false, "a finding with no category fails closed as sensitive");
+  assert.equal(evaluateStructureGate({ ...base, finding: {}, structureAutoApply: true }).approved, false, "an empty finding object fails closed");
 });
 
 test("evaluateStructureGate (council C5): strict testsGreen + widened path protection + identity-exact touched set", () => {
@@ -131,6 +144,13 @@ test("evaluateStructureGate (council C5): strict testsGreen + widened path prote
   // widened protected classes + drive-relative
   assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: [".gitlab-ci.yml"] }).ok, false, "CI config protected");
   assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: ["secrets/key.pem"] }).ok, false, "key material protected");
+  assert.equal(validateTransformPlan({ type: "merge-duplicate", rationale: "r", plannedTouched: ["src/foo.test.mjs"] }).ok, false, "test files off-limits (testsGreen must stay honest)");
+  assert.equal(validateTransformPlan({ type: "merge-duplicate", rationale: "r", plannedTouched: ["tests/foo.mjs"] }).ok, false, "tests/ dir off-limits");
+  assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: ["azure-pipelines.yaml"] }).ok, false, ".yaml CI variant protected too");
+  assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: [".buildkite/pipeline.yml"] }).ok, false, "buildkite CI protected");
+  assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: ["deploy/AuthKey.p8"] }).ok, false, ".p8 key material protected");
+  assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: [".aws/credentials"] }).ok, false, "credential store protected");
+  assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: [".docker/config.json"] }).ok, false, "docker credential config protected");
   assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: ["C:outside.mjs"] }).ok, false, "drive-relative path is repo-escape");
   // a control-char / edge-whitespace path is a malformed plan, and does NOT collapse to a clean name
   assert.equal(validateTransformPlan({ type: "relocate", rationale: "r", plannedTouched: ["a.mjs\n"] }).ok, false, "control char → malformed plan");
