@@ -11,15 +11,24 @@ test("R9: makeFixLoopDeps drives the loop off runGroupedReview when --groups is 
   let seen = null;
   const runGroupedReview = async (cwd, m, backends, opts) => {
     seen = opts;
-    return { findings: [{ file: "a.mjs", title: "x", category: "bug", severity: "P2" }], coverage: { unitsReviewed: 1, unitsSelected: 1, complete: false, budgetSpent: 5 } };
+    return { findings: [{ file: "a.mjs", title: "x", category: "bug", severity: "P2" }], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: false, budgetSpent: 5 } };
   };
   const runAuditReview = async () => { throw new Error("per-file path must NOT be used when --groups is set"); };
   const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 100 }, { runGroupedReview, runAuditReview });
-  const rev = await deps.review({ budget: 5, changedFiles: null });
+  const rev = await deps.review({ budget: 500, changedFiles: null }); // budget ≥ maxCells → cap not hit
   assert.equal(seen.lensGroups, "fine", "the grouped path is selected + the preset threaded");
-  assert.equal(seen.maxCells, 100, "the cell cap is threaded");
-  assert.equal(rev.coverage.complete, false, "grouped coverage.complete flows to the loop's convergence guard");
+  assert.equal(seen.maxCells, 100, "the cell cap is threaded (uncapped when budget ≥ maxCells)");
   assert.equal(rev.ran, true, "a grouped pass that reviewed a unit is ran:true");
+});
+
+test("R9 (council Grok/Codex P1): a grouped pass's cells are CAPPED to the per-pass budget", async () => {
+  // each cell = one paid agent call; a pass must never dispatch more cells than its budget allots, else
+  // one pass blows the whole loop budget → a 1-pass stop with under-reported spend.
+  let seen = null;
+  const runGroupedReview = async (cwd, m, backends, opts) => { seen = opts; return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: true, budgetSpent: 0 } }; };
+  const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 1500 }, { runGroupedReview });
+  await deps.review({ budget: 40, changedFiles: null });
+  assert.equal(seen.maxCells, 40, "cells capped to the per-pass budget (min(1500, 40))");
 });
 
 test("R9: without --groups the loop still uses the per-file runAuditReview", async () => {

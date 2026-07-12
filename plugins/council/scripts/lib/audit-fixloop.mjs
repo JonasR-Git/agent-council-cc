@@ -291,7 +291,10 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // counts complete for the pre-cell-matrix path). STALLED only when fresh AUTO-FIXABLE findings
     // remained unapplied — fresh PROPOSE-ONLY findings (architecture/SSOT/etc.) are expected not to
     // auto-apply and must NOT read as a stall (that would falsely stop with real fixes still open).
-    const coverageComplete = rev?.coverage?.complete !== false;
+    // Prefer the grouped path's passComplete (scheduled cells reviewed — transient-completable) over
+    // the strict `complete` (which capped/unsupplied force false PERSISTENTLY → the loop could never
+    // converge; council R9 Codex/Claude P1). Per-file path sets neither → undefined → treated complete.
+    const coverageComplete = (rev?.coverage?.passComplete ?? rev?.coverage?.complete) !== false;
     // AUTO-FIXABLE = a localized finding the fixer can actually apply. A propose-only / cross-cutting
     // finding (architecture/SSOT/logical) is offered to fix() only to be surfaced as a proposal — it
     // NEVER auto-applies, so counting it as live work would (a) falsely read as a stall and (b) pin a

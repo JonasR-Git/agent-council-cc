@@ -61,6 +61,16 @@ test("B5: once coverage IS complete, a zero-fresh pass converges as before", asy
   assert.equal(out.passesRun, 3);
 });
 
+test("R9 (council Codex/Claude): passComplete gates convergence — a capped grouped pass still converges", async () => {
+  // a capped/unsupplied grouped pass reports strict complete:false (one-shot report honesty) but
+  // passComplete:true (all SCHEDULED cells reviewed). The loop must converge off passComplete, not
+  // burn to maxPasses re-hitting the same persistent cap every pass.
+  const review = async () => ({ findings: [f("a.mjs", "recurring token")], coverage: { budgetSpent: 1, complete: false, passComplete: true } });
+  const out = await runEndless("/x", { maxPasses: 20, dryStreak: 2, budget: 100 }, { review, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /diminishing/, "passComplete lets the zero-fresh streak converge despite strict complete:false");
+  assert.ok(out.passesRun < 20, "did not burn to the max-pass ceiling on a persistent cap");
+});
+
 test("runEndless respects the finite total budget", async () => {
   // each pass charges exactly the budget it is handed
   const review = async ({ pass, budget }) => ({ findings: [f(`b${pass}.mjs`, `unique budget token ${pass} beta`)], coverage: { budgetSpent: budget } });

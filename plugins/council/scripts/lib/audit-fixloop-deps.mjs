@@ -41,10 +41,12 @@ function buildDupPeers(dupClusters = []) {
 
 export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   // R9 wiring: when --groups is set, drive the loop off the cell-granular GROUPED six-eyes review
-  // (runGroupedReview) instead of the per-file runAuditReview — its coverage.complete then feeds the
-  // loop's convergence guard so the run keeps going until the matrix is whole. Both return a
-  // compatible {findings, coverage:{unitsReviewed/unitsSelected/complete/budgetSpent}} shape. Each path
-  // is independently injectable for tests.
+  // (runGroupedReview) instead of the per-file runAuditReview — its coverage.complete feeds the loop's
+  // convergence guard so a pass whose six-eyes matrix is INCOMPLETE (cells unreviewed) does NOT count
+  // toward the dry streak. NOTE: complete reflects THIS pass's scheduled cells (the selected maxUnits
+  // window under its budget cap), not a whole-project matrix — the progressive window + blast-radius
+  // re-scope move coverage across the project over passes. Both paths return a compatible {findings,
+  // coverage:{unitsReviewed/unitsSelected/complete/budgetSpent}} shape; each is injectable for tests.
   const doPerFile = impl.runAuditReview ?? runAuditReview;
   const doGrouped = impl.runGroupedReview ?? runGroupedReview;
   const doReview = options.lensGroups ? doGrouped : doPerFile;
@@ -83,9 +85,13 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       skipClaude: options.skipClaude,
       ledger: options.ledger,
       // R9: when set, doReview is runGroupedReview — it honors maxUnits/unitOffset (per-file selection)
-      // and drives the cell matrix off these; runAuditReview ignores them.
+      // and drives the cell matrix off these; runAuditReview ignores them. CAP the pass's cells to the
+      // per-pass BUDGET (each cell = one paid agent call) so a grouped pass never dispatches more calls
+      // than the pass is allotted — else it ignored the budget entirely and one pass blew the whole
+      // loop budget → a 1-pass stop with under-reported spend (council Grok R9 P0/P1). budgetSpent then
+      // stays ≤ budget and the loop iterates honestly.
       lensGroups: options.lensGroups,
-      maxCells: options.maxCells
+      maxCells: options.lensGroups ? Math.max(1, Math.min(options.maxCells ?? Infinity, Math.floor(budget))) : options.maxCells
     });
     // Surface a top-level `ran` the loop can trust. runAuditReview swallows backend
     // failures (rate-limit / unreachable / undispatched) into 0 findings WITHOUT throwing,

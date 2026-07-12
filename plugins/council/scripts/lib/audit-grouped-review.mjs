@@ -165,16 +165,24 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   const attempted = files.filter((f) => !noContent.has(f));
   const reviewedFiles = results.length ? attempted.filter((f) => reviewedSet.has(f)) : attempted;
 
-  // capped OR an unsupplied (oversize/unreadable) file → never full coverage. When there were 0 cells
-  // to schedule AND nothing was unsupplied (every selected file was vacuously empty), the run IS
-  // vacuously complete — sixEyesComplete([]) is fail-closed false, so special-case it (council Codex C1).
-  const complete = capped || unsupplied.length > 0 ? false : cells.length === 0 ? true : Boolean(matrixOut.complete);
+  // TWO completeness signals (council R9 Codex/Claude P1):
+  //  - `complete` (STRICT, for the one-shot report): capped OR an unsupplied file → never full six-eyes
+  //    coverage; 0 cells with nothing unsupplied = vacuously complete.
+  //  - `passComplete` (for the LOOP's convergence guard): were all SCHEDULED cells reviewed by all
+  //    seats? This is TRANSIENT-completable — a failed cell (rate-limit) flips it false so the loop
+  //    keeps going + retries, but a PERSISTENT cap/unsupplied does NOT force it false (those are
+  //    surfaced as caveats, not re-reviewable work) — else the loop could NEVER converge, re-hitting
+  //    the same cap every pass and burning to max-passes. Pass-local by nature (this window's cells);
+  //    whole-project cell coverage across passes is a deliberate future enhancement.
+  const passComplete = cells.length === 0 ? true : Boolean(matrixOut.complete);
+  const complete = capped || unsupplied.length > 0 ? false : passComplete;
   return {
     findings: scoped.all,
     refuted: scoped.refuted ?? [],
     reviewed: reviewedFiles,
     coverage: {
       complete,
+      passComplete, // the loop convergence signal (scheduled cells done; capped/unsupplied don't block it)
       ran: true,
       groupPreset: options.lensGroups ?? "fine",
       reviewers: reviewerMap(backends, options),

@@ -1737,6 +1737,14 @@ async function handleAudit(argv) {
     booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "supervise"]
   });
   const cwd = process.cwd();
+  // Validate the grouped-review preset + cap ONCE, up front — before any preflight/coverage/spend, for
+  // EVERY audit subcommand (council R9 Codex P2 fail-fast + one-shot consistency). resolveLensGroups
+  // also throws downstream, but a typo shouldn't first run a long coverage job or a review.
+  if (options.groups != null && !["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
+  if (options["max-cells"] != null) {
+    const nmc = Number(options["max-cells"]);
+    if (!Number.isFinite(nmc) || nmc < 1) throw new Error("--max-cells must be a positive number");
+  }
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
   let churnDays = 90;
   if (options["churn-days"] != null) {
@@ -1926,11 +1934,34 @@ async function handleAudit(argv) {
         if (!Number.isFinite(n) || n < 1) throw new Error("--dry-streak must be a positive number");
         dryStreak = Math.floor(n);
       }
-      let loopBudget = 60; // the loop's OWN default (not the single-pass review default)
+      // R9: --groups drives the loop off the GROUPED six-eyes review (cell-granular coverage feeds the
+      // convergence guard). Validate the preset + cap up front so a bad value fails before any spend.
+      let loopLensGroups;
+      let loopMaxCells;
+      if (options.groups) {
+        if (!["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
+        loopLensGroups = String(options.groups);
+        loopMaxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
+        if (options["max-cells"] != null) {
+          const nc = Number(options["max-cells"]);
+          if (!Number.isFinite(nc) || nc < 1) throw new Error("--max-cells must be a positive number");
+          loopMaxCells = Math.floor(nc);
+        }
+      }
+      // The loop budget is in AGENT CALLS. A per-file pass is a handful; a GROUPED pass is up to
+      // maxCells calls, so a grouped loop's budget must be CELL-SCALE — else one pass blows the 60
+      // default and the loop stops after a single pass (council Grok R9). Default a grouped run to ~4
+      // passes' worth of cells, and raise the ceiling accordingly. The per-pass cell dispatch is capped
+      // to the remaining budget (makeFixLoopDeps), so this bounds total spend honestly.
+      const budgetMax = loopLensGroups ? Math.max(2000, loopMaxCells * 20) : 2000;
+      let loopBudget = loopLensGroups ? loopMaxCells * 4 : 60;
       if (options.budget != null) {
         const n = Number(options.budget);
-        if (!Number.isFinite(n) || n < 2 || n > 2000) throw new Error("--budget must be between 2 and 2000");
+        if (!Number.isFinite(n) || n < 2 || n > budgetMax) throw new Error(`--budget must be between 2 and ${budgetMax}`);
         loopBudget = Math.floor(n);
+      }
+      if (loopLensGroups && !options.json) {
+        console.error(`note: --groups makes each pass a ${loopMaxCells}-cell six-eyes review (each cell = one agent call); the loop budget is ${loopBudget} agent calls (≈${Math.max(1, Math.floor(loopBudget / loopMaxCells))} full grouped pass(es)). Raise --budget for more passes.`);
       }
 
       // Coverage gate (§5): produce coverage ONCE via a project script and ingest it, so
@@ -1975,20 +2006,6 @@ async function handleAudit(argv) {
         } else {
           const missing = ["claude", "codex", "grok"].filter((s) => !ready[s]);
           console.error(`⚠ --sensitive-auto-apply requested but seats unreachable (${missing.join(", ")}) — §6 stays propose-only.`);
-        }
-      }
-      // R9: --groups drives the loop off the GROUPED six-eyes review (cell-granular coverage feeds the
-      // convergence guard). Validate the preset + cap up front so a bad value fails before any spend.
-      let loopLensGroups;
-      let loopMaxCells;
-      if (options.groups) {
-        if (!["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
-        loopLensGroups = String(options.groups);
-        loopMaxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
-        if (options["max-cells"] != null) {
-          const nc = Number(options["max-cells"]);
-          if (!Number.isFinite(nc) || nc < 1) throw new Error("--max-cells must be a positive number");
-          loopMaxCells = Math.floor(nc);
         }
       }
       const deps = makeFixLoopDeps(cwd, model, backends, {
@@ -2131,11 +2148,28 @@ async function handleAudit(argv) {
       throw new Error("no callable reviewers (Codex/Grok/Claude all unavailable or skipped) — endless review needs at least one");
     }
     const { maxUnits } = parseAuditBudgetOptions(options);
-    let budget = 60;
+    // R9: --groups drives the endless loop off the grouped six-eyes review. Validate up front (before
+    // any spend) + scale the AGENT-CALL budget to cell-scale (a grouped pass is up to maxCells calls).
+    let endlessLensGroups;
+    let endlessMaxCells;
+    if (options.groups) {
+      if (!["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
+      endlessLensGroups = String(options.groups);
+      endlessMaxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
+      if (options["max-cells"] != null) {
+        const nc = Number(options["max-cells"]);
+        if (!Number.isFinite(nc) || nc < 1) throw new Error("--max-cells must be a positive number");
+        endlessMaxCells = Math.floor(nc);
+      }
+    }
+    let budget = endlessLensGroups ? endlessMaxCells * 4 : 60;
     if (options.budget != null) {
       const n = Number(options.budget);
       if (!Number.isFinite(n) || n < 2) throw new Error("--budget must be a number >= 2");
       budget = Math.floor(n);
+    }
+    if (endlessLensGroups && !options.json) {
+      console.error(`note: --groups makes each pass a ${endlessMaxCells}-cell six-eyes review (each cell = one agent call); the loop budget is ${budget} agent calls (≈${Math.max(1, Math.floor(budget / endlessMaxCells))} full grouped pass(es)). Raise --budget for more passes.`);
     }
     let maxPasses = 10;
     if (options["max-passes"] != null) {
@@ -2149,33 +2183,23 @@ async function handleAudit(argv) {
       if (!Number.isFinite(n) || n < 1) throw new Error("--dry-streak must be a positive number");
       dryStreak = Math.floor(n);
     }
-    // R9: --groups drives the endless loop off the GROUPED six-eyes review too (validated up front).
-    let endlessLensGroups;
-    let endlessMaxCells;
-    if (options.groups) {
-      if (!["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
-      endlessLensGroups = String(options.groups);
-      endlessMaxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
-      if (options["max-cells"] != null) {
-        const nc = Number(options["max-cells"]);
-        if (!Number.isFinite(nc) || nc < 1) throw new Error("--max-cells must be a positive number");
-        endlessMaxCells = Math.floor(nc);
-      }
-    }
-    // Each pass advances the hotspot window (progressive coverage) and skips the
-    // global reduce after pass 1 (its input is the static map — identical every
-    // pass — so re-running it just re-charges budget). With --groups the pass is the
-    // cell-granular grouped review whose coverage.complete gates the loop's dry streak.
+    // Each pass advances the hotspot window (progressive coverage) and skips the global reduce after
+    // pass 1 (its input is the static map — identical every pass — so re-running it just re-charges
+    // budget). With --groups the pass is the cell-granular grouped review whose passComplete gates the
+    // dry streak. The window WRAPS (% unit count) so an overrun never returns a 0-unit review that
+    // grouped would report as never-complete (council R9 Claude/Codex). Grouped cells are capped to the
+    // per-pass budget so a pass never dispatches more paid calls than it is allotted (council R9 P1).
+    const nonTestUnits = Math.max(1, (model?.files ?? []).filter((f) => !f.isTest).length);
     const doEndlessReview = endlessLensGroups ? runGroupedReview : runAuditReview;
     const review = ({ budget: passBudget, pass }) =>
       doEndlessReview(cwd, model, backends, {
         ...merged,
         budget: passBudget,
         maxUnits,
-        unitOffset: (pass - 1) * maxUnits,
+        unitOffset: ((pass - 1) * maxUnits) % nonTestUnits,
         skipReduce: pass > 1,
         lensGroups: endlessLensGroups,
-        maxCells: endlessMaxCells,
+        maxCells: endlessLensGroups ? Math.max(1, Math.min(endlessMaxCells, Math.floor(passBudget))) : undefined,
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok
       });

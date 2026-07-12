@@ -115,11 +115,13 @@ test("council Codex C2: a recurring PROPOSE-ONLY finding does not pin its tier (
 test("R9: a --groups fix loop does NOT converge while grouped coverage is INCOMPLETE", async () => {
   const gModel = { files: [{ id: "a.mjs", fanIn: 1 }] };
   let pass = 0;
-  // findings empty every pass, but the six-eyes matrix is incomplete until pass 3 → the loop must keep
-  // reviewing (cells still unreviewed) and not declare a false dry convergence at pass 1.
+  // findings empty every pass, but the six-eyes matrix's scheduled cells are incomplete (some failed)
+  // until pass 3 → the loop must keep reviewing (passComplete gates the dry streak) and not declare a
+  // false dry convergence at pass 1. (budgetSpent kept tiny so this isolates the convergence logic; the
+  // real per-pass cell→budget cap is pinned separately in audit-fixloop-deps.)
   const runGroupedReview = async () => {
     pass += 1;
-    return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, complete: pass >= 3, budgetSpent: 1 } };
+    return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, passComplete: pass >= 3, budgetSpent: 1 } };
   };
   const runAuditFix = async () => ({ fixed: [], failed: [], spent: 0 });
   const deps = makeFixLoopDeps("/x", gModel, {}, { lensGroups: "fine", maxCells: 50 }, { runGroupedReview, runAuditFix });

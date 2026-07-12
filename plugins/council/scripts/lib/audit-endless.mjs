@@ -137,11 +137,11 @@ export async function runEndless(cwd, options = {}, deps = {}) {
     spent += Math.min(Math.max(1, passSpent), totalBudget - spent);
     const fresh = dedupeNew(passFindings, seen);
     all.push(...fresh);
-    // B5 (cell-aware convergence): a zero-fresh pass only advances the dry streak when the
-    // review's six-eyes COVERAGE is complete. If cells are still unreviewed (coverage.complete
-    // === false), "found nothing new" is not real convergence — there is work left — so the
-    // streak resets. Absent coverage info (undefined, the pre-cell-matrix path) counts as complete.
-    const coverageComplete = res?.coverage?.complete !== false;
+    // B5 (cell-aware convergence): a zero-fresh pass only advances the dry streak when the review's
+    // scheduled cells were all reviewed. Prefer the grouped path's passComplete (transient-completable)
+    // over the strict `complete` — capped/unsupplied force `complete` false PERSISTENTLY, which would
+    // stop the streak from ever advancing (council R9). Absent info (per-file path) counts as complete.
+    const coverageComplete = (res?.coverage?.passComplete ?? res?.coverage?.complete) !== false;
     dryStreak = fresh.length === 0 && coverageComplete ? dryStreak + 1 : 0;
     passes.push({ pass: passNo, found: passFindings.length, fresh: fresh.length, spent });
     onProgress(`  pass ${passNo}: +${fresh.length} new (total ${all.length}); dry ${dryStreak}/${dryStop}`);

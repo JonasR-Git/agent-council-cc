@@ -38,12 +38,13 @@ test("runGroupedReview: the cell-matrix path returns findings + six-eyes coverag
   assert.deepEqual(out.coverage.reviewers, { codex: true, grok: true, claude: true });
 });
 
-test("runGroupedReview: a CAPPED run never claims complete coverage", async () => {
+test("runGroupedReview: a CAPPED run is not COMPLETE (report) but IS passComplete (loop) — council R9", async () => {
   const runMatrix = async () => ({ findings: [], matrix: { summary: () => ({}) }, complete: true });
   const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "fine", ledger: false, maxCells: 5 }, { runMatrix, ...FS });
   assert.equal(out.coverage.capped, true);
   assert.ok(out.coverage.cellsDropped > 0, "the overflow is surfaced");
-  assert.equal(out.coverage.complete, false, "a capped run is never six-eyes complete");
+  assert.equal(out.coverage.complete, false, "strict complete: a capped run is never six-eyes complete (one-shot report honesty)");
+  assert.equal(out.coverage.passComplete, true, "passComplete: the SCHEDULED cells were all reviewed — cap is a caveat, not re-reviewable work, so it must NOT block loop convergence forever");
 });
 
 test("runGroupedReview: no reachable reviewer → ran:false with a specific reason, no matrix call", async () => {
