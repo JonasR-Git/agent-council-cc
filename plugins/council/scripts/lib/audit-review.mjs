@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { buildReformatPrompt, interpolate, makeFenceNonce, runCodexStructured, runGrokStructured, runStructuredWithRetry } from "./agents.mjs";
+import { runClaudeStructured } from "./claude-agent.mjs";
 import { mergeFindings, parseAgentFindings } from "./findings.mjs";
 import { fingerprintFinding, recordAndAnnotate } from "./ledger.mjs";
 import { annotateScopes } from "./scope.mjs";
@@ -46,12 +47,21 @@ export function makeBudget(total) {
 export function reviewerActive(name, backends, options = {}) {
   if (name === "codex") return !options.skipCodex && Boolean(backends?.codex?.companionAvailable);
   if (name === "grok") return !options.skipGrok && Boolean(backends?.grok?.cli?.available);
+  // B2: Claude is a FIRST-CLASS finder (six-eyes: every model runs every lens itself, never a
+  // synthesizer-only). Gated on the ACTUAL cli probe — the audit path must probe Claude
+  // (probeClaude defaults on via bare probeBackends), else this stays false and only Codex+Grok
+  // find (silently four eyes, not six). skipClaude opts out symmetrically with skipCodex/skipGrok.
+  if (name === "claude") return !options.skipClaude && Boolean(backends?.claude?.cli?.available);
   return false;
 }
 
 /** How many agent calls a single unit review will actually dispatch. */
 export function activeReviewerCount(backends, options = {}) {
-  return (reviewerActive("codex", backends, options) ? 1 : 0) + (reviewerActive("grok", backends, options) ? 1 : 0);
+  return (
+    (reviewerActive("codex", backends, options) ? 1 : 0) +
+    (reviewerActive("grok", backends, options) ? 1 : 0) +
+    (reviewerActive("claude", backends, options) ? 1 : 0)
+  );
 }
 
 /**
@@ -196,6 +206,14 @@ export async function reviewUnit(cwd, backends, options, unitId, model, budget) 
   if (reviewerActive("grok", backends, options)) {
     jobs.push(
       runStructuredWithRetry((p) => runGrokStructured(cwd, backends, options, p), prompt, (s) => parseAgentFindings(s, "grok"), { budget, ...AUDIT_REPAIR_OPTS }).then((r) => ({ ...r, agent: "grok" }))
+    );
+  }
+  // B2: Claude is the THIRD finder (six-eyes). It runs the SAME unit prompt independently, so every
+  // model searches every lens itself — never a synthesizer-only. A spawned `claude -p` (--safe-mode,
+  // read-only) separate from the orchestrating session, so its verdict is independent + isolated.
+  if (reviewerActive("claude", backends, options)) {
+    jobs.push(
+      runStructuredWithRetry((p) => runClaudeStructured(cwd, backends, options, p), prompt, (s) => parseAgentFindings(s, "claude"), { budget, ...AUDIT_REPAIR_OPTS }).then((r) => ({ ...r, agent: "claude" }))
     );
   }
   const raw = await Promise.all(jobs);
@@ -366,7 +384,11 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
       unparsedReturns,
       reformatsUsed,
       reduceRan: reduce.ran,
-      reviewers: { codex: reviewerActive("codex", backends, options), grok: reviewerActive("grok", backends, options) },
+      reviewers: {
+        codex: reviewerActive("codex", backends, options),
+        grok: reviewerActive("grok", backends, options),
+        claude: reviewerActive("claude", backends, options)
+      },
       failed,
       suppliedChars,
       totalCharsOfReviewed: totalChars,

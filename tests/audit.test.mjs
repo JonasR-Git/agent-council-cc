@@ -184,6 +184,18 @@ test("reviewerActive/activeReviewerCount reflect policy AND probed availability"
   assert.equal(activeReviewerCount({ codex: { companionAvailable: false }, grok: { cli: { available: false } } }, {}), 0);
 });
 
+test("B2: Claude is a first-class FINDER — six-eyes when all three are probed", () => {
+  const three = { codex: { companionAvailable: true }, grok: { cli: { available: true } }, claude: { cli: { available: true } } };
+  assert.equal(reviewerActive("claude", three, {}), true, "a probed Claude cli is an active finder");
+  assert.equal(activeReviewerCount(three, {}), 3, "codex + grok + claude = six eyes");
+  // gated on the ACTUAL probe: an un-probed / unavailable Claude stays silent (four eyes), never counted
+  assert.equal(reviewerActive("claude", { claude: { cli: { available: false } } }, {}), false);
+  assert.equal(reviewerActive("claude", { claude: {} }, {}), false, "no cli probe → not active (avoids silent 4-eyes)");
+  // skipClaude opts out symmetrically with skipCodex/skipGrok
+  assert.equal(reviewerActive("claude", three, { skipClaude: true }), false);
+  assert.equal(activeReviewerCount(three, { skipClaude: true }), 2);
+});
+
 test("writeAuditDoc writes inside root but rejects escaping/absolute docPath", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-doc-"));
   const ok = writeAuditDoc(dir, [], { source: "test" }, { docPath: "docs/OUT.md" });
