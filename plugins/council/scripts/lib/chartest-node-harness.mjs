@@ -77,9 +77,17 @@ export function changedLinesCovered(coverageDoc, absTargetPath, source, changedL
  *   - source   (the target's CURRENT source text, for offset→line mapping in the coverage check)
  * A run's timeout / non-zero exit / capture fault fails the specific check closed (no throw escapes).
  */
-export function makeNodeCharHarness({ cwd, testFile, targetFile, changedLines = [], source = "", runCommand, readCoverage, coverageDir, timeoutMs = 60_000 } = {}) {
-  const runOnce = async (extraEnv = {}) => {
-    const res = await runCommand("node", ["--test", testFile], { cwd, env: { ...process.env, ...extraEnv }, timeoutMs });
+export function makeNodeCharHarness({ cwd, testFile, targetFile, changedLines = [], source = "", runCommand, readCoverage, coverageDir, timeoutMs = 60_000, sandboxArgs } = {}) {
+  // SANDBOX the model-generated test (council Grok P0 — RCE): the test body is written by a seat that saw
+  // untrusted target source, then executed by `node --test`. Node's permission model
+  // (--experimental-permission) DENIES child_process (no shell/spawn/curl) and fs WRITES by default — the
+  // two vectors a prompt-injected test would use to tamper or persist. fs READS are allowed (the test must
+  // import the target; source read-exfil is no worse than the audit already sending source to the model
+  // seats). A node too old to support the flag simply errors → the run fails → fail-CLOSED (propose-only).
+  // Overridable via sandboxArgs (tests pass []); the coverage run additionally allows writing its dir.
+  const baseSandbox = Array.isArray(sandboxArgs) ? sandboxArgs : ["--experimental-permission", "--allow-fs-read=*"];
+  const runOnce = async (extraEnv = {}, extraArgs = []) => {
+    const res = await runCommand("node", [...baseSandbox, ...extraArgs, "--test", testFile], { cwd, env: { ...process.env, ...extraEnv }, timeoutMs });
     return res ?? { status: 1, stdout: "", timedOut: false };
   };
   return {
@@ -104,11 +112,27 @@ export function makeNodeCharHarness({ cwd, testFile, targetFile, changedLines = 
     },
     executesTarget: async () => {
       if (typeof readCoverage !== "function" || !coverageDir) return false; // can't verify → fail closed
-      const r = await runCommand("node", ["--test", testFile], { cwd, env: { ...process.env, NODE_V8_COVERAGE: coverageDir }, timeoutMs });
+      // the coverage run must be allowed to WRITE its NODE_V8_COVERAGE dir under the sandbox
+      const r = await runOnce({ NODE_V8_COVERAGE: coverageDir }, [`--allow-fs-write=${coverageDir}`]);
       if (!r || r.timedOut || r.status !== 0) return false;
       const doc = readCoverage(coverageDir);
       if (!doc) return false;
       return changedLinesCovered(doc, path.isAbsolute(targetFile) ? targetFile : path.join(cwd, targetFile), source, changedLines);
+    },
+    // ACCEPT-phase coverage check (council Grok P1): the test must actually EXECUTE the target module —
+    // ≥1 of the target's functions ran (count>0) — not merely import it unused with a tautology. Weaker
+    // than the changed-line bar (the diff is unknown pre-apply) but it forecloses "imports target, asserts
+    // 1===1". Fail-closed: no coverage reader / target absent / no executed function → false.
+    executesModule: async () => {
+      if (typeof readCoverage !== "function" || !coverageDir) return false;
+      const r = await runOnce({ NODE_V8_COVERAGE: coverageDir }, [`--allow-fs-write=${coverageDir}`]);
+      if (!r || r.timedOut || r.status !== 0) return false;
+      const doc = readCoverage(coverageDir);
+      const abs = path.isAbsolute(targetFile) ? targetFile : path.join(cwd, targetFile);
+      const norm = (u) => { try { return path.resolve(u.startsWith("file:") ? new URL(u).pathname.replace(/^\/([A-Za-z]:)/, "$1") : u); } catch { return u; } };
+      const script = (doc?.result ?? []).find((s) => norm(String(s.url ?? "")) === path.resolve(abs));
+      if (!script) return false;
+      return (script.functions ?? []).some((fn) => (fn.ranges ?? []).some((rg) => (rg.count ?? 0) > 0));
     }
   };
 }

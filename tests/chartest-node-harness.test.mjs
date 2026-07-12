@@ -67,6 +67,25 @@ test("makeNodeCharHarness.executesTarget fails closed without a coverage reader,
   assert.equal(await withCov.executesTarget(), true, "changed lines 1-2 covered");
 });
 
+test("makeNodeCharHarness SANDBOXES the test run with the Node permission model (council Grok P0 — RCE)", async () => {
+  let seenArgs = null;
+  const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", runCommand: async (cmd, args) => { seenArgs = args; return { status: 0, stdout: "ok 1", timedOut: false }; } });
+  await h.passesOnUnmodified();
+  assert.ok(seenArgs.includes("--experimental-permission"), "the model-generated test runs under the permission sandbox");
+  assert.ok(seenArgs.some((a) => a.startsWith("--allow-fs-read")), "fs reads allowed (import the target); child_process/writes denied by default");
+  assert.ok(!seenArgs.some((a) => a.startsWith("--allow-child-process")), "child_process is NOT granted → no shell/spawn exfil");
+});
+
+test("makeNodeCharHarness.executesModule is true only when the target actually ran a function (not import-unused)", async () => {
+  const abs = path.resolve("/r/m.mjs");
+  const ran = { result: [{ url: `file://${abs.replace(/\\/g, "/")}`, functions: [{ ranges: [{ startOffset: 0, endOffset: 20, count: 2 }] }] }] };
+  const importedOnly = { result: [{ url: `file://${abs.replace(/\\/g, "/")}`, functions: [{ ranges: [{ startOffset: 0, endOffset: 20, count: 0 }] }] }] };
+  const hRan = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", coverageDir: "/c", readCoverage: () => ran, runCommand: async () => ({ status: 0, stdout: "ok 1", timedOut: false }) });
+  assert.equal(await hRan.executesModule(), true, "a count>0 target function → the test exercised the module");
+  const hImp = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", coverageDir: "/c", readCoverage: () => importedOnly, runCommand: async () => ({ status: 0, stdout: "ok 1", timedOut: false }) });
+  assert.equal(await hImp.executesModule(), false, "imported but no function executed → not a real characterization");
+});
+
 test("makeNodeCharHarness.perturbedRun returns the observable under a faked clock/locale (null on failure)", async () => {
   let seenEnv = null;
   const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", runCommand: async (cmd, args, opts) => { seenEnv = opts.env; return { status: 0, stdout: '{"tz":"x"}', timedOut: false }; } });

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import path from "node:path";
 
 import { makeCharTestGate } from "../plugins/council/scripts/lib/chartest-wiring.mjs";
 
@@ -15,7 +16,13 @@ function baseDeps(overrides = {}) {
     runCommand: runPass,
     writeFile: (p, s) => files.set(p, s),
     removeFile: (p) => files.delete(p),
-    readCoverage: () => ({ result: [{ url: "file:///r/m.mjs", functions: [{ ranges: [{ startOffset: 0, endOffset: 9999, count: 1 }] }] }] }),
+    // covered target module (a count>0 function range for /r/m.mjs) so accept's executesModule + verify's
+    // executesChanged pass; the url matches path.resolve("/r/m.mjs") after normalization
+    readCoverage: () => ({ result: [{ url: `file://${path.resolve("/r/m.mjs").replace(/\\/g, "/")}`, functions: [{ ranges: [{ startOffset: 0, endOffset: 9999, count: 1 }] }] }] }),
+    // no-op fs: keep the test off the real filesystem
+    freshDir: (d) => d,
+    rmDir: () => {},
+    mkCoverageDir: () => "/covdir",
     _files: files,
     ...overrides
   };
@@ -55,6 +62,16 @@ test("makeCharTestGate.verify passes when the test stays green + covers the chan
   const res = await g.verify({ file: "m.mjs", source: "export const f = () => 42;", code: "import test from 'node:test';", changedLines: [1] });
   assert.equal(res.pass, true);
   assert.equal(deps._files.size, 0, "the transient test file is removed after verify");
+});
+
+test("makeCharTestGate.verify: a pure DELETION (empty changedLines) skips the changed-line bar (dead_code; council Grok P2)", async () => {
+  // a dead-code deletion has no NEW lines to cover; requiring changed-line coverage would ALWAYS revert
+  // it. The still-green check alone attests behaviour preservation. Force coverage to FAIL to prove it is
+  // not consulted for a deletion.
+  const deps = baseDeps({ readCoverage: () => ({ result: [] }) }); // executesChanged would be false if consulted
+  const g = makeCharTestGate("/r", {}, {}, deps);
+  const res = await g.verify({ file: "m.mjs", source: "x", code: "import test from 'node:test';", changedLines: [] });
+  assert.equal(res.pass, true, "deletion-only: green test is enough; the changed-line bar is skipped");
 });
 
 test("makeCharTestGate.verify FAILS (revert) when the test goes red after the refactor", async () => {

@@ -1763,6 +1763,17 @@ function attachOpenRouterSeats(backends, merged, policy, json) {
   if (!json) for (const w of backend.warnings ?? []) console.error(`⚠ openrouter: ${w}`);
 }
 
+// Build the §5 char-test gate for a fix run, or null when --chartest is off. Fail-LOUD when the flag IS
+// set but no generator seat can write tests (council Grok P1): otherwise makeCharTestGate returns null,
+// runAuditFix silently skips the gate, and behaviour-preserving refactors auto-apply UNGATED while the
+// operator believes --chartest is protecting them. Erroring up front (before any spend) is the honest fix.
+function resolveCharTestGate(cwd, backends, merged, options) {
+  if (!options.chartest) return null;
+  const gate = makeCharTestGate(cwd, backends, merged);
+  if (!gate) throw new Error("--chartest requires a reachable generator seat (Claude/Codex/Grok/OpenRouter) to write characterization tests — none is available; fix a backend or drop --chartest");
+  return gate;
+}
+
 // Assemble the fix-report telemetry meta (metrics + before→after codebase shape). FAIL-SOFT: any git
 // error just omits the shape — a telemetry report must never break a completed fix run. Only called on
 // --html. The before/after shape is bounded to the CHANGED files (a fix touches a small set).
@@ -2111,8 +2122,9 @@ async function handleAudit(argv) {
         skipOpenRouter: merged.skipOpenRouter,
         skipSeats: merged.skipSeats ?? options.skipSeats,
         // §5 char-test gate (opt-in --chartest): behaviour-preserving refactors must keep a generated
-        // characterization test green across the change, else revert to propose-only. null when off.
-        charTestGate: options.chartest ? makeCharTestGate(cwd, backends, merged) : null,
+        // characterization test green across the change, else revert to propose-only. null when off;
+        // fail-loud when requested but no generator seat is reachable (never silently ungated).
+        charTestGate: resolveCharTestGate(cwd, backends, merged, options),
         claudeModel: merged["claude-model"] ?? merged.claudeModel,
         sensitiveAutoApply,
         reviewPatch,

@@ -38,6 +38,10 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
   const removeFile = deps.removeFile ?? ((p) => { try { fs.rmSync(p, { force: true }); } catch { /* best effort */ } });
   const readCoverage = deps.readCoverage ?? defaultReadCoverage;
   const mkCoverageDir = deps.mkCoverageDir ?? ((testFile) => path.join(path.dirname(testFile), `.council-chartest-cov-${path.basename(testFile)}`));
+  // freshDir returns an EMPTY dir (rm then mkdir) so a prior run's coverage json can never be merged into
+  // this run's executesChanged check (council Grok P2 — stale coverage false-pass); rmDir tears it down.
+  const freshDir = deps.freshDir ?? ((d) => { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* */ } try { fs.mkdirSync(d, { recursive: true }); } catch { /* */ } return d; });
+  const rmDir = deps.rmDir ?? ((d) => { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } });
   const timeoutMs = Number(options.charTestTimeoutMs) || 60_000;
 
   // The generator seat: default to the first active seat (model-agnostic — the critic writes a test, not
@@ -55,15 +59,16 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
   return {
     eligible: (finding) => isRefactorClass(finding),
 
-    // ACCEPT (clean tree): generate + pin behaviour (deterministic, non-vacuous). executesTarget is
-    // DEFERRED to verify (the changed lines are only known post-apply), so the accept harness stubs it
-    // true. The transient test file is deleted before returning so the tree is clean for applyFix.
+    // ACCEPT (clean tree): generate + pin behaviour (deterministic, non-vacuous) AND require the test to
+    // actually EXECUTE the target module (council Grok P1 — no "import unused + assert 1===1"). The exact
+    // changed-line coverage is DEFERRED to verify (the diff is unknown pre-apply), so acceptCharTest's
+    // executesTarget maps to executesModule here. The transient test + coverage dir are deleted before
+    // returning so the tree is clean for applyFix.
     accept: async ({ file, source }) => {
       const testFile = transientTestPath(root, file);
-      const acceptHarness = {
-        ...makeNodeCharHarness({ cwd: root, testFile, targetFile: file, source, runCommand, timeoutMs }),
-        executesTarget: async () => true // deferred to the verify phase (changed lines unknown pre-apply)
-      };
+      const coverageDir = freshDir(mkCoverageDir(testFile));
+      const h = makeNodeCharHarness({ cwd: root, testFile, targetFile: file, source, runCommand, readCoverage, coverageDir, timeoutMs });
+      const acceptHarness = { ...h, executesTarget: h.executesModule };
       let res;
       try {
         res = await acceptCharTestForTarget(file, source, {
@@ -75,27 +80,32 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
         });
       } finally {
         removeFile(testFile);
+        rmDir(coverageDir);
       }
       // carry the generated code forward so verify can re-materialise the SAME test post-apply
       return { accepted: res.accepted, reason: res.reason, code: res.code, testFile };
     },
 
-    // VERIFY (post-apply tree): re-materialise the accepted test, require it STILL passes AND covers the
-    // changed lines, then delete it. The mutation gate stays OPTIONAL (only when a scorer is configured).
+    // VERIFY (post-apply tree): re-materialise the accepted test, require it STILL passes AND — for an
+    // addition/modification — covers the changed lines, then delete it. A pure DELETION has no new lines
+    // to cover (council Grok P2: dead_code deletions), so the changed-line bar is skipped there; the
+    // still-green check alone attests behaviour preservation. Mutation gate stays OPTIONAL.
     verify: async ({ file, source, code, changedLines }) => {
       const testFile = transientTestPath(root, file);
       if (!code) return { pass: false, reason: "no accepted char-test to verify" };
       writeFile(testFile, code);
-      const coverageDir = mkCoverageDir(testFile);
+      const coverageDir = freshDir(mkCoverageDir(testFile));
       const harness = makeNodeCharHarness({ cwd: root, testFile, targetFile: file, changedLines, source, runCommand, readCoverage, coverageDir, timeoutMs });
+      const hasNewLines = Array.isArray(changedLines) && changedLines.length > 0;
       try {
         return await verifyCharTestAfterFix({ accepted: true, testPath: testFile }, {
           runAccepted: harness.passesOnUnmodified, // "passes on the CURRENT (post-refactor) tree" = behaviour preserved
-          executesChanged: harness.executesTarget
+          // only require changed-line coverage when the refactor ADDED/MODIFIED lines; a pure deletion has none
+          executesChanged: hasNewLines ? harness.executesTarget : undefined
         });
       } finally {
         removeFile(testFile);
-        try { fs.rmSync(coverageDir, { recursive: true, force: true }); } catch { /* best effort */ }
+        rmDir(coverageDir);
       }
     }
   };
