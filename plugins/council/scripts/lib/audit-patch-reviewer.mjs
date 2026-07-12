@@ -89,13 +89,15 @@ export function makePatchReviewer(cwd, backends, options = {}, deps = {}) {
     codex: deps.runCodex ?? ((prompt) => runCodexStructured(cwd, backends, options, prompt, "patch-review")),
     grok: deps.runGrok ?? ((prompt) => runGrokStructured(cwd, backends, grokOpts, prompt))
   };
-  return async ({ file, finding, diff, after = "", context = "" }) => {
+  return async ({ file, finding, diff, after, context }) => {
     // A3: hand each seat the POST-PATCH surrounding source so it judges the diff IN CONTEXT
     // (the whole function + callers), not blind on the hunk alone. `after` is the applied
     // patch's full file content threaded from the fix engine; `context` is an explicit
-    // override. Empty is fine — buildPatchReviewPrompt just omits the block. The prompt caps
-    // it (CONTEXT_MAX_CHARS), so an oversized file can't blow the context window.
-    const ctx = context || after || "";
+    // override that WINS when provided — including an explicit "" to SUPPRESS the block even
+    // when `after` is populated (unambiguous: undefined = fall back to after, "" = suppress).
+    // buildPatchReviewPrompt WINDOWS the source around the changed hunk and caps it, so an
+    // oversized file neither blinds the reviewer with a file head nor blows the context window.
+    const ctx = context !== undefined ? context : (after ?? "");
     const votes = await Promise.all(
       PATCH_REVIEW_SEATS.map(async (seat) => {
         try {
