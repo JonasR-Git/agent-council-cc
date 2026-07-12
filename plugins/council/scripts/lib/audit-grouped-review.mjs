@@ -11,6 +11,7 @@ import { resolveLensGroups } from "./audit-lens-groups.mjs";
 import { chunkSource } from "./audit-group-prompt.mjs";
 import { DEFAULT_MAX_CELLS, capCells, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
 import { activeReviewerCount, reviewerActive, selectUnits } from "./audit-review.mjs";
+import { tierOfLens } from "./audit-tiers.mjs";
 import { mergeFindings } from "./findings.mjs";
 import { annotateScopes } from "./scope.mjs";
 import { recordAndAnnotate } from "./ledger.mjs";
@@ -80,10 +81,13 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   const factsOf = (file) => factsFor(model, file);
 
   const allCells = enumerateCells(files, groups, models, chunksOf, factsOf);
-  // enumerateCells forces ≥1 chunk PER FILE, so an UNSUPPLIED file (0 chunks) would still get real
-  // null-source cells — wasted spawns that could mark a triple "done" with nothing reviewed. Drop
-  // them here; the file stays surfaced in filesUnsupplied and forces complete:false below.
-  const supplied = unsupplied.length ? allCells.filter((c) => !unsupplied.includes(c.file)) : allCells;
+  // enumerateCells forces ≥1 chunk PER FILE, so a file that produced NO real chunk would still get
+  // real null-source cells — wasted spawns that could mark a triple "done" with nothing reviewed.
+  // Drop cells for any such file: UNSUPPLIED files (oversize/unreadable — also force complete:false +
+  // surfaced below) AND a legitimately empty 0-byte file (vacuously clean, contributes no cells and
+  // does NOT force incomplete). Council round-2 (Grok): the earlier filter dropped only unsupplied.
+  const noContent = new Set(files.filter((f) => (chunkCache.get(f)?.length ?? 0) === 0));
+  const supplied = noContent.size ? allCells.filter((c) => !noContent.has(c.file)) : allCells;
   const { cells, dropped, capped } = capCells(supplied, options.maxCells ?? DEFAULT_MAX_CELLS);
 
   // Surface the planned cost BEFORE spending it (council Grok P1 / Claude nit): a grouped run can
@@ -92,7 +96,7 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
     progress(
       `  grouped review: ${models.length} seat(s) × ${groups.length} group(s) × ${files.length - unsupplied.length} file(s) → ${supplied.length} cell(s)` +
         `${capped ? `, capped to ${cells.length} (${dropped} deferred — raise --max-cells)` : ""}` +
-        `${unsupplied.length ? `; ${unsupplied.length} file(s) too large to review → coverage PARTIAL` : ""}`
+        `${unsupplied.length ? `; ${unsupplied.length} file(s) too large or unreadable → coverage PARTIAL` : ""}`
     );
   }
 
@@ -119,8 +123,20 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   const lensById = new Map();
   for (const f of cellFindings) if (f?.id && f?.lens) lensById.set(String(f.id), f.lens);
   const relens = (f) => {
-    const lens = (f.ids ?? []).map((id) => lensById.get(String(id))).find(Boolean);
-    return lens ? { ...f, lens } : f;
+    const lenses = (f.ids ?? []).map((id) => lensById.get(String(id))).filter(Boolean);
+    if (!lenses.length) return f;
+    // Conflict rule (council Codex R1-3 + Grok round-2): when a bucket merges findings surfaced under
+    // DIFFERENT lens groups, keep the most FOUNDATIONAL lens (lowest tier — logical/structure before
+    // quality). On a TIER TIE, keep security_secrets — the lens the P0 live-hole override keys on — so
+    // a security attribution never loses to a same-tier generic lens by mere id order.
+    const lens = lenses.reduce((best, l) => {
+      const tl = tierOfLens(l);
+      const tb = tierOfLens(best);
+      if (tl !== tb) return tl < tb ? l : best;
+      if (best === "security_secrets" || l === "security_secrets") return best === "security_secrets" ? best : l;
+      return best;
+    });
+    return { ...f, lens };
   };
 
   const byAgent = new Map();

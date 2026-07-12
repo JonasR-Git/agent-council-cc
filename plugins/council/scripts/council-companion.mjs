@@ -2164,7 +2164,7 @@ function renderAuditReviewReport(out) {
     // reviewers×groups×units equation which lies for multi-chunk or capped runs (council Grok P2).
     const gExtras = [];
     if (c.capped) gExtras.push(`capped — ${c.cellsDropped} cell(s) deferred (raise --max-cells)`);
-    if (c.filesUnsupplied?.length) gExtras.push(`${c.filesUnsupplied.length} file(s) too large to review`);
+    if (c.filesUnsupplied?.length) gExtras.push(`${c.filesUnsupplied.length} file(s) too large or unreadable`);
     if (c.unitsFailed) gExtras.push(`${c.unitsFailed} unit(s) had no successful cell`);
     if (c.ran === false) gExtras.push(c.ranReason ?? "nothing dispatched");
     L.push(`Six-eyes GROUPED review (--groups ${c.groupPreset}): ${reviewers} across ${c.groups} lens-group(s) over ${c.unitsReviewed ?? 0}/${c.unitsSelected} module(s), ${c.cellsScheduled} cell(s) scheduled. Coverage ${c.complete ? "COMPLETE (every scheduled cell reviewed by all seats)" : "PARTIAL"}.${gExtras.length ? ` ⚠ ${gExtras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);

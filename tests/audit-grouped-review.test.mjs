@@ -73,6 +73,40 @@ test("runGroupedReview: the group-authoritative lens survives merge (not re-deri
   assert.equal(typeof tierOfLens(norm[0].lens), "number");
 });
 
+test("runGroupedReview: a cross-group merge keeps the most foundational (lowest-tier) lens", async () => {
+  // Same defect surfaced under a quality group (docs_maintainability, tier 3) and a structure group
+  // (architecture_ssot, tier 1). The merged finding must be handled at the higher-priority tier.
+  const runMatrix = async () => ({
+    findings: [
+      { id: "codex-1", agent: "codex", severity: "P2", category: "docs", title: "god module mixes 5 concerns", detail: "d", file: "a.mjs", line: 3, lens: "docs_maintainability" },
+      { id: "grok-1", agent: "grok", severity: "P2", category: "design", title: "god module mixes 5 concerns", detail: "d", file: "a.mjs", line: 3, lens: "architecture_ssot" }
+    ],
+    matrix: { summary: () => ({}) },
+    complete: true
+  });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "tier", ledger: false }, { runMatrix, ...FS });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].lens, "architecture_ssot", "lower-tier lens wins the merge");
+  assert.ok(tierOfLens("architecture_ssot") < tierOfLens("docs_maintainability"), "sanity: structure < quality");
+});
+
+test("runGroupedReview: on a tier TIE the merge keeps the security lens (not id order)", async () => {
+  // security_secrets and correctness are both tier 2; the correctness finding is FIRST. The merge
+  // must still keep security_secrets so the P0 live-hole attribution survives.
+  const runMatrix = async () => ({
+    findings: [
+      { id: "codex-1", agent: "codex", severity: "P1", category: "bug", title: "tainted path reaches exec", detail: "d", file: "a.mjs", line: 7, lens: "correctness" },
+      { id: "grok-1", agent: "grok", severity: "P1", category: "security", title: "tainted path reaches exec", detail: "d", file: "a.mjs", line: 7, lens: "security_secrets" }
+    ],
+    matrix: { summary: () => ({}) },
+    complete: true
+  });
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "tier", ledger: false }, { runMatrix, ...FS });
+  assert.equal(out.findings.length, 1);
+  assert.equal(tierOfLens("security_secrets"), tierOfLens("correctness"), "sanity: same tier");
+  assert.equal(out.findings[0].lens, "security_secrets", "security attribution wins the tie");
+});
+
 test("runGroupedReview: a defect seen by two seats on the same cell merges to consensus", async () => {
   const runMatrix = async () => ({
     findings: [
