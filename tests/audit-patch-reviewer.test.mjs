@@ -14,6 +14,8 @@ test("buildClaudeReviewArgs is read-only: inspect tools allowed, edit/exec/netwo
   assert.ok(args.includes("--strict-mcp-config"));
   assert.ok(args.includes("--safe-mode"), "safe-mode disables audited-repo CLAUDE.md/hooks/plugins/MCP");
   assert.equal(args[args.indexOf("--model") + 1], "claude-opus-4-8");
+  assert.equal(args[args.indexOf("--effort") + 1], "xhigh", "A2: reviewer reasons at xhigh by default");
+  assert.equal(buildClaudeReviewArgs({ claudeEffort: "high" })[buildClaudeReviewArgs({ claudeEffort: "high" }).indexOf("--effort") + 1], "high", "explicit effort wins");
 });
 
 test("makePatchReviewer runs all three seats on the same patch and returns parsed verdicts", async () => {

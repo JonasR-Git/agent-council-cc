@@ -28,7 +28,12 @@ export function buildClaudeReviewArgs(options = {}) {
     ...CLAUDE_REVIEW_DISALLOWED,
     "--strict-mcp-config",
     "--permission-mode",
-    "default"
+    "default",
+    // A2: reasoning effort defaults to xhigh (user pref: always xhigh, never max) so the §6
+    // patch reviewer thinks as hard as possible. An unknown value warns + falls back to the
+    // CLI default, so this can't break the seat. Valid: low|medium|high|xhigh|max.
+    "--effort",
+    options.claudeEffort ?? "xhigh"
   ];
   if (options.claudeModel) args.push("--model", options.claudeModel);
   return args;

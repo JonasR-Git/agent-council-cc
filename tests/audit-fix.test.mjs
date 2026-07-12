@@ -140,6 +140,7 @@ test("buildFixWriteArgs enables edit tools but denies exec/network, non-interact
   assert.ok(args.includes("--strict-mcp-config"));
   assert.equal(args[args.indexOf("--permission-mode") + 1], "acceptEdits");
   assert.equal(args[args.indexOf("--model") + 1], "claude-opus-4-8");
+  assert.equal(args[args.indexOf("--effort") + 1], "xhigh", "A2: fixer reasons at xhigh by default");
 });
 
 // --- full orchestration with injected adapters -------------------------------

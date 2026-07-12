@@ -265,7 +265,11 @@ export function buildFixWriteArgs(options = {}) {
     ...WRITE_DISALLOWED,
     "--strict-mcp-config",
     "--permission-mode",
-    "acceptEdits"
+    "acceptEdits",
+    // A2: fixer reasons at xhigh (user pref: always xhigh, never max) for the best minimal
+    // patch. Unknown value warns + falls back, so it can't break the writer.
+    "--effort",
+    options.claudeEffort ?? "xhigh"
   ];
   if (options.claudeModel) args.push("--model", options.claudeModel);
   return args;

@@ -183,9 +183,13 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
   if (options.grokSandbox) baseArgs.push("--sandbox", String(options.grokSandbox));
   if (options.resumeSessionId) baseArgs.push("--resume", String(options.resumeSessionId));
   const args = [...baseArgs];
-  const hasOverrides = Boolean(options.grokModel || options.grokEffort);
+  // A2: default reasoning effort to grok-4.5's real ceiling "high" (xhigh/max clamp to it),
+  // honoring the user's "always xhigh reasoning". An explicit grokEffort still wins; on an
+  // invalid-params error the retry below drops to the CLI default (fail-safe).
+  const grokEffort = options.grokEffort ?? "high";
+  const hasOverrides = Boolean(options.grokModel || grokEffort);
   if (options.grokModel) args.push("--model", options.grokModel);
-  if (options.grokEffort) args.push("--effort", options.grokEffort);
+  if (grokEffort) args.push("--effort", grokEffort);
 
   try {
     let result = await runCommandAsync(bin, args, { cwd, timeoutMs: options.agentTimeoutMs });
