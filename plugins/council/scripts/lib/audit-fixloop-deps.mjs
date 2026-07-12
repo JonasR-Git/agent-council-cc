@@ -24,6 +24,7 @@
 import { runAuditFix } from "./audit-fix.mjs";
 import { normalizeFindings } from "./audit-normalize.mjs";
 import { runAuditReview } from "./audit-review.mjs";
+import { runGroupedReview } from "./audit-grouped-review.mjs";
 
 /** file -> Set(peer files that share a duplicate cluster with it). */
 function buildDupPeers(dupClusters = []) {
@@ -39,7 +40,14 @@ function buildDupPeers(dupClusters = []) {
 }
 
 export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
-  const doReview = impl.runAuditReview ?? runAuditReview;
+  // R9 wiring: when --groups is set, drive the loop off the cell-granular GROUPED six-eyes review
+  // (runGroupedReview) instead of the per-file runAuditReview — its coverage.complete then feeds the
+  // loop's convergence guard so the run keeps going until the matrix is whole. Both return a
+  // compatible {findings, coverage:{unitsReviewed/unitsSelected/complete/budgetSpent}} shape. Each path
+  // is independently injectable for tests.
+  const doPerFile = impl.runAuditReview ?? runAuditReview;
+  const doGrouped = impl.runGroupedReview ?? runGroupedReview;
+  const doReview = options.lensGroups ? doGrouped : doPerFile;
   const doFix = impl.runAuditFix ?? runAuditFix;
   const maxUnits = Math.max(1, options.maxUnits ?? 8);
   const hubFanIn = options.hubFanIn ?? 8;
@@ -73,7 +81,11 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       // B2 (council grok-1): thread skipClaude too, else the fix loop spawns the Claude finder
       // even when the user opted out (reviewers:[codex,grok] / --skip-claude), inflating cost.
       skipClaude: options.skipClaude,
-      ledger: options.ledger
+      ledger: options.ledger,
+      // R9: when set, doReview is runGroupedReview — it honors maxUnits/unitOffset (per-file selection)
+      // and drives the cell matrix off these; runAuditReview ignores them.
+      lensGroups: options.lensGroups,
+      maxCells: options.maxCells
     });
     // Surface a top-level `ran` the loop can trust. runAuditReview swallows backend
     // failures (rate-limit / unreachable / undispatched) into 0 findings WITHOUT throwing,

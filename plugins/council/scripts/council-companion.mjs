@@ -1977,12 +1977,28 @@ async function handleAudit(argv) {
           console.error(`⚠ --sensitive-auto-apply requested but seats unreachable (${missing.join(", ")}) — §6 stays propose-only.`);
         }
       }
+      // R9: --groups drives the loop off the GROUPED six-eyes review (cell-granular coverage feeds the
+      // convergence guard). Validate the preset + cap up front so a bad value fails before any spend.
+      let loopLensGroups;
+      let loopMaxCells;
+      if (options.groups) {
+        if (!["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
+        loopLensGroups = String(options.groups);
+        loopMaxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
+        if (options["max-cells"] != null) {
+          const nc = Number(options["max-cells"]);
+          if (!Number.isFinite(nc) || nc < 1) throw new Error("--max-cells must be a positive number");
+          loopMaxCells = Math.floor(nc);
+        }
+      }
       const deps = makeFixLoopDeps(cwd, model, backends, {
         maxUnits,
         minSeverity: fixMinSeverity,
         allowUntested: options["allow-untested"],
         coverage,
         verdictMap: logical.verdictMap,
+        lensGroups: loopLensGroups,
+        maxCells: loopMaxCells,
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
         skipClaude: merged.skipClaude, // B2 (grok-1): honor the Claude opt-out in the fix loop too
@@ -2133,16 +2149,33 @@ async function handleAudit(argv) {
       if (!Number.isFinite(n) || n < 1) throw new Error("--dry-streak must be a positive number");
       dryStreak = Math.floor(n);
     }
+    // R9: --groups drives the endless loop off the GROUPED six-eyes review too (validated up front).
+    let endlessLensGroups;
+    let endlessMaxCells;
+    if (options.groups) {
+      if (!["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
+      endlessLensGroups = String(options.groups);
+      endlessMaxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
+      if (options["max-cells"] != null) {
+        const nc = Number(options["max-cells"]);
+        if (!Number.isFinite(nc) || nc < 1) throw new Error("--max-cells must be a positive number");
+        endlessMaxCells = Math.floor(nc);
+      }
+    }
     // Each pass advances the hotspot window (progressive coverage) and skips the
     // global reduce after pass 1 (its input is the static map — identical every
-    // pass — so re-running it just re-charges budget).
+    // pass — so re-running it just re-charges budget). With --groups the pass is the
+    // cell-granular grouped review whose coverage.complete gates the loop's dry streak.
+    const doEndlessReview = endlessLensGroups ? runGroupedReview : runAuditReview;
     const review = ({ budget: passBudget, pass }) =>
-      runAuditReview(cwd, model, backends, {
+      doEndlessReview(cwd, model, backends, {
         ...merged,
         budget: passBudget,
         maxUnits,
         unitOffset: (pass - 1) * maxUnits,
         skipReduce: pass > 1,
+        lensGroups: endlessLensGroups,
+        maxCells: endlessMaxCells,
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok
       });

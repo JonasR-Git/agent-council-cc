@@ -187,8 +187,12 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
       cellsScheduled: cells.length,
       cellsDropped: dropped,
       capped,
-      // the grouped path bounds cost by the CELL count (maxCells), not an agent-call budget — the
-      // matrix summary reports how many of those cells actually completed vs failed.
+      // budgetSpent = the cells actually dispatched (each cell is one paid agent call). The fix/endless
+      // loop charges this against its per-run agent-call budget so a grouped loop's total spend is
+      // bounded the same way the per-file path's is (council R9 wiring).
+      budgetSpent: cells.length,
+      // the grouped path bounds per-pass cost by the CELL count (maxCells); the matrix summary reports
+      // how many of those cells actually completed vs failed.
       matrix: matrixOut.matrix?.summary?.() ?? null
     }
   };

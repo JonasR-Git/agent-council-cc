@@ -112,6 +112,21 @@ test("council Codex C2: a recurring PROPOSE-ONLY finding does not pin its tier (
   assert.match(out.stopReason, /all tiers converged/);
 });
 
+test("R9: a --groups fix loop does NOT converge while grouped coverage is INCOMPLETE", async () => {
+  const gModel = { files: [{ id: "a.mjs", fanIn: 1 }] };
+  let pass = 0;
+  // findings empty every pass, but the six-eyes matrix is incomplete until pass 3 → the loop must keep
+  // reviewing (cells still unreviewed) and not declare a false dry convergence at pass 1.
+  const runGroupedReview = async () => {
+    pass += 1;
+    return { findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, complete: pass >= 3, budgetSpent: 1 } };
+  };
+  const runAuditFix = async () => ({ fixed: [], failed: [], spent: 0 });
+  const deps = makeFixLoopDeps("/x", gModel, {}, { lensGroups: "fine", maxCells: 50 }, { runGroupedReview, runAuditFix });
+  await runFixLoop("/x", { budget: 100, dryStreak: 1, maxPasses: 10 }, { ...deps, checkpoint: noCheckpoint });
+  assert.ok(pass >= 3, `the loop kept reviewing until the grouped matrix was complete (ran ${pass} passes, not a dry stop at pass 1)`);
+});
+
 test("council Codex C2: 'all tiers converged' wins over the max-passes ceiling when they coincide", async () => {
   // dryStreak 1 → each empty pass advances a tier; starting tier 1, 3 passes reach tier 4 (converged)
   // exactly at maxPasses 3. The convergence reason must win over the generic "reached max passes".

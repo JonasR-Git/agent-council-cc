@@ -7,6 +7,30 @@ import { ineligibleReason } from "../plugins/council/scripts/lib/audit-fix.mjs";
 const model = { files: [{ id: "a.mjs", fanIn: 2 }, { id: "hub.mjs", fanIn: 12 }, { id: "b.mjs", fanIn: 1 }] };
 const bigModel = { files: Array.from({ length: 6 }, (_, i) => ({ id: `f${i}.mjs`, fanIn: 1 })) };
 
+test("R9: makeFixLoopDeps drives the loop off runGroupedReview when --groups is set", async () => {
+  let seen = null;
+  const runGroupedReview = async (cwd, m, backends, opts) => {
+    seen = opts;
+    return { findings: [{ file: "a.mjs", title: "x", category: "bug", severity: "P2" }], coverage: { unitsReviewed: 1, unitsSelected: 1, complete: false, budgetSpent: 5 } };
+  };
+  const runAuditReview = async () => { throw new Error("per-file path must NOT be used when --groups is set"); };
+  const deps = makeFixLoopDeps("/x", model, {}, { lensGroups: "fine", maxCells: 100 }, { runGroupedReview, runAuditReview });
+  const rev = await deps.review({ budget: 5, changedFiles: null });
+  assert.equal(seen.lensGroups, "fine", "the grouped path is selected + the preset threaded");
+  assert.equal(seen.maxCells, 100, "the cell cap is threaded");
+  assert.equal(rev.coverage.complete, false, "grouped coverage.complete flows to the loop's convergence guard");
+  assert.equal(rev.ran, true, "a grouped pass that reviewed a unit is ran:true");
+});
+
+test("R9: without --groups the loop still uses the per-file runAuditReview", async () => {
+  let usedGrouped = false;
+  const runGroupedReview = async () => { usedGrouped = true; return { findings: [], coverage: {} }; };
+  const runAuditReview = async () => ({ findings: [], coverage: { unitsReviewed: 1, unitsSelected: 1, budgetSpent: 1 } });
+  const deps = makeFixLoopDeps("/x", model, {}, {}, { runGroupedReview, runAuditReview });
+  await deps.review({ budget: 5, changedFiles: null });
+  assert.equal(usedGrouped, false, "the grouped path is opt-in — default stays per-file");
+});
+
 test("full-scope passes advance a WRAPPING window keyed to full passes, not the global pass counter", async () => {
   const calls = [];
   const runAuditReview = async (cwd, m, backends, opts) => {
