@@ -51,6 +51,7 @@ import { nodesFromGraph } from "./lib/import-graph.mjs";
 import { resolveAutonomy } from "./lib/audit-autonomy.mjs";
 import { reconcilePendingFixes } from "./lib/ledger.mjs";
 import { runEndless } from "./lib/audit-endless.mjs";
+import { runSupervised } from "./lib/supervisor.mjs";
 import { runAudit } from "./lib/audit-run.mjs";
 import { toSarif } from "./lib/audit-sarif.mjs";
 import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
@@ -1720,7 +1721,7 @@ async function handleWatch(argv) {
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply"]
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "supervise"]
   });
   const cwd = process.cwd();
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
@@ -1952,7 +1953,16 @@ async function handleAudit(argv) {
       // B5: per-tier convergence (structure → correctness → quality) is ON by default so a
       // Structure/SSOT consolidation lands before Correctness runs on the consolidated code; --flat
       // opts out (single flat convergence). --per-tier remains as a redundant affirmation.
-      const out = await runFixLoop(cwd, { budget: loopBudget, maxPasses, dryStreak, maxUnits, resume: options.resume, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
+      const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) };
+      // C3/M10: --supervise wraps the loop in the endless supervisor so a multi-hour autonomous run
+      // survives rate-limit resets — a resumable stop (throttled/backends-down/did-not-run) waits
+      // reset-aware then --resumes from the checkpoint; a terminal convergence returns as normal.
+      const out = options.supervise
+        ? await runSupervised(
+            ({ resume }) => runFixLoop(cwd, { ...loopOpts, resume: resume || options.resume }, deps),
+            { onWait: ({ attempt, waitMs, stopReason }) => options.json || console.error(`⏸ supervisor: rate-limited — reset-aware wait ${Math.round(waitMs / 1000)}s (attempt ${attempt}) [${stopReason}]…`) }
+          )
+        : await runFixLoop(cwd, { ...loopOpts, resume: options.resume }, deps);
       // Return to the base branch after the final pass (fix stayed on the integration
       // branch); report if the checkout couldn't complete so the user isn't stranded silently.
       out.baseBranch = baseBranch;
@@ -2068,11 +2078,14 @@ async function handleAudit(argv) {
         skipGrok: merged.skipGrok
       });
     const tEndless = Date.now();
-    const out = await runEndless(
-      cwd,
-      { budget, maxPasses, dryStreak, resume: options.resume, onProgress: options.json ? undefined : (m) => console.error(m) },
-      { review }
-    );
+    const endlessOpts = { budget, maxPasses, dryStreak, onProgress: options.json ? undefined : (m) => console.error(m) };
+    // C3/M10: --supervise survives rate-limit resets across a multi-hour endless review.
+    const out = options.supervise
+      ? await runSupervised(
+          ({ resume }) => runEndless(cwd, { ...endlessOpts, resume: resume || options.resume }, { review }),
+          { onWait: ({ attempt, waitMs, stopReason }) => options.json || console.error(`⏸ supervisor: rate-limited — reset-aware wait ${Math.round(waitMs / 1000)}s (attempt ${attempt}) [${stopReason}]…`) }
+        )
+      : await runEndless(cwd, { ...endlessOpts, resume: options.resume }, { review });
     recordAuditMetrics(cwd, "endless", { wallClockMs: Date.now() - tEndless, passesRun: out.passesRun, spent: out.spent, findings: out.findings.length, stopReason: out.stopReason }, nowIso());
     if (options.doc) {
       const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: `endless (${out.passesRun} passes)` }, { docPath: options["doc-path"] });
