@@ -23,6 +23,26 @@ export const STRUCTURE_LENSES = Object.freeze(["architecture_ssot", "logical_sen
 
 const KNOWN_TRANSFORMS = Object.freeze(["consolidate-ssot", "merge-duplicate", "remove-dead", "relocate", "extract-shared"]);
 
+// §6 sensitive classes — REPLICATED from audit-fix.mjs (kept a self-contained LEAF module so it can
+// be imported anywhere without a cycle; keep in sync). A structural finding that is ALSO sensitive
+// (e.g. an SSOT-dedup of duplicated AUTH-check code) must clear the §6 sensitiveAutoApply consent
+// too, not just structureAutoApply (council C2 codex P1).
+const SENSITIVE_CATEGORIES = new Set(["security", "auth", "concurrency", "data-loss", "data-integrity", "crypto"]);
+const SENSITIVE_LENSES = new Set(["security_secrets", "concurrency_resources", "data_integrity", "config_cicd_security"]);
+
+/** True if a finding is also in a §6 sensitive class (by category or lens). */
+export function isSensitiveStructureClass(f) {
+  return SENSITIVE_CATEGORIES.has(String(f?.category ?? "").toLowerCase()) || SENSITIVE_LENSES.has(String(f?.lens ?? ""));
+}
+
+// Paths a structure transform must NEVER touch: repo-escape (traversal/absolute/drive) or a protected
+// class (CI, git internals, deps, lockfiles, secrets) — a wrong structural auto-apply here is
+// catastrophic (council C2 codex P1). Mirrors audit-fix's unsafe/protected checks.
+const STRUCTURE_PROTECTED_RE = [/(^|\/)\.github(\/|$)/i, /(^|\/)\.git(\/|$)/i, /(^|\/)node_modules(\/|$)/i, /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i, /(^|\/)\.env(\.|$)/i];
+function isUnsafePath(posix) {
+  return posix === "" || posix.split("/").includes("..") || /^[a-zA-Z]:[\\/]/.test(posix) || posix.startsWith("/");
+}
+
 function normPosix(p) {
   return String(p ?? "")
     .replace(/[\x00-\x1f\x7f]/g, "") // strip CR/LF/control — a path can't contain them, and leaving
@@ -43,17 +63,27 @@ export function isStructureClass(finding) {
  * stays propose-only (surfaced in the report, never silently auto-applied). Non-structural findings
  * are not this gate's concern (structural:false).
  */
-export function structureFixDisposition(finding, { structureAutoApply = false } = {}) {
+export function structureFixDisposition(finding, { structureAutoApply = false, sensitiveAutoApply = false } = {}) {
   if (!isStructureClass(finding)) return { structural: false, eligible: false };
   // STRICT === true (council C2 grok P1): a high-stakes autonomy flag must not be granted by any
   // truthy value — a string "false"/"0" or a stray env var must NOT enable structure auto-apply.
-  const consented = structureAutoApply === true;
+  const structConsent = structureAutoApply === true;
+  // DOUBLE consent (council C2 codex P1): a finding that is structural AND also §6-sensitive (e.g. an
+  // SSOT-dedup of duplicated auth-check code — lens architecture_ssot, category security) must ALSO
+  // clear the operator's SEPARATE sensitiveAutoApply gate, or an operator who withheld §6 consent
+  // would get sensitive code auto-rewritten via the structure path. Never granted by consent alone.
+  const alsoSensitive = isSensitiveStructureClass(finding);
+  const sensConsent = !alsoSensitive || sensitiveAutoApply === true;
+  const eligible = structConsent && sensConsent;
   return {
     structural: true,
-    eligible: consented,
-    reason: consented
+    alsoSensitive,
+    eligible,
+    reason: eligible
       ? "structure class → council-gated auto-apply (consented)"
-      : "structure class (architecture/SSOT/logical) → propose-only (no structureAutoApply consent)"
+      : !structConsent
+        ? "structure class (architecture/SSOT/logical) → propose-only (no structureAutoApply consent)"
+        : "structure+sensitive class → propose-only (also needs §6 sensitiveAutoApply consent)"
   };
 }
 
@@ -70,7 +100,14 @@ export function validateTransformPlan(plan) {
   if (!plan.rationale || typeof plan.rationale !== "string" || !plan.rationale.trim()) errors.push("missing rationale");
   const plannedTouched = Array.isArray(plan.plannedTouched) ? [...new Set(plan.plannedTouched.map(normPosix).filter(Boolean))] : [];
   if (plannedTouched.length === 0) errors.push("plannedTouched is empty — a structure transform MUST declare the exact files it touches");
-  return { ok: errors.length === 0, errors, plannedTouched, type: type || null };
+  // PATH SAFETY (council C2 codex P1): a structure transform must not escape the repo (traversal /
+  // absolute / drive) or touch a protected class (CI, git, deps, lockfiles, secrets). These are
+  // fail-closed gate errors here, not left to an upstream orchestrator that doesn't exist yet.
+  const unsafe = plannedTouched.filter(isUnsafePath);
+  const protectedPaths = plannedTouched.filter((f) => STRUCTURE_PROTECTED_RE.some((re) => re.test(f)));
+  if (unsafe.length) errors.push(`unsafe path(s) (traversal/absolute/drive): ${unsafe.join(", ")}`);
+  if (protectedPaths.length) errors.push(`protected path(s) (CI/git/deps/lock/secrets — never structure-auto-touched): ${protectedPaths.join(", ")}`);
+  return { ok: errors.length === 0, errors, plannedTouched, type: type || null, unsafe, protectedPaths };
 }
 
 /**
@@ -91,6 +128,14 @@ export function enforcePlannedTouched(actualChanged, plannedTouched) {
  * the full test suite green AND no public-API change (an exported symbol removed/renamed/re-signatured
  * is a behaviour change even if tests pass, because callers outside the repo break). Fail-closed:
  * unknown API status (publicApiChanged !== false) blocks.
+ *
+ * PROXY LIMITS (council C2 nit — for whoever computes publicApiChanged in C3): tests-green + a static
+ * public-API diff is NECESSARY but not SUFFICIENT. It cannot see (1) a subtly different behaviour
+ * under an UNCHANGED signature on an untested edge case (very plausible when merging two divergent
+ * implementations), (2) dynamic/reflective consumers a static diff misses (string import(), CJS
+ * interop, external package callers), or (3) non-JS contract drift (CLI flags, JSON schema, type
+ * decls). The unanimous council + fail-closed-on-unknown are the backstops; do not treat this as
+ * ground-truth behaviour proof.
  */
 export function behaviourEquivalent({ testsGreen = false, publicApiChanged = null } = {}) {
   const apiOk = publicApiChanged === false;
@@ -103,14 +148,16 @@ export function behaviourEquivalent({ testsGreen = false, publicApiChanged = nul
  * valid, the applied change matched the plan exactly, behaviour is equivalent, AND the council is
  * unanimous. Returns a structured, serializable result for the report.
  */
-export function evaluateStructureGate({ plan, actualChanged, verdicts, testsGreen = false, publicApiChanged = null, required, structureAutoApply = false } = {}) {
+export function evaluateStructureGate({ plan, actualChanged, verdicts, testsGreen = false, publicApiChanged = null, structureAutoApply = false } = {}) {
   // CONSENT is folded in (council C2 grok P1): the header's condition (1) must be enforced by the
   // gate itself, not left to a caller to remember to AND. Strict === true (no truthy coercion).
   const consented = structureAutoApply === true;
   const planCheck = validateTransformPlan(plan);
   const touched = enforcePlannedTouched(actualChanged, planCheck.plannedTouched);
   const behaviour = behaviourEquivalent({ testsGreen, publicApiChanged });
-  const council = evaluatePatchVerdicts(verdicts, required ? { required } : undefined);
+  // ALWAYS the full 3-seat unanimity — `required` is intentionally NOT exposed (council C2 codex P2):
+  // this is a self-contained fail-closed decision, so a future caller can't silently weaken 3/3.
+  const council = evaluatePatchVerdicts(verdicts);
   const approved = consented && planCheck.ok && touched.ok && behaviour.ok && council.approved;
   const blockers = [];
   if (!consented) blockers.push("consent: structureAutoApply not granted (=== true)");

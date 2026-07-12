@@ -38,6 +38,29 @@ test("structureFixDisposition is propose-only WITHOUT consent, council-gated aut
   assert.equal(structureFixDisposition({ lens: "correctness" }, { structureAutoApply: true }).structural, false);
 });
 
+test("structureFixDisposition (council codex P1): a structural+SENSITIVE finding needs BOTH consents", () => {
+  // lens architecture_ssot (structural) + category security (sensitive): e.g. consolidating duplicated auth checks
+  const dual = { lens: "architecture_ssot", category: "security" };
+  assert.equal(structureFixDisposition(dual, { structureAutoApply: true }).eligible, false, "structure consent alone is NOT enough for sensitive code");
+  assert.equal(structureFixDisposition(dual, { structureAutoApply: true, sensitiveAutoApply: true }).eligible, true, "both consents → eligible");
+  assert.match(structureFixDisposition(dual, { structureAutoApply: true }).reason, /sensitiveAutoApply/);
+  // a sensitive LENS (concurrency) tagged structural also requires §6 consent
+  assert.equal(structureFixDisposition({ lens: "logical_sense", category: "concurrency" }, { structureAutoApply: true }).eligible, false);
+  // a plain structural finding (no sensitive tag) needs only structure consent
+  assert.equal(structureFixDisposition({ lens: "architecture_ssot", category: "design" }, { structureAutoApply: true }).eligible, true);
+});
+
+test("validateTransformPlan (council codex P1): rejects repo-escape and protected paths", () => {
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: ["../../outside-repo.mjs"] }).errors.join(), /unsafe path/);
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: ["/etc/passwd"] }).errors.join(), /unsafe path/);
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: ["C:/Windows/x.mjs"] }).errors.join(), /unsafe path/);
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: [".github/workflows/ci.yml"] }).errors.join(), /protected path/);
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: ["package-lock.json"] }).errors.join(), /protected path/);
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: ["src/.env.local"] }).errors.join(), /protected path/);
+  // a normal repo path is fine
+  assert.equal(validateTransformPlan({ ...plan, plannedTouched: ["src/a.mjs", "src/b.mjs"] }).ok, true);
+});
+
 test("validateTransformPlan requires a known type, a rationale, and a non-empty planned set", () => {
   assert.equal(validateTransformPlan(plan).ok, true);
   assert.deepEqual(validateTransformPlan(plan).plannedTouched, ["a.mjs", "b.mjs"]);
