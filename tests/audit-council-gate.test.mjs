@@ -252,6 +252,24 @@ test("windowContextToBudget windows around the CHANGED region for an oversized f
   assert.equal(r.text.includes("SENTINEL_FILE_HEAD"), false, "the irrelevant file head is NOT shown");
 });
 
+test("windowContextToBudget (council Codex C3): a MULTI-hunk patch keeps EVERY changed region visible", () => {
+  const lines = [];
+  for (let i = 1; i <= 2000; i += 1) {
+    if (i === 100) lines.push("const SENTINEL_HUNK_A = 100; // first changed region");
+    else if (i === 1900) lines.push("const SENTINEL_HUNK_B = 1900; // second, DISTANT changed region");
+    else lines.push(`const filler_${i} = ${i}; // ${"pad".repeat(6)}`);
+  }
+  const src = lines.join("\n");
+  assert.ok(src.length > 14_000, "fixture must exceed the budget to force windowing");
+  // a diff touching line 100 AND line 1900 — the old min..max span front-sliced away the 1900 region
+  const r = windowContextToBudget(src, "@@ -100,1 +100,1 @@\n-x\n+y\n@@ -1900,1 +1900,1 @@\n-a\n+b", 14_000);
+  assert.equal(r.windowed, true);
+  assert.ok(r.text.length <= 14_000, "windowed text respects the budget");
+  assert.ok(r.text.includes("SENTINEL_HUNK_A"), "the FIRST changed region is shown");
+  assert.ok(r.text.includes("SENTINEL_HUNK_B"), "the SECOND (distant) changed region is ALSO shown — not front-sliced away");
+  assert.ok(r.text.includes("omitted"), "the gap between the two windows is marked, not silently joined");
+});
+
 test("windowContextToBudget falls back to a head slice when the diff has no parseable hunk header", () => {
   const src = "x".repeat(50_000);
   const r = windowContextToBudget(src, "no hunk header here", 14_000);

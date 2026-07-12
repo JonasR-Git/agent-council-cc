@@ -40,53 +40,73 @@ const CONTEXT_MAX_CHARS = 14_000; // surrounding-source budget so the verdict is
 const CONTEXT_PAD_LINES = 60; // lines of surrounding context kept around the changed hunk
 
 /**
- * The post-patch NEW-file line range touched by a unified diff, from its hunk headers.
- * Returns { min, max } (1-based) or null when no `@@ … +start,count @@` header parses.
- * Used to WINDOW the surrounding source around the change instead of head-truncating it.
+ * The post-patch NEW-file line ranges touched by a unified diff — one { min, max } (1-based) PER hunk,
+ * from each `@@ … +start,count @@` header. Returns [] when none parse. Per-hunk (not merged into one
+ * span) so a multi-hunk patch windows EACH changed region, not just the min-to-max envelope.
  */
-function changedLineRange(diff) {
+function changedLineRanges(diff) {
   const re = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm;
-  let min = Infinity;
-  let max = -Infinity;
+  const ranges = [];
   let m;
   while ((m = re.exec(String(diff ?? ""))) !== null) {
     const start = Number.parseInt(m[1], 10);
     const count = m[2] === undefined ? 1 : Number.parseInt(m[2], 10);
     if (!Number.isFinite(start)) continue;
-    min = Math.min(min, start);
-    max = Math.max(max, start + Math.max(count, 1) - 1);
+    ranges.push({ min: start, max: start + Math.max(count, 1) - 1 });
   }
-  return min === Infinity ? null : { min, max };
+  return ranges;
 }
 
+const WINDOW_SEP = "\n…[omitted]…\n";
+
 /**
- * Fit post-patch `context` (the whole file, as the fix engine passes it) into `maxChars`
- * while keeping the CHANGED region visible. Under budget → returned whole. Over budget →
- * windowed around the diff's changed lines (with CONTEXT_PAD_LINES of padding), NOT
- * head-truncated — the reviewer must see the code the patch touched, not an irrelevant file
- * head (A3's whole purpose). Falls back to a head slice only when the diff has no parseable
- * hunk header. Result text is always ≤ maxChars. Returns { text, windowed }.
+ * Fit post-patch `context` (the whole file, as the fix engine passes it) into `maxChars` while keeping
+ * EVERY changed region visible. Under budget → returned whole. Over budget → a window per hunk (with
+ * CONTEXT_PAD_LINES of padding, overlapping windows merged), NOT head-truncated. A multi-hunk patch that
+ * changed line 100 AND line 1900 previously collapsed to one 100..1900 span and got front-sliced, so the
+ * 1900 hunk's context vanished though the seat still confirmed it (council Codex C3). Now each region is
+ * represented; padding is shrunk uniformly to fit, and if even the bare changed cores don't fit a
+ * fail-closed marker is appended (never silently drop a hunk). Result text is always ≤ maxChars.
  */
 export function windowContextToBudget(context, diff, maxChars = CONTEXT_MAX_CHARS) {
   const ctx = String(context ?? "");
   if (ctx.length <= maxChars) return { text: ctx, windowed: false };
-  const range = changedLineRange(diff);
-  if (!range) return { text: ctx.slice(0, maxChars), windowed: true }; // no hunk info → head (best effort)
+  const ranges = changedLineRanges(diff);
+  if (!ranges.length) return { text: ctx.slice(0, maxChars), windowed: true }; // no hunk info → head (best effort)
   const lines = ctx.split("\n");
-  const keepLo = Math.max(0, range.min - 1); // 1-based → 0-based; changed region [keepLo, keepHi)
-  const keepHi = Math.min(lines.length, range.max);
-  let start = Math.max(0, keepLo - CONTEXT_PAD_LINES);
-  let end = Math.min(lines.length, keepHi + CONTEXT_PAD_LINES);
-  const join = (s, e) => lines.slice(s, e).join("\n");
-  // Shrink the padding toward the changed region (head first, then tail) until it fits,
-  // always keeping the changed lines themselves inside the window.
-  while (join(start, end).length > maxChars && (start < keepLo || end > keepHi)) {
-    if (start < keepLo) start += 1;
-    if (join(start, end).length <= maxChars) break;
-    if (end > keepHi) end -= 1;
+  const n = lines.length;
+  // A padded window per hunk (0-based half-open [s,e)), keeping the changed CORE [cs,ce) that must never
+  // be padded away; sorted + merged where they overlap or touch.
+  const wins = ranges
+    .map((r) => ({ s: Math.max(0, r.min - 1 - CONTEXT_PAD_LINES), e: Math.min(n, r.max + CONTEXT_PAD_LINES), cs: Math.max(0, r.min - 1), ce: Math.min(n, r.max) }))
+    .sort((a, b) => a.s - b.s);
+  const merged = [];
+  for (const w of wins) {
+    const last = merged[merged.length - 1];
+    if (last && w.s <= last.e) {
+      last.e = Math.max(last.e, w.e);
+      last.ce = Math.max(last.ce, w.ce);
+      last.cs = Math.min(last.cs, w.cs);
+    } else merged.push({ ...w });
   }
-  let text = join(start, end);
-  if (text.length > maxChars) text = text.slice(0, maxChars); // the changed region alone exceeds budget
+  const render = () => merged.map((w) => lines.slice(w.s, w.e).join("\n")).join(WINDOW_SEP);
+  // Shrink padding UNIFORMLY across all windows (each keeps its changed core) until it fits.
+  let text = render();
+  while (text.length > maxChars) {
+    let shrunk = false;
+    for (const w of merged) {
+      if (w.s < w.cs) { w.s += 1; shrunk = true; }
+      if (w.e > w.ce) { w.e -= 1; shrunk = true; }
+    }
+    if (!shrunk) break; // all windows are down to their changed cores — can't shrink further
+    text = render();
+  }
+  if (text.length > maxChars) {
+    // Even the bare changed cores + separators exceed the budget: FAIL-CLOSED — slice + a loud marker
+    // so a seat never confirms a patch whose changed code it could not fully see.
+    const marker = "\n…[TRUNCATED — not all changed regions are shown; do not confirm what you cannot see]";
+    text = `${text.slice(0, Math.max(0, maxChars - marker.length))}${marker}`;
+  }
   return { text, windowed: true };
 }
 
