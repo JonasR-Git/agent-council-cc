@@ -11,6 +11,7 @@ import {
   detectOracleCmd,
   enforceTouched,
   ineligibleReason,
+  isSensitiveClass,
   parsePorcelainZ,
   runAuditFix,
   scheduleFixes,
@@ -38,6 +39,21 @@ test("ineligibleReason rejects §6 sensitive classes (auth/crypto/concurrency/da
   assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "auth" }), /sensitive/);
   assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", lens: "data_integrity" }), /sensitive/);
   assert.equal(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "correctness" }), null, "ordinary bugs stay fixable");
+});
+
+test("isSensitiveClass trims + case-folds BOTH category and lens (kept in sync with structure-gate's twin)", () => {
+  // trailing-space category must still classify as sensitive (a normalizer/model slip)
+  assert.equal(isSensitiveClass({ category: "security " }), true, "trailing-space category must still be sensitive");
+  // mixed-case + surrounding whitespace lens must still classify as sensitive
+  assert.equal(isSensitiveClass({ lens: " Security_Secrets " }), true, "case/whitespace lens must still be sensitive");
+  assert.equal(isSensitiveClass({ category: "Concurrency" }), true, "case-only category variant stays sensitive");
+  assert.equal(isSensitiveClass({ category: "correctness" }), false, "an ordinary category is never sensitive");
+  // the ineligibleReason gate must reflect the same hardening end-to-end
+  assert.match(
+    ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "security " }),
+    /sensitive/,
+    "a trailing-space category must not slip an auth/crypto fix past the §6 gate into ordinary auto-apply"
+  );
 });
 
 test("ineligibleReason keeps a refuted finding propose-only (annotate-only refuter never auto-fixes disputed)", () => {

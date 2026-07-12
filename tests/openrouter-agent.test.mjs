@@ -249,6 +249,34 @@ test("runOpenRouterStructured: a 400 that is NOT a parameter rejection is surfac
   assert.equal(isRateLimitError(`${r.stderr}`), false, "a 400 is not a transient rate-limit");
 });
 
+test("runOpenRouterStructured: durationMs is a REAL elapsed-ms figure even with no injected deps.now (matches CLI seats)", async () => {
+  registerOpenRouterKey("sk-secret");
+  const r = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", {
+    transport: async () => ({ status: 200, body: JSON.stringify({ choices: [{ message: { content: "ok" } }] }) })
+  });
+  assert.equal(typeof r.durationMs, "number", "production callers pass no deps.now — durationMs must still be a real number, not null");
+  assert.ok(r.durationMs >= 0);
+});
+
+test("runOpenRouterStructured: durationMs is real (not null) on the error/catch path too", async () => {
+  registerOpenRouterKey("sk-secret");
+  const r = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", { transport: async () => { throw new Error("boom"); } });
+  assert.equal(typeof r.durationMs, "number");
+});
+
+test("runOpenRouterStructured: effort comes ONLY from the seat (@effort suffix) — options.openrouterEffort is a dead/unwired global, never read", async () => {
+  registerOpenRouterKey("sk-secret");
+  const payloads = [];
+  const transport = async (_url, payload) => {
+    payloads.push(payload);
+    return { status: 200, body: JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+  };
+  // seatBackends()'s seat has NO effort configured; options carries a global override that must be ignored.
+  const r = await runOpenRouterStructured("/x", seatBackends(), { openrouterEffort: "high" }, "p", "or-x", { transport });
+  assert.equal(r.status, 0);
+  assert.equal("reasoning" in payloads[0], false, "no per-seat effort -> no reasoning field, even though options.openrouterEffort is set");
+});
+
 test("runOpenRouterStructured: a transport timeout → status 124 timedOut; a missing seat → skipped", async () => {
   registerOpenRouterKey("sk-secret");
   const r = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-x", { transport: async () => { throw new Error("timeout"); } });

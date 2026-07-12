@@ -51,6 +51,23 @@ test("gateFunnel buckets revert/reject reasons by gate", () => {
   assert.equal(f.test, 1);        // failed: tests failed
 });
 
+test("P2: gateFunnel reads the fix-LOOP's flat rejectedReason field (not just .reason)", () => {
+  // runFixLoop's `proposed` entries are flat ({...finding, rejectedReason}), never {finding, reason}.
+  // Before the fix, gateOf(p.reason) === gateOf(undefined) === "other" for every one of them.
+  const loopOut = {
+    proposed: [
+      { file: "a.mjs", title: "x", rejectedReason: "changed lines not executed by any test (2 uncovered) → propose-only" },
+      { file: "b.mjs", title: "y", rejectedReason: "touched files outside target: c.mjs → propose-only" },
+      { file: "c.mjs", title: "z", rejectedReason: "§6 council not unanimous (dissent: grok) → propose-only" }
+    ]
+  };
+  const f = gateFunnel(loopOut);
+  assert.equal(f.coverage, 1);
+  assert.equal(f.touched, 1);
+  assert.equal(f.council, 1);
+  assert.equal(f.other, 0, "none of the three fall through to the catch-all bucket");
+});
+
 test("councilTally counts unanimity, dissent, and per-seat verdicts", () => {
   const c = councilTally(out());
   assert.equal(c.reviewed, 2);

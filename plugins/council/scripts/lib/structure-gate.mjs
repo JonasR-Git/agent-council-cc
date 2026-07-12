@@ -241,14 +241,23 @@ export function evaluateStructureGate({ plan, actualChanged, verdicts, finding =
   // sensitivity rides on category here).
   const alsoSensitive = finding ? sensitiveOrUnclassified(finding) : true;
   const consented = structureAutoApply === true && (!alsoSensitive || sensitiveAutoApply === true);
+  // STRUCTURAL CLASS is folded in as a fail-closed guard (council review P2): the gate previously
+  // never checked isStructureClass(finding) itself — `finding` was used ONLY for the sensitivity
+  // sub-check — so a future caller routing findings here by severity/category (plausible; the
+  // function is self-contained and takes `finding`) could auto-apply a multi-file transform for a
+  // non-structural finding under structureAutoApply alone, bypassing the single-file §6 path it
+  // should have gone through instead. An absent finding also fails closed (never treated as
+  // structural by default), mirroring how sensitivity treats an absent finding as sensitive.
+  const structural = finding ? isStructureClass(finding) : false;
   const planCheck = validateTransformPlan(plan);
   const touched = enforcePlannedTouched(actualChanged, planCheck.plannedTouched);
   const behaviour = behaviourEquivalent({ testsGreen, publicApiChanged });
   // ALWAYS the full 3-seat unanimity — `required` is intentionally NOT exposed (council C2 codex P2):
   // this is a self-contained fail-closed decision, so a future caller can't silently weaken 3/3.
   const council = evaluatePatchVerdicts(verdicts);
-  const approved = consented && planCheck.ok && touched.ok && behaviour.ok && council.approved;
+  const approved = structural && consented && planCheck.ok && touched.ok && behaviour.ok && council.approved;
   const blockers = [];
+  if (!structural) blockers.push("finding: not a structural class (architecture_ssot/logical_sense) — this gate is not its concern");
   if (!consented) {
     if (structureAutoApply !== true) blockers.push("consent: structureAutoApply not granted (=== true)");
     else blockers.push("consent: structural+sensitive finding also needs sensitiveAutoApply (=== true)");

@@ -243,6 +243,24 @@ test("A10: claude's plan may still arrive as a FILE - it then critiques without 
   assert.deepEqual([...new Set(run.ranking.map((r) => r.votes))], [2], "pools stay symmetric");
 });
 
+test("the resolved solveWriter is interpolated into the synthesis instructions, not the literal policy key", async () => {
+  const calls = [];
+  const run = await runSolve(SOLVE_TMP, seatBackends(), solveOpts({ solveWriter: "codex" }), recordingDeps(calls));
+
+  assert.match(run.sections.synthesis, /exactly ONE writer \(codex\)/);
+  assert.doesNotMatch(run.sections.synthesis, /policy solve_writer/);
+  assert.match(run.report, /exactly ONE writer \(codex\)/);
+  assert.doesNotMatch(run.report, /policy solve_writer/);
+});
+
+test("solveWriter defaults to claude in the synthesis instructions when unset", async () => {
+  const calls = [];
+  const run = await runSolve(SOLVE_TMP, seatBackends(), solveOpts(), recordingDeps(calls));
+
+  assert.match(run.sections.synthesis, /exactly ONE writer \(claude\)/);
+  assert.match(run.report, /exactly ONE writer \(claude\)/);
+});
+
 test("A10 (fail-closed): with every seat skipped there are no plans, no critiques, and both CLI seats stay visible", async () => {
   const calls = [];
   const run = await runSolve(

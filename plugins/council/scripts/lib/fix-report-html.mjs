@@ -33,19 +33,28 @@ export function fixReportRows(out) {
   for (const f of out?.fixed ?? []) rows.push({ finding: f.finding, file: f.file ?? f.finding?.file, commit: f.commit, council: f.council, status: statusOf("fixed", f) });
   for (const x of out?.failed ?? []) rows.push({ finding: x.finding, file: x.file ?? x.finding?.file, reason: x.reason, status: statusOf("failed", x) });
   for (const r of out?.rejected ?? []) rows.push({ finding: r.finding, file: r.finding?.file, reason: r.reason, council: r.council, status: statusOf("rejected", r) });
-  // `proposed` is the fix-LOOP's propose-only bucket (same shape as rejected).
-  for (const p of out?.proposed ?? []) rows.push({ finding: p.finding, file: p.finding?.file ?? p.file, reason: p.reason, council: p.council, status: statusOf("rejected", p) });
+  // `proposed` is the fix-LOOP's propose-only bucket. Its entries are FLAT (`{...finding,
+  // rejectedReason}`), not the nested `{finding, reason}` shape `rejected` uses — fall back to the
+  // flat fields so the row (and statusOf's gate classification) isn't blank (council loop-report).
+  for (const p of out?.proposed ?? []) {
+    const pf = p.finding ?? p;
+    const preason = p.reason ?? p.rejectedReason;
+    rows.push({ finding: pf, file: pf?.file ?? p.file, reason: preason, council: p.council, status: statusOf("rejected", { reason: preason }) });
+  }
   for (const s of out?.skipped ?? []) rows.push({ finding: s.finding, file: s.file ?? s.finding?.file, reason: s.reason, status: statusOf("skipped", s) });
   rows.sort((a, b) => (SEV_RANK[a.finding?.severity] ?? 4) - (SEV_RANK[b.finding?.severity] ?? 4));
   return rows;
 }
 
-/** Aggregate the outcome counts. Pure. */
+/** Aggregate the outcome counts. Pure. An "unverified" fix (--allow-untested — the test gate never
+ *  ran) is counted SEPARATELY from "fixed" (verified) — folding it in would let the headline claim
+ *  tests were green for a commit whose tests never ran (council loop-report). */
 export function fixReportStats(rows) {
-  const s = { total: rows.length, fixed: 0, council: 0, proposed: 0, gated: 0, failed: 0 };
+  const s = { total: rows.length, fixed: 0, unverified: 0, council: 0, proposed: 0, gated: 0, failed: 0 };
   for (const r of rows) {
     const k = r.status.key;
-    if (k === "fixed" || k === "unverified") s.fixed += 1;
+    if (k === "fixed") s.fixed += 1;
+    else if (k === "unverified") s.unverified += 1;
     else if (k === "council") s.council += 1;
     else if (k === "proposed" || k === "no-consensus") s.proposed += 1;
     else if (k === "gate" || k === "skipped") s.gated += 1;
@@ -74,9 +83,9 @@ h1,h2{text-wrap:balance;line-height:1.1;font-weight:660;letter-spacing:-.015em}
 section.band{border-top:1px solid var(--line);padding:clamp(2.4rem,5vw,3.6rem) 0}
 .bi{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.16em;color:var(--muted);margin-bottom:1.1rem}.bi b{color:var(--brass)}
 .band h2{font-size:clamp(1.4rem,3vw,2rem);margin:0 0 .6rem}.band .sub{color:var(--ink-soft);max-width:64ch;margin:0 0 1.4rem}
-.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:.8rem}@media(max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.8rem}@media(max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}}
 .stat{border:1px solid var(--line);border-radius:12px;padding:1.1rem 1rem;background:var(--surface)}.stat .n{font-family:var(--font-mono);font-size:clamp(1.5rem,3.4vw,2.1rem);font-weight:640;font-variant-numeric:tabular-nums}.stat .l{font-size:.76rem;color:var(--muted);margin-top:.35rem;line-height:1.35}
-.stat.found .n{color:var(--ink)}.stat.fixed .n{color:var(--pass)}.stat.council .n{color:var(--brass)}.stat.proposed .n{color:var(--warn)}.stat.gated .n{color:var(--muted)}
+.stat.found .n{color:var(--ink)}.stat.fixed .n{color:var(--pass)}.stat.unverified .n{color:var(--warn)}.stat.council .n{color:var(--brass)}.stat.proposed .n{color:var(--warn)}.stat.gated .n{color:var(--muted)}
 .pipe{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:1.3rem 1.2rem 1.1rem;overflow-x:auto}
 .pipe .cap{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:1rem;display:flex;justify-content:space-between;gap:1rem}
 .gates{display:flex;gap:.5rem;min-width:640px}.gate{flex:1;min-width:84px;border:1px solid color-mix(in srgb,var(--pass) 55%,var(--line));background:color-mix(in srgb,var(--pass) 9%,var(--surface-2));border-radius:9px;padding:.7rem .6rem;display:flex;flex-direction:column;gap:.5rem;position:relative}
@@ -250,9 +259,12 @@ export function renderFixReportHtml(out, meta = {}) {
   const genAt = meta.generatedAt ?? "";
 
   const tableRows = rows.length ? rows.map(findingRow).join("\n") : `<tr><td colspan="5" class="tf">keine Funde</td></tr>`;
+  // Never claim "Tests grün pro Commit" when an --allow-untested run left fixes unverified — that
+  // would assert green tests for a commit whose test gate never ran (council loop-report).
+  const testsNote = stats.unverified ? `${stats.unverified} unverifiziert (--allow-untested)` : "Tests grün pro Commit";
   const verdictText = red
     ? `${stats.total} Funde · Integrationslauf ROT — Commits liegen isoliert zum Review`
-    : `${stats.total} Funde · ${stats.fixed + stats.council} angewendet & getestet · ${stats.proposed} vorgeschlagen · Tests grün pro Commit`;
+    : `${stats.total} Funde · ${stats.fixed + stats.council} angewendet & getestet · ${stats.proposed} vorgeschlagen · ${testsNote}`;
 
   return `<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Council Audit Fix — Lauf-Bericht</title><style>${STYLE}</style></head><body>
@@ -277,6 +289,7 @@ ${metaCell("Erzeugt", genAt || "pro Lauf")}
 <div class="stats">
 <div class="stat found"><div class="n">${stats.total}</div><div class="l">Funde gesamt</div></div>
 <div class="stat fixed"><div class="n">${stats.fixed}</div><div class="l">gefixt + verifiziert</div></div>
+<div class="stat unverified"><div class="n">${stats.unverified}</div><div class="l">gefixt, unverifiziert (--allow-untested)</div></div>
 <div class="stat council"><div class="n">${stats.council}</div><div class="l">council-angewendet (§6)</div></div>
 <div class="stat proposed"><div class="n">${stats.proposed}</div><div class="l">vorgeschlagen</div></div>
 <div class="stat gated"><div class="n">${stats.gated}</div><div class="l">unter Gate / übersprungen</div></div>

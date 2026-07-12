@@ -398,3 +398,33 @@ test("gateFindings tier-orders the actionable set and separates surfaced/skipped
 test("fixKey is line-independent and separator-normalized", () => {
   assert.equal(fixKey({ file: "src\\a.mjs", finding: { title: "The  Bug" } }), fixKey({ file: "src/a.mjs", finding: { title: "the bug" } }));
 });
+
+test("P2: seenReview is rebuilt from the checkpoint on resume (a recurring finding does not reset the dry streak)", async () => {
+  // Without rebuilding seenReview, a finding already recorded in a prior checkpoint's `reviewed` list
+  // is treated as brand-new on the very next pass after resume — resetting dryStreak to 0 instead of
+  // letting it climb toward dryStop, exactly mirroring audit-endless's `seen.add(endlessKey(f))` restore.
+  const recurring = finding({ file: "a.mjs", title: "recurring propose-only", scope: "cross-cutting" });
+  const prior = { fixed: [], failed: [], proposed: [], passes: [], spent: 0, passNo: 5, dryStreak: 1, branch: null, reviewed: [recurring] };
+  const review = async () => ({ findings: [recurring], coverage: { budgetSpent: 1 } });
+  const fix = async () => ({ fixed: [], failed: [], spent: 0 });
+  // maxPasses:6 with prior.passNo:5 allows exactly ONE more pass, isolating this single pass's effect.
+  const out = await runFixLoop("/x", { budget: 20, resume: true, dryStreak: 2, maxPasses: 6 }, { review, fix, loadCheckpoint: () => prior, checkpoint: noCheckpoint });
+  assert.equal(out.dryStreak, 2, "the already-seen recurring finding keeps the dry streak climbing instead of resetting to 0");
+});
+
+test("P2: runFixLoop returns changedFiles (union of fixed files) so `audit fix --loop --html` can render the shape delta", async () => {
+  let p = 0;
+  const review = async () =>
+    p++ === 0
+      ? { findings: [finding({ file: "a.mjs", title: "bug" }), finding({ file: "b.mjs", title: "bug2" })], coverage: { budgetSpent: 2 } }
+      : { findings: [], coverage: { budgetSpent: 1 } };
+  const fix = async (actionable) => ({
+    fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "c" })),
+    failed: [],
+    branch: "council/x",
+    changedFiles: actionable.map((f) => f.file),
+    spent: 2
+  });
+  const out = await runFixLoop("/x", { budget: 40, dryStreak: 2 }, { review, fix, checkpoint: noCheckpoint });
+  assert.deepEqual([...out.changedFiles].sort(), ["a.mjs", "b.mjs"]);
+});

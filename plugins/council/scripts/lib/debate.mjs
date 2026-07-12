@@ -1,4 +1,4 @@
-import { interpolate, loadPrompt } from "./agents.mjs";
+import { interpolate, loadPrompt, makeFenceNonce } from "./agents.mjs";
 import { extractJsonObject, SEVERITY_RANK } from "./findings.mjs";
 import { SCHEMAS } from "./schemas.mjs";
 import { makeSeatRunners } from "./seats.mjs";
@@ -61,8 +61,12 @@ function parseDebateRebuttal(stdout, agent, id) {
   if (!checked.valid) {
     return noReplyRebuttal(agent, id, "unparseable reply", checked.errors);
   }
+  // Trust the CALLER's id, never the model-echoed doc.id (anti-spoofing convention used elsewhere,
+  // e.g. findings.mjs ignores doc.agent and trusts only the runner's identity): a diverging/empty
+  // echoed id would otherwise make applyDebateOutcomes' byId lookup miss and silently drop a real
+  // concede/revise.
   return {
-    id: String(doc.id ?? id),
+    id: String(id),
     agent,
     stance: normalizeStance(doc.stance),
     note: String(doc.note ?? "").trim(),
@@ -80,8 +84,10 @@ function parseDebateCounter(stdout, agent, id) {
   if (!checked.valid) {
     return noReplyCounter(agent, id, "unparseable reply", checked.errors);
   }
+  // Trust the CALLER's id, never the model-echoed doc.id — same anti-spoofing rationale as
+  // parseDebateRebuttal above.
   return {
-    id: String(doc.id ?? id),
+    id: String(id),
     agent,
     upheld: Boolean(doc.upheld),
     note: String(doc.note ?? "").trim(),
@@ -120,12 +126,19 @@ function runAgentPrompt(agent, cwd, backends, options, prompt, deps = {}) {
   return run(prompt);
 }
 
+// Both prompts interpolate finding/diff-derived text (ITEM_JSON) and, for the counter, a peer
+// model's free-text critique (REBUTTAL_NOTE) — the same untrusted-data shape every other
+// model/repo-content prompt in this codebase fences with a one-time nonce (r1-independent,
+// r2-peer-critique, r2-plan-critique, r1-proposal, r2-verify, buildReformatPrompt). Without it, a
+// reviewed diff containing instruction-like text quoted verbatim into a finding's `detail` could be
+// fed unframed to the author/critic model.
 function buildRebuttalPrompt(entry) {
   const template = loadPrompt("debate-rebuttal");
   return interpolate(template, {
     AGENT: entry.author,
     ITEM_ID: entry.id,
-    ITEM_JSON: JSON.stringify(entry.payload, null, 2)
+    ITEM_JSON: JSON.stringify(entry.payload, null, 2),
+    NONCE: makeFenceNonce()
   });
 }
 
@@ -136,7 +149,8 @@ function buildCounterPrompt(entry, rebuttal) {
     AUTHOR: entry.author,
     ITEM_ID: entry.id,
     ITEM_JSON: JSON.stringify(entry.payload, null, 2),
-    REBUTTAL_NOTE: rebuttal?.note ?? "(no note)"
+    REBUTTAL_NOTE: rebuttal?.note ?? "(no note)",
+    NONCE: makeFenceNonce()
   });
 }
 

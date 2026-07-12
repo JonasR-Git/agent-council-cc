@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseRefutation, partitionByRefutation, shouldVerify, verifierAvailability, verifierFor } from "../plugins/council/scripts/lib/verify.mjs";
+import {
+  isTrustworthyVerifierResult,
+  parseRefutation,
+  partitionByRefutation,
+  shouldVerify,
+  verifierAvailability,
+  verifierFor
+} from "../plugins/council/scripts/lib/verify.mjs";
 
 test("shouldVerify targets P0/P1 single-agent findings, protects consensus + lower severities", () => {
   assert.equal(shouldVerify({ severity: "P0", consensus: false }), true);
@@ -33,6 +40,24 @@ test("B2: verifierFor only picks a REACHABLE seat when availability is known (co
 test("verifierAvailability reflects the probed backends", () => {
   const a = verifierAvailability({ codex: { companionAvailable: true }, grok: { cli: { available: false } }, claude: { cli: { available: true } } });
   assert.deepEqual(a, { codex: true, grok: false, claude: true });
+});
+
+test("isTrustworthyVerifierResult does NOT trust a truncated reply even with status 0 and parseable stdout", () => {
+  // A maxBuffer-overflow kill can still report exit 0 if the process had already flushed output
+  // as/just-before the kill — status===0 alone must not be trusted when truncated is true.
+  const truncatedButParseable = { status: 0, timedOut: false, truncated: true, skipped: false, stdout: '{"refuted": true, "reason": "looks fine"}' };
+  assert.equal(isTrustworthyVerifierResult(truncatedButParseable), false, "a truncated run must never be trusted, even if status===0 and stdout parses cleanly");
+  // sanity: the same stdout WOULD parse as a confident refutation if it were (wrongly) trusted —
+  // demonstrating exactly what the truncated guard prevents from silently hiding a real finding.
+  assert.deepEqual(parseRefutation(truncatedButParseable.stdout), { refuted: true, reason: "looks fine" });
+  // a clean, non-truncated run with the same shape IS trusted
+  const clean = { ...truncatedButParseable, truncated: false };
+  assert.equal(isTrustworthyVerifierResult(clean), true);
+  // the pre-existing guards still hold
+  assert.equal(isTrustworthyVerifierResult({ ...clean, skipped: true }), false);
+  assert.equal(isTrustworthyVerifierResult({ ...clean, timedOut: true }), false);
+  assert.equal(isTrustworthyVerifierResult({ ...clean, status: 1 }), false);
+  assert.equal(isTrustworthyVerifierResult({ ...clean, stdout: "   " }), false);
 });
 
 test("parseRefutation reads a strict {refuted,reason} JSON, rejects malformed", () => {

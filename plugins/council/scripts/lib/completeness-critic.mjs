@@ -127,10 +127,13 @@ export function parseCompleteness(stdout) {
  *
  * Two distinct outputs:
  *  - `coverageComplete` = is the SEARCH thorough (structural whole AND critic finds no gap), WITHOUT
- *    the dry streak. This is the signal to feed B5's `coverage.complete`. It must NOT include dryOk:
- *    coverage.complete GATES the dry streak, so a dry-dependent completeness could never let the
- *    streak rise → dry stop would deadlock (council C1 grok P1). Wire coverage.complete =
- *    assessCompleteness(...).coverageComplete, and let the loop keep the dry streak separately.
+ *    the dry streak. The real wiring (audit-grouped-review.mjs) exposes this as its OWN
+ *    `coverage.completenessComplete` field — it must NEVER be assigned into `coverage.complete`
+ *    (that field stays the strict six-eyes signal; conflating the two would break report honesty).
+ *    `coverage.completenessComplete` ANDs into the loop's dry-streak gate instead of feeding
+ *    `coverage.complete` directly: `coverage.complete` GATES the dry streak, so a dry-dependent
+ *    completeness fed into it could never let the streak rise → dry stop would deadlock (council C1
+ *    grok P1). Keep the dry streak tracked separately in the loop, as today.
  *  - `complete` = the FULL stop verdict: coverage thorough AND passes have gone dry.
  *
  * `nextTargets` is the concrete extra work an incomplete verdict should schedule (un-scheduled

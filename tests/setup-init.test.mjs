@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { loadPolicy } from "../plugins/council/scripts/lib/policy.mjs";
+import { DEFAULT_POLICY, loadPolicy } from "../plugins/council/scripts/lib/policy.mjs";
 
 const COMPANION = fileURLToPath(
   new URL("../plugins/council/scripts/council-companion.mjs", import.meta.url)
@@ -46,6 +46,23 @@ test("setup --init scaffolds a .council.yml that loadPolicy reads back", (t) => 
   assert.equal(policy.claude_backend, "spawn");
   assert.equal(policy.claude_model, "claude-opus-4-8");
   assert.equal(policy.default_mode, "deliberate");
+});
+
+test("setup --init defaults default_mode to DEFAULT_POLICY.default_mode when --default-mode is omitted", (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "council-init-"));
+  const result = runSetupInit(cwd);
+  if (result.error && (result.error.code === "EPERM" || result.error.code === "ENOENT")) {
+    t.skip("child_process.spawn is blocked by this sandbox");
+    return;
+  }
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(JSON.parse(result.stdout).written, true);
+
+  const policy = loadPolicy(cwd);
+  // The scaffold's un-flagged default must not silently diverge from DEFAULT_POLICY's own value -
+  // previously the scaffold hardcoded "deliberate" while DEFAULT_POLICY.default_mode is "review".
+  assert.equal(DEFAULT_POLICY.default_mode, "review");
+  assert.equal(policy.default_mode, DEFAULT_POLICY.default_mode);
 });
 
 test("setup --init rejects model strings that could inject into the YAML", (t) => {

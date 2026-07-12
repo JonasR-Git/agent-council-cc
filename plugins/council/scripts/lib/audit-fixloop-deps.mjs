@@ -8,7 +8,11 @@
 //   pass number, which mixes scope modes) and WRAP at the end so an overrun re-reviews
 //   the top band instead of returning an empty review the loop would misread as "dry".
 //   A localized pass reviews exactly the changed files; if none of them are known model
-//   units it falls back to full scope rather than reviewing nothing.
+//   units it falls back to full scope rather than reviewing nothing. It also folds the
+//   PRIOR pass's coverage.completenessGaps (M8 completeness critic + B4 structural gaps)
+//   into THIS pass's scope — a flagged file rides alongside (or becomes) the changed-files
+//   scope, so a gap the critic/matrix flagged is actually RE-TARGETED next pass instead of
+//   only resetting the loop's dry streak.
 // - fix: runAuditFix on the actionable set, threading branch + stayOnBranch so ONE
 //   integration branch continues across passes.
 // - expandScope: blast-radius (§7) — a HUB-file change (fan-in >= threshold) forces a
@@ -37,6 +41,28 @@ function buildDupPeers(dupClusters = []) {
     }
   }
   return peers;
+}
+
+/**
+ * Recover REAL model file ids named by a completeness-gap token (coverage.completenessGaps —
+ * completeness-critic's flattened `nextTargets`: un-scheduled files, "groupId:file#chunk"
+ * incomplete-triple ids, or a critic-flagged class/where string). Only an EXACT match against a
+ * known model file id is honored — a bare defect-class token ("concurrency") or an unresolvable
+ * "where" description is not itself a valid scope target, and fuzzy-matching it risks folding in
+ * the wrong file. Tried in order: the raw token, the token with a trailing "#chunk" stripped, then
+ * that with a leading "groupId:" prefix also stripped.
+ */
+function gapFileIds(gaps, knownIds) {
+  if (!Array.isArray(gaps) || !gaps.length) return [];
+  const out = [];
+  for (const g of gaps) {
+    const s = String(g ?? "");
+    const withoutChunk = s.includes("#") ? s.slice(0, s.lastIndexOf("#")) : s;
+    const afterColon = withoutChunk.includes(":") ? withoutChunk.slice(withoutChunk.indexOf(":") + 1) : withoutChunk;
+    const hit = [s, withoutChunk, afterColon].find((c) => knownIds.has(c));
+    if (hit && !out.includes(hit)) out.push(hit);
+  }
+  return out;
 }
 
 // A grouped pass spends its per-pass budget on THREE kinds of paid agent call: cells, the (optional)
@@ -95,6 +121,13 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   const importersOf = model?.graph?.importers ?? {};
   const dupPeers = buildDupPeers(model?.dupClusters);
   let fullPasses = 0; // counts ONLY full-scope passes, so the window advance is honest
+  const knownFileIds = new Set(files.map((f) => f?.id).filter(Boolean));
+  // M8 follow-up (council P2): files flagged by the PRIOR pass's completeness gaps (structural
+  // un-scheduled/incomplete cells + the critic's flagged classes, coverage.completenessGaps). Folded
+  // into the NEXT pass's scope below so a flagged gap actually gets RE-TARGETED — before this fix the
+  // gap was computed and exposed but never consumed, and only completenessComplete=false resetting the
+  // dry streak kept the loop from converging over it, without ever scheduling the gap itself.
+  let pendingGapFiles = [];
 
   // A5: the model/effort/TIMEOUT pins (--codex-model/--grok-model/--claude-model, --agent-timeout and
   // their .council.yml policy equivalents) must reach EVERY seat the loop spawns — the seat runners read
@@ -116,11 +149,15 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   };
 
   const review = async ({ budget, changedFiles }) => {
-    const scopedFiles = changedFiles && changedFiles.length ? files.filter((f) => changedFiles.includes(f.id)) : null;
+    // Fold the PRIOR pass's flagged gap files (if any) into this pass's scope: they ride ALONGSIDE
+    // an existing localized changedFiles scope, or — absent one — BECOME it, so the loop actually
+    // re-targets the gap next pass instead of only resetting the dry streak.
+    const gapScope = pendingGapFiles.length ? [...new Set([...(changedFiles ?? []), ...pendingGapFiles])] : changedFiles;
+    const scopedFiles = gapScope && gapScope.length ? files.filter((f) => gapScope.includes(f.id)) : null;
     let reviewFiles;
     let offset = 0;
     if (scopedFiles && scopedFiles.length) {
-      reviewFiles = scopedFiles; // localized pass: review the changed band from the top
+      reviewFiles = scopedFiles; // localized pass: review the changed (+ folded gap) band from the top
     } else {
       // Full scope (first pass, hub-forced full, or empty-scoped fallback): advance the
       // window by full-scope passes and WRAP so an overrun never returns an empty review.
@@ -193,6 +230,9 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       agents: rawFindings[i]?.agents ?? nf.agents
     }));
     const cov = rev?.coverage ?? {};
+    // Capture THIS pass's flagged gaps for the NEXT call (replaces, not accumulates — a gap that
+    // got resolved this pass naturally drops off coverage.completenessGaps and stops being scoped).
+    pendingGapFiles = gapFileIds(cov.completenessGaps, knownFileIds);
     const selected = cov.unitsSelected ?? 0;
     const reviewed = cov.unitsReviewed ?? 0;
     // ran:false must not DISCARD real findings (council Codex C2 P2): on a budget-starved pass where no

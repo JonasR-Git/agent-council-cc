@@ -29,14 +29,14 @@ function toPosix(p) {
  * filtered to `areas` prefixes. Uses NUL-delimited `git ls-files` so filenames
  * with spaces/quotes/newlines survive; falls back to an fs walk outside a repo.
  */
-export function enumerateFiles(root, { areas } = {}) {
+function enumerateFiles(root, { areas } = {}) {
   const res = runCommand("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { cwd: root });
   let rel;
-  if (res.status === 0 && res.stdout.length) {
-    rel = res.stdout.split("\0").filter(Boolean);
-  } else {
-    rel = walk(root).map((abs) => toPosix(path.relative(root, abs)));
-  }
+  // git succeeded: trust it (an empty repo is genuinely empty — do NOT fall back to a
+  // non-gitignore-aware walk that would leak dist/coverage). Only walk when git failed.
+  // (Mirrors inventoryFiles below — the two enumerators must agree on what "empty" means.)
+  if (res.status === 0) rel = res.stdout.length ? res.stdout.split("\0").filter(Boolean) : [];
+  else rel = walk(root).map((abs) => toPosix(path.relative(root, abs)));
   const prefixes = (areas ?? []).map((a) => toPosix(a).replace(/\/+$/, ""));
   const seen = new Set();
   const files = [];
@@ -164,10 +164,13 @@ function fileFacts(text) {
 /** git commits touching each file in the last `days` days -> { map, ok }. */
 function churnMap(root, days) {
   const map = new Map();
-  const res = runCommand("git", ["log", `--since=${days}.days`, "--name-only", "--pretty=format:"], { cwd: root, timeout: 30_000 });
+  // -z: NUL-delimited + unquoted raw filenames, so keys align with enumerateFiles'
+  // `git ls-files -z` ids. Without -z, git C-quotes non-ASCII paths (core.quotePath
+  // default true) and churn would silently miss every non-ASCII filename.
+  const res = runCommand("git", ["log", `--since=${days}.days`, "--name-only", "-z", "--pretty=format:"], { cwd: root, timeout: 30_000 });
   if (res.status !== 0 || res.error) return { map, ok: false };
-  for (const line of res.stdout.split(/\r?\n/)) {
-    const id = line.trim();
+  for (const chunk of res.stdout.split("\0")) {
+    const id = chunk.trim();
     if (id) map.set(id, (map.get(id) ?? 0) + 1);
   }
   return { map, ok: true };

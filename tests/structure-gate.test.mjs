@@ -157,6 +157,23 @@ test("evaluateStructureGate (council C5): strict testsGreen + widened path prote
   assert.equal(enforcePlannedTouched(["a.mjs\n"], ["a.mjs"]).ok, false, "a weird-named actual file is NOT the planned clean name");
 });
 
+test("evaluateStructureGate (council P2): a NON-structural finding is rejected regardless of structureAutoApply", () => {
+  // {lens:"correctness", category:"design"} is neither architecture_ssot nor logical_sense — this
+  // gate is not its concern; it must be rejected even though every other gate would pass.
+  const nonStructural = { lens: "correctness", category: "design" };
+  const base = { plan, actualChanged: ["a.mjs", "b.mjs"], verdicts: okVerdicts, testsGreen: true, publicApiChanged: false, structureAutoApply: true, finding: nonStructural };
+  const result = evaluateStructureGate(base);
+  assert.equal(result.approved, false, "a non-structural finding must never auto-apply via this gate");
+  assert.match(result.summary, /not a structural class/);
+  // structureFixDisposition agrees (structural:false) — the two must not diverge
+  assert.equal(structureFixDisposition(nonStructural, { structureAutoApply: true }).structural, false);
+  // an absent finding is ALSO treated as non-structural (fail-closed), not just non-sensitive
+  const { finding, ...withoutFinding } = base;
+  void finding;
+  assert.equal(evaluateStructureGate(withoutFinding).approved, false);
+  assert.match(evaluateStructureGate(withoutFinding).summary, /not a structural class/);
+});
+
 test("evaluateStructureGate is fail-closed on a missing seat (council not unanimous)", () => {
   const twoSeats = evaluateStructureGate({ plan, actualChanged: ["a.mjs", "b.mjs"], verdicts: [{ seat: "claude", verdict: "confirm" }, { seat: "codex", verdict: "confirm" }], testsGreen: true, publicApiChanged: false, structureAutoApply: true, finding: { lens: "architecture_ssot", category: "design" } });
   assert.equal(twoSeats.approved, false, "3 seats required — a missing grok blocks");

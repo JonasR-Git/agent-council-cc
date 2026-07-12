@@ -297,8 +297,12 @@ export async function runOpenRouterStructured(cwd, backends, options, prompt, se
   if (!key) return buildAgentResult(seatId, "openrouter", { status: 1, stdout: "", stderr: "openrouter: no API key registered" }, {});
 
   const transport = deps.transport ?? postJson;
-  const effort = options?.openrouterEffort ?? seat.effort;
-  const started = deps.now ? deps.now() : 0;
+  const effort = seat.effort;
+  // Unconditional real clock in production; `deps.now` merely OVERRIDES it for tests (council
+  // finding: gating the timer itself on deps.now meant every production run — no caller passes
+  // deps.now — reported durationMs:null while CLI seats always report a real ms figure).
+  const now = deps.now ?? Date.now;
+  const started = now();
   // name the SEAT (not just the slug) in every surfaced error — with 5 possible or-* seats, "which seat
   // is dead?" is otherwise unanswerable from the logs.
   const label = `openrouter ${seatId} (${seat.model})`;
@@ -330,7 +334,7 @@ export async function runOpenRouterStructured(cwd, backends, options, prompt, se
       else break; // nothing left to drop → surface the 400
       res = await doPost(fields);
     }
-    const durationMs = deps.now ? deps.now() - started : null;
+    const durationMs = now() - started;
     if (res.status >= 200 && res.status < 300) {
       let choice = null;
       let parseError = "";
@@ -355,7 +359,7 @@ export async function runOpenRouterStructured(cwd, backends, options, prompt, se
     // then fails the exact-match redaction and leaks the prefix into stderr/logs.
     return buildAgentResult(seatId, "openrouter", { status: res.status || 1, stdout: "", stderr: `${label}: status=${res.status} ${scrub(String(res.body ?? "")).slice(0, 300)}`, durationMs }, { model: seat.model });
   } catch (err) {
-    const durationMs = deps.now ? deps.now() - started : null;
+    const durationMs = now() - started;
     const timedOut = /timeout/i.test(String(err?.message ?? ""));
     return buildAgentResult(seatId, "openrouter", { status: timedOut ? 124 : 1, stdout: "", stderr: scrub(`${label}: ${err?.message ?? err}`), timedOut, durationMs }, { model: seat.model });
   }

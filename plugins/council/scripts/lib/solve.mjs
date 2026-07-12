@@ -393,7 +393,7 @@ export async function runSolve(cwd, backends, options = {}, deps = {}) {
     header: `Problem: ${problem.trim().split(/\r?\n/)[0]}`,
     ranking: renderRankingSection(ranking),
     debate: debates.length ? renderSolveDebates(debates) : null,
-    synthesis: SYNTHESIS_INSTRUCTIONS
+    synthesis: synthesisInstructions(options.solveWriter ?? "claude")
   };
 
   return {
@@ -410,13 +410,15 @@ export async function runSolve(cwd, backends, options = {}, deps = {}) {
   };
 }
 
-const SYNTHESIS_INSTRUCTIONS = [
-  "## Your turn (Claude) - synthesis",
-  "1. Take the best-ranked plan as the skeleton; graft the strongest improvements from the others.",
-  "2. Resolve or explicitly accept every blocker (debate outcomes above help).",
-  "3. Present the final plan to the user for approval BEFORE implementing.",
-  "4. Implementation: exactly ONE writer (policy solve_writer) on a dedicated branch; then /council:review on the diff. The writer's own verdict does not count towards approval."
-].join("\n");
+function synthesisInstructions(solveWriter) {
+  return [
+    "## Your turn (Claude) - synthesis",
+    "1. Take the best-ranked plan as the skeleton; graft the strongest improvements from the others.",
+    "2. Resolve or explicitly accept every blocker (debate outcomes above help).",
+    "3. Present the final plan to the user for approval BEFORE implementing.",
+    `4. Implementation: exactly ONE writer (${solveWriter}) on a dedicated branch; then /council:review on the diff. The writer's own verdict does not count towards approval.`
+  ].join("\n");
+}
 
 export function renderSolveDebates(debates) {
   const lines = ["## Debate (bounded, blockers only)"];
@@ -552,11 +554,7 @@ function renderSolveReport({ problem, options, r1Results, r2Results, plans, crit
     lines.push("");
   }
 
-  lines.push("## Your turn (Claude) - synthesis");
-  lines.push("1. Take the best-ranked plan as the skeleton; graft the strongest improvements from the others.");
-  lines.push("2. Resolve or explicitly accept every blocker (debate outcomes above help).");
-  lines.push("3. Present the final plan to the user for approval BEFORE implementing.");
-  lines.push("4. Implementation: exactly ONE writer (policy solve_writer) on a dedicated branch; then /council:review on the diff. The writer's own verdict does not count towards approval.");
+  lines.push(synthesisInstructions(options.solveWriter ?? "claude"));
   lines.push("");
 
   return lines.join("\n");

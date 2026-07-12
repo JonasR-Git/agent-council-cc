@@ -181,6 +181,80 @@ test("a scoped pass whose files aren't in the model falls back to full scope, ne
   assert.equal(seen, model.files.length, "unknown changed files -> full scope, not zero units");
 });
 
+// --- M8 follow-up (council P2): completeness gaps are CONSUMED by the next pass's scope,
+// not just observed via coverage.completenessComplete. Before this fix a flagged gap could
+// only reset the loop's dry streak; the loop never once scheduled the flagged file itself.
+test("M8 follow-up: a flagged completeness gap is folded into the NEXT pass's scope (re-targeted, not just a dry-streak reset)", async () => {
+  const seen = [];
+  const runAuditReview = async (cwd, m) => {
+    seen.push(m.files.map((f) => f.id));
+    return seen.length === 1
+      ? { findings: [], coverage: { budgetSpent: 1, completenessGaps: ["b.mjs"] } } // pass 1 flags b.mjs
+      : { findings: [], coverage: { budgetSpent: 1 } }; // pass 2+: nothing flagged
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview });
+  await deps.review({ budget: 5, changedFiles: null }); // pass 1: full scope, flags b.mjs
+  await deps.review({ budget: 5, changedFiles: null }); // pass 2: would normally be full scope again
+  assert.deepEqual(seen[1], ["b.mjs"], "the flagged gap file becomes the next pass's scope instead of the whole model again");
+});
+
+test("M8 follow-up: a gap file rides ALONGSIDE an already-localized changedFiles scope", async () => {
+  const seen = [];
+  const runAuditReview = async (cwd, m) => {
+    seen.push(m.files.map((f) => f.id));
+    return seen.length === 1
+      ? { findings: [], coverage: { budgetSpent: 1, completenessGaps: ["hub.mjs"] } }
+      : { findings: [], coverage: { budgetSpent: 1 } };
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview });
+  await deps.review({ budget: 5, changedFiles: null }); // flags hub.mjs
+  await deps.review({ budget: 5, changedFiles: ["a.mjs"] }); // localized pass on a.mjs
+  assert.deepEqual(seen[1].sort(), ["a.mjs", "hub.mjs"], "the gap file is folded IN, not dropped by the localized scope");
+});
+
+test("M8 follow-up: a non-file gap token (defect class / group id) is NOT folded — it doesn't force a narrow scope", async () => {
+  const seen = [];
+  const runAuditReview = async (cwd, m) => {
+    seen.push(m.files.map((f) => f.id));
+    return seen.length === 1
+      ? { findings: [], coverage: { budgetSpent: 1, completenessGaps: ["concurrency", "some-group-id"] } }
+      : { findings: [], coverage: { budgetSpent: 1 } };
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview });
+  await deps.review({ budget: 5, changedFiles: null });
+  await deps.review({ budget: 5, changedFiles: null }); // still full scope — no real file matched
+  assert.equal(seen[1].length, model.files.length, "an unmatched gap token is ignored, not force-scoped");
+});
+
+test("M8 follow-up: an incomplete-triple gap token (groupId:file#chunk) resolves to its file", async () => {
+  const seen = [];
+  const runAuditReview = async (cwd, m) => {
+    seen.push(m.files.map((f) => f.id));
+    return seen.length === 1
+      ? { findings: [], coverage: { budgetSpent: 1, completenessGaps: ["fine:b.mjs#2"] } }
+      : { findings: [], coverage: { budgetSpent: 1 } };
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview });
+  await deps.review({ budget: 5, changedFiles: null });
+  await deps.review({ budget: 5, changedFiles: null });
+  assert.deepEqual(seen[1], ["b.mjs"], "the file portion of a groupId:file#chunk gap token is recovered");
+});
+
+test("M8 follow-up: a resolved gap drops out — scope returns to normal once it stops recurring", async () => {
+  const seen = [];
+  const runAuditReview = async (cwd, m) => {
+    seen.push(m.files.map((f) => f.id));
+    if (seen.length === 1) return { findings: [], coverage: { budgetSpent: 1, completenessGaps: ["b.mjs"] } };
+    return { findings: [], coverage: { budgetSpent: 1 } }; // gap resolved — no longer reported
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, { maxUnits: 8 }, { runAuditReview });
+  await deps.review({ budget: 5, changedFiles: null }); // pass 1: flags b.mjs
+  await deps.review({ budget: 5, changedFiles: null }); // pass 2: narrowed to b.mjs, gap no longer reported
+  await deps.review({ budget: 5, changedFiles: null }); // pass 3: gap gone -> full scope resumes
+  assert.deepEqual(seen[1], ["b.mjs"]);
+  assert.equal(seen[2].length, model.files.length, "the gap stopped recurring, so scope returns to normal");
+});
+
 test("fix threads branch + stayOnBranch (and severity/max) to runAuditFix", async () => {
   let seen;
   const runAuditFix = async (cwd, findings, backends, opts) => {

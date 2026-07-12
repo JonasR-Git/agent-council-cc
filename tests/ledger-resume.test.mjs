@@ -10,7 +10,7 @@ import {
   recordAndAnnotate,
   resolveLedgerEntry
 } from "../plugins/council/scripts/lib/ledger.mjs";
-import { readCachedR1, writeCachedR1 } from "../plugins/council/scripts/lib/resume.mjs";
+import { readCachedR1, resumeContextKey, writeCachedR1 } from "../plugins/council/scripts/lib/resume.mjs";
 
 function withState(fn) {
   const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-ledger-state-"));
@@ -118,6 +118,27 @@ test("listAllJobsDirs finds per-workspace job dirs under the state root", async 
     else process.env.AGENT_COUNCIL_STATE_DIR = previous;
     fs.rmSync(stateRoot, { recursive: true, force: true });
   }
+});
+
+test("resumeContextKey changes when claudeModel or claudeBackend changes", () => {
+  const base = {
+    focusText: "focus",
+    policyFocus: "policy",
+    codexModel: "gpt-5",
+    grokModel: "grok-4",
+    grokEffort: "high",
+    claudeModel: "claude-opus-4-8",
+    claudeBackend: "spawn",
+    base: "main",
+    scope: "diff"
+  };
+  const keyA = resumeContextKey(base);
+  const keyDifferentModel = resumeContextKey({ ...base, claudeModel: "claude-haiku-4-5" });
+  const keyDifferentBackend = resumeContextKey({ ...base, claudeBackend: "api" });
+  assert.notEqual(keyA, keyDifferentModel, "a changed claudeModel must not reuse the same resume-cache key");
+  assert.notEqual(keyA, keyDifferentBackend, "a changed claudeBackend must not reuse the same resume-cache key");
+  // Sanity: identical options still produce a stable, identical key.
+  assert.equal(keyA, resumeContextKey({ ...base }));
 });
 
 test("R1 cache round-trips only successful outputs, keyed by snapshot", () => {

@@ -25,7 +25,6 @@ export function summarizeProgress(logText) {
 
   const r1Done = new Set();
   const raisedByAgent = {};
-  let r1Expected = null;
   let r2Done = 0;
   let r2Total = null;
   let reachedR1 = false;
@@ -38,10 +37,12 @@ export function summarizeProgress(logText) {
 
     // e.g. "r1: grok done (1/3) raised=9" — the raised= suffix (when present) gives
     // a LIVE per-agent finding count before the final merge fills in shared/disputed.
+    // The "(x/N)" progress suffix itself is NOT the authoritative R1 total: both renderers
+    // derive that from the per-agent `states` map instead (agentR1States), so its groups
+    // are intentionally unread here beyond identifying the agent + raised count.
     const r1 = line.match(/^r1:\s*(\w+)\s+done(?:\s*\((\d+)\/(\d+)\))?(?:\s+raised=(\d+))?/);
     if (r1) {
       r1Done.add(r1[1].toLowerCase());
-      if (r1[3]) r1Expected = Number(r1[3]);
       if (r1[4] != null) raisedByAgent[r1[1].toLowerCase()] = Number(r1[4]);
     }
     const r2 = line.match(/^r2:\s*[\w-]+->[\w-]+\s+done(?:\s*\((\d+)\/(\d+)\))?/);
@@ -53,7 +54,7 @@ export function summarizeProgress(logText) {
     if (r2start) r2Total = Number(r2start[1]);
   }
 
-  return { r1Done, raisedByAgent, r1Expected, r2Done, r2Total, reachedR1, reachedR2, lastPhase };
+  return { r1Done, raisedByAgent, r2Done, r2Total, reachedR1, reachedR2, lastPhase };
 }
 
 /**

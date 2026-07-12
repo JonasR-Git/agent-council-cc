@@ -21,14 +21,26 @@ test("parseGrokEnvelope extracts text and sessionId, rejects prose", () => {
   assert.equal(parseGrokEnvelope(JSON.stringify({ notText: 1 })), null);
 });
 
-test("shell-bound arguments containing % are refused (cmd expansion guard)", (t) => {
+test("shell-bound arguments containing % are refused (cmd expansion guard), except for git (P1)", (t) => {
   if (process.platform !== "win32") {
     t.skip("cmd shell path is Windows-only");
     return;
   }
+  // The guard still fail-closes for any other bare/shim command routed through cmd.exe.
   const result = runCommand("definitely-not-a-real-command", ["%PATH%"]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Refusing to pass '%'/);
+
+  // But git is exempted from cmd.exe routing entirely (needsCmdShell("git") === false),
+  // so legitimate pretty-format tokens like `--format=%H` reach git.exe untouched instead
+  // of tripping this guard - restoring patch-id reconciliation on Windows.
+  const gitResult = runCommand("git", ["log", "--format=%H", "-n", "1"], { cwd: ROOT });
+  if (gitResult.error?.code === "ENOENT" || gitResult.error?.code === "EPERM") {
+    t.skip("git binary unavailable in this sandbox");
+    return;
+  }
+  assert.doesNotMatch(gitResult.stderr, /Refusing to pass '%'/);
+  assert.equal(gitResult.status, 0, gitResult.stderr);
 });
 
 test("shell-bound arguments containing a newline are refused (cmd truncation guard, A4 claude-1)", (t) => {

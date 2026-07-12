@@ -12,8 +12,6 @@ import { readLedgerEntries } from "./ledger.mjs";
  *   ignored   - real but won't act now (true positive)
  *   dismissed - reviewed, not a real issue (false positive)
  */
-const TRUE_POSITIVE = new Set(["fixed", "ignored"]);
-const FALSE_POSITIVE = new Set(["dismissed"]);
 
 export function buildOverview(entries) {
   const byCategory = {};

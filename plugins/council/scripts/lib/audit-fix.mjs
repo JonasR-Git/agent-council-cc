@@ -132,7 +132,10 @@ const SENSITIVE_LENSES = new Set(["security_secrets", "concurrency_resources", "
 
 /** True if a finding is in a §6 never-auto-apply class (propose-only regardless of level). */
 export function isSensitiveClass(f) {
-  return SENSITIVE_CATEGORIES.has(String(f?.category ?? "").toLowerCase()) || SENSITIVE_LENSES.has(String(f?.lens ?? ""));
+  // TRIM + lowercase BOTH sides (kept in sync with structure-gate.mjs's isSensitiveStructureClass):
+  // category was case-folded but NOT trimmed and lens was exact, so "security " (trailing space) or
+  // "Security_Secrets" mis-classified as non-sensitive would defeat the §6 consent gate.
+  return SENSITIVE_CATEGORIES.has(String(f?.category ?? "").trim().toLowerCase()) || SENSITIVE_LENSES.has(String(f?.lens ?? "").trim().toLowerCase());
 }
 
 /**

@@ -52,6 +52,46 @@ test("fixReportStats aggregates outcome buckets", () => {
   assert.equal(s.failed, 1);
 });
 
+test("P2: fixReportRows reads the fix-LOOP's flat proposed shape (finding/reason not blank)", () => {
+  // runFixLoop's `proposed` entries are flat ({...finding, rejectedReason}), not the nested
+  // {finding, reason} shape `rejected` uses. Before the fix both finding/reason were undefined here.
+  const loopOut = {
+    fixed: [], rejected: [], failed: [], skipped: [],
+    proposed: [{ file: "big.mjs", title: "consolidate", severity: "P2", category: "design", rejectedReason: "cross-cutting → propose-only" }]
+  };
+  const rows = fixReportRows(loopOut);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].finding.title, "consolidate");
+  assert.equal(rows[0].file, "big.mjs");
+  assert.equal(rows[0].reason, "cross-cutting → propose-only");
+  assert.equal(rows[0].status.key, "proposed");
+});
+
+test("P2: fixReportStats counts an unverified fix separately from a verified 'fixed' — never folded into the green headline", () => {
+  const out = {
+    fixed: [
+      { finding: { severity: "P1", title: "verified one" }, file: "a.mjs", commit: "c1", verified: true },
+      { finding: { severity: "P1", title: "unverified one" }, file: "b.mjs", commit: "c2", verified: false }
+    ],
+    rejected: [], failed: [], skipped: []
+  };
+  const rows = fixReportRows(out);
+  const s = fixReportStats(rows);
+  assert.equal(s.fixed, 1, "only the verified fix counts as 'fixed'");
+  assert.equal(s.unverified, 1, "the unverified fix is bucketed separately, not folded into 'fixed'");
+});
+
+test("P2: renderFixReportHtml never claims 'Tests grün pro Commit' when a fix is unverified (--allow-untested)", () => {
+  const out = {
+    branch: "b", baseBranch: "master",
+    fixed: [{ finding: { severity: "P1", title: "risky one" }, file: "a.mjs", commit: "c1", verified: false }],
+    rejected: [], failed: [], skipped: []
+  };
+  const html = renderFixReportHtml(out);
+  assert.ok(!/Tests grün pro Commit/.test(html), "the blanket 'tests green' claim is not made for an unverified run");
+  assert.match(html, /unverifiziert/);
+});
+
 test("renderFixReportHtml is self-contained, escapes content, shows pills + council verdicts", () => {
   const html = renderFixReportHtml(sampleOut(), { seats: "Claude · Codex · Grok", sensitiveAutoApply: true });
   assert.match(html, /^<!doctype html>/);

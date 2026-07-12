@@ -1,12 +1,12 @@
-// M10/C3 — endless SUPERVISOR + staged whole-project phases.
+// M10/C3 — endless SUPERVISOR.
 //
 // A single audit fix/endless loop invocation stops when it exhausts its per-run budget OR hits a
 // rate limit its in-run retries can't outlast (a multi-hour reset). The SUPERVISOR wraps the loop so
 // an autonomous whole-project run survives those gaps: on a RESUMABLE stop it WAITS reset-aware
 // (until the limit resets, honoring a retry-after hint) then RESUMES the loop (--resume, from the
 // checkpoint), until the loop reports a TERMINAL stop (converged / all-tiers / max-passes) or a
-// wall-clock cap. Staging (structure clean → detail) is the per-tier convergence from B5; this
-// module just names the phases for the report + supervises the reset-aware resume.
+// wall-clock cap. Staging (structure clean → detail) is the per-tier convergence from B5, driven
+// entirely inside runFixLoop itself — this module only supervises the reset-aware resume.
 import { backoffMs, isRateLimitError, retryAfterFrom } from "./audit-retry.mjs";
 
 // A TERMINAL convergence must NEVER be mistaken for resumable. Narrow to the real loop phrases only
@@ -36,22 +36,6 @@ export function isResumableStop(stopReason) {
  */
 export function resetAwareWaitMs(signal, attempt = 1, { baseMs, maxMs, factor } = {}) {
   return backoffMs(Math.max(1, attempt), { baseMs, maxMs, factor, retryAfterS: retryAfterFrom(signal) });
-}
-
-// The staged whole-project phases: STRUCTURE first (tiers 0 Logical + 1 Structure/SSOT) so a
-// consolidation lands before DETAIL (tiers 2 Correctness + 3 Quality) runs on the consolidated code
-// — a bug is then found once, post-consolidation, not N times across copies (the B5 per-tier order).
-// Title reflects BOTH tiers it covers (council C3 codex P2): tier 0 (Logical-sense) is a
-// propose-only verdict tier the mechanical loop skips (FIRST_TIER=1), so borrowing tier 1's exact
-// "Structure / SSOT" title would mislabel propose-only design verdicts as mechanical structure fixes.
-export const STAGED_PHASES = Object.freeze([
-  { id: "structure", title: "Logical + Structure / SSOT", tiers: [0, 1] },
-  { id: "detail", title: "Detail (correctness → quality)", tiers: [2, 3] }
-]);
-
-/** Which staged phase a tier belongs to (structure = 0/1, detail = 2/3; unknown → detail). */
-export function phaseOfTier(tier) {
-  return STAGED_PHASES.find((p) => p.tiers.includes(tier))?.id ?? "detail";
 }
 
 /**

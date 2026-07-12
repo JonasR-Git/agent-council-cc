@@ -2,9 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  STAGED_PHASES,
   isResumableStop,
-  phaseOfTier,
   resetAwareWaitMs,
   runSupervised
 } from "../plugins/council/scripts/lib/supervisor.mjs";
@@ -45,17 +43,6 @@ test("runSupervised (council C3 codex P2): a null runPass result surfaces as an 
   const out = await runSupervised(async () => null, { sleep: async () => {} });
   assert.match(out.supervisorStop, /anomaly/, "a malformed pass is flagged, not mistaken for convergence");
   assert.equal(out.stopReason, "runPass returned no result");
-});
-
-test("STAGED_PHASES / phaseOfTier map structure-first (0,1) then detail (2,3)", () => {
-  assert.deepEqual(STAGED_PHASES.map((p) => p.id), ["structure", "detail"]);
-  // council C3 codex P2: the phase title reflects that tier 0 (Logical) is included, not tier 1's exact name
-  assert.match(STAGED_PHASES[0].title, /Logical/);
-  assert.equal(phaseOfTier(0), "structure");
-  assert.equal(phaseOfTier(1), "structure");
-  assert.equal(phaseOfTier(2), "detail");
-  assert.equal(phaseOfTier(3), "detail");
-  assert.equal(phaseOfTier(99), "detail", "unknown tiers default to detail");
 });
 
 test("runSupervised returns immediately on a terminal stop (no wait)", async () => {

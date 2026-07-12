@@ -189,7 +189,15 @@ async function runOneTransform(transform, deps, options) {
   const guard2 = enforcePlannedTouched(deps.git.changedFiles(), planned);
   if (!guard2.ok) return revert(`tree changed during gating (extra: ${guard2.extra.join(", ") || "-"}) — refusing to commit`);
 
-  const commit = deps.git.commitFiles(planned, `audit-multifix: ${transform.title ?? "consolidation"} (${planned.length} files)`);
+  // The commit itself can still fail (adapter contract mismatch, disk/git error) - a throw
+  // here must revert the same as every other gate, never leave the fully-applied,
+  // gate-passed transform sitting uncommitted in a tree reported as "rejected".
+  let commit;
+  try {
+    commit = deps.git.commitFiles(planned, `audit-multifix: ${transform.title ?? "consolidation"} (${planned.length} files)`);
+  } catch (err) {
+    return revert(`commit failed: ${String(err?.message ?? err)}`);
+  }
   return { outcome: "commit", committed: commit, planned };
 }
 

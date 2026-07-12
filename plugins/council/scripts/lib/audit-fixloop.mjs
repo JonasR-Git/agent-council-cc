@@ -12,7 +12,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { dedupeNew, endlessStopReason } from "./audit-endless.mjs";
+import { dedupeNew, endlessKey, endlessStopReason } from "./audit-endless.mjs";
 import { retryOnRateLimit } from "./audit-retry.mjs";
 import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
@@ -114,6 +114,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const seenFixed = new Set();
   const seenProposed = new Set();
   const seenReview = new Set();
+  const reviewedAll = []; // persisted so a resume can rebuild seenReview (mirrors audit-endless)
   let spent = 0;
   let dryStreak = 0;
   let stalledStreak = 0;
@@ -147,6 +148,13 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
         if (!seenProposed.has(k)) { seenProposed.add(k); proposedAll.push(p); }
       }
       if (Array.isArray(prior.passes)) passes.push(...prior.passes);
+      // Rebuild the review dedupe set from the persisted raw findings (mirrors audit-endless's
+      // `for (const f of all) seen.add(endlessKey(f))`) — without this a recurring propose-only
+      // finding re-counts as "fresh" on every resume, resetting the dry streak (council loop-report).
+      if (Array.isArray(prior.reviewed)) {
+        reviewedAll.push(...prior.reviewed);
+        for (const f of prior.reviewed) seenReview.add(endlessKey(f));
+      }
       // Clamp untrusted checkpoint numerics into range so a corrupt/negative value can't
       // bypass the budget or pass ceiling.
       spent = clamp(prior.spent ?? 0, 0, totalBudget);
@@ -227,6 +235,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     const findings = rev?.findings ?? [];
     charge(rev?.coverage?.budgetSpent, Math.max(1, passBudget)); // a review always costs >= 1
     const freshFindings = dedupeNew(findings, seenReview);
+    reviewedAll.push(...freshFindings);
 
     const gated = gate(findings, { changedFiles, pass: passNo });
     for (const p of gated.surfaced ?? []) {
@@ -325,9 +334,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
 
     passes.push({ pass: passNo, reviewed: findings.length, fresh: freshFindings.length, actionable: gated.actionable.length, fixed: freshFixed.length, failed: (fx?.failed ?? []).length, spent });
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
-    checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason: null, done: false });
+    checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason: null, done: false });
   }
 
-  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason, done: true });
-  return { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak };
+  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason, done: true });
+  return { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak, changedFiles: [...new Set(fixedAll.map((f) => f.file))] };
 }

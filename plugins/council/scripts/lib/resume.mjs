@@ -16,6 +16,8 @@ export function resumeContextKey(options = {}) {
     options.codexModel ?? "",
     options.grokModel ?? "",
     options.grokEffort ?? "",
+    options.claudeModel ?? "",
+    options.claudeBackend ?? "",
     options.base ?? "",
     options.scope ?? ""
   ].join("");

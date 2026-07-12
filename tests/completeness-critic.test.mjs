@@ -180,6 +180,19 @@ test("runCompletenessAssessment: no runner (critic omitted) + clean structure �
   assert.equal(r.criticRan, false);
 });
 
+test("runCompletenessAssessment: a BLANK reply (rate-limited/skipped seat) → coverageComplete UNDEFINED, not false", async () => {
+  // audit-grouped-review's real runCritic returns '' on a skipped/non-zero/failed CLI run
+  // (`r && !r.skipped && r.status === 0 ? r.stdout : ""`). That must degrade exactly like an
+  // omitted runner or a throw — NOT like a malformed reply — else a routinely rate-limited critic
+  // would silently flip from graceful (undefined) to convergence-blocking (false), pinning every
+  // `--completeness-critic` loop from ever going dry.
+  for (const blank of ["", "   ", "\n\t"]) {
+    const r = await runCompletenessAssessment({ ...cleanScope, runCritic: async () => blank });
+    assert.equal(r.coverageComplete, undefined, `blank reply ${JSON.stringify(blank)} must not block convergence`);
+    assert.equal(r.criticRan, false, `blank reply ${JSON.stringify(blank)} means the critic did not usefully run`);
+  }
+});
+
 test("assessCompleteness surfaces concrete nextTargets from gaps + missing groups (loop can act, not spin)", () => {
   const out = assessCompleteness({
     structural: { ok: false, missingGroups: ["perf-memory"], incompleteTriples: [{ groupId: "g2", file: "a.mjs", chunk: 1 }] },

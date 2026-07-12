@@ -95,7 +95,10 @@ function gateOf(reason) {
 export function gateFunnel(out) {
   const funnel = { touched: 0, content: 0, snapshot: 0, coverage: 0, oracle: 0, test: 0, council: 0, eligibility: 0, other: 0 };
   for (const r of out?.rejected ?? []) funnel[gateOf(r.reason)] += 1;
-  for (const p of out?.proposed ?? []) funnel[gateOf(p.reason)] += 1;
+  // The fix-LOOP's `proposed` entries are FLAT (`{...finding, rejectedReason}`), not the nested
+  // `{finding, reason}` shape `rejected` uses — fall back to `.rejectedReason` so a loop run's gate
+  // funnel buckets correctly instead of dumping every proposal into "other" (council loop-report).
+  for (const p of out?.proposed ?? []) funnel[gateOf(p.reason ?? p.rejectedReason)] += 1;
   for (const f of out?.failed ?? []) funnel[gateOf(f.reason)] += 1;
   return funnel;
 }

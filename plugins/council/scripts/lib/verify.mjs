@@ -80,6 +80,15 @@ async function mapWithLimit(items, limit, fn) {
   return results;
 }
 
+// Trust a refutation only from a clean, COMPLETE run (not skipped/timed-out/truncated/failed/
+// empty). `truncated` can co-occur with status===0 (a maxBuffer-overflow kill can still report exit
+// 0 if the process had already flushed output as/just-before the kill), so status===0 alone is not
+// enough — mirrors textOf() in audit-patch-reviewer.mjs, which also excludes truncated. Exported as
+// a pure predicate so this fail-closed decision is directly unit-testable without spawning a process.
+export function isTrustworthyVerifierResult(res) {
+  return !res.skipped && !res.timedOut && !res.truncated && res.status === 0 && Boolean(String(res.stdout ?? "").trim());
+}
+
 async function runVerifier(agent, cwd, backends, options, prompt) {
   if (agent === "codex") return runCodexStructured(cwd, backends, options, prompt, "verify");
   if (agent === "claude") return runClaudeStructured(cwd, backends, options, prompt);
@@ -125,8 +134,7 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
       EVIDENCE: evidence
     });
     const res = await runVerifier(agent, cwd, backends, verifyOpts, prompt);
-    // Trust a refutation only from a clean run (not skipped/timed-out/failed/empty).
-    const trustworthy = !res.skipped && !res.timedOut && res.status === 0 && Boolean(String(res.stdout ?? "").trim());
+    const trustworthy = isTrustworthyVerifierResult(res);
     const verdict = trustworthy ? parseRefutation(res.stdout) : null;
     return { finding, agent, verdict, hadEvidence };
   });

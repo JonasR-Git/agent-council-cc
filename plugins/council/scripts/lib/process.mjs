@@ -8,6 +8,16 @@ export function needsCmdShell(command) {
     return false;
   }
   const text = String(command ?? "");
+  if (/^git(?:\.exe)?$/i.test(text)) {
+    // git.exe is a native PE binary on every supported Windows install (Git for
+    // Windows, scoop, choco) - never a .cmd/.bat shim - so it needs no shell to
+    // be found or executed. Routing it through cmd.exe anyway would force every
+    // arg through prepareSpawn's '%' fail-closed guard below, which permanently
+    // breaks legitimate git pretty-format tokens (e.g. `--format=%H`, used by
+    // the patch-id reconcile path) since cmd.exe would otherwise try to expand
+    // them as %VAR% environment references.
+    return false;
+  }
   return /\.(?:cmd|bat)$/i.test(text) || !/[\\/]/.test(text);
 }
 
@@ -24,8 +34,10 @@ function prepareSpawn(command, args = []) {
     return { command, args, shell: false };
   }
   // cmd.exe expands %VAR% even inside double quotes and offers no reliable
-  // in-quote escape. Shell-bound args are our own constants (git/taskkill
-  // flags, refs, paths) and never legitimately contain % - fail closed.
+  // in-quote escape. git is exempted above (needsCmdShell never routes it
+  // here); the remaining shell-bound commands (taskkill, other bare names,
+  // .cmd/.bat shims) are our own constants and never legitimately contain
+  // % - fail closed.
   for (const token of [command, ...args]) {
     if (String(token).includes("%")) {
       throw new Error(
@@ -73,7 +85,10 @@ export function runCommand(command, args = [], options = {}) {
     stdio: options.stdio ?? "pipe",
     shell: prepared.shell,
     windowsHide: true,
-    timeout: options.timeout
+    // Accept both option names: runCommandAsync's option is `timeoutMs`, and
+    // some callers pass that same name into this sync API by mistake - honor
+    // it here too instead of silently dropping the intended cap (P2).
+    timeout: options.timeoutMs ?? options.timeout
   });
 
   return {

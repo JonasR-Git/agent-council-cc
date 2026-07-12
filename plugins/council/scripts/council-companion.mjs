@@ -110,7 +110,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs worktree add|remove|list <slug> [--base <ref>] [--force]",
       "",
       "Flags:",
-      "  --wait|--background  --base <ref>  --scope auto|working-tree|branch",
+      "  --background  --base <ref>  --scope auto|working-tree|branch",
       "  --codex-model <id>  --grok-model <id>  --codex-effort <l>  --grok-effort <l>",
       "  --skip-codex  --skip-grok  --claude-findings <path>  --claude-findings-wait <path>",
       "  --wait-timeout <seconds>  --peer-severities P0,P1  --debate-rounds 0|1|2  --debate-resume",
@@ -306,7 +306,11 @@ function scaffoldPolicyFile(cwd, options) {
   const claudeModel = sanitizeModelValue(options["claude-model"], "--claude-model");
   const codexModel = sanitizeModelValue(options["codex-model"], "--codex-model");
   const grokModel = sanitizeModelValue(options["grok-model"], "--grok-model");
-  const defaultMode = options["default-mode"] === "review" ? "review" : "deliberate";
+  // default_mode is currently INFORMATIONAL only: no code path reads policy.default_mode to pick a mode
+  // (the slash commands dispatch via explicit --quick/--adversarial/--loop flags). Default to
+  // DEFAULT_POLICY's own value so an un-flagged scaffold doesn't silently diverge from it (council
+  // companion-cli nit).
+  const defaultMode = options["default-mode"] === "deliberate" ? "deliberate" : DEFAULT_POLICY.default_mode;
 
   const contents = [
     "# Council policy. Unknown keys are ignored; re-run /council:setup --init to regenerate.",
@@ -368,7 +372,10 @@ function buildCodexReviewArgs(options, adversarial, focusText) {
   if (options.base) args.push("--base", options.base);
   if (options.scope) args.push("--scope", options.scope);
   if (codexModel) args.push("--model", codexModel);
-  if (adversarial && focusText) args.push(focusText);
+  // Forward the focus text regardless of mode - plain review/--quick must honor it too, not only
+  // adversarial (council companion-cli P2: it was silently dropped for the companion path while the
+  // grok CLI-direct fallback honored it, so identical commands behaved differently by installed backend).
+  if (focusText) args.push(focusText);
   return args;
 }
 
@@ -379,7 +386,7 @@ function buildGrokReviewArgs(options, adversarial, focusText) {
   if (options.scope) args.push("--scope", options.scope);
   if (grokModel) args.push("--model", grokModel);
   if (grokEffort) args.push("--effort", grokEffort);
-  if (adversarial && focusText) args.push(focusText);
+  if (focusText) args.push(focusText);
   return args;
 }
 
@@ -839,6 +846,10 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
       "claude-model",
       "cwd"
     ],
+    // "wait" is accepted (but unused) for backward compatibility with docs/slash-commands that mention
+    // --wait as the (default) opposite of --background - omitting --background already waits
+    // synchronously, so it is intentionally a no-op rather than an unknown-flag error (council
+    // companion-cli nit).
     booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "skip-claude", "debate-resume", "force-budget", "resume", "verify"]
   });
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
@@ -2230,7 +2241,33 @@ async function handleAudit(argv) {
       findings = Array.isArray(raw) ? raw : raw.findings ?? raw.all ?? [];
     } else {
       if (!options.json) console.error("No --from findings file; running a fresh audit review first…");
-      const rev = await runAuditReview(cwd, model, backends, { ...merged, budget, maxUnits, skipCodex: merged.skipCodex, skipGrok: merged.skipGrok });
+      // Honor --groups/--max-cells for the fresh review here too, mirroring `audit review`'s wiring —
+      // otherwise a grouped request passed validation up front but silently ran the plain per-file
+      // engine instead of the grouped six-eyes matrix (council companion-cli P2).
+      let rev;
+      if (options.groups) {
+        let maxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
+        if (options["max-cells"] != null) {
+          const n = Number(options["max-cells"]);
+          if (!Number.isFinite(n) || n < 1) throw new Error("--max-cells must be a positive number");
+          maxCells = Math.floor(n);
+        }
+        if (options.budget != null && !options.json) {
+          console.error("note: --budget does not bound --groups (grouped cost is bounded by --max-cells); ignoring --budget for this run");
+        }
+        rev = await runGroupedReview(cwd, model, backends, {
+          ...merged,
+          maxUnits,
+          lensGroups: String(options.groups),
+          maxCells,
+          completenessCritic,
+          skipCodex: merged.skipCodex,
+          skipGrok: merged.skipGrok,
+          onProgress: options.json ? undefined : (m) => console.error(m)
+        });
+      } else {
+        rev = await runAuditReview(cwd, model, backends, { ...merged, budget, maxUnits, skipCodex: merged.skipCodex, skipGrok: merged.skipGrok });
+      }
       findings = rev.findings;
     }
     let maxFixes;
@@ -2260,8 +2297,11 @@ async function handleAudit(argv) {
     const fixTokenSince = Date.now() - TOKEN_SNAPSHOT_WINDOW_MS;
     const fixTokensBefore = options.html ? tokenSnapshot(fixTokenSince) : null;
     // §5 char-test gate (opt-in --chartest) also on single-shot `audit fix`: a behaviour-preserving
-    // refactor must keep its generated characterization test green across the change. null when off.
-    const singleCharTestGate = options.chartest ? makeCharTestGate(cwd, backends, merged) : null;
+    // refactor must keep its generated characterization test green across the change. null when off;
+    // fail-loud (via resolveCharTestGate, same as the --loop path) when requested but no generator seat
+    // is reachable — otherwise the raw helper would return null and refactors would auto-apply UNGATED
+    // while the operator believes --chartest is protecting them (council companion-cli P1).
+    const singleCharTestGate = resolveCharTestGate(cwd, backends, merged, options);
     const out = await runAuditFix(cwd, findings, backends, {
       ...merged,
       dryRun: options["dry-run"],
