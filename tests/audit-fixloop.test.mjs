@@ -37,6 +37,37 @@ test("--retry-on-limit backs off and retries a rate-limited review instead of st
   assert.ok(!/rate limit/i.test(out.stopReason ?? ""), "a retried limit is not a stop reason");
 });
 
+test("B5: fresh PROPOSE-ONLY findings do NOT count as stalled (only fresh auto-fixable that failed)", async () => {
+  // Every pass surfaces a NEW finding, but the gate deems them all non-actionable (propose-only,
+  // e.g. architecture/SSOT). The OLD stalled rule (fresh>0 && fixed==0) would falsely stop; B5 keys
+  // stalled on fresh AUTO-FIXABLE, so this runs to the budget instead of a spurious 'stalled'.
+  let p = 0;
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: `proposal ${p++}` })], coverage: { budgetSpent: 1 } });
+  const fix = async () => ({ fixed: [], failed: [], rejected: [], spent: 0 });
+  const gate = () => ({ actionable: [], surfaced: [], skipped: [], redirected: [] });
+  const out = await runFixLoop("/x", { budget: 6, dryStreak: 2 }, { review, fix, gate, checkpoint: noCheckpoint });
+  assert.ok(!/stalled/.test(out.stopReason ?? ""), "propose-only findings are not a stall");
+  assert.match(out.stopReason, /budget exhausted|max passes/);
+});
+
+test("B5: fresh AUTO-FIXABLE findings that fail to apply DO stall (honest stop)", async () => {
+  let p = 0;
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: `fixable ${p++}` })], coverage: { budgetSpent: 1 } });
+  const fix = async () => ({ fixed: [], failed: [{ reason: "gate red" }], spent: 1 });
+  const gate = (findings) => ({ actionable: findings, surfaced: [], skipped: [], redirected: [] });
+  const out = await runFixLoop("/x", { budget: 20, dryStreak: 2 }, { review, fix, gate, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /stalled/, "auto-fixable work that never applies is an honest stall");
+});
+
+test("B5: an INCOMPLETE six-eyes coverage does not let a zero-fresh pass declare diminishing returns", async () => {
+  // review keeps returning the same (already-seen) finding → 0 fresh, but coverage.complete:false.
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: "recurring" })], coverage: { budgetSpent: 1, complete: false } });
+  const fix = async (actionable) => ({ fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], spent: 1 });
+  const out = await runFixLoop("/x", { budget: 5, dryStreak: 2 }, { review, fix, checkpoint: noCheckpoint });
+  assert.ok(!/diminishing returns/.test(out.stopReason ?? ""), "unreviewed cells block false convergence");
+  assert.match(out.stopReason, /budget exhausted|max passes/);
+});
+
 test("without --retry-on-limit, a rate-limited review still stops the loop (opt-in only)", async () => {
   const review = async () => { throw new Error("HTTP 429 rate limit"); };
   const out = await runFixLoop("/x", { budget: 10 }, { review, fix: async () => ({}), checkpoint: noCheckpoint });

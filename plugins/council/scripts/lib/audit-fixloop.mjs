@@ -120,11 +120,11 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   let stopReason = null;
   let changedFiles = null; // null = full scope on the first pass
   let branch = null;
-  // Per-tier convergence (§3, opt-in): run each tier (0 logical -> 1 structure -> 2
-  // correctness -> 3 quality) to dry before advancing, so a Structure consolidation lands
-  // before Correctness runs on the consolidated code. OFF by default (structure is
-  // propose-only today, so it would only march through empty tiers); turned on when
-  // structure auto-apply lands.
+  // Per-tier convergence (§3): run each tier (0 logical -> 1 structure -> 2 correctness -> 3
+  // quality) to dry before advancing, so a Structure consolidation lands before Correctness runs
+  // on the consolidated code (a bug is then found once, post-consolidation, not N times across
+  // copies). The pure default is OFF so the function contract is stable; the audit-fix CLI defaults
+  // it ON (B5, --per-tier) at the call site, where real findings carry a lens (see the wiring).
   const perTier = Boolean(options.perTierConvergence);
   let currentTier = 0;
   let tierDryStreak = 0;
@@ -261,10 +261,15 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     const expanded = changed.length ? expandScope(changed) ?? changed : [];
     changedFiles = expanded.length ? expanded : null;
 
-    // Honest convergence: dry when the REVIEW found nothing new; stalled when new
-    // findings exist but none could be auto-applied this pass.
-    dryStreak = freshFindings.length === 0 ? dryStreak + 1 : 0;
-    stalledStreak = freshFindings.length > 0 && freshFixed.length === 0 ? stalledStreak + 1 : 0;
+    // Honest, cell-aware convergence (B5): DRY only when the review found nothing new AND its
+    // six-eyes coverage is complete (unreviewed cells → still work → reset; absent coverage info
+    // counts complete for the pre-cell-matrix path). STALLED only when fresh AUTO-FIXABLE findings
+    // remained unapplied — fresh PROPOSE-ONLY findings (architecture/SSOT/etc.) are expected not to
+    // auto-apply and must NOT read as a stall (that would falsely stop with real fixes still open).
+    const coverageComplete = rev?.coverage?.complete !== false;
+    const freshActionable = gate(freshFindings, { changedFiles, pass: passNo }).actionable.length;
+    dryStreak = freshFindings.length === 0 && coverageComplete ? dryStreak + 1 : 0;
+    stalledStreak = freshActionable > 0 && freshFixed.length === 0 ? stalledStreak + 1 : 0;
     // Advance to the next tier once the current one has nothing new to fix for K passes.
     if (perTier) {
       const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier).length;

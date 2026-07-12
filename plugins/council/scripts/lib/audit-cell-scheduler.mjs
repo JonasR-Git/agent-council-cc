@@ -178,7 +178,14 @@ export function makeCellReviewer(cwd, backends, options = {}, deps = {}) {
     }
     const doc = parseAgentFindings(res.stdout, cell.model);
     if (!doc.parseOk) return { ok: false, cell, res, unparsed: true };
-    return { ok: true, cell, findings: doc.findings };
+    // B5: stamp each finding's LENS from the GROUP it was found in — the pass is scoped to exactly
+    // one group, so the group's parent lens is authoritative (a model-claimed class would anyway be
+    // re-found + tagged by that class's own group pass under six-eyes). Without this, tierOfLens(
+    // f.lens) sees undefined → the finding falls into the Quality tier and structure-first per-tier
+    // staging silently breaks. Falls back to any model lens only when the group has none.
+    const groupLens = cell.group?.lenses?.[0] ?? null;
+    const findings = doc.findings.map((f) => ({ ...f, lens: groupLens ?? f.lens ?? null }));
+    return { ok: true, cell, findings };
   };
 }
 

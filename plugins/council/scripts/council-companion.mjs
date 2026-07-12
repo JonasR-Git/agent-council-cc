@@ -1720,7 +1720,7 @@ async function handleWatch(argv) {
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "html", "retry-on-limit", "sensitive-auto-apply"]
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply"]
   });
   const cwd = process.cwd();
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
@@ -1949,7 +1949,10 @@ async function handleAudit(argv) {
         retryOnLimit: options["retry-on-limit"]
       });
       const tLoop = Date.now();
-      const out = await runFixLoop(cwd, { budget: loopBudget, maxPasses, dryStreak, maxUnits, resume: options.resume, perTierConvergence: options["per-tier"], retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
+      // B5: per-tier convergence (structure → correctness → quality) is ON by default so a
+      // Structure/SSOT consolidation lands before Correctness runs on the consolidated code; --flat
+      // opts out (single flat convergence). --per-tier remains as a redundant affirmation.
+      const out = await runFixLoop(cwd, { budget: loopBudget, maxPasses, dryStreak, maxUnits, resume: options.resume, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
       // Return to the base branch after the final pass (fix stayed on the integration
       // branch); report if the checkout couldn't complete so the user isn't stranded silently.
       out.baseBranch = baseBranch;

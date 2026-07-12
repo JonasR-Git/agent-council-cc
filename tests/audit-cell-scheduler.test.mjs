@@ -215,6 +215,17 @@ test("B4 (council grok-3): an ok-less reviewer result is marked FAILED, not done
   assert.equal(out.matrix.summary().done, 0);
 });
 
+test("B5: makeCellReviewer stamps each finding's LENS from its group (so tier gating works)", async () => {
+  const review = makeCellReviewer("/x", {}, {}, {
+    runCodex: async () => ({ status: 0, stdout: '{"agent":"codex","findings":[{"severity":"P1","title":"a","detail":"d"},{"severity":"P2","title":"b","detail":"d","lens":"security_secrets"}]}' })
+  });
+  const cell = { model: "codex", groupId: "correctness-logic", group: { id: "correctness-logic", lenses: ["correctness"], focus: "logic" }, file: "a.mjs", chunk: 0, chunkData: { text: "x", index: 0, total: 1, startLine: 1, endLine: 1 } };
+  const r = await review(cell);
+  // the pass is scoped to the correctness-logic group → every finding is tagged its group's lens
+  assert.equal(r.findings[0].lens, "correctness");
+  assert.equal(r.findings[1].lens, "correctness", "the group lens is authoritative for a group-scoped pass");
+});
+
 test("B4 (council grok-4): enumerateCells threads per-file static facts onto each cell + into the prompt", async () => {
   const cells = enumerateCells(
     ["a.mjs"],

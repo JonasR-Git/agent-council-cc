@@ -44,6 +44,23 @@ test("runEndless stops at the max-pass ceiling when every pass finds something n
   assert.equal(out.findings.length, 3, "three unique findings accumulated");
 });
 
+test("B5: an INCOMPLETE six-eyes coverage never lets a zero-fresh pass declare diminishing returns", async () => {
+  // Every pass finds the same (already-seen) finding → 0 fresh, but coverage is NOT complete, so
+  // there are still unreviewed cells → the dry streak must NOT advance. The loop runs to maxPasses.
+  const review = async () => ({ findings: [f("a.mjs", "recurring token")], coverage: { budgetSpent: 1, complete: false } });
+  const out = await runEndless("/x", { maxPasses: 4, dryStreak: 2, budget: 100 }, { review, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /max passes/, "incomplete coverage blocks false convergence");
+  assert.equal(out.passesRun, 4);
+  assert.equal(out.dryStreak, 0, "the dry streak never advanced while cells were unreviewed");
+});
+
+test("B5: once coverage IS complete, a zero-fresh pass converges as before", async () => {
+  const review = async () => ({ findings: [f("a.mjs", "recurring token")], coverage: { budgetSpent: 1, complete: true } });
+  const out = await runEndless("/x", { maxPasses: 20, dryStreak: 2, budget: 100 }, { review, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /diminishing/);
+  assert.equal(out.passesRun, 3);
+});
+
 test("runEndless respects the finite total budget", async () => {
   // each pass charges exactly the budget it is handed
   const review = async ({ pass, budget }) => ({ findings: [f(`b${pass}.mjs`, `unique budget token ${pass} beta`)], coverage: { budgetSpent: budget } });
