@@ -85,7 +85,21 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     // normalizeFindings; the loop path did NOT — so downstream tierOfLens(f.lens) saw
     // undefined and dropped EVERY loop finding into the Quality tier (id 3), silently
     // disabling structure-first --per-tier staging. Normalizing here repairs tier gating.
-    const findings = normalizeFindings(rev?.findings ?? [], {});
+    // BUT normalizeFindings canonicalizes to {location:{path,startLine}} and DROPS the top-level
+    // file/line + refuter flags. runAuditFix keys on f.file (ineligibleReason "no target file") and
+    // the gate treats f.refuted as propose-only — so without re-attaching them the loop rejected
+    // EVERY finding and never auto-fixed anything (council P0, empirically confirmed). Re-attach the
+    // operational fields onto the canonical shape (normalizeFindings is a pure 1:1 map, so index i
+    // aligns with the raw finding). file/line come from the canonical location (index-independent).
+    const rawFindings = rev?.findings ?? [];
+    const findings = normalizeFindings(rawFindings, {}).map((nf, i) => ({
+      ...nf,
+      file: nf.location?.path ?? rawFindings[i]?.file,
+      line: nf.location?.startLine ?? rawFindings[i]?.line,
+      verified: rawFindings[i]?.verified,
+      refuted: rawFindings[i]?.refuted,
+      agents: rawFindings[i]?.agents ?? nf.agents
+    }));
     const cov = rev?.coverage ?? {};
     const selected = cov.unitsSelected ?? 0;
     const reviewed = cov.unitsReviewed ?? 0;

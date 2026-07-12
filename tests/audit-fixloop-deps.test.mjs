@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { makeFixLoopDeps } from "../plugins/council/scripts/lib/audit-fixloop-deps.mjs";
+import { ineligibleReason } from "../plugins/council/scripts/lib/audit-fix.mjs";
 
 const model = { files: [{ id: "a.mjs", fanIn: 2 }, { id: "hub.mjs", fanIn: 12 }, { id: "b.mjs", fanIn: 1 }] };
 const bigModel = { files: Array.from({ length: 6 }, (_, i) => ({ id: `f${i}.mjs`, fanIn: 1 })) };
@@ -55,6 +56,22 @@ test("review assigns a canonical lens to every finding (repairs loop-path tier s
   const rev = await deps.review({ budget: 5, changedFiles: null });
   assert.ok(rev.findings[0].lens, "finding carries a lens");
   assert.equal(typeof rev.findings[0].lens, "string");
+});
+
+test("review-normalized findings stay ELIGIBLE for runAuditFix (retain top-level .file)", async () => {
+  // Regression guard for the P0: normalizeFindings canonicalizes to {location:{path}} and drops the
+  // top-level .file that runAuditFix keys on (ineligibleReason "no target file"). Before the fix the
+  // loop normalized every finding into an un-targetable shape → it never auto-fixed anything, and no
+  // test caught it because they only asserted .lens. Assert the finding is a valid fix target.
+  const runAuditReview = async () => ({
+    findings: [{ category: "bug", title: "off-by-one", file: "a.mjs", line: 12, severity: "P1" }],
+    coverage: { unitsReviewed: 1, unitsSelected: 1, budgetSpent: 1 }
+  });
+  const deps = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview });
+  const rev = await deps.review({ budget: 5, changedFiles: null });
+  assert.equal(rev.findings[0].file, "a.mjs", "top-level .file survives normalization");
+  assert.equal(rev.findings[0].line, 12, "top-level .line survives");
+  assert.notEqual(ineligibleReason(rev.findings[0]), "no target file", "runAuditFix accepts it as a target");
 });
 
 test("a scoped pass whose files aren't in the model falls back to full scope, never an empty review", async () => {

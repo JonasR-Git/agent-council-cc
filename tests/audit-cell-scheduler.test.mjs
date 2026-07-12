@@ -238,6 +238,31 @@ test("B5 (council codex P2): a MULTI-lens group keeps a finding's specific lens 
   assert.equal(r.findings[1].lens, "correctness", "an unlensed finding falls back to the group's first lens");
 });
 
+test("makeCellReviewer stamps file=cell.file + a GLOBALLY-UNIQUE id (fleet P1: no cross-cell lens collision)", async () => {
+  // The model may omit/mis-state file, and its ids restart per cell (`codex-1`), which collided the
+  // grouped path's id-keyed lens re-stamp. Force the cell's file + a cell-unique id.
+  const stdout = '{"agent":"codex","findings":[{"severity":"P1","title":"t","detail":"d","file":"WRONG.mjs","id":"codex-1"}]}';
+  const review = makeCellReviewer("/x", {}, {}, { runCodex: async () => ({ status: 0, stdout }) });
+  const cellA = { model: "codex", groupId: "g1", group: { id: "g1", lenses: ["correctness"] }, file: "a.mjs", chunk: 0, chunkData: { text: "x", index: 0, total: 1, startLine: 1, endLine: 1 } };
+  const cellB = { model: "codex", groupId: "g2", group: { id: "g2", lenses: ["security_secrets"] }, file: "a.mjs", chunk: 0, chunkData: { text: "x", index: 0, total: 1, startLine: 1, endLine: 1 } };
+  const rA = await review(cellA);
+  const rB = await review(cellB);
+  assert.equal(rA.findings[0].file, "a.mjs", "the cell's file is authoritative, not the model's claim");
+  assert.notEqual(rA.findings[0].id, rB.findings[0].id, "the same model's 1st finding in two cells gets DISTINCT ids");
+  assert.ok(rA.findings[0].id.includes("g1") && rB.findings[0].id.includes("g2"), "the id carries the cell key");
+});
+
+test("makeCellReviewer (multi-lens group): an unlensed finding DERIVES its lens from category (Codex C1)", async () => {
+  // A security finding the model labels category 'security' but leaves lens-less must NOT default to
+  // lenses[0]=correctness in a tier cell — derive security_secrets so the P0 override still fires.
+  const review = makeCellReviewer("/x", {}, {}, {
+    runCodex: async () => ({ status: 0, stdout: '{"agent":"codex","findings":[{"severity":"P0","title":"sqli","detail":"d","category":"security"}]}' })
+  });
+  const cell = { model: "codex", groupId: "tier-correctness", group: { id: "tier-correctness", lenses: ["correctness", "concurrency_resources", "security_secrets"] }, file: "a.mjs", chunk: 0, chunkData: { text: "x", index: 0, total: 1, startLine: 1, endLine: 1 } };
+  const r = await review(cell);
+  assert.equal(r.findings[0].lens, "security_secrets", "category security → security_secrets (in the group), not lenses[0]");
+});
+
 test("B4 (council grok-4): enumerateCells threads per-file static facts onto each cell + into the prompt", async () => {
   const cells = enumerateCells(
     ["a.mjs"],

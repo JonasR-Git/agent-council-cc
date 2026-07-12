@@ -11,6 +11,7 @@ import { runCodexStructured, runGrokStructured } from "./agents.mjs";
 import { runClaudeStructured } from "./claude-agent.mjs";
 import { isRateLimitError, retryOnRateLimit } from "./audit-retry.mjs";
 import { parseAgentFindings } from "./findings.mjs";
+import { categoryToLens } from "./audit-normalize.mjs";
 
 export const DEFAULT_MAX_INFLIGHT = 6; // mandatory concurrency cap (target 4–8)
 export const DEFAULT_MAX_CELLS = 4000; // total-cell backstop for capCells (a cost guard; B5 sets policy)
@@ -178,15 +179,27 @@ export function makeCellReviewer(cwd, backends, options = {}, deps = {}) {
     }
     const doc = parseAgentFindings(res.stdout, cell.model);
     if (!doc.parseOk) return { ok: false, cell, res, unparsed: true };
-    // B5: stamp each finding's LENS so tierOfLens(f.lens) works (else it falls into the Quality
-    // tier and structure-first per-tier staging silently breaks). For a SINGLE-lens group (the
-    // 'lens'/'fine' presets) the group's lens is authoritative and overrides any model-claimed
-    // class. For a MULTI-lens group (the 'tier' preset bundles several lenses per pass, or a custom
-    // group) forcing lenses[0] would DISCARD the finding's real lens and could defeat the P0
-    // live-hole override, which keys on the specific lens (council B5 codex P2) — so there we keep
-    // the model-supplied lens and only fall back to the first group lens when the model gave none.
+    // Stamp three authoritative facts from the CELL onto each finding (council fleet P1s):
+    //  1. FILE: the cell reviewed a KNOWN file (cell.file). The model may omit/mis-state `file`, so
+    //     forcing cell.file prevents lost/wrong targets downstream (Grok G2).
+    //  2. ID: model-emitted ids are NOT unique across cells (parseAgentFindings falls back to
+    //     `${agent}-${i+1}`, and the prompt shows "x-1"), so a model reviewing one file across many
+    //     groups re-emits "codex-1" for the 1st finding of EVERY group. The grouped path re-stamps
+    //     the group lens by finding id, so colliding ids cross-contaminate lenses (Opus O3/O8, Grok
+    //     G9). Make the id globally unique by prefixing the cell key.
+    //  3. LENS: so tierOfLens(f.lens) works. SINGLE-lens group → its lens is authoritative. MULTI-lens
+    //     group (tier preset) → keep the model's lens if it's one of the group's; else DERIVE from the
+    //     finding category (a security finding in a tier cell must not silently become lenses[0]
+    //     =correctness — Codex C1); else fall back to lenses[0].
     const lenses = Array.isArray(cell.group?.lenses) ? cell.group.lenses : [];
-    const findings = doc.findings.map((f) => ({ ...f, lens: (lenses.length === 1 ? lenses[0] : f.lens) ?? lenses[0] ?? null }));
+    const pickLens = (f) => {
+      if (lenses.length === 1) return lenses[0];
+      if (f.lens && lenses.includes(f.lens)) return f.lens;
+      const derived = categoryToLens(f.category, null);
+      if (derived && lenses.includes(derived)) return derived;
+      return f.lens ?? lenses[0] ?? null;
+    };
+    const findings = doc.findings.map((f, i) => ({ ...f, file: cell.file, id: `${cellKey(cell)}#${i}`, lens: pickLens(f) }));
     return { ok: true, cell, findings };
   };
 }

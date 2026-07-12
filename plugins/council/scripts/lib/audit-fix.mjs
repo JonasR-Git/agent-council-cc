@@ -22,7 +22,7 @@ import { wrapMarkdownFence } from "./markdown-fence.mjs";
 //
 // Safety model (hardened after council review council-361da25f):
 //  - Clean working tree is MANDATORY (no --allow-dirty escape hatch): the rollback
-//    ops (reset --hard + clean -fdx) would otherwise destroy the user's WIP.
+//    ops (reset --hard + clean -fd) would otherwise destroy the user's WIP.
 //  - Paths are normalized to posix before every gate (Windows-separator bypass).
 //  - The write runner gets ONLY nonce-fenced untrusted data (source AND the finding
 //    fields), runs at the repo root, and any nonzero/timeout exit reverts the unit.
@@ -312,9 +312,12 @@ function realGit(root) {
     changedFiles: () => parsePorcelainZ(g(["status", "--porcelain", "-z"]).stdout),
     resetHard: (ref) => {
       const r = g(["reset", "--hard", ref]);
-      // -x also removes ignored files: safe because a clean tree is mandatory, so
-      // anything present is the agent's own output (incl. ignored escape attempts).
-      const c = g(["clean", "-fdx"]);
+      // clean -fd removes the agent's UNTRACKED output (new files it created) but NOT ignored files:
+      // `git status --porcelain` (isClean) does not list ignored files, so a repo with a gitignored
+      // .env + node_modules reports clean — an earlier `-x` here would DELETE the user's local secrets
+      // and dependencies on the first revert, then break every later test gate (council fleet P1
+      // data-loss). Reverting tracked state + removing untracked output is the correct safe revert.
+      const c = g(["clean", "-fd"]);
       // A failed restore is an emergency: a rejected/vetoed patch left in the tree could be
       // staged by a later same-file finding, committing bytes that were never accepted.
       // Fail loud so the caller aborts instead of continuing over a dirty tree.
