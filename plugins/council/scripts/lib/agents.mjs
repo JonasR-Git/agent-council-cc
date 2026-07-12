@@ -176,8 +176,10 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
     wantSession ? "json" : "plain"
   ];
   // Optional sandbox profile (filesystem + NETWORK isolation). The §6 patch reviewer sets a
-  // read-only profile so a hostile repo can't reach the network via MCP integrations. An
-  // unknown profile just fails the call → the seat casts no vote (fail-closed), never unsafe.
+  // read-only profile so a hostile repo can't reach the network via MCP integrations. NOTE:
+  // grok does NOT error on an unrecognized profile (it runs unsandboxed), so the caller MUST
+  // pass a profile that actually exists — the reviewer hardcodes "read-only", a verified-valid
+  // grok profile (off/workspace/devbox/read-only/strict). Don't pass an unvetted value here.
   if (options.grokSandbox) baseArgs.push("--sandbox", String(options.grokSandbox));
   if (options.resumeSessionId) baseArgs.push("--resume", String(options.resumeSessionId));
   const args = [...baseArgs];

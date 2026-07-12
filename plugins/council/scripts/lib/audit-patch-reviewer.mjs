@@ -65,9 +65,19 @@ function textOf(res) {
  * Fail-closed: a seat that throws, times out, is unavailable, or returns nothing casts
  * no vote — evaluatePatchVerdicts then can't reach unanimity and the fix stays proposed.
  */
+// ISOLATION MODEL (honest): only the Claude seat is HARD-isolated from the audited repo's
+// instruction files (--safe-mode disables CLAUDE.md/hooks/plugins/MCP). Codex still loads
+// AGENTS.md and Grok's --sandbox is filesystem/network isolation, not instruction
+// suppression — so a hostile repo CAN bias those two toward CONFIRM (a soft in-prompt
+// "ignore repo config" is their only instruction defense). The SAFETY INVARIANT still
+// holds: approval requires UNANIMITY, and the hard-isolated Claude seat votes independently
+// of any repo instruction — so a codex/grok bias alone can never manufacture a false
+// approval. Exfiltration is blocked on all three (fs/network isolation everywhere).
 export function makePatchReviewer(cwd, backends, options = {}, deps = {}) {
-  // The Grok seat runs under a read-only sandbox (filesystem + network) so a hostile repo
-  // can't exfiltrate via MCP/network during the review; unknown profile → fail-closed.
+  // The Grok seat runs under grok's "read-only" sandbox (a verified-valid profile:
+  // off/workspace/devbox/read-only/strict) so a hostile repo can't exfiltrate via
+  // MCP/network during the review. Note: grok does not error on an unknown profile, so we
+  // pin a known-valid one rather than trusting caller input.
   const grokOpts = { ...options, grokSandbox: options.grokSandbox ?? "read-only" };
   const runners = {
     claude: deps.runClaude ?? ((prompt) => realClaudeReview(cwd, backends, options, prompt)),

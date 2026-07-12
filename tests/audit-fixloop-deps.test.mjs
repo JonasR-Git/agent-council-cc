@@ -28,16 +28,20 @@ test("review surfaces a top-level `ran` from the REAL coverage shape (throttled 
   // runAuditReview never returns a top-level `ran` — it reports coverage.{unitsReviewed,
   // unitsAttempted}. The dep must translate "attempted units but ALL failed" into ran:false
   // so the loop stops honestly instead of counting an unreviewed pass toward convergence.
-  const mk = (unitsReviewed, unitsAttempted) => async () => ({ findings: [], coverage: { unitsReviewed, unitsAttempted, budgetSpent: 1 } });
+  const mk = (unitsReviewed, unitsSelected, unitsAttempted) => async () => ({ findings: [], coverage: { unitsReviewed, unitsSelected, unitsAttempted: unitsAttempted ?? unitsSelected, budgetSpent: 1 } });
 
-  const throttled = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview: mk(0, 3) }); // 3 tried, all failed
-  assert.equal((await throttled.review({ budget: 5, changedFiles: null })).ran, false, "all units failed → ran:false");
+  const throttled = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview: mk(0, 3, 3) }); // 3 selected+tried, all failed
+  assert.equal((await throttled.review({ budget: 5, changedFiles: null })).ran, false, "units failed → ran:false");
 
-  const reviewed = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview: mk(2, 2) }); // 2 reviewed, found nothing
+  // Grok's case: units SELECTED but none DISPATCHED (no reachable reviewer / budget-starved)
+  const undispatched = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview: mk(0, 3, 0) });
+  assert.equal((await undispatched.review({ budget: 5, changedFiles: null })).ran, false, "selected-but-undispatched is NOT convergence");
+
+  const reviewed = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview: mk(2, 2, 2) }); // 2 reviewed, found nothing
   assert.equal((await reviewed.review({ budget: 5, changedFiles: null })).ran, true, "reviewed but empty is a real dry pass");
 
-  const nothing = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview: mk(0, 0) }); // nothing to review
-  assert.equal((await nothing.review({ budget: 5, changedFiles: null })).ran, true, "0 attempted is not a failure");
+  const nothing = makeFixLoopDeps("/x", model, {}, {}, { runAuditReview: mk(0, 0, 0) }); // nothing to review
+  assert.equal((await nothing.review({ budget: 5, changedFiles: null })).ran, true, "0 selected is not a failure");
 });
 
 test("a scoped pass whose files aren't in the model falls back to full scope, never an empty review", async () => {

@@ -16,13 +16,21 @@ const RATE_LIMIT_RE = /rate[ _-]?limit|too many requests|resource[ _-]?exhausted
 // PERMANENT failures — billing/quota exhaustion, auth — must NEVER be retried, even when
 // they carry an HTTP 429 (a quota 429 is not transient: retrying sleeps for hours then
 // returns the same error). Checked FIRST, before any transient signal.
-const PERMANENT_RE = /insufficient[ _-]?quota|quota (?:exceeded|exhausted)|billing|payment required|permission denied|invalid[ _-]?api[ _-]?key|unauthor(?:ized|ised)/i;
+// Order-agnostic quota match ("quota exceeded" AND "exceeded your quota") plus the other
+// permanent classes. Permanent → never retried, even with an HTTP 429.
+const PERMANENT_RE = /insufficient[ _-]?quota|quota[\s\w]{0,20}(?:exceeded|exhausted|reached)|(?:exceeded|exhausted|reached)[\s\w]{0,20}quota|billing|payment required|permission denied|invalid[ _-]?api[ _-]?key|unauthor(?:ized|ised)/i;
 
 /** True if an error looks like a TRANSIENT rate-limit / overload the run can wait out. */
 export function isRateLimitError(err) {
   if (err == null) return false;
-  const text = typeof err === "string" ? err : String(err?.message ?? err?.error ?? err?.reason ?? "");
-  const code = typeof err === "object" && err ? String(err.code ?? "") : "";
+  // Extract text from string, message, AND a nested error.message (SDKs wrap the real
+  // message one level deep) so a nested permanent-quota error isn't stringified to "[object
+  // Object]" and misread as transient.
+  const text =
+    typeof err === "string"
+      ? err
+      : String(err?.message ?? err?.error?.message ?? err?.error ?? err?.reason ?? "");
+  const code = typeof err === "object" && err ? String(err.code ?? err.error?.code ?? "") : "";
   if (PERMANENT_RE.test(text) || PERMANENT_RE.test(code)) return false; // permanent → never retry
   if (typeof err === "number") return TRANSIENT_STATUS.has(err);
   if (typeof err === "string") return RATE_LIMIT_RE.test(err);

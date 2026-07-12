@@ -71,14 +71,16 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       ledger: options.ledger
     });
     // Surface a top-level `ran` the loop can trust. runAuditReview swallows backend
-    // failures (rate-limit / unreachable) into 0 findings WITHOUT throwing, so the loop
-    // must distinguish "reviewed, found nothing" (dry — real) from "couldn't review"
-    // (attempted units but ALL failed — must NOT count as convergence). ran is FALSE only
-    // in the latter case; "nothing to review" (0 attempted) stays ran:true.
+    // failures (rate-limit / unreachable / undispatched) into 0 findings WITHOUT throwing,
+    // so the loop must distinguish "reviewed, found nothing" (dry — real) from "couldn't
+    // review". Key on unitsSELECTED, not unitsAttempted: if units were selected (there WAS
+    // work) but none produced a review — whether they failed OR were never dispatched (no
+    // reachable reviewer, budget-starved) — that is NOT convergence → ran:false. Only a
+    // genuinely empty scope (0 selected) stays ran:true.
     const cov = rev?.coverage ?? {};
-    const attempted = cov.unitsAttempted ?? 0;
+    const selected = cov.unitsSelected ?? 0;
     const reviewed = cov.unitsReviewed ?? 0;
-    return { ...rev, ran: reviewed > 0 || attempted === 0 };
+    return { ...rev, ran: reviewed > 0 || selected === 0 };
   };
 
   const fix = async (actionable, ctx = {}) =>

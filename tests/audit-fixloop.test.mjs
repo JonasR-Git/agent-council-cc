@@ -58,7 +58,7 @@ test("END-TO-END real wiring: a throttled review (real coverage shape) stops the
   // Refutes the contract-drift concern: makeFixLoopDeps.review must translate the REAL
   // runAuditReview coverage (0 reviewed, N attempted → all failed) into ran:false so the
   // loop's guard fires. No synthetic {ran:false} shape — the actual dep chain.
-  const runAuditReview = async () => ({ findings: [], coverage: { unitsReviewed: 0, unitsAttempted: 3, budgetSpent: 1 } });
+  const runAuditReview = async () => ({ findings: [], coverage: { unitsReviewed: 0, unitsSelected: 3, unitsAttempted: 3, budgetSpent: 1 } });
   const deps = makeFixLoopDeps("/x", { files: [{ id: "a.mjs", fanIn: 1 }] }, {}, {}, { runAuditReview });
   const out = await runFixLoop("/x", { budget: 20, dryStreak: 2 }, { review: deps.review, fix: async () => ({ ok: true, fixed: [], changedFiles: [] }), checkpoint: noCheckpoint });
   assert.match(out.stopReason, /did not run/, "throttled real-shape review stops honestly");
