@@ -37,9 +37,20 @@ test("--retry-on-limit backs off and retries a rate-limited review instead of st
 });
 
 test("without --retry-on-limit, a rate-limited review still stops the loop (opt-in only)", async () => {
-  const review = async () => { throw new Error("429 rate limit"); };
+  const review = async () => { throw new Error("HTTP 429 rate limit"); };
   const out = await runFixLoop("/x", { budget: 10 }, { review, fix: async () => ({}), checkpoint: noCheckpoint });
   assert.match(out.stopReason, /review error/);
+});
+
+test("a review that did NOT run (ran:false) stops honestly, never declares false convergence", async () => {
+  // A throttled/backends-down review returns ran:false with 0 findings. It must NOT be
+  // counted toward the dry streak (which would report a clean 'converged' success).
+  let calls = 0;
+  const review = async () => { calls += 1; return { findings: [], ran: false }; };
+  const out = await runFixLoop("/x", { budget: 20, dryStreak: 2 }, { review, fix: async () => ({}), checkpoint: noCheckpoint });
+  assert.equal(calls, 1, "stopped on the first non-running review, did not loop to a fake dry convergence");
+  assert.match(out.stopReason, /did not run/);
+  assert.ok(!/diminishing returns/.test(out.stopReason), "not reported as convergence");
 });
 
 test("re-scopes each pass to the previous pass's changed files (diff-scoped re-review)", async () => {

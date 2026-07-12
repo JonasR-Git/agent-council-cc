@@ -38,11 +38,19 @@ async function realClaudeReview(cwd, backends, options, prompt) {
   return res.stdout;
 }
 
-/** Extract the model's reply text from whatever a seat runner returned. */
+/**
+ * Extract a seat's reply text — but ONLY from a cleanly-completed run. A skipped,
+ * timed-out, truncated, or non-zero-exit run yields "" so it casts NO vote, even if it
+ * emitted a partial "VERDICT: ..." before dying. This keeps all three seats symmetric
+ * and fail-closed (the Claude runner already throws on failure; Codex/Grok return a
+ * structured result whose status/timedOut/truncated we must honor).
+ */
 function textOf(res) {
   if (res == null) return "";
   if (typeof res === "string") return res;
   if (res.skipped) return "";
+  if (res.timedOut || res.truncated) return "";
+  if (res.status != null && res.status !== 0) return "";
   return String(res.stdout ?? res.text ?? "");
 }
 
@@ -80,13 +88,12 @@ export function makePatchReviewer(cwd, backends, options = {}, deps = {}) {
  * sensitive class propose-only rather than silently never-approve.
  */
 export function patchReviewerReady(backends) {
-  let claude = false;
-  try {
-    claude = Boolean(backends?.claude?.bin || findClaudeBinary());
-  } catch {
-    claude = false;
-  }
-  const codex = Boolean(backends?.codex?.companionAvailable);
-  const grok = Boolean(backends?.grok?.bin || backends?.grok?.cli?.available);
+  // Use the ACTUAL availability probes, not fallback command-name strings: probeBackends
+  // supplies default "claude"/"grok" bin names even when the reachability probe FAILED, so
+  // Boolean(bin) does NOT mean reachable. A false-positive would print ENABLED and then run
+  // a gate that can never reach unanimity.
+  const claude = Boolean(backends?.claude?.cli?.available);
+  const codex = Boolean(backends?.codex?.companionAvailable || backends?.codex?.cli?.available);
+  const grok = Boolean(backends?.grok?.cli?.available);
   return { ready: claude && codex && grok, claude, codex, grok };
 }

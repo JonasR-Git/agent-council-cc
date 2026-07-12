@@ -8,12 +8,17 @@ test("isRateLimitError recognizes the common shapes, ignores unrelated errors", 
   assert.equal(isRateLimitError(new Error("HTTP 429 Too Many Requests")), true);
   assert.equal(isRateLimitError({ status: 429 }), true);
   assert.equal(isRateLimitError({ status: 529 }), true);
-  assert.equal(isRateLimitError({ code: "insufficient_quota" }), true);
+  assert.equal(isRateLimitError({ status: 503 }), true);
   assert.equal(isRateLimitError("resource_exhausted"), true);
   assert.equal(isRateLimitError(529), true);
   assert.equal(isRateLimitError(new Error("ENOENT: no such file")), false);
   assert.equal(isRateLimitError(new Error("tests failed after fix")), false);
   assert.equal(isRateLimitError(null), false);
+  // PERMANENT exhaustion must NOT be retried (would sleep for hours then fail)
+  assert.equal(isRateLimitError({ code: "insufficient_quota" }), false);
+  assert.equal(isRateLimitError(new Error("disk quota exceeded")), false);
+  // a BARE numeric token must not trigger (e.g. a stack frame "line 429")
+  assert.equal(isRateLimitError(new Error("error at line 429 in file")), false);
 });
 
 test("backoffMs is exponential and capped; an explicit retry-after hint wins", () => {
@@ -55,7 +60,7 @@ test("retryOnRateLimit gives up after `retries` and rethrows the rate-limit erro
   const seen = [];
   await assert.rejects(
     () => retryOnRateLimit(
-      async () => { calls += 1; throw new Error("429"); },
+      async () => { calls += 1; throw new Error("HTTP 429 rate limit exceeded"); },
       { retries: 2, baseMs: 10, sleep: async () => {}, onRetry: (i) => seen.push(i.attempt) }
     ),
     /429/

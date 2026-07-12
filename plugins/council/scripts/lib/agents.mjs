@@ -9,8 +9,11 @@ import { fileURLToPath } from "node:url";
 import { findGrokBinary } from "./discover.mjs";
 import { runCommandAsync } from "./process.mjs";
 
+// A read-only review never needs to write, execute, OR reach the network. Web/browser
+// tools are denied too so a prompt-injection in an untrusted diff can't exfiltrate repo
+// data or fetch remote instructions (unknown tool names are harmlessly ignored per CLI).
 export const READONLY_DISALLOWED_TOOLS =
-  "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal";
+  "search_replace,Write,Edit,NotebookEdit,image_gen,image_edit,image_to_video,reference_to_video,Bash,BashOutput,KillShell,run_command,run_terminal_cmd,execute_command,shell,terminal,web_search,web_fetch,WebSearch,WebFetch,browser,browser_search,fetch";
 
 export const JSON_ONLY_REMINDER =
   "\n\nIMPORTANT: your previous reply could not be parsed. Reply with ONLY the raw JSON object specified above — no explanation, no markdown code fences, nothing before or after it.";

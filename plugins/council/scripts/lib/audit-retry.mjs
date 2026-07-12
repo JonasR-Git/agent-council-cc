@@ -3,15 +3,23 @@
 // dead — it should back off and retry so the loop survives a transient limit. Pure +
 // injectable (sleep is a dep) so the backoff/retry logic is unit-tested without waiting.
 
-const RATE_LIMIT_RE = /rate[ _-]?limit|too many requests|quota|resource[ _-]?exhausted|overloaded|\b429\b|\b529\b/i;
+// Match rate-limit / overload signals while avoiding false positives: a BARE numeric
+// "429" (e.g. "line 429") and a generic "quota" (disk EDQUOT: "quota exceeded" is fine,
+// bare "quota" is not) must NOT trigger a retry. 429/529/503 count only with HTTP/status
+// context; 503 / service-unavailable (overloaded upstream) is included.
+// Only TRANSIENT throttling/overload — never PERMANENT exhaustion. "insufficient_quota" /
+// "quota exceeded" (billing or disk) is permanent and must NOT be retried (it would sleep
+// for hours then return the same error). Bare numeric "429" (e.g. "line 429") is excluded;
+// 429/529/503 count only with http/status context. 503 / service-unavailable is included.
+const RATE_LIMIT_RE = /rate[ _-]?limit|too many requests|resource[ _-]?exhausted|overloaded|service unavailable|temporarily unavailable|http[\s/]?(?:429|529|503)|(?:status|statuscode|code)[\s:=]*(?:429|529|503)/i;
 
-/** True if an error looks like a transient rate-limit / overload the run can wait out. */
+/** True if an error looks like a TRANSIENT rate-limit / overload the run can wait out. */
 export function isRateLimitError(err) {
   if (err == null) return false;
-  if (typeof err === "number") return err === 429 || err === 529;
+  if (typeof err === "number") return err === 429 || err === 529 || err === 503;
   if (typeof err === "string") return RATE_LIMIT_RE.test(err);
   const status = err.status ?? err.statusCode ?? err.code;
-  if (status === 429 || status === 529 || status === "rate_limited" || status === "insufficient_quota") return true;
+  if (status === 429 || status === 529 || status === 503 || status === "rate_limited") return true;
   const msg = String(err.message ?? err.error ?? err.reason ?? "");
   return RATE_LIMIT_RE.test(msg);
 }

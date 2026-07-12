@@ -190,6 +190,15 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       stopReason = `review error on pass ${passNo}: ${String(err?.message ?? err)}`;
       break;
     }
+    // A review that DID NOT actually run (no reachable reviewer, or a rate-limit the
+    // retries couldn't outlast) returns ran:false with zero findings. That is NOT a clean
+    // "nothing to fix" — counting it toward the dry streak would let a throttled run declare
+    // false convergence and exit reporting success while nothing was reviewed. Stop honestly.
+    if (rev && rev.ran === false) {
+      passes.push({ pass: passNo, error: "review did not run (no reachable reviewer or rate-limited)" });
+      stopReason = `review did not run on pass ${passNo} (backends unavailable or rate-limited) — stopped without false convergence`;
+      break;
+    }
     const findings = rev?.findings ?? [];
     charge(rev?.coverage?.budgetSpent, Math.max(1, passBudget)); // a review always costs >= 1
     const freshFindings = dedupeNew(findings, seenReview);

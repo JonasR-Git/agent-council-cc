@@ -7,6 +7,7 @@ import { fingerprintFinding, resolveLedgerEntry } from "./ledger.mjs";
 import { runCommand, runCommandAsync } from "./process.mjs";
 import { snapshotViolation } from "./audit-snapshot.mjs";
 import { evaluatePatchVerdicts } from "./audit-council-gate.mjs";
+import { retryOnRateLimit } from "./audit-retry.mjs";
 import { coverageOfLines, ingestCoverage, parseDiffLines } from "./audit-coverage-ingest.mjs";
 import { ensureStateDir, nowIso, resolveStateDir, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
@@ -460,6 +461,17 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
   // findings still flow in (so they aren't silently dropped) but fail the gate → propose.
   const sensitiveAutoApply = Boolean(options.sensitiveAutoApply) && typeof deps.reviewPatch === "function";
   const reviewPatch = deps.reviewPatch;
+  // Rate-limit resilience at the layer where a 429 is actually thrown (the model calls):
+  // wrap applyFix + reviewPatch so a transient limit backs off + retries instead of being
+  // recorded as a failed fix. Opt-in (--retry-on-limit); a non-rate-limit error still
+  // propagates immediately. Sleep injectable for tests.
+  const withLimitRetry = options.retryOnLimit
+    ? (fn) => retryOnRateLimit(fn, {
+        retries: Math.max(1, Math.min(20, options.retryLimit ?? 5)),
+        sleep: deps.sleep,
+        onRetry: ({ attempt, ms }) => log(`  rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt})`)
+      })
+    : (fn) => fn();
   const oracleCmd = deps.oracleCmd ?? options.oracleCmd ?? detectOracleCmd(root);
   const runOracle = deps.runOracle ?? (oracleCmd ? (() => realRunOracle(root, oracleCmd, options)) : null);
   const oracleName = deps.oracleName ?? oracleCmd?.name ?? "lint/typecheck";
@@ -584,7 +596,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         const prompt = buildFixPrompt(task.file, source, finding);
         log(`fix: ${finding.severity} ${task.file} — ${finding.title}`);
         try {
-          await applyFix(prompt, task, finding);
+          await withLimitRetry(() => applyFix(prompt, task, finding));
           const changed = git.changedFiles();
           if (!changed.length) {
             skipped.push({ finding, file: task.file, reason: "agent made no change" });
@@ -677,7 +689,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             const diff = git.diffText(task.file, snapshot);
             let verdicts;
             try {
-              verdicts = await reviewPatch({ file: task.file, finding, diff, before: source, after: afterSource });
+              verdicts = await withLimitRetry(() => reviewPatch({ file: task.file, finding, diff, before: source, after: afterSource }));
             } catch (err) {
               git.resetHard(snapshot);
               rejected.push({ finding, reason: `§6 council review error: ${String(err?.message ?? err)} → propose-only` });
@@ -699,6 +711,17 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               git.resetHard(snapshot);
               rejected.push({ finding, reason: `§6 changed set drifted during review (${postReview.violations.join(", ")}) → propose-only`, council: councilVerdict });
               log(`  reverted — §6 changed set drifted during review`);
+              continue;
+            }
+            // Bind the commit to the EXACT bytes the council reviewed: re-diff and compare.
+            // A hook, reviewer side effect, or concurrent process could have changed the
+            // target's CONTENT during the async review while keeping the same filename (which
+            // the touched-set check alone would miss). Any drift → the reviewed patch is
+            // stale → revert rather than commit unreviewed bytes.
+            if (git.diffText(task.file, snapshot) !== diff) {
+              git.resetHard(snapshot);
+              rejected.push({ finding, reason: "§6 reviewed bytes changed during review (diff drift) → propose-only", council: councilVerdict });
+              log(`  reverted — §6 reviewed bytes drifted during review`);
               continue;
             }
             log(`  §6 council unanimous (${councilVerdict.summary}) — auto-apply approved`);

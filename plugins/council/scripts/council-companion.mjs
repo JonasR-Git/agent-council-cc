@@ -1920,12 +1920,15 @@ async function handleAudit(argv) {
         if (ready.ready) {
           sensitiveAutoApply = true;
           reviewPatch = makePatchReviewer(cwd, backends, {
-            claudeModel: merged["claude-model"],
-            codexModel: merged["codex-model"],
-            grokModel: merged["grok-model"],
+            // CLI flag wins, else the policy-configured model (exposed camelCase by
+            // mergeOptionsWithPolicy) — don't silently drop policy model pins.
+            claudeModel: merged["claude-model"] ?? merged.claudeModel,
+            codexModel: merged["codex-model"] ?? merged.codexModel,
+            grokModel: merged["grok-model"] ?? merged.grokModel,
             agentTimeoutMs: merged.agentTimeoutMs
           });
           console.error("§6 council-gated auto-apply ENABLED — sensitive fixes require UNANIMOUS Claude+Codex+Grok confirmation of the patch.");
+          console.error("⚠ SECURITY: the §6 reviewers run LLM CLIs inside this repository. Project hooks/settings still fire. Enable --sensitive-auto-apply ONLY on repositories you trust.");
         } else {
           const missing = ["claude", "codex", "grok"].filter((s) => !ready[s]);
           console.error(`⚠ --sensitive-auto-apply requested but seats unreachable (${missing.join(", ")}) — §6 stays propose-only.`);
@@ -1939,9 +1942,10 @@ async function handleAudit(argv) {
         verdictMap: logical.verdictMap,
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
-        claudeModel: merged["claude-model"],
+        claudeModel: merged["claude-model"] ?? merged.claudeModel,
         sensitiveAutoApply,
-        reviewPatch
+        reviewPatch,
+        retryOnLimit: options["retry-on-limit"]
       });
       const tLoop = Date.now();
       const out = await runFixLoop(cwd, { budget: loopBudget, maxPasses, dryStreak, maxUnits, resume: options.resume, perTierConvergence: options["per-tier"], retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);

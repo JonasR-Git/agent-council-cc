@@ -87,7 +87,11 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
         claudeModel: options.claudeModel,
         // §6: consented council-gated auto-apply. sensitiveAutoApply only takes effect in
         // runAuditFix when a reviewPatch is ALSO injected (both are threaded from the CLI).
-        sensitiveAutoApply: options.sensitiveAutoApply
+        sensitiveAutoApply: options.sensitiveAutoApply,
+        // Rate-limit resilience must reach the layer where the 429 is actually thrown
+        // (applyFix / reviewPatch) — the loop-level wrapper never sees it because
+        // runAuditFix records a per-fix failure instead of throwing.
+        retryOnLimit: options.retryOnLimit
       },
       options.reviewPatch ? { reviewPatch: options.reviewPatch } : {}
     );

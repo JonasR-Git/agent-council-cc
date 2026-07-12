@@ -43,6 +43,28 @@ test("makePatchReviewer is fail-closed: an erroring or skipped seat casts NO vot
   assert.equal(evaluatePatchVerdicts(verdicts).approved, false);
 });
 
+test("makePatchReviewer: a failed/timed-out Codex/Grok run casts NO vote even if it emitted CONFIRM", async () => {
+  const review = makePatchReviewer("/x", {}, {}, {
+    runClaude: async () => "VERDICT: CONFIRM\nREASON: ok",
+    runCodex: async () => ({ status: 1, stdout: "VERDICT: CONFIRM" }),               // non-zero exit → no vote
+    runGrok: async () => ({ status: 124, timedOut: true, stdout: "VERDICT: CONFIRM" }) // timed out → no vote
+  });
+  const verdicts = await review(patch);
+  assert.equal(verdicts.length, 1, "only the cleanly-completed claude run voted");
+  assert.equal(evaluatePatchVerdicts(verdicts).approved, false, "a truncated/failed run cannot manufacture unanimity");
+});
+
+test("makePatchReviewer: a truncated (partial) Codex/Grok run casts no vote", async () => {
+  const review = makePatchReviewer("/x", {}, {}, {
+    runClaude: async () => "VERDICT: CONFIRM\nREASON: ok",
+    runCodex: async () => ({ status: 0, truncated: true, stdout: "VERDICT: CONFIRM" }),
+    runGrok: async () => "VERDICT: CONFIRM\nREASON: ok"
+  });
+  const verdicts = await review(patch);
+  assert.equal(verdicts.length, 2);
+  assert.equal(evaluatePatchVerdicts(verdicts).approved, false, "codex truncated → missing → not unanimous");
+});
+
 test("makePatchReviewer: three genuine confirms approve the patch", async () => {
   const ok = async () => "VERDICT: CONFIRM\nREASON: correct";
   const review = makePatchReviewer("/x", {}, {}, { runClaude: ok, runCodex: ok, runGrok: ok });
@@ -50,6 +72,9 @@ test("makePatchReviewer: three genuine confirms approve the patch", async () => 
 });
 
 test("patchReviewerReady requires all three seats reachable", () => {
-  assert.equal(patchReviewerReady({ claude: { bin: "/c" }, codex: { companionAvailable: true }, grok: { bin: "/g" } }).ready, true);
-  assert.equal(patchReviewerReady({ claude: { bin: "/c" }, codex: { companionAvailable: false }, grok: { bin: "/g" } }).ready, false);
+  // Reachability comes from the ACTUAL probes, not fallback bin names.
+  assert.equal(patchReviewerReady({ claude: { cli: { available: true } }, codex: { companionAvailable: true }, grok: { cli: { available: true } } }).ready, true);
+  assert.equal(patchReviewerReady({ claude: { cli: { available: true } }, codex: { companionAvailable: false }, grok: { cli: { available: true } } }).ready, false);
+  // a fallback bin name with a FAILED probe is NOT reachable
+  assert.equal(patchReviewerReady({ claude: { bin: "claude", cli: { available: false } }, codex: { companionAvailable: true }, grok: { bin: "grok", cli: { available: false } } }).ready, false);
 });
