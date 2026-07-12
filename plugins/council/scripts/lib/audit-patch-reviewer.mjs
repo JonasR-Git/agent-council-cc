@@ -82,19 +82,26 @@ function textOf(res) {
  * Fail-closed: a seat that throws, times out, is unavailable, or returns nothing casts
  * no vote — evaluatePatchVerdicts then can't reach unanimity and the fix stays proposed.
  */
-// ISOLATION MODEL (honest): only the Claude seat is HARD-isolated from the audited repo's
+// ISOLATION MODEL (honest — A6): only the Claude seat is HARD-isolated from the audited repo's
 // instruction files (--safe-mode disables CLAUDE.md/hooks/plugins/MCP). Codex still loads
-// AGENTS.md and Grok's --sandbox is filesystem/network isolation, not instruction
-// suppression — so a hostile repo CAN bias those two toward CONFIRM (a soft in-prompt
-// "ignore repo config" is their only instruction defense). The SAFETY INVARIANT still
-// holds: approval requires UNANIMITY, and the hard-isolated Claude seat votes independently
-// of any repo instruction — so a codex/grok bias alone can never manufacture a false
-// approval. Exfiltration is blocked on all three (fs/network isolation everywhere).
+// AGENTS.md and Grok's --sandbox is NOT instruction suppression — so a hostile repo CAN bias
+// those two toward CONFIRM (a soft in-prompt "ignore repo config" is their only instruction
+// defense). The SAFETY INVARIANT still holds: approval requires UNANIMITY, and the hard-isolated
+// Claude seat votes independently of any repo instruction — so a codex/grok bias alone can never
+// manufacture a false approval.
+//
+// EXFILTRATION is blocked on all three by the TOOL DENY-LISTS, not the OS sandbox: Claude's
+// review allow-list is Read/Grep/Glob only (no Bash/web/MCP), and Codex/Grok run with
+// READONLY_DISALLOWED_TOOLS (write/exec/web/browser/mcp/fetch all denied). That tool-layer
+// control holds on EVERY platform. Grok's --sandbox is a best-effort OS extra that is a NO-OP on
+// native Windows (the primary platform) — so it hardens fs/network only where the OS honors it,
+// and is never the thing we rely on.
 export function makePatchReviewer(cwd, backends, options = {}, deps = {}) {
-  // The Grok seat runs under grok's "read-only" sandbox (a verified-valid profile:
-  // off/workspace/devbox/read-only/strict) so a hostile repo can't exfiltrate via
-  // MCP/network during the review. Note: grok does not error on an unknown profile, so we
-  // pin a known-valid one rather than trusting caller input.
+  // The Grok seat additionally requests grok's "read-only" sandbox profile (a verified-valid one:
+  // off/workspace/devbox/read-only/strict) as defense-in-depth. This is BEST-EFFORT — a no-op on
+  // native Windows and grok does not error on an unknown profile — so the actual no-exfil
+  // guarantee is READONLY_DISALLOWED_TOOLS (MCP/web/fetch denied), not this profile. We still pin
+  // a known-valid value rather than trusting caller input for the platforms that do honor it.
   const grokOpts = { ...options, grokSandbox: options.grokSandbox ?? "read-only" };
   const runners = {
     claude: deps.runClaude ?? ((prompt) => realClaudeReview(cwd, backends, options, prompt)),

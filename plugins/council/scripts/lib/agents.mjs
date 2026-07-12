@@ -222,6 +222,10 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
     promptFile,
     "--cwd",
     cwd,
+    // --always-approve is set PER-RUN so a non-interactive review never blocks on a tool prompt,
+    // and it overrides any global grok permission config for this invocation. It only auto-approves
+    // ALLOWED tools — it does NOT override --disallowed-tools, so the denied write/exec/web/mcp
+    // tools below stay denied. The deny-list, not the permission mode, is the read-only control.
     "--always-approve",
     "--disallowed-tools",
     READONLY_DISALLOWED_TOOLS,
@@ -230,11 +234,14 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
     "--output-format",
     wantSession ? "json" : "plain"
   ];
-  // Optional sandbox profile (filesystem + NETWORK isolation). The §6 patch reviewer sets a
-  // read-only profile so a hostile repo can't reach the network via MCP integrations. NOTE:
-  // grok does NOT error on an unrecognized profile (it runs unsandboxed), so the caller MUST
-  // pass a profile that actually exists — the reviewer hardcodes "read-only", a verified-valid
-  // grok profile (off/workspace/devbox/read-only/strict). Don't pass an unvetted value here.
+  // Optional sandbox profile — a BEST-EFFORT, defense-in-depth extra, NOT the primary control.
+  // HONESTY (A6): grok's --sandbox is an OS-level profile that is a NO-OP on native Windows (the
+  // repo's primary platform) and grok does NOT error on an unrecognized profile (it just runs
+  // unsandboxed). So this must never be RELIED upon. The real read-only/no-exfil guarantee comes
+  // from READONLY_DISALLOWED_TOOLS above (write/exec/web/browser/mcp/fetch all denied) — a
+  // tool-layer control that holds on every platform. When the caller does pass a profile it pins
+  // a verified-valid one (off/workspace/devbox/read-only/strict); on a Linux/mac host that honors
+  // it, it tightens fs/network at the OS layer too, but the deny-list is what actually enforces.
   if (options.grokSandbox) baseArgs.push("--sandbox", String(options.grokSandbox));
   if (options.resumeSessionId) baseArgs.push("--resume", String(options.resumeSessionId));
   const args = [...baseArgs];
