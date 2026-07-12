@@ -7,9 +7,9 @@ import { hashLite } from "./util.mjs";
 // Audit V4 - the `--endless` mode. It runs BOUNDED review passes over the project
 // and keeps going until the returns diminish (K consecutive passes add nothing
 // new), a finite total agent-call budget is spent, or a max-pass ceiling is hit -
-// whichever comes first. It is deliberately a REVIEW/PROPOSE loop, not an endless
-// auto-fix loop: editing code in an unbounded loop is exactly the runaway the
-// council warned about, so auto-fix stays the explicit, one-shot `audit fix`.
+// whichever comes first. It is deliberately a REVIEW/PROPOSE loop that never edits
+// code: looped AUTO-fix lives in the separately-gated `audit fix --loop` (M3, on an
+// isolated integration branch with per-fix + integration test gates), not here.
 //
 // Progressive coverage: the caller advances the reviewed unit window each pass
 // (offset), so pass N reviews the NEXT band of hotspots rather than re-rolling the

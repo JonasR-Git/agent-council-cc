@@ -17,8 +17,9 @@
 //   not importer ids), so a covered dependent regression is caught by the per-fix +
 //   integration test gates, and an UNCOVERED one on a leaf edit can be missed until the
 //   model exposes import edges. Documented gap.
-// - verdictsFor: the Tier-0 verdict map (empty until the detector is wired to gate; it
-//   currently emits only observations, so this is honestly {}).
+// - verdictsFor: returns options.verdictMap — the Tier-0 verdict map the CLI threads in from
+//   detectLogical (council-companion), whose above-floor, non-quarantined verdicts DO gate
+//   (prune/redirect) findings; {} only for a bare caller that injects no map.
 
 import { runAuditFix } from "./audit-fix.mjs";
 import { normalizeFindings } from "./audit-normalize.mjs";

@@ -61,7 +61,8 @@ function defaultCheckpoint(cwd, state) {
  * process+redirect set, tier-ordered (Structure -> Correctness -> Quality) so a bug is
  * fixed once post-consolidation; `surfaced` are serious findings parked behind a
  * remove?/redirect (the report must foreground them). Without a verdict map nothing is
- * pruned — the honest default until Tier 0 is wired in.
+ * pruned — the default for a bare caller that injects no map (the CLI threads in
+ * detectLogical's Tier-0 verdict map, which DOES gate).
  */
 export function gateFindings(findings, verdictMap = {}) {
   const g = applyTierGating(findings, verdictMap);

@@ -2060,6 +2060,12 @@ async function handleAudit(argv) {
       if (!Number.isFinite(n) || n < 1) throw new Error("--retry-limit must be a positive number");
       singleRetryLimit = Math.floor(n);
     }
+    // §6 council-gated auto-apply is wired ONLY in the --loop path (it injects the patch reviewer);
+    // single-shot `audit fix` has no reviewer, so runAuditFix forces sensitiveAutoApply off. Warn so a
+    // user passing --sensitive-auto-apply single-shot isn't misled into thinking it took effect (F3).
+    if (options["sensitive-auto-apply"] && !options.json) {
+      console.error("note: --sensitive-auto-apply has no effect on single-shot `audit fix` (§6 council review runs only in `audit fix --loop`); sensitive fixes stay propose-only");
+    }
     const tFix = Date.now();
     const out = await runAuditFix(cwd, findings, backends, {
       ...merged,
@@ -2310,7 +2316,7 @@ function renderFixLoopReport(out) {
   L.push("");
   L.push("## Verified vs. NOT verified (review the gaps)");
   L.push(`- ${out.fixed.length - unverified}/${out.fixed.length} fix(es) test-gated (green per commit + final integration)${unverified ? ` · ${unverified} UNVERIFIED (--allow-untested)` : ""}`);
-  L.push("- NOT measured: change-line coverage, behaviour-equivalence, mutation adequacy — eyeball the diffs + the proposals below");
+  L.push("- change-line coverage is §5-gated per fix WHEN a coverage artifact (--coverage/lcov) was supplied, else NOT measured; behaviour-equivalence + mutation adequacy are NOT measured — eyeball the diffs + the proposals below");
 
   if (out.fixed.length) {
     L.push("");

@@ -99,6 +99,10 @@ export function windowContextToBudget(context, diff, maxChars = CONTEXT_MAX_CHAR
   // Grok R4 P1) + a neutral truncation mark. slice(0,maxChars) guards a pathologically small budget.
   if (renderWins(cores.map((c) => ({ s: c.cs, e: c.ce }))).length > maxChars) {
     const sepTotal = WINDOW_SEP.length * Math.max(0, cores.length - 1);
+    // Equal share per core. Under a PATHOLOGICAL budget (maxChars smaller than the seps+mark+one-char-
+    // per-core overhead — unreachable at the production CONTEXT_MAX_CHARS=14k with realistic hunk
+    // counts) the trailing slice(0,maxChars) bounds the result; showing N regions in < N chars is a
+    // mathematical impossibility, not a fixable front-slice (council Grok R4-round2 P2, noted).
     const per = Math.max(1, Math.floor((maxChars - sepTotal - TRUNCATED_MARK.length) / cores.length));
     const clipped = cores.map((c) => slice(c.cs, c.ce).slice(0, per)).join(WINDOW_SEP) + TRUNCATED_MARK;
     return { text: clipped.slice(0, maxChars), windowed: true };
@@ -160,7 +164,7 @@ export function buildPatchReviewPrompt(file, finding, diff, seat = "reviewer", c
     ...(ctx
       ? [
           windowed
-            ? `The patched source of ${file} is WINDOWED around the changed region(s) (the full file exceeds the review budget). A region marked […omitted…] or […truncated…] is code you have NOT seen — DISSENT rather than confirm behaviour that depends on it:`
+            ? `The patched source of ${file} is WINDOWED around the changed region(s) (the full file exceeds the review budget). A gap marked "[omitted]" or a "[truncated" note is code you have NOT seen — DISSENT rather than confirm behaviour that depends on it:`
             : `The full patched source of ${file} is below, for judging the change in context:`,
           `--- BEGIN PATCHED SOURCE ${file} ${nonce} ---`,
           wrapMarkdownFence(ctx),
