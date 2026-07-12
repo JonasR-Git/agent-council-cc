@@ -58,6 +58,7 @@ import { toSarif } from "./lib/audit-sarif.mjs";
 import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { writeFixReportHtml } from "./lib/fix-report-html.mjs";
+import { assembleFixMeta, changedFilesShape } from "./lib/fix-report-meta.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
 import {
@@ -1731,6 +1732,38 @@ async function handleWatch(argv) {
 // fine run is ~1080 cells; this caps an accidental fan-out while still covering a normal run — raise
 // it explicitly with --max-cells (a capped run reports PARTIAL coverage, never silently truncates).
 const GROUPED_CLI_DEFAULT_MAX_CELLS = 1500;
+
+// Assemble the fix-report telemetry meta (metrics + before→after codebase shape). FAIL-SOFT: any git
+// error just omits the shape — a telemetry report must never break a completed fix run. Only called on
+// --html. The before/after shape is bounded to the CHANGED files (a fix touches a small set).
+async function computeFixReportMeta(cwd, out, ctx = {}) {
+  let shapeBefore;
+  let shapeAfter;
+  let numstat;
+  try {
+    const changed = Array.isArray(out?.changedFiles) ? out.changedFiles : [];
+    const base = out?.baseBranch;
+    const head = out?.branch;
+    if (changed.length && base && head) {
+      const cache = new Map();
+      for (const ref of [base, head]) {
+        for (const f of changed) {
+          const r = await runCommandAsync("git", ["show", `${ref}:${f}`], { cwd, timeoutMs: 15_000 });
+          cache.set(`${ref}:${f}`, r.status === 0 ? r.stdout : "");
+        }
+      }
+      const shapes = changedFilesShape(changed, base, head, (ref, p) => cache.get(`${ref}:${p}`));
+      shapeBefore = shapes.before;
+      shapeAfter = shapes.after;
+      const ns = await runCommandAsync("git", ["diff", "--numstat", `${base}..${head}`], { cwd, timeoutMs: 15_000 });
+      numstat = ns.status === 0 ? ns.stdout : undefined;
+    }
+  } catch {
+    /* fail-soft — omit the shape section */
+  }
+  return assembleFixMeta(out, { ...ctx, shapeBefore, shapeAfter, numstat });
+}
+
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells"],
@@ -2062,7 +2095,8 @@ async function handleAudit(argv) {
       if (options.html) {
         // Use the RESOLVED consent flag (in scope), not out.sensitiveAutoApply which the loop never
         // returns — else the §6-council-gated report label always fell back to safe-auto (council F3).
-        const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply, generatedAt: nowIso() });
+        const meta = await computeFixReportMeta(cwd, out, { wallClockMs: Date.now() - tLoop, finishedAt: nowIso(), autonomy: options.autonomy ?? "aggressive", sensitiveAutoApply });
+        const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply, generatedAt: nowIso(), metrics: meta.metrics, ...(meta.shape ? { shape: meta.shape } : {}) });
         console.log(renderFixLoopReport(out));
         console.log(`\nHTML report: ${file}`);
         return;
@@ -2127,7 +2161,8 @@ async function handleAudit(argv) {
       return;
     }
     if (options.html) {
-      const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply: Boolean(out.sensitiveAutoApply), generatedAt: nowIso() });
+      const meta = await computeFixReportMeta(cwd, out, { wallClockMs: Date.now() - tFix, finishedAt: nowIso(), autonomy: options.autonomy ?? "aggressive", sensitiveAutoApply: false });
+      const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply: Boolean(out.sensitiveAutoApply), generatedAt: nowIso(), metrics: meta.metrics, ...(meta.shape ? { shape: meta.shape } : {}) });
       console.log(renderAuditFixReport(out));
       console.log(`\nHTML report: ${file}`);
       return;
