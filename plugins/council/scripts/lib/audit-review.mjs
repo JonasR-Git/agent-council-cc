@@ -161,12 +161,12 @@ export async function reviewUnit(cwd, backends, options, unitId, model, budget) 
   const jobs = [];
   if (reviewerActive("codex", backends, options)) {
     jobs.push(
-      runStructuredWithRetry((p) => runCodexStructured(cwd, backends, options, p, "audit"), prompt, (s) => parseAgentFindings(s, "codex"), { budget }).then((r) => ({ ...r, agent: "codex" }))
+      runStructuredWithRetry((p) => runCodexStructured(cwd, backends, options, p, "audit"), prompt, (s) => parseAgentFindings(s, "codex"), { budget, reformat: true }).then((r) => ({ ...r, agent: "codex" }))
     );
   }
   if (reviewerActive("grok", backends, options)) {
     jobs.push(
-      runStructuredWithRetry((p) => runGrokStructured(cwd, backends, options, p), prompt, (s) => parseAgentFindings(s, "grok"), { budget }).then((r) => ({ ...r, agent: "grok" }))
+      runStructuredWithRetry((p) => runGrokStructured(cwd, backends, options, p), prompt, (s) => parseAgentFindings(s, "grok"), { budget, reformat: true }).then((r) => ({ ...r, agent: "grok" }))
     );
   }
   const raw = await Promise.all(jobs);
@@ -216,7 +216,7 @@ export async function globalReduce(cwd, backends, options, model, budget) {
     useCodex ? (p) => runCodexStructured(cwd, backends, options, p, "audit-reduce") : (p) => runGrokStructured(cwd, backends, options, p),
     prompt,
     (s) => parseAgentFindings(s, agent),
-    { budget }
+    { budget, reformat: true }
   );
   // A parse miss whose retry then failed still means the reduce RAN (it just
   // yielded nothing parseable) — report ran:true + unparsed, not a "skipped".

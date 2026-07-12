@@ -19,34 +19,80 @@ export const JSON_ONLY_REMINDER =
   "\n\nIMPORTANT: your previous reply could not be parsed. Reply with ONLY the raw JSON object specified above — no explanation, no markdown code fences, nothing before or after it.";
 
 /**
- * Run a structured agent call and retry ONCE (by default) if it ran but produced
- * unparseable output. `runFor(prompt)` issues the call and returns a runner result
- * ({ stdout, status, skipped, timedOut, ... }); `parse(stdout)` returns a doc with
- * a `.parseOk` flag. A reminder is appended to the prompt on retry. Only retries a
- * genuine parse miss (status 0, not skipped/timed-out) — a reminder cannot fix a
- * crashed or absent backend.
- *
- * A retry is a REAL extra agent call, so when a finite `budget` is supplied the
- * retry is charged (`retryCost`, default 1) and declined when the budget can't
- * afford it — the caller charges the first call up front, this charges the retry,
- * so budget accounting stays honest and bounded. Returns the final runner result
- * plus `retryAttempts` and `parseMissed` (true if any attempt produced status-0
- * output that failed to parse, even if a later attempt failed differently).
+ * Build a REFORMAT-repair prompt: hand a model its own unparseable reply and ask it to reshape
+ * that EXISTING content into a valid JSON object — no re-analysis. Much cheaper than a full
+ * re-run and it salvages a reply whose content was right but whose JSON was malformed (trailing
+ * comma, stray prose, truncated fence). Passed via a prompt FILE by the runners, so embedded
+ * newlines are safe (unlike a CLI arg). The garbled text is the model's own output; we still
+ * frame it plainly and instruct "preserve, do not invent" so nothing is fabricated on repair.
  */
-export async function runStructuredWithRetry(runFor, prompt, parse, { reminder = JSON_ONLY_REMINDER, maxRetries = 1, budget = null, retryCost = 1 } = {}) {
+export function buildReformatPrompt(garbled, { schemaHint = "the JSON object specified in your previous task" } = {}) {
+  return [
+    "Your previous reply could not be parsed as JSON. Below, delimited, is that exact reply.",
+    `Reformat it into ONLY ${schemaHint}: a single raw JSON object — no markdown fences, no prose,`,
+    "nothing before or after. Preserve ALL content (every finding/field verbatim); do not add,",
+    "drop, or invent anything. If the reply contained no usable structured content, output {}.",
+    "",
+    "--- BEGIN UNPARSEABLE REPLY ---",
+    String(garbled ?? ""),
+    "--- END UNPARSEABLE REPLY ---"
+  ].join("\n");
+}
+
+/**
+ * Run a structured agent call and repair unparseable output so one garbled reply does not
+ * discard a whole unit. `runFor(prompt)` issues the call and returns a runner result
+ * ({ stdout, status, skipped, timedOut, ... }); `parse(stdout)` returns a doc with a
+ * `.parseOk` flag. Only a GENUINE parse miss (status 0, not skipped/timed-out) is repaired —
+ * a reminder/reformat cannot fix a crashed or absent backend.
+ *
+ * Repair escalates cheapest-first, per parse miss:
+ *   1. REFORMAT (opt-in via `reformat`): re-issue via `runFor` with a reformat prompt seeded
+ *      with the garbled output (reshape existing content, no re-analysis). Tried at most ONCE.
+ *      `reformat` may be `true` (use buildReformatPrompt) or a `(garbled) => prompt` builder.
+ *   2. REMINDER RETRY: re-run the full task with `reminder` appended, up to `maxRetries` times
+ *      (default 2, i.e. up to two reminder retries — maxRetries>1 so a single bad reply that
+ *      would waste the whole reviewer's analysis gets more than one recovery attempt).
+ *
+ * Every repair call is a REAL extra agent call: with a finite `budget` each is charged
+ * (`reformatCost`/`retryCost`, default 1) and DECLINED when unaffordable, so accounting stays
+ * honest and bounded. Returns the final result plus `retryAttempts`, `reformatAttempts`, and
+ * `parseMissed` (true if any status-0 attempt failed to parse).
+ */
+export async function runStructuredWithRetry(
+  runFor,
+  prompt,
+  parse,
+  { reminder = JSON_ONLY_REMINDER, maxRetries = 2, budget = null, retryCost = 1, reformat = false, reformatCost = 1 } = {}
+) {
   let result = await runFor(prompt);
   let attempts = 1;
+  let reformatAttempts = 0;
   let parseMissed = false;
+  const okRun = (r) => r && !r.skipped && r.status === 0 && !r.timedOut;
   while (attempts <= maxRetries) {
-    if (result.skipped || result.status !== 0 || result.timedOut) break;
+    if (!okRun(result)) break;
     if (parse(result.stdout)?.parseOk !== false) break;
     parseMissed = true;
+    // 1. Cheapest repair first: reformat the EXISTING output (once), before spending a full re-run.
+    if (reformat && reformatAttempts === 0 && (!budget || budget.canSpend(reformatCost))) {
+      if (budget) budget.charge(reformatCost);
+      reformatAttempts += 1;
+      const reformatPrompt = typeof reformat === "function" ? reformat(result.stdout) : buildReformatPrompt(result.stdout);
+      const repaired = await runFor(reformatPrompt);
+      if (okRun(repaired) && parse(repaired.stdout)?.parseOk !== false) {
+        result = repaired;
+        break;
+      }
+      // reformat didn't yield parseable JSON → fall through to a full reminder retry
+    }
+    // 2. Full re-run with an escalating reminder.
     if (budget && !budget.canSpend(retryCost)) break; // never exceed the finite budget
     if (budget) budget.charge(retryCost);
     result = await runFor(prompt + reminder);
     attempts += 1;
   }
-  return { ...result, retryAttempts: attempts, parseMissed };
+  return { ...result, retryAttempts: attempts, reformatAttempts, parseMissed };
 }
 
 /**
