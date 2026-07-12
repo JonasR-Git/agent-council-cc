@@ -5,6 +5,8 @@ import { interpolate, makeFenceNonce, runCodexStructured, runGrokStructured, run
 import { mergeFindings, parseAgentFindings } from "./findings.mjs";
 import { fingerprintFinding, recordAndAnnotate } from "./ledger.mjs";
 import { annotateScopes } from "./scope.mjs";
+import { buildEvidence } from "./deliberate.mjs";
+import { verifyFindings } from "./verify.mjs";
 import { nowIso, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 
@@ -283,6 +285,22 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
   // them to 'fixed'. Best-effort; fingerprint keys are file+title (audit-fix uses the
   // same fingerprint to close the loop).
   if (options.ledger !== false) scoped = recordAndAnnotate(cwd, options.jobId ?? "audit-review", scoped, options.nowIso ?? nowIso());
+  // A1 (quality): adversarial refutation on the AUDIT path. A P0/P1 SINGLE-agent finding is
+  // re-checked by a seat that did NOT raise it; an evidence-based refutation drops it to a
+  // low-confidence `refuted` bucket instead of surfacing it as real. Consensus findings are
+  // protected. Default-on (was only wired into `deliberate`); disable with verifyAudit:false.
+  // Bounded — only P0/P1 non-consensus — and best-effort so a verifier failure never drops
+  // the whole review. Needs ≥2 reachable seats (a finding must never be refuted by its author).
+  let refutedCount = 0;
+  if (options.verifyAudit !== false && activeReviewerCount(backends, options) > 1) {
+    try {
+      const vr = await verifyFindings(cwd, backends, options, scoped, buildEvidence, workspaceRoot(cwd));
+      scoped = vr.merged;
+      refutedCount = vr.refutedCount ?? 0;
+    } catch {
+      /* refutation is best-effort */
+    }
+  }
   // Only units that actually got >=1 successful agent review count as reviewed;
   // dispatched-but-empty/failed units must not inflate coverage.
   const reviewedUnits = results.filter((r) => r.reviewed);
@@ -295,8 +313,10 @@ export async function runAuditReview(cwd, model, backends, options = {}) {
   const unparsedReturns = results.reduce((s, r) => s + (r.unparsed ?? 0), 0) + (reduce.unparsed ?? 0);
   return {
     findings: scoped.all,
+    refuted: scoped.refuted ?? [],
     reviewed: reviewedUnits.map((r) => r.unitId),
     coverage: {
+      refutedCount,
       unitsReviewed: reviewedUnits.length,
       unitsAttempted: results.length,
       unitsSelected: units.length,
