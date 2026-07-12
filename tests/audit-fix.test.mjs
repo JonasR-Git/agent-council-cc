@@ -196,6 +196,60 @@ test("runAuditFix commits a fix when the edit is in-scope and tests pass", async
   assert.match(out.branch, /^council\/audit-fix-base0000/);
 });
 
+// --- §5 char-test gate: behaviour-preserving refactor guard ------------------
+
+const refactor = (o) => loc({ file: "a.mjs", title: "consolidate SSOT", lens: "architecture_ssot", ...o });
+
+test("runAuditFix §5: a refactor commits only after char-test ACCEPT (pre-apply) + VERIFY (post-fix) both pass", async () => {
+  const git = fakeGit();
+  const seen = [];
+  const charTestGate = {
+    eligible: (f) => f.lens === "architecture_ssot",
+    accept: async () => { seen.push("accept"); return { accepted: true, code: "TEST", reason: "pinned" }; },
+    verify: async () => { seen.push("verify"); return { pass: true, reason: "preserved" }; }
+  };
+  const out = await runAuditFix(tmp(), [refactor()], {}, {}, baseDeps(git, {
+    applyFix: async () => { seen.push("apply"); git.setChanged(["a.mjs"]); },
+    charTestGate
+  }));
+  assert.equal(out.fixed.length, 1, "committed after both phases");
+  assert.deepEqual(seen, ["accept", "apply", "verify"], "accept runs on the CLEAN tree before apply; verify after");
+});
+
+test("runAuditFix §5: a refactor whose behaviour can't be CHARACTERISED stays propose-only (no apply)", async () => {
+  const git = fakeGit();
+  let applied = 0;
+  const out = await runAuditFix(tmp(), [refactor()], {}, {}, baseDeps(git, {
+    applyFix: async () => { applied += 1; git.setChanged(["a.mjs"]); },
+    charTestGate: { eligible: () => true, accept: async () => ({ accepted: false, reason: "non-deterministic target" }), verify: async () => ({ pass: true }) }
+  }));
+  assert.equal(applied, 0, "the fix is never applied when the char-test can't be accepted");
+  assert.equal(out.fixed.length, 0);
+  assert.ok(out.rejected.some((r) => /char-test/.test(r.reason)), "surfaced as a §5 propose-only");
+});
+
+test("runAuditFix §5: a refactor that turns the pinned test RED is reverted to propose-only (behaviour changed)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [refactor()], {}, {}, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    charTestGate: { eligible: () => true, accept: async () => ({ accepted: true, code: "T" }), verify: async () => ({ pass: false, reason: "the characterization test went RED after the refactor" }) }
+  }));
+  assert.equal(out.fixed.length, 0);
+  assert.ok(git.calls.some((c) => c[0] === "resetHard"), "the refactor is reverted");
+  assert.ok(out.rejected.some((r) => /char-test.*RED|RED.*refactor/.test(r.reason)));
+});
+
+test("runAuditFix §5: a NON-refactor finding (correctness) is NOT char-test-gated", async () => {
+  const git = fakeGit();
+  let accepted = 0;
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix bug", lens: "correctness" })], {}, {}, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    charTestGate: { eligible: (f) => f.lens === "architecture_ssot", accept: async () => { accepted += 1; return { accepted: true }; }, verify: async () => ({ pass: true }) }
+  }));
+  assert.equal(accepted, 0, "a correctness fix (intends to change behaviour) is not gated by a char-test");
+  assert.equal(out.fixed.length, 1);
+});
+
 // --- §6 council gate: sensitive-class auto-apply -----------------------------
 
 const sensitiveGit = (o) => Object.assign(fakeGit(o), { diffText: () => "@@ -1 +1 @@\n-old\n+new\n" });

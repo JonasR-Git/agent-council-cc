@@ -168,7 +168,12 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
         // continuation pass is the integration branch → false durable promotion; council Opus O7).
         ledgerBaseBranch: options.ledgerBaseBranch
       },
-      options.reviewPatch ? { reviewPatch: options.reviewPatch } : {}
+      {
+        ...(options.reviewPatch ? { reviewPatch: options.reviewPatch } : {}),
+        // §5 char-test gate (opt-in) threaded to runAuditFix's deps so a refactor must keep its
+        // characterization test green across the change; null/absent → the gate is skipped.
+        ...(options.charTestGate ? { charTestGate: options.charTestGate } : {})
+      }
     );
 
   // Blast radius (§7): re-scope the next pass to the changed files PLUS their real

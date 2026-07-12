@@ -60,6 +60,7 @@ import { writeJobHtml } from "./lib/html-report.mjs";
 import { writeFixReportHtml } from "./lib/fix-report-html.mjs";
 import { assembleFixMeta, changedFilesShape } from "./lib/fix-report-meta.mjs";
 import { openRouterBackend } from "./lib/openrouter-agent.mjs";
+import { makeCharTestGate } from "./lib/chartest-wiring.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
 import {
@@ -92,7 +93,7 @@ function printUsage() {
       "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
       "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
       "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
-      "    audit fix --loop [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume] [--allow-untested]   (autonomous fix-until-dry on an isolated branch)",
+      "    audit fix --loop [--supervise] [--flat] [--chartest] [--max-passes <n>] [--dry-streak <n>] [--resume] [--allow-untested]   (autonomous fix-until-dry on an isolated branch)",
       "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume]   (bounded review/propose loop)",
       "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/council-companion.mjs cancel [job-id]",
@@ -1796,7 +1797,7 @@ async function computeFixReportMeta(cwd, out, ctx = {}) {
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "supervise", "completeness-critic", "skip-openrouter"]
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest"]
   });
   const cwd = process.cwd();
   // Validate the grouped-review preset + cap ONCE, up front — before any preflight/coverage/spend, for
@@ -2109,6 +2110,9 @@ async function handleAudit(argv) {
         // SET shrinks, and evaluatePatchVerdicts ignores the non-required OR votes.
         skipOpenRouter: merged.skipOpenRouter,
         skipSeats: merged.skipSeats ?? options.skipSeats,
+        // §5 char-test gate (opt-in --chartest): behaviour-preserving refactors must keep a generated
+        // characterization test green across the change, else revert to propose-only. null when off.
+        charTestGate: options.chartest ? makeCharTestGate(cwd, backends, merged) : null,
         claudeModel: merged["claude-model"] ?? merged.claudeModel,
         sensitiveAutoApply,
         reviewPatch,
@@ -2200,6 +2204,9 @@ async function handleAudit(argv) {
       console.error("note: --sensitive-auto-apply has no effect on single-shot `audit fix` (§6 council review runs only in `audit fix --loop`); sensitive fixes stay propose-only");
     }
     const tFix = Date.now();
+    // §5 char-test gate (opt-in --chartest) also on single-shot `audit fix`: a behaviour-preserving
+    // refactor must keep its generated characterization test green across the change. null when off.
+    const singleCharTestGate = options.chartest ? makeCharTestGate(cwd, backends, merged) : null;
     const out = await runAuditFix(cwd, findings, backends, {
       ...merged,
       dryRun: options["dry-run"],
@@ -2209,7 +2216,7 @@ async function handleAudit(argv) {
       retryOnLimit: options["retry-on-limit"],
       retryLimit: singleRetryLimit,
       onProgress: options.json ? undefined : (m) => console.error(m)
-    });
+    }, singleCharTestGate ? { charTestGate: singleCharTestGate } : {});
     if (!options["dry-run"]) {
       recordAuditMetrics(cwd, "fix", { wallClockMs: Date.now() - tFix, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, rejected: out.rejected?.length ?? 0, ledgerResolved: out.ledgerResolved ?? 0, integrationFailed: Boolean(out.integrationFailed) }, nowIso());
     }

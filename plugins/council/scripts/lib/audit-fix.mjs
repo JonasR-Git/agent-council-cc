@@ -487,6 +487,13 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
   // findings still flow in (so they aren't silently dropped) but fail the gate → propose.
   const sensitiveAutoApply = Boolean(options.sensitiveAutoApply) && typeof deps.reviewPatch === "function";
   const reviewPatch = deps.reviewPatch;
+  // §5 characterization-test gate (opt-in --chartest): for a behaviour-PRESERVING refactor, a generated
+  // test pins the target's current behaviour on the CLEAN tree (accept), and after the refactor applies
+  // it must STILL pass AND cover the changed lines (verify) — else the refactor changed behaviour and is
+  // reverted to propose-only. Injected by the CLI; absent → the gate is skipped (default path unchanged).
+  // Fail-closed: an eligible finding whose char-test cannot be ACCEPTED is kept propose-only (a refactor
+  // we cannot characterise is not auto-applied).
+  const charTestGate = deps.charTestGate ?? null;
   // Rate-limit resilience at the layer where a 429 is actually thrown (the model calls):
   // wrap applyFix + reviewPatch so a transient limit backs off + retries instead of being
   // recorded as a failed fix. Opt-in (--retry-on-limit); a non-rate-limit error still
@@ -624,6 +631,24 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         }
         const prompt = buildFixPrompt(task.file, source, finding);
         log(`fix: ${finding.severity} ${task.file} — ${finding.title}`);
+        // §5 char-test ACCEPT (on the CLEAN tree, BEFORE the refactor): pin the target's behaviour with a
+        // generated, deterministic, non-vacuous test. Only for behaviour-preserving refactor classes; a
+        // correctness/security fix INTENDS to change behaviour and is not char-test-gated. Fail-closed:
+        // an eligible refactor whose behaviour can't be characterised stays propose-only.
+        let charAccepted = null;
+        if (charTestGate && charTestGate.eligible(finding)) {
+          try {
+            charAccepted = await withLimitRetry(() => charTestGate.accept({ file: task.file, source }));
+          } catch (err) {
+            charAccepted = { accepted: false, reason: `char-test accept error: ${String(err?.message ?? err)}` };
+          }
+          if (!charAccepted.accepted) {
+            rejected.push({ finding, reason: `§5 char-test: ${charAccepted.reason} → propose-only` });
+            log(`  propose-only — §5 char-test not accepted (${charAccepted.reason})`);
+            continue;
+          }
+          log(`  §5 char-test accepted — behaviour pinned; will verify preservation after the refactor`);
+        }
         try {
           await withLimitRetry(() => applyFix(prompt, task, finding));
           const changed = git.changedFiles();
@@ -700,6 +725,25 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               log("  reverted — tests failed");
               continue;
             }
+          }
+          // §5 char-test VERIFY (after the refactor, tree = post-fix): the pinned test must STILL pass
+          // (behaviour preserved) AND execute the now-known changed lines. A RED test means the refactor
+          // silently changed behaviour the existing suite didn't catch → revert to propose-only.
+          if (charAccepted?.accepted) {
+            const changedLines = typeof git.diffLines === "function" ? git.diffLines(task.file, snapshot) : [];
+            let verdict;
+            try {
+              verdict = await withLimitRetry(() => charTestGate.verify({ ...charAccepted, file: task.file, source: afterSource, changedLines }));
+            } catch (err) {
+              verdict = { pass: false, reason: `char-test verify error: ${String(err?.message ?? err)}` };
+            }
+            if (!verdict.pass) {
+              git.resetHard(snapshot);
+              rejected.push({ finding, reason: `§5 char-test: ${verdict.reason} → propose-only` });
+              log(`  reverted — §5 char-test failed (${verdict.reason})`);
+              continue;
+            }
+            log(`  §5 char-test verified — behaviour preserved across the refactor`);
           }
           // §6 council gate (LAST, after every mechanical gate is green): a sensitive-class
           // patch must be UNANIMOUSLY confirmed by the three council seats before it may
