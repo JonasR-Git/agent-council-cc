@@ -147,6 +147,20 @@ test("runGroupedReview: an oversized file is UNSUPPLIED — surfaced + forces PA
   assert.equal(out.coverage.complete, false, "matrix.complete:true is overridden — an unreviewed file can't be six-eyes complete");
 });
 
+test("runGroupedReview: an all-EMPTY (0-byte) readable scope is vacuously COMPLETE, not failed", async () => {
+  // A readable 0-byte file yields 0 cells and is NOT unsupplied. With every selected file empty the
+  // matrix gets 0 cells; sixEyesComplete([]) is fail-closed false, but there is nothing to review, so
+  // the run must report complete + not count the empty file as failed (council Codex C1 / Opus O3).
+  let seenCells = null;
+  const runMatrix = async (cells) => { seenCells = cells.length; return { findings: [], results: [], matrix: { summary: () => ({}) }, complete: false }; };
+  const empty = { readFile: () => "", statSize: () => 0 };
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false }, { runMatrix, ...empty });
+  assert.equal(seenCells, 0, "an empty file schedules no cells");
+  assert.deepEqual(out.coverage.filesUnsupplied, [], "an empty file is NOT unsupplied");
+  assert.equal(out.coverage.complete, true, "nothing to review → vacuously complete");
+  assert.equal(out.coverage.unitsFailed, 0, "the empty file is not miscounted as a failed unit");
+});
+
 test("runGroupedReview: an unreadable file is UNSUPPLIED, not a silent empty review", async () => {
   const runMatrix = async () => ({ findings: [], matrix: { summary: () => ({}) }, complete: true });
   const unreadable = { readFile: () => { throw new Error("EACCES"); }, statSize: () => 40 };

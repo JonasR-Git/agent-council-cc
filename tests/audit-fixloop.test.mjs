@@ -83,6 +83,35 @@ test("B5 council (grok P1): per-tier does NOT global-dry-converge before a later
   assert.match(out.stopReason, /all tiers converged/);
 });
 
+test("council Codex C2: a recurring PROPOSE-ONLY finding does not pin its tier (later tiers still reached)", async () => {
+  // A tier-1 (structure) architecture proposal recurs every pass and is never auto-applied. Before
+  // the fix it kept `actionable` non-empty → tierDryStreak reset forever → tier 1 pinned → the
+  // tier-2 correctness bug behind it was never reached. Now propose-only findings don't count as
+  // live tier work, so the stage advances and the real bug is fixed.
+  let correctnessFixed = false;
+  const review = async () => ({
+    findings: [
+      finding({ file: "a.mjs", title: "god module", lens: "architecture_ssot", scope: "cross-cutting", fixDisposition: "propose-only" }),
+      ...(correctnessFixed ? [] : [finding({ file: "b.mjs", title: "off-by-one", lens: "correctness" })])
+    ],
+    coverage: { budgetSpent: 1 }
+  });
+  const fix = async (actionable) => {
+    const auto = actionable.filter((f) => f.scope !== "cross-cutting");
+    if (auto.some((f) => f.lens === "correctness")) correctnessFixed = true;
+    return {
+      fixed: auto.map((f) => ({ file: f.file, finding: f, commit: "x" })),
+      rejected: actionable.filter((f) => f.scope === "cross-cutting").map((f) => ({ finding: f, reason: "cross-cutting → propose-only" })),
+      failed: [],
+      changedFiles: auto.map((f) => f.file),
+      spent: 1
+    };
+  };
+  const out = await runFixLoop("/x", { budget: 80, maxPasses: 40, dryStreak: 2, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  assert.ok(out.fixed.some((f) => f.finding.lens === "correctness"), "the tier-2 correctness bug was reached + fixed despite the recurring tier-1 proposal");
+  assert.match(out.stopReason, /all tiers converged/);
+});
+
 test("B5 council (grok P2): per-tier position is checkpointed and restored on resume", async () => {
   // persistence: the checkpoint carries currentTier/tierDryStreak/stalledStreak
   let saved = null;

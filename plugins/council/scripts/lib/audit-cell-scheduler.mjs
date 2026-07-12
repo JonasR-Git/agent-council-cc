@@ -219,7 +219,17 @@ export async function runCellMatrix(cells, reviewCell, { models, maxInflight, re
   const results = await scheduleCells(
     cells,
     async (cell, idx) => {
-      const r = await runOne(cell, idx);
+      // A cell that THROWS (retries exhausted, or a non-rate-limit error) must still be recorded
+      // FAILED in the matrix — else scheduleCells' catch records {ok:false} but the triple is left
+      // neither done nor failed, so the matrix summary loses the failed cell (council Grok G2 / Codex
+      // C1). Catch here and markFailed before returning a normal ok:false result.
+      let r;
+      try {
+        r = await runOne(cell, idx);
+      } catch (err) {
+        matrix.markFailed(cell);
+        return { ok: false, cell, error: String(err?.message ?? err) };
+      }
       if (r && r.ok === true) matrix.markDone(cell);
       else matrix.markFailed(cell);
       return r;

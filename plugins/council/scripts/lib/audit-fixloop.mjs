@@ -285,14 +285,23 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // remained unapplied — fresh PROPOSE-ONLY findings (architecture/SSOT/etc.) are expected not to
     // auto-apply and must NOT read as a stall (that would falsely stop with real fixes still open).
     const coverageComplete = rev?.coverage?.complete !== false;
-    const freshActionable = gate(freshFindings, { changedFiles, pass: passNo }).actionable.length;
+    // AUTO-FIXABLE = a localized finding the fixer can actually apply. A propose-only / cross-cutting
+    // finding (architecture/SSOT/logical) is offered to fix() only to be surfaced as a proposal — it
+    // NEVER auto-applies, so counting it as live work would (a) falsely read as a stall and (b) pin a
+    // per-tier stage forever: it recurs every pass, keeps `actionable` non-empty, and the tier never
+    // advances while a Tier-2 correctness bug behind it is never reached (council Codex C2 P1).
+    const autoFixable = (f) => f?.scope !== "cross-cutting" && f?.fixDisposition !== "propose-only";
+    const freshActionable = gate(freshFindings, { changedFiles, pass: passNo }).actionable.filter(autoFixable).length;
     dryStreak = freshFindings.length === 0 && coverageComplete ? dryStreak + 1 : 0;
     stalledStreak = freshActionable > 0 && freshFixed.length === 0 ? stalledStreak + 1 : 0;
-    // Advance to the next tier once the current one has nothing new to fix for K passes.
+    // Advance to the next tier once the current one has nothing new AUTO-FIXABLE for K passes AND the
+    // review's six-eyes coverage is complete (an incomplete grouped matrix still has cells to review —
+    // advancing then would declare "all tiers converged" over unreviewed work; council Codex C2 P1).
     if (perTier) {
-      const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier).length;
-      if (actionable.length > 0 || tierFresh > 0) tierDryStreak = 0;
-      else if ((tierDryStreak += 1) >= dryStop) {
+      const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier && autoFixable(f)).length;
+      const tierAuto = actionable.filter(autoFixable).length;
+      if (tierAuto > 0 || tierFresh > 0) tierDryStreak = 0;
+      else if (coverageComplete && (tierDryStreak += 1) >= dryStop) {
         currentTier += 1;
         tierDryStreak = 0;
         stalledStreak = 0; // a tier advance IS progress — never carry a stall from a done tier into the next (council B5 grok P1-b)

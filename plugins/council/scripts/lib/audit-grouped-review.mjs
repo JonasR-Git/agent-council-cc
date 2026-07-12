@@ -94,7 +94,7 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   // dispatch ~1000+ paid spawns; the operator sees the count (and any cap / oversize skip) up front.
   if (progress) {
     progress(
-      `  grouped review: ${models.length} seat(s) × ${groups.length} group(s) × ${files.length - unsupplied.length} file(s) → ${supplied.length} cell(s)` +
+      `  grouped review: ${models.length} seat(s) × ${groups.length} group(s) × ${files.length - noContent.size} file(s) → ${supplied.length} cell(s)` +
         `${capped ? `, capped to ${cells.length} (${dropped} deferred — raise --max-cells)` : ""}` +
         `${unsupplied.length ? `; ${unsupplied.length} file(s) too large or unreadable → coverage PARTIAL` : ""}`
     );
@@ -157,10 +157,16 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   // runMatrix is injected in a test → fall back to "all attempted files reviewed".
   const results = Array.isArray(matrixOut.results) ? matrixOut.results : [];
   const reviewedSet = new Set(results.filter((r) => r?.ok === true).map((r) => r?.cell?.file).filter(Boolean));
-  const attempted = files.filter((f) => !unsupplied.includes(f));
+  // A file with NO content (unsupplied OR a vacuously-clean 0-byte file) had no cells, so it is not a
+  // real review target — exclude it from attempted so an empty file is not miscounted as unitsFailed
+  // while coverage claims complete (council Opus O3).
+  const attempted = files.filter((f) => !noContent.has(f));
   const reviewedFiles = results.length ? attempted.filter((f) => reviewedSet.has(f)) : attempted;
 
-  const complete = capped || unsupplied.length > 0 ? false : Boolean(matrixOut.complete); // capped OR an unreviewed file → never full coverage
+  // capped OR an unsupplied (oversize/unreadable) file → never full coverage. When there were 0 cells
+  // to schedule AND nothing was unsupplied (every selected file was vacuously empty), the run IS
+  // vacuously complete — sixEyesComplete([]) is fail-closed false, so special-case it (council Codex C1).
+  const complete = capped || unsupplied.length > 0 ? false : cells.length === 0 ? true : Boolean(matrixOut.complete);
   return {
     findings: scoped.all,
     refuted: scoped.refuted ?? [],

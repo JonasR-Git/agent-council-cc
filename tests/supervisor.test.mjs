@@ -93,6 +93,19 @@ test("runSupervised is bounded by a wall-clock cap (never infinite on a stuck li
   assert.equal(out.supervisorStop, "wall-clock cap reached", "the 24h-style wall-clock branch is actually exercised");
 });
 
+test("runSupervised (council O4/G4): a review that CANNOT run repeatedly stops terminally, no ~24h thrash", async () => {
+  // A permanent quota is swallowed to a generic "review did not run" (resumable by text). Without the
+  // bound it would resume up to maxAttempts/wall-clock; the did-not-run streak caps it fast.
+  let calls = 0;
+  let clock = 0;
+  const out = await runSupervised(
+    async () => { calls += 1; return { stopReason: "review did not run on pass N (backends unavailable or rate-limited)" }; },
+    { sleep: async (ms) => { clock += ms; }, now: () => clock, maxDidNotRun: 3, maxAttempts: 1000, baseMs: 60_000 }
+  );
+  assert.match(out.supervisorStop, /could not run 3 attempts/, "bounded by the did-not-run streak, not maxAttempts");
+  assert.equal(calls, 3, "gave up after 3 consecutive did-not-run passes");
+});
+
 test("runSupervised: an explicit resumable:false forces a terminal stop even with a rate-limit stopReason", async () => {
   let calls = 0;
   const out = await runSupervised(async () => { calls += 1; return { stopReason: "rate-limited", resumable: false }; }, { sleep: async () => { throw new Error("must not wait"); } });

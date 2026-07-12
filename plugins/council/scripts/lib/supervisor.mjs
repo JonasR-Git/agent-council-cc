@@ -64,12 +64,18 @@ export function phaseOfTier(tier) {
  * `sleep`/`now` are injectable for tests; `onWait` reports each backoff. Returns the last pass
  * result plus `attempts` and `supervisorStop`.
  */
-export async function runSupervised(runPass, { maxAttempts = 100, maxWallClockMs = 24 * 3600_000, baseMs, maxMs, factor, sleep, now, onWait } = {}) {
+export async function runSupervised(runPass, { maxAttempts = 100, maxWallClockMs = 24 * 3600_000, maxDidNotRun = 3, baseMs, maxMs, factor, sleep, now, onWait } = {}) {
   if (typeof runPass !== "function") throw new Error("runSupervised requires a runPass function");
   const doSleep = sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const clock = now ?? (() => Date.now());
   const started = clock();
   let attempt = 0;
+  // A PERMANENT quota/billing exhaustion is swallowed to ok:false at the cell layer (not thrown), so
+  // the loop reports a generic "review did not run" stopReason — indistinguishable from a transient
+  // outage by text alone. isResumableStop would then resume it up to maxAttempts/24h, thrashing on an
+  // unrecoverable billing failure (council Opus O4 / Grok G4). Bound consecutive did-not-run resumes:
+  // if the review can't run for maxDidNotRun tries in a row, no amount of waiting will help → terminal.
+  let didNotRunStreak = 0;
   let last = null;
   let resume = false;
   while (attempt < Math.max(1, maxAttempts)) {
@@ -96,6 +102,12 @@ export async function runSupervised(runPass, { maxAttempts = 100, maxWallClockMs
         ? false
         : last?.resumable === true || isResumableStop(stop) || Boolean(last?.err && isRateLimitError(last.err));
     if (!resumable) return { ...last, attempts: attempt, supervisorStop: last?.done ? "done" : "terminal" };
+    // Give up on a review that CANNOT run repeatedly (permanent quota / persistent outage): waiting
+    // longer won't fix billing exhaustion. A genuine transient limit clears within a window or two.
+    didNotRunStreak = DID_NOT_RUN_RE.test(stop ?? "") ? didNotRunStreak + 1 : 0;
+    if (didNotRunStreak >= Math.max(1, maxDidNotRun)) {
+      return { ...last, attempts: attempt, supervisorStop: `terminal — the review could not run ${didNotRunStreak} attempts in a row (likely permanent quota/outage, not a transient limit)` };
+    }
     if (clock() - started >= maxWallClockMs) return { ...last, attempts: attempt, supervisorStop: "wall-clock cap reached" };
     const waitMs = resetAwareWaitMs(last?.err ?? stop, attempt, { baseMs, maxMs, factor });
     if (onWait) {
