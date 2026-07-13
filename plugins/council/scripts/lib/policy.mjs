@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { workspaceRoot } from "./state.mjs";
+import { loadCouncilEnv } from "./dotenv.mjs";
 
 export const DEFAULT_POLICY = {
   version: 1,
@@ -153,6 +154,9 @@ function coerceScalar(s) {
 
 export function loadPolicy(cwd) {
   const root = workspaceRoot(cwd);
+  // Auto-load a gitignored `.council.env` (local secrets like OPENROUTER_API_KEY) into the environment
+  // BEFORE anything reads it — convenience, fail-soft, never overrides an explicit shell export.
+  loadCouncilEnv(root);
   const candidates = [
     path.join(root, ".council.yml"),
     path.join(root, ".council.yaml"),
