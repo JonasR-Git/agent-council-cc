@@ -3,12 +3,16 @@
 version: 1
 
 # Pinned per-repo (matching ~/.codex/config.toml + ~/.grok/config.toml).
-# Codex reasoning effort (xhigh) comes from ~/.codex/config.toml model_reasoning_effort.
+# Codex reasoning effort (high) comes from ~/.codex/config.toml model_reasoning_effort.
 # If the Grok login temporarily loses a pinned model, runGrokStructured retries
 # once with CLI defaults instead of failing the round.
 codex_model: gpt-5.6-sol
 grok_model: grok-4.5
 grok_effort: high
+# Claude seat: spawn an independent Fable 5 reviewer (buildClaudeArgs defaults --effort xhigh) instead of
+# the driving session — so the autonomous audit loop gets a real 6-eyes Claude seat.
+claude_backend: spawn
+claude_model: claude-fable-5
 
 # Default slash mode hint for humans/skills: review | deliberate
 default_mode: deliberate
