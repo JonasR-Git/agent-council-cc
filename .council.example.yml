@@ -82,3 +82,29 @@ verify_findings: false
 # Override per run with --force-budget. Reads the same limits as `usage --limits`
 # (implies a live network call to the Claude usage endpoint).
 budget_guard: 0
+
+# --------------------------------------------------------------------------
+# OpenRouter — optional EXTRA seats (up to 5) that join six-eyes alongside
+# the built-in Claude/Codex/Grok. Each configured model becomes its own seat:
+# it finds independently, refutes, AND raises the §6 patch-gate unanimity bar
+# (every configured seat must confirm a patch before auto-apply).
+#
+# SECURITY: the API key is read ONLY from the environment variable named below
+# (default OPENROUTER_API_KEY) — NEVER from this file. This file is read from the
+# (untrusted) repo, so a key here would ship your source to that key's account.
+# Set the key in your environment:
+#     export OPENROUTER_API_KEY=sk-or-v1-...        (bash/zsh, current shell)
+#     setx OPENROUTER_API_KEY "sk-or-v1-..."        (Windows, persistent — new shells)
+#     $env:OPENROUTER_API_KEY="sk-or-v1-..."        (PowerShell, current session)
+# Without the key the seats are parsed but stay INACTIVE (available:false).
+#
+# Model entry forms (flat list — YAML nesting is not parsed):
+#   - vendor/model                      → auto id  (or-vendor-model)
+#   - myid=vendor/model                 → custom seat id (or-myid)
+#   - myid=vendor/model@high            → + reasoning effort
+# openrouter_models:
+#   - tencent/hy3:free                  # a FREE model — good for a wiring test
+#   - deepseek/deepseek-chat
+#   - coder=qwen/qwen-2.5-coder-32b-instruct@high
+openrouter_api_key_env: OPENROUTER_API_KEY
+# openrouter_base_url: https://openrouter.ai/api/v1   # default; only openrouter.ai or a loopback proxy

@@ -36,3 +36,12 @@ deliberate_peer: true
 
 # xhigh reviews of large diffs regularly exceed 30min (observed: codex timeout in acceptance run)
 agent_timeout_minutes: 90
+
+# OpenRouter extra seats (join six-eyes + raise the §6 bar). The API key is read ONLY
+# from $OPENROUTER_API_KEY — never from this file. Without the key these stay inactive.
+# Add up to 5. Verified working end-to-end with tencent/hy3:free (a free model).
+openrouter_api_key_env: OPENROUTER_API_KEY
+openrouter_models:
+  - tencent/hy3:free
+  # - deepseek/deepseek-chat
+  # - coder=qwen/qwen-2.5-coder-32b-instruct@high
