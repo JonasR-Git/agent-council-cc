@@ -64,12 +64,18 @@ const DEFAULT_LIMITS = Object.freeze({
   maxFileBytes: 300_000 // per authored file; a bigger reply is a malformed unit, not a big fix
 });
 
-function normalizeLimits(limits = {}) {
+export function normalizeLimits(limits = {}) {
   const int = (v, def, min, max) => (Number.isFinite(v) ? Math.max(min, Math.min(max, Math.floor(v))) : def);
+  // A caller may only TIGHTEN a bound, never RAISE it (the no-escape-hatch invariant). The review
+  // budget is DEFAULT_LIMITS.maxDiffBytes and the disclosed-content clamp is the same, so a caller who
+  // could raise maxDiffBytes past the default would make the council VETO gate admit a diff of which the
+  // seats are only ever shown the first 60k — reviewing a truncated tail, exactly what the oversized-diff
+  // veto exists to prevent (council final, Grok P2). So every ceiling here is the DEFAULT, not a big
+  // absolute — a supplied value can only lower it.
   return {
-    maxWallClockMs: int(limits?.maxWallClockMs, DEFAULT_LIMITS.maxWallClockMs, 1, 24 * 3_600_000),
-    maxDiffBytes: int(limits?.maxDiffBytes, DEFAULT_LIMITS.maxDiffBytes, 1, 10_000_000),
-    maxFileBytes: int(limits?.maxFileBytes, DEFAULT_LIMITS.maxFileBytes, 1, 10_000_000)
+    maxWallClockMs: int(limits?.maxWallClockMs, DEFAULT_LIMITS.maxWallClockMs, 1, DEFAULT_LIMITS.maxWallClockMs),
+    maxDiffBytes: int(limits?.maxDiffBytes, DEFAULT_LIMITS.maxDiffBytes, 1, DEFAULT_LIMITS.maxDiffBytes),
+    maxFileBytes: int(limits?.maxFileBytes, DEFAULT_LIMITS.maxFileBytes, 1, DEFAULT_LIMITS.maxFileBytes)
   };
 }
 

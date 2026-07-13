@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { buildPoisonedSource, captureObservable, changedLinesCovered, makeNodeCharHarness, POISON_SENTINEL } from "../plugins/council/scripts/lib/chartest-node-harness.mjs";
+import { buildExportPoisonedSource, buildPoisonedSource, captureObservable, changedExportsFor, changedLinesCovered, makeNodeCharHarness, POISON_SENTINEL } from "../plugins/council/scripts/lib/chartest-node-harness.mjs";
 import { exportSnapshot } from "../plugins/council/scripts/lib/audit-snapshot.mjs";
 import { runCommandAsync } from "../plugins/council/scripts/lib/process.mjs";
 
@@ -206,7 +206,171 @@ test("executesTarget DEGRADES HONESTLY when the coverage document is empty: pois
   const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [1], source: ORIGINAL_SRC, coverageDir: "/cov", readCoverage: () => null, runCommand: poisonAwareRun(files), readFile, writeFile });
   assert.equal(await h.executesTarget(), true, "dependence established by the probe when coverage is unavailable");
   assert.ok(h.notes.some((n) => /changed-line coverage unavailable/.test(n)), "the degradation is DISCLOSED — never claimed as measured line coverage");
+  assert.ok(h.notes.some((n) => /PER-EXPORT/.test(n) && /'f'/.test(n)), "the changed line was attributed to export 'f' and measured at EXPORT granularity");
   assert.equal(files.get(TARGET_ABS), ORIGINAL_SRC, "restored");
+});
+
+// ---------------------------- PER-EXPORT POISON PROBE (the granularity fix) ----------------------------
+// The whole-module probe proves the test depends on the MODULE — but a test that exercises export A used
+// to false-green a change in export B. The per-export probe attributes the CHANGED lines to the export
+// region they fall inside, poisons ONLY that export (every other export keeps its real implementation),
+// and requires the same hashed test's outcome to differ. Un-attributable changes degrade to the
+// whole-module probe WITH a disclosure note — coarser granularity is said, never silently claimed finer.
+
+const AB_SRC = [
+  "export function a() {", // 1
+  "  return 1;", //           2
+  "}", //                     3
+  "export function b() {", // 4
+  "  return 2;", //           5
+  "}", //                     6
+  ""
+].join("\n");
+
+const MULTI_SRC = [
+  'import path from "node:path";', //   1 — module-level code BEFORE the first export (unattributable)
+  "", //                                2
+  "export function a() {", //           3
+  "  return 1;", //                     4
+  "}", //                               5
+  "export const K = 7;", //             6
+  "export default function main() {", //7
+  "  return a() + K;", //               8
+  "}", //                               9
+  ""
+].join("\n");
+
+test("changedExportsFor attributes changed lines to the export region they fall inside (region = decl → next export/EOF)", () => {
+  assert.deepEqual(changedExportsFor(MULTI_SRC, [4]).exports, ["a"], "a body line belongs to its export");
+  assert.deepEqual(changedExportsFor(MULTI_SRC, [6]).exports, ["K"], "a one-line const export is its own region");
+  assert.deepEqual(changedExportsFor(MULTI_SRC, [4, 8]).exports, ["a", "default"], "lines across two exports name both (default included)");
+  assert.equal(changedExportsFor(MULTI_SRC, []).exports, null, "no changed lines → nothing to attribute → fail closed");
+  const before = changedExportsFor(MULTI_SRC, [1]);
+  assert.equal(before.exports, null, "a line before the first export cannot be attributed");
+  assert.match(before.reason, /outside every export region/, "with the honest cause");
+  assert.equal(changedExportsFor(MULTI_SRC, [999]).exports, null, "a line past EOF cannot be attributed → fail closed");
+  const opaque = changedExportsFor('export * from "./x.mjs";\n', [1]);
+  assert.equal(opaque.exports, null, "a star re-export surface is un-enumerable");
+  assert.match(opaque.reason, /un-enumerable/);
+  const listForm = changedExportsFor("function a() {\n  return 1;\n}\nexport { a };\n", [4]);
+  assert.equal(listForm.exports, null, "a list-export region cannot be singly poisoned");
+  assert.match(listForm.reason, /cannot be singly poisoned/);
+});
+
+test("buildExportPoisonedSource poisons ONLY the named export — every other export keeps its REAL implementation", () => {
+  const v = buildExportPoisonedSource(AB_SRC, "b");
+  assert.ok(v.includes(POISON_SENTINEL), "the poisoned export throws the sentinel");
+  assert.match(v, /export \{ __councilPoison__ as b \};/, "b's binding is the poison");
+  assert.ok(v.includes("export function a() {"), "a stays REALLY exported and implemented");
+  assert.ok(v.includes("  return 2;"), "b's real body stays defined (internally callable — no load-time explosion)");
+  assert.ok(!/as a \}/.test(v), "a's binding is NOT poisoned");
+  assert.deepEqual(exportSnapshot(v).names, exportSnapshot(AB_SRC).names, "the enumerable surface is IDENTICAL");
+  // the default export: a NAMED default declaration keeps its module-scope binding (internal refs stay real)
+  const d = buildExportPoisonedSource(MULTI_SRC, "default");
+  assert.ok(d.includes("export default __councilPoison__;"), "the default binding is the poison");
+  assert.match(d, /\nfunction main\(\) \{/, "the real declaration survives un-exported, name intact");
+  assert.equal(exportSnapshot(d).hasDefault, true, "default preserved on the surface");
+  assert.deepEqual(exportSnapshot(d).names, exportSnapshot(MULTI_SRC).names, "named surface unchanged");
+  // an ANONYMOUS default (expression form) has no module-scope binding to preserve → a plain const keeps
+  // the expression (and any side effects) evaluated while the default binding becomes the poison
+  const anon = buildExportPoisonedSource("export default { v: 1 };\nexport const K = 2;\n", "default");
+  assert.ok(anon.includes("const __councilRealDefault__ = { v: 1 };"), "the expression stays evaluated, un-exported");
+  assert.ok(anon.includes("export default __councilPoison__;"), "and the default binding is the poison");
+  assert.deepEqual(exportSnapshot(anon).names, ["K"], "the sibling named export is untouched");
+});
+
+test("buildExportPoisonedSource fails CLOSED (null) on unknown names, opaque surfaces and surface-drifting transforms", () => {
+  assert.equal(buildExportPoisonedSource(AB_SRC, "nope"), null, "an unknown export cannot be poisoned");
+  assert.equal(buildExportPoisonedSource(AB_SRC, "b; import x"), null, "a non-identifier name is rejected (no twin injection)");
+  assert.equal(buildExportPoisonedSource('export * from "./x.mjs";\n', "a"), null, "opaque surface → no twin");
+  // un-exporting `export const a = 1, b = 2` would silently DROP b from the twin (whose import then fails
+  // at LINK time → a spurious outcome difference → false accept). exportSnapshot is single-name-blind for
+  // multi-declarators, so the snapshot compare CANNOT see it — the declarator scan must reject instead.
+  assert.equal(buildExportPoisonedSource("export const a = 1, b = 2;\n", "a"), null, "multi-declarator → surface drift → null");
+  // and the scan is bracket-depth aware: commas INSIDE the single initializer do not reject
+  assert.ok(buildExportPoisonedSource("export const cfg = { x: 1, y: [1, 2] };\nexport const other = 3;\n", "cfg"), "inner commas are not declarators");
+});
+
+// A run simulating a test that exercises ONLY export `a`: it fails exactly when the CURRENT on-disk
+// target poisons a's binding (the per-export twin for `a`, or the whole-module twin, which poisons all).
+const exercisesOnlyA = (files) => async () => (String(files.get(TARGET_ABS) ?? "").includes("as a };")
+  ? { status: 1, stdout: `not ok 1 - ${POISON_SENTINEL}`, timedOut: false }
+  : { status: 0, stdout: 'TAP version 13\n{"v":1}\nok 1', timedOut: false });
+
+test("PER-EXPORT PROBE rejects a test that exercises export A when the change is in export B (the gap this closes)", async () => {
+  const { files, readFile, writeFile } = memFs({ [TARGET_ABS]: AB_SRC });
+  // sanity: the WHOLE-MODULE probe accepts this test (it does depend on the module via `a`) — which is
+  // exactly why module granularity could not attest the changed REGION and this bar had to exist
+  const hModule = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", runCommand: exercisesOnlyA(files), readFile, writeFile });
+  assert.equal(await hModule.executesModule(), true, "module-level dependence holds (the old, too-coarse signal)");
+  // the changed line (5) is inside export b — poisoning ONLY b leaves the a-exercising test green → reject
+  const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [5], source: AB_SRC, runCommand: exercisesOnlyA(files), readFile, writeFile });
+  assert.equal(await h.executesTarget(), false, "unchanged outcome with only 'b' poisoned → the changed region is NOT exercised");
+  assert.ok(h.notes.some((n) => /does not exercise the changed export 'b'/.test(n)), "the HONEST cause names the un-exercised export");
+  assert.equal(files.get(TARGET_ABS), AB_SRC, "the target is restored byte-for-byte");
+});
+
+test("PER-EXPORT PROBE accepts a test that exercises the changed export, and requires EVERY changed export to be exercised", async () => {
+  const { files, readFile, writeFile } = memFs({ [TARGET_ABS]: AB_SRC });
+  const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [2], source: AB_SRC, runCommand: exercisesOnlyA(files), readFile, writeFile });
+  assert.equal(await h.executesTarget(), true, "poisoning the changed export 'a' flips the outcome → the region is exercised");
+  assert.ok(h.notes.some((n) => /PER-EXPORT/.test(n) && /'a'/.test(n) && /line granularity not established/.test(n)), "export granularity is claimed, line granularity honestly NOT");
+  assert.equal(files.get(TARGET_ABS), AB_SRC, "restored");
+  // a change spanning BOTH exports: 'a' is exercised but 'b' is not → the whole check rejects
+  const both = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [2, 5], source: AB_SRC, runCommand: exercisesOnlyA(files), readFile, writeFile });
+  assert.equal(await both.executesTarget(), false, "one un-exercised changed export fails the whole check");
+  assert.ok(both.notes.some((n) => /does not exercise the changed export 'b'/.test(n)));
+  assert.equal(files.get(TARGET_ABS), AB_SRC, "restored after the multi-export probe too");
+});
+
+test("PER-EXPORT PROBE degrades to the WHOLE-MODULE probe — and SAYS SO — when the changed lines cannot be attributed", async () => {
+  // the changed line sits in a module-level helper ABOVE the first export: no export region contains it
+  const HELPER_SRC = [
+    "function helper() {", // 1
+    "  return 5;", //          2  ← the changed line
+    "}", //                    3
+    "export function a() {", //4
+    "  return helper();", //   5
+    "}", //                    6
+    ""
+  ].join("\n");
+  const { files, readFile, writeFile } = memFs({ [TARGET_ABS]: HELPER_SRC });
+  const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [2], source: HELPER_SRC, runCommand: poisonAwareRun(files), readFile, writeFile });
+  assert.equal(await h.executesTarget(), true, "module dependence still attested by the whole-module probe");
+  assert.ok(h.notes.some((n) => /per-export granularity NOT established/.test(n)), "the degradation is DISCLOSED — never a silent finer claim");
+  assert.ok(h.notes.some((n) => /outside every export region/.test(n)), "with the attribution cause");
+  assert.equal(files.get(TARGET_ABS), HELPER_SRC, "restored");
+});
+
+test("PER-EXPORT PROBE on an un-enumerable surface degrades AND the whole-module probe still fails closed", async () => {
+  const STAR_SRC = 'export * from "./x.mjs";\n';
+  const { files, readFile, writeFile } = memFs({ [TARGET_ABS]: STAR_SRC });
+  const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [1], source: STAR_SRC, runCommand: okRun("ok 1"), readFile, writeFile });
+  assert.equal(await h.executesTarget(), false, "opaque surface → neither probe can attest → fail closed");
+  assert.ok(h.notes.some((n) => /per-export granularity NOT established/.test(n)), "the degrade is recorded");
+  assert.ok(h.notes.some((n) => /cannot fake the target's export surface/.test(n)), "and the whole-module probe's own honest cause too");
+  assert.equal(files.get(TARGET_ABS), STAR_SRC, "the target is untouched");
+});
+
+test("PER-EXPORT PROBE restores the target byte-for-byte even when the poisoned run THROWS, and fails closed on a timeout", async () => {
+  const { files, readFile, writeFile } = memFs({ [TARGET_ABS]: AB_SRC });
+  let call = 0;
+  const throwing = async () => {
+    call += 1;
+    if (call === 1) return { status: 0, stdout: '{"v":1}', timedOut: false }; // the real baseline run
+    throw new Error("spawn exploded mid-probe");
+  };
+  const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [2], source: AB_SRC, runCommand: throwing, readFile, writeFile });
+  await assert.rejects(() => h.executesTarget(), /spawn exploded/, "the fault propagates (the gate fails it closed)");
+  assert.equal(files.get(TARGET_ABS), AB_SRC, "the finally-restore ran: no poisoned tree even on a thrown per-export run");
+  // an incomplete (timed-out) per-export run is never an approval
+  const b = memFs({ [TARGET_ABS]: AB_SRC });
+  let n = 0;
+  const timingOut = async () => (n++ === 0 ? { status: 0, stdout: '{"v":1}', timedOut: false } : { status: 0, stdout: "", timedOut: true });
+  const ht = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [2], source: AB_SRC, runCommand: timingOut, readFile: b.readFile, writeFile: b.writeFile });
+  assert.equal(await ht.executesTarget(), false, "a timed-out per-export run → fail closed");
+  assert.ok(ht.notes.some((nn) => /did not complete/.test(nn)));
+  assert.equal(b.files.get(TARGET_ABS), AB_SRC, "restored after the timed-out run");
 });
 
 test("makeNodeCharHarness SANDBOXES the test run with the Node permission model (council Grok P0 — RCE)", async () => {
@@ -379,6 +543,55 @@ test("INTEGRATION: the POISON PROBE accepts a genuine char-test and rejects an i
     assert.equal(await hTaut.executesModule(), false, "import-unused + assert 1===1 → identical pass under poison → rejected");
     assert.ok(hTaut.notes.some((n) => /does not depend on the target/.test(n)), "and the reject cause is the honest one");
     assert.equal(fs.readFileSync(targetFile, "utf8"), targetSource, "target intact after the rejecting probe too");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("INTEGRATION: the PER-EXPORT probe rejects a real test that exercises export A when the change is in export B, under the REAL default sandbox", { timeout: 120_000 }, async () => {
+  // The whole-module probe was blind to WHERE inside the module the change landed: a test exercising
+  // `add` attested a change inside `mul`. Per-export poisoning closes that — with the SAME test, the SAME
+  // full sandbox, and no inspector.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chartest-harness-it-perexport-"));
+  try {
+    const targetFile = path.join(dir, "target.mjs");
+    const targetSource = [
+      "export function add(a, b) {", // 1
+      "  return a + b;", //             2
+      "}", //                           3
+      "export function mul(a, b) {", // 4
+      "  return a * b;", //             5
+      "}", //                           6
+      ""
+    ].join("\n");
+    fs.writeFileSync(targetFile, targetSource, "utf8");
+    const realFs = { readFile: (p) => fs.readFileSync(p, "utf8"), writeFile: (p, s) => fs.writeFileSync(p, s, "utf8") };
+    const testFile = path.join(dir, "target.chartest.mjs");
+    fs.writeFileSync(
+      testFile,
+      [
+        'import test from "node:test";',
+        'import assert from "node:assert/strict";',
+        'import { add } from "./target.mjs";', // mul is never touched
+        "",
+        'test("add characterization", () => {',
+        "  const observed = add(2, 3);",
+        "  console.log(JSON.stringify({ sum: observed }));",
+        "  assert.equal(observed, 5);",
+        "});"
+      ].join("\n"),
+      "utf8"
+    );
+    // the change is in mul (line 5) but the test only exercises add → REJECT (this used to pass)
+    const hWrong = makeNodeCharHarness({ cwd: dir, testFile, targetFile, changedLines: [5], source: targetSource, runCommand: realRunCommand, timeoutMs: 20_000, ...realFs });
+    assert.equal(await hWrong.executesTarget(), false, "a change in 'mul' is NOT attested by an add-only test");
+    assert.ok(hWrong.notes.some((n) => /does not exercise the changed export 'mul'/.test(n)), "the honest cause names the un-exercised export");
+    assert.equal(fs.readFileSync(targetFile, "utf8"), targetSource, "the target is byte-identical after the rejecting probe");
+    // the change is in add (line 2) and the test exercises add → ACCEPT, at disclosed export granularity
+    const hRight = makeNodeCharHarness({ cwd: dir, testFile, targetFile, changedLines: [2], source: targetSource, runCommand: realRunCommand, timeoutMs: 20_000, ...realFs });
+    assert.equal(await hRight.executesTarget(), true, "poisoning only 'add' fails the test → the changed region IS exercised");
+    assert.ok(hRight.notes.some((n) => /PER-EXPORT/.test(n) && /'add'/.test(n)), "the granularity note names the attributed export");
+    assert.equal(fs.readFileSync(targetFile, "utf8"), targetSource, "byte-identical after the accepting probe too");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

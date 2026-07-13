@@ -64,6 +64,15 @@ const STRUCTURE_PROTECTED_RE = [
   /(^|\/)node_modules(\/|$)/i,
   /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i,
   /(^|\/)(Cargo\.lock|go\.sum|poetry\.lock|composer\.lock|Gemfile\.lock)$/i,
+  // MANIFESTS + build output (council final, Grok P1): the gate covered LOCKfiles but not the manifest
+  // itself. With --structure-auto-apply a transform could list package.json in plannedTouched, no-op the
+  // test script or inject a malicious postinstall, and still pass testsGreen (the oracle is defeated by
+  // its own gutted script) and publicApi (the JS surface is unchanged) → it would land. package.json,
+  // Dockerfiles and generated build output are integrity-load-bearing, never a behaviour-preserving
+  // consolidation target. Kept in sync with plan-spec's PLAN_PROTECTED_RE + build-step's PROTECTED_RE.
+  /(^|\/)package\.json$/i,
+  /(^|\/)Dockerfile(\.[^/]*)?$/i,
+  /(^|\/)(dist|build|vendor|coverage)(\/|$)/i,
   /(^|\/)\.env(\.|$)/i,
   /(^|\/)\.council/,
   // TEST files are OFF-LIMITS (council C5 grok P1): a structural transform that rewrites a test could

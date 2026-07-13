@@ -61,6 +61,14 @@ test("validateTransformPlan (council codex P1): rejects repo-escape and protecte
   assert.match(validateTransformPlan({ ...plan, plannedTouched: [".github/workflows/ci.yml"] }).errors.join(), /protected path/);
   assert.match(validateTransformPlan({ ...plan, plannedTouched: ["package-lock.json"] }).errors.join(), /protected path/);
   assert.match(validateTransformPlan({ ...plan, plannedTouched: ["src/.env.local"] }).errors.join(), /protected path/);
+  // MANIFESTS + build output (council final, Grok P1): a transform listing package.json could no-op the
+  // test script (defeating the testsGreen oracle) or inject a postinstall and still pass the JS-surface
+  // check. package.json / Dockerfile / dist|build|vendor|coverage are never consolidation targets.
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: ["package.json"] }).errors.join(), /protected path/);
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: ["packages/x/package.json"] }).errors.join(), /protected path/);
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: ["Dockerfile"] }).errors.join(), /protected path/);
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: ["dist/bundle.mjs"] }).errors.join(), /protected path/);
+  assert.match(validateTransformPlan({ ...plan, plannedTouched: ["build/out.mjs"] }).errors.join(), /protected path/);
   // a normal repo path is fine
   assert.equal(validateTransformPlan({ ...plan, plannedTouched: ["src/a.mjs", "src/b.mjs"] }).ok, true);
 });

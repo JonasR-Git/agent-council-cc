@@ -780,17 +780,17 @@ export async function runBuildStep({ step, planSpec = null, snapshot = null } = 
     }
     gates.coverage = { ok: true, files: Object.keys(requiredCoverage) };
 
-    // 8. Full suite green on the candidate — the step must not regress anything outside its test.
-    phase = "fullSuite";
-    const suite = await deps.runFullSuite();
-    b = budgetGate("the full suite");
-    if (b) return b;
-    if (suite?.ok !== true) return fail("fullSuite", "full suite RED on the candidate — the step regressed something outside its own test; reverted");
-    gates.fullSuite = { ok: true };
-
-    // 9. §6 council: every required seat reviews the SAME complete STAGED multi-file diff + the
-    // step + the hashed test + the RED/GREEN evidence. Oversized diff = VETO — a truncated tail is
-    // never reviewed (split the step instead). Unanimity or veto (missing/dissent/abstain/unknown).
+    // 8. §6 council FIRST — before the unsandboxed full suite (council P0, Grok BLOCK + Fable):
+    // RED/GREEN/coverage ran the model-authored test+impl UNDER the permission sandbox (the RCE
+    // control). The full suite, by contrast, runs `node --test`/`npm test` WITHOUT the sandbox, and it
+    // necessarily executes the model-authored IMPL (and auto-discovers the model-authored test file on
+    // disk) — a payload inert under the sandbox but active under plain node would get a free unsandboxed
+    // execution. Sandboxing the full suite would break legitimate user suites (they run the real impl),
+    // and excluding the test file cannot exclude the impl. So the ONLY sound containment is to make the
+    // §6 council — the design's trust anchor, which authorises the commit anyway — read and unanimously
+    // confirm the COMPLETE diff (impl + test bytes) BEFORE any of it runs unsandboxed. Every required
+    // seat reviews the SAME complete STAGED diff; an oversized diff is a VETO (a truncated tail is never
+    // reviewed — split the step). Unanimity or veto (missing/dissent/abstain/unknown).
     phase = "council";
     git.stageSet([...touched]);
     const reviewedDiff = String(git.diffCachedSet([...touched], snapshotRef) ?? "");
@@ -803,7 +803,9 @@ export async function runBuildStep({ step, planSpec = null, snapshot = null } = 
       snapshot: snapshotRef,
       red: { runs: limits.redRuns, assertionLevel: true, stdout: redStdout[0] ?? "" },
       green: { runs: limits.greenRuns },
-      fullSuite: { ok: true },
+      // The full suite runs AFTER this review now, so its result is not yet known — the council judges
+      // the diff + the sandboxed RED/GREEN evidence, and the full suite then gates the approved bytes.
+      fullSuite: { pending: true },
       testSha256: testHash
     };
     const verdicts = await deps.reviewStep({
@@ -828,6 +830,15 @@ export async function runBuildStep({ step, planSpec = null, snapshot = null } = 
     const council = evaluatePatchVerdicts(verdicts, { required: requiredPatchSeats(deps.backends ?? {}, {}) });
     gates.council = { ok: council.approved, summary: council.summary, confirms: council.confirms, dissents: council.dissents, abstains: council.abstains, missing: council.missing };
     if (!council.approved) return fail("council", `§6 council not unanimous (${council.summary}) — veto`);
+
+    // 9. Full suite green — now on COUNCIL-APPROVED bytes. The unsandboxed run only ever touches a diff
+    // that every required seat has read and confirmed, so no unreviewed model bytes execute unsandboxed.
+    phase = "fullSuite";
+    const suite = await deps.runFullSuite();
+    b = budgetGate("the full suite");
+    if (b) return b;
+    if (suite?.ok !== true) return fail("fullSuite", "full suite RED on the candidate — the step regressed something outside its own test; reverted");
+    gates.fullSuite = { ok: true };
 
     // 10. REVIEWED-BYTE BINDING: the review was async — re-check the changed set, the test hash,
     // and the staged diff BYTE-FOR-BYTE against what the council saw. The set is re-STAGED first so

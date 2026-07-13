@@ -4,8 +4,23 @@ import test from "node:test";
 import {
   buildTransformAuthorPrompt,
   buildTransformPlanPrompt,
+  normalizeLimits,
   runStructureTransform
 } from "../plugins/council/scripts/lib/structure-wiring.mjs";
+
+test("normalizeLimits: a caller may only TIGHTEN a bound, never RAISE it (council final Grok P2 — no escape hatch)", () => {
+  // The council VETO gate admits a diff up to maxDiffBytes but the seats are only ever SHOWN the first
+  // 60k (the disclosed-content clamp). A caller who could raise maxDiffBytes would make the gate review a
+  // TRUNCATED tail — exactly what the oversized-diff veto exists to prevent.
+  const raised = normalizeLimits({ maxDiffBytes: 5_000_000, maxFileBytes: 9_000_000, maxWallClockMs: 24 * 3_600_000 });
+  assert.equal(raised.maxDiffBytes, 60_000, "a supplied value ABOVE the default is clamped to the default");
+  assert.equal(raised.maxFileBytes, 300_000);
+  assert.ok(raised.maxWallClockMs <= 20 * 60_000, "the wall-clock ceiling cannot be raised either");
+  // ...but a caller CAN lower it
+  assert.equal(normalizeLimits({ maxDiffBytes: 10_000 }).maxDiffBytes, 10_000, "a smaller value tightens the bound");
+  // ...and the defaults hold when nothing is supplied
+  assert.equal(normalizeLimits().maxDiffBytes, 60_000);
+});
 
 // --- fixtures ------------------------------------------------------------------------------------
 
