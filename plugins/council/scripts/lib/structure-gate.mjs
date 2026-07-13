@@ -1,10 +1,12 @@
 // M9/C2 — council-gated STRUCTURE auto-fix.
 //
-// STATUS: STAGED — this gate is fully built + unit-tested but NOT yet wired into the live fix path (no
-// production importer; council fleet O2/C5/G5/F1). Structural findings still route through audit-fix's
-// generic propose-only path. Wire evaluateStructureGate + a multi-file transform generator before
-// enabling structureAutoApply. The security hardening below (double consent, strict testsGreen, path
-// protection) must hold BEFORE that wiring.
+// STATUS: WIRED (opt-in, double-consented). structure-wiring.mjs composes this gate with the multi-file
+// transform applier it was waiting for (build-step.mjs), runAuditFix runs the structure pass, and
+// council-companion exposes it as `audit fix --structure-auto-apply`. Reaching a live apply still needs
+// BOTH consents: structureAutoApply === true AND — for a §6-sensitive structural finding —
+// sensitiveAutoApply === true. Without them a structural finding stays exactly what it was: a proposal.
+// The security hardening below (double consent, strict testsGreen, path protection) is what makes that
+// wiring safe; do not weaken it.
 //
 // architecture_ssot / logical_sense fixes are MULTI-FILE, behaviour-preserving consolidations (dedup
 // an SSOT violation, merge parallel implementations, delete dead code). They are propose-only by
