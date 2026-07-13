@@ -22,6 +22,19 @@ const MODELS = ["claude", "codex", "grok"];
 const finitePct = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const numOr0 = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
+// D (fail-soft hole): a provider window whose reset timestamp is a VALID time clearly in the PAST beyond
+// a small grace is STALE — its percent is from a bygone window that has ALREADY reset, so it must never
+// drive a guard (for guard purposes stale == unknown). `graceMs` absorbs clock skew + a just-passed reset
+// (aligned with evaluatePause5h's just-reset grace). Conservative on purpose: a MISSING/unparseable
+// timestamp, or one in the FUTURE / within grace, is NOT stale — so FRESH data behaves exactly as before.
+const STALE_WINDOW_GRACE_MS = 15 * 60e3;
+function windowIsStale(resetsAt, nowMs, graceMs = STALE_WINDOW_GRACE_MS) {
+  if (resetsAt == null) return false;
+  const ms = Date.parse(resetsAt);
+  if (!Number.isFinite(ms)) return false;
+  return ms < nowMs - graceMs;
+}
+
 /**
  * Parse a `--usage-ceiling` value into `{ claude, codex, grok }` (each 1..100).
  * Forms (a missing model always falls back to its DEFAULT_CEILING value):
@@ -112,7 +125,7 @@ function codexFiveHourWindow(cd) {
  * snapshot. Token reading is independent (its own try/catch, degrading to zeros)
  * and never affects a model's availability.
  */
-export async function readUsageSnapshot({ homeDir, sinceMs, readers } = {}) {
+export async function readUsageSnapshot({ homeDir, sinceMs, readers, nowMs = Date.now() } = {}) {
   const R = readers && typeof readers === "object" ? readers : DEFAULT_READERS;
   const home = homeDir ?? "";
 
@@ -196,6 +209,21 @@ export async function readUsageSnapshot({ homeDir, sinceMs, readers } = {}) {
     }
   } catch {
     /* fail-soft: grok stays unavailable */
+  }
+
+  // D: drop any STALE window's percent (+ its stale reset) so BOTH guards fail-soft on it — evaluateCeiling
+  // never breaches on a null weekPercent and evaluatePause5h never pauses on a null fiveHourPercent. This
+  // is the SSOT for staleness: the pure evaluators stay untouched and inherit it. Only past-grace windows
+  // are dropped; `available` stays true (the provider IS reachable — just THIS window's number is dead).
+  for (const m of [claude, codex, grok]) {
+    if (windowIsStale(m.weekResetsAt, nowMs)) {
+      m.weekPercent = null;
+      m.weekResetsAt = null;
+    }
+    if ("fiveHourResetsAt" in m && windowIsStale(m.fiveHourResetsAt, nowMs)) {
+      m.fiveHourPercent = null;
+      m.fiveHourResetsAt = null;
+    }
   }
 
   return { claude, codex, grok };

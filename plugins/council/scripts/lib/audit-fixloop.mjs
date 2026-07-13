@@ -15,19 +15,16 @@ import path from "node:path";
 
 import { dedupeNew, endlessKey, endlessStopReason } from "./audit-endless.mjs";
 import { NOOP_REPORTER } from "./progress.mjs";
-import { evaluateCeiling, evaluatePause5h, readUsageSnapshot } from "./usage-guard.mjs";
+import { readUsageSnapshot } from "./usage-guard.mjs";
+import { MAX_AUTONOMOUS_WAIT_MS, evaluateBetweenPassGuards } from "./audit-loop-guards.mjs";
 import { retryOnRateLimit } from "./audit-retry.mjs";
 import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
 import { resolveStateDir, writeFileAtomic } from "./state.mjs";
-import { hashLite } from "./util.mjs";
 
-// The autonomous 5h pause waits IN-PROCESS to a KNOWN future reset. Cap the wait so a wrong/rolled
-// resetsAt can never turn into an indefinite/absurd sleep: max = maxAheadMs (5h15m) + the pause buffer
-// (2m). evaluatePause5h already refuses to mark anything past this bound schedulable; this is the
-// belt-and-suspenders bound at the sleep site. NOTE: an in-process multi-hour wait is FRAGILE — the
-// machine/terminal must stay up — but the checkpoint written FIRST makes a mid-wait death --resume-able.
-const MAX_AUTONOMOUS_WAIT_MS = 5 * 3600e3 + 17 * 60e3;
+// NOTE: an in-process multi-hour autonomous pause wait is FRAGILE — the machine/terminal must stay up —
+// but the checkpoint written FIRST makes a mid-wait death --resume-able. The MAX_AUTONOMOUS_WAIT_MS
+// bound + the between-pass guard DECISION now live in audit-loop-guards.mjs (SSOT with audit-endless).
 
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, Math.floor(Number.isFinite(n) ? n : lo)));
 
@@ -177,7 +174,6 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // in the checkpoint so it survives the non-autonomous exit/resume boundary).
   let pauseInfo = null;
   let pauseGuard = null;
-  const pauseWindowSig = (blockers) => blockers.map((b) => `${b.model}@${b.resetsAt ?? "?"}`).sort().join(",");
   // Per-tier convergence (§3): run each tier (0 logical -> 1 structure -> 2 correctness -> 3
   // quality) to dry before advancing, so a Structure consolidation lands before Correctness runs
   // on the consolidated code (a bug is then found once, post-consolidation, not N times across
@@ -255,6 +251,18 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     spent += Math.min(Math.max(0, a), totalBudget - spent);
   };
 
+  // The loop's terminal-stop decision, in ONE place (SSOT): per-tier convergence, the bounded stops
+  // (max passes / budget / dry — dry only in flat mode), and the flat-mode stall. Evaluated BOTH at the
+  // next loop head AND right after a pass completes (C / codex-4), so the between-pass ceiling/pause
+  // guards are skipped on an already-terminal final pass. Reads the live counters via closure.
+  const computeTerminalStop = () => {
+    if (perTier && currentTier > 3) return "all tiers converged (structure -> correctness -> quality)";
+    const bounded = endlessStopReason({ passNo, spent, dryStreak: perTier ? 0 : dryStreak }, { maxPasses, totalBudget, dryStop });
+    if (bounded) return bounded;
+    if (!perTier && stalledStreak >= dryStop) return `stalled — actionable findings remain but none are auto-applicable (${stalledStreak} passes)`;
+    return null;
+  };
+
   for (;;) {
     // Under per-tier staging the GLOBAL dry/stalled streaks are TIER-UNAWARE — they see findings
     // from ALL tiers while `fix` is only offered the CURRENT tier's set, so recurring later-tier
@@ -264,10 +272,8 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // dry/stalled apply only in flat (non-per-tier) mode.
     // Check per-tier CONVERGENCE first (council Codex C2 P2): a run that advances past the last tier
     // on the SAME iteration it also hits maxPasses/budget should report the meaningful "all tiers
-    // converged", not the generic ceiling — the tiers genuinely finished.
-    stopReason = perTier && currentTier > 3 ? "all tiers converged (structure -> correctness -> quality)" : null;
-    if (!stopReason) stopReason = endlessStopReason({ passNo, spent, dryStreak: perTier ? 0 : dryStreak }, { maxPasses, totalBudget, dryStop });
-    if (!stopReason && !perTier && stalledStreak >= dryStop) stopReason = `stalled — actionable findings remain but none are auto-applicable (${stalledStreak} passes)`;
+    // converged", not the generic ceiling — the tiers genuinely finished. (SSOT via computeTerminalStop.)
+    stopReason = computeTerminalStop();
     if (stopReason) break;
 
     passNo += 1;
@@ -402,6 +408,16 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     const cpState = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, stopReason: null, done: false };
     checkpoint(cpState);
 
+    // C (codex-4): if THIS pass already tripped a terminal stop, break now WITHOUT running the
+    // between-pass ceiling/pause guards — the run is ending regardless, so an exit-75 pause or a
+    // multi-hour autonomous sleep on an already-terminal final pass is pointless. The guards below run
+    // only when ANOTHER pass would actually execute. (Same reason the next loop head would compute.)
+    const terminalNow = computeTerminalStop();
+    if (terminalNow) {
+      stopReason = terminalNow;
+      break;
+    }
+
     // Between passes: honor --usage-ceiling on a CONFIRMED provider-quota breach. FAIL-SOFT —
     // a usage-read failure is treated as "not breached" (the loop continues); only an available
     // model at/over its ceiling stops the loop, never unknown/unavailable usage. Stash the snapshot
@@ -410,9 +426,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       try {
         const snap = await readUsage();
         reporter.usage?.(snap, usageCeiling);
-        const { breached, breaches } = evaluateCeiling(snap, usageCeiling);
-        if (breached) {
-          stopReason = `usage-ceiling: ${breaches.map((b) => `${b.model} ${b.percent}%≥${b.ceiling}% (${b.window})`).join(", ")}`;
+        const { ceiling } = evaluateBetweenPassGuards({ usageCeiling, snapshot: snap });
+        if (ceiling?.breached) {
+          stopReason = `usage-ceiling: ${ceiling.breaches.map((b) => `${b.model} ${b.percent}%≥${b.ceiling}% (${b.window})`).join(", ")}`;
           onProgress(stopReason);
           reporter.line(`⛔ ${stopReason}`);
           break;
@@ -431,35 +447,43 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
         const snap = await readUsage();
         reporter.usage?.(snap); // bare: refresh the live 5h numbers without clobbering any active ceiling
         const nowMs = nowFn();
-        const p = evaluatePause5h(snap, pause5h.threshold, { nowMs });
-        if (p.paused) {
-          const blockersDesc = p.blockers.map((b) => `${b.model} 5h ${b.percent}%≥${b.threshold}%`).join(", ");
-          const windowSig = pauseWindowSig(p.blockers);
+        // Shared DECISION (SSOT with audit-endless): schedulability + the anti-thrash window signature +
+        // the pauseId. Durable progress here = MORE committed fixes than the last pause carried.
+        const { pause } = evaluateBetweenPassGuards({
+          pause5h,
+          snapshot: snap,
+          nowMs,
+          prevWindowSig: pauseGuard?.windowSig ?? null,
+          madeProgress: fixedAll.length > (pauseGuard?.fixedCount ?? 0),
+          pauseIdSeed: `${options.runId ?? ""}|${branch ?? ""}|${passNo}`
+        });
+        if (pause) {
+          const blockersDesc = pause.blockers.map((b) => `${b.model} 5h ${b.percent}%≥${b.threshold}%`).join(", ");
           // ANTI-THRASH: a resume that immediately re-pauses on the SAME 5h window with NO durable-fix
           // progress since that pause is a spin (a wrong reset time, or the window never actually
           // cleared). Hard-stop for manual attention instead of waiting/exiting into the same loop.
-          if (pauseGuard && pauseGuard.windowSig === windowSig && fixedAll.length <= (pauseGuard.fixedCount ?? 0)) {
+          if (pause.thrash) {
             stopReason = `quota-pause-manual: ${blockersDesc} — resumed but the same 5h window is still over threshold with no progress; stopping for manual attention`;
-            pauseInfo = { schedulable: false, resumeAt: null, blockers: p.blockers, threshold: pause5h.threshold, autonomous: Boolean(pause5h.autonomous), thrash: true, pauseId: hashLite(`${options.runId ?? ""}|${branch ?? ""}|${passNo}|thrash|${windowSig}`) };
+            pauseInfo = { schedulable: false, resumeAt: null, blockers: pause.blockers, threshold: pause5h.threshold, autonomous: Boolean(pause5h.autonomous), thrash: true, pauseId: pause.pauseId };
             reporter.line(`⏸ ${stopReason}`);
             onProgress(stopReason);
             checkpoint({ ...cpState, pauseGuard, stopReason, done: false });
             break;
           }
           // Remember this pause so the NEXT iteration / resume can detect a no-progress re-pause.
-          pauseGuard = { windowSig, fixedCount: fixedAll.length, passNo };
+          pauseGuard = { windowSig: pause.windowSig, fixedCount: fixedAll.length, passNo };
 
           // AUTONOMOUS + schedulable: wait IN-PROCESS to the KNOWN future reset, then continue the loop
           // (the next pass re-reads usage). Checkpoint FIRST so a mid-wait process death stays
           // --resume-able. Only a valid, bounded future wait — never an indefinite/absurd sleep.
-          if (pause5h.autonomous && p.schedulable) {
-            const resumeMs = Date.parse(p.resumeAt);
+          if (pause5h.autonomous && pause.schedulable) {
+            const resumeMs = Date.parse(pause.resumeAt);
             const waitMs = Number.isFinite(resumeMs) ? Math.max(0, resumeMs - nowMs) : NaN;
             if (Number.isFinite(waitMs) && waitMs <= MAX_AUTONOMOUS_WAIT_MS) {
               pauseGuard.autonomous = true;
               checkpoint({ ...cpState, pauseGuard, stopReason: null, done: false });
-              reporter.line(`⏸ autonomous: waiting until ${p.resumeAt} for ${blockersDesc} reset`);
-              onProgress(`⏸ autonomous: waiting until ${p.resumeAt} for ${blockersDesc} reset`);
+              reporter.line(`⏸ autonomous: waiting until ${pause.resumeAt} for ${blockersDesc} reset`);
+              onProgress(`⏸ autonomous: waiting until ${pause.resumeAt} for ${blockersDesc} reset`);
               await sleepFn(waitMs);
               continue; // resume the loop in-process; do NOT exit
             }
@@ -469,10 +493,10 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
           // NON-autonomous (or autonomous-but-unschedulable): clean stop between passes carrying a
           // resume contract. The companion emits the contract + exit 75 from pauseInfo; the loop is
           // already back-on-base + --resume-able.
-          stopReason = p.schedulable
-            ? `quota-pause: ${blockersDesc} — resume ${p.resumeAt}`
+          stopReason = pause.schedulable
+            ? `quota-pause: ${blockersDesc} — resume ${pause.resumeAt}`
             : `quota-pause-manual: ${blockersDesc} — reset time not schedulable, resume manually`;
-          pauseInfo = { schedulable: p.schedulable, resumeAt: p.resumeAt, blockers: p.blockers, threshold: pause5h.threshold, autonomous: Boolean(pause5h.autonomous), pauseId: hashLite(`${options.runId ?? ""}|${branch ?? ""}|${passNo}|${p.resumeAt ?? "manual"}`) };
+          pauseInfo = { schedulable: pause.schedulable, resumeAt: pause.resumeAt, blockers: pause.blockers, threshold: pause5h.threshold, autonomous: Boolean(pause5h.autonomous), pauseId: pause.pauseId };
           reporter.line(`⏸ ${stopReason}`);
           onProgress(stopReason);
           checkpoint({ ...cpState, pauseGuard, stopReason, done: false });

@@ -114,7 +114,7 @@ function printUsage() {
       "    audit fix --loop [--deep] [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]   (autonomous fix-until-dry on an isolated branch)",
       "      --deep : ONE flag for max analysis depth — grouped six-eyes over the full lens partition (incl. SSOT/architecture), completeness critic, char-test gate, budget auto-sized to a full sweep. Auto-apply stays explicit (--structure-auto-apply/--sensitive-auto-apply).",
       "      --usage-ceiling : WEEKLY hard stop on a confirmed per-model quota breach (default 40/50/40). --pause-at-5h : SOFT pause on the 5h window, ON BY DEFAULT at 85% (a plain run pauses safely with a manual-resume contract; `off` disables, `<pct>` retunes, `auto` waits in-process to the reset then resumes itself).",
-      "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume]   (bounded review/propose loop)",
+      "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume] [--groups fine|tier|lens] [--max-cells <n>] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]   (bounded review/propose loop)",
       "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/council-companion.mjs cancel [job-id]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
@@ -2081,15 +2081,26 @@ async function computeFixReportMeta(cwd, out, ctx = {}) {
  * emitted resume argv re-invokes the companion with `--resume` appended (idempotent). `state`
  * distinguishes a schedulable pause ("pause_requested") from a manual stop ("manual_stop"); both exit 75.
  */
-export function buildPausePayload(out, { baseBranch = null, cwd = null, argv = [], observedAt } = {}) {
-  const pz = (out && out.pause) || {};
+export function buildResumeArgv(argv) {
+  // The resume argv BOTH the machine payload (resume.argv) and the human resume hint reuse: the
+  // original audit tokens + --resume (idempotent). Keeping them derived from ONE place is what makes a
+  // copied stderr line carry the run's original flags exactly like the JSON contract (grok-hint / F).
   const resumeArgv = ["audit", ...(Array.isArray(argv) ? argv : [])];
   if (!resumeArgv.includes("--resume")) resumeArgv.push("--resume");
+  return resumeArgv;
+}
+
+export function buildPausePayload(out, { baseBranch = null, cwd = null, argv = [], observedAt } = {}) {
+  const pz = (out && out.pause) || {};
   return {
     schemaVersion: 1,
     event: "council.pause.v1",
     state: pz.schedulable ? "pause_requested" : "manual_stop",
     reason: "quota_5h",
+    // A THRASH stop (resume→re-pause on the SAME still-full 5h window with no progress) and a plain
+    // unschedulable-timestamp stop are BOTH manual_stop; `thrash` distinguishes them for a machine
+    // consumer without breaking the v1 schema (additive field, grok-thrash / E).
+    thrash: pz.thrash === true,
     runId: out?.branch ?? baseBranch ?? null,
     pauseId: pz.pauseId ?? null,
     pass: out?.passesRun ?? 0,
@@ -2097,8 +2108,61 @@ export function buildPausePayload(out, { baseBranch = null, cwd = null, argv = [
     blockers: (pz.blockers ?? []).map((b) => ({ model: b.model, usedPercent: b.percent, threshold: b.threshold, resetsAt: b.resetsAt ?? null })),
     observedAt: observedAt ?? nowIso(),
     resumeAt: pz.resumeAt ?? null,
-    resume: { cwd, argv: resumeArgv }
+    resume: { cwd, argv: buildResumeArgv(argv) }
   };
+}
+
+/**
+ * Emit a --pause-at-5h clean stop (a NON-autonomous pause, or an autonomous one whose reset was not
+ * schedulable) and set EXIT 75 (EX_TEMPFAIL). Shared by BOTH loops (fix-loop + endless) so the resume
+ * CONTRACT never forks: --json prints the machine `council.pause.v1` payload, else a human resume line.
+ * `argv` is the raw audit-subcommand argv (buildPausePayload appends --resume); `resumeHint` is the
+ * exact human re-run command for THIS subcommand. The caller MUST `return` right after (skip the normal
+ * report — a pause is neither a crash nor a completion).
+ */
+function emitPauseContract(out, { baseBranch = null, cwd = null, argv = [], json = false } = {}) {
+  process.exitCode = 75;
+  const pz = out.pause ?? {};
+  const nArgv = normalizeArgv(argv);
+  if (json) {
+    outputResult(buildPausePayload(out, { baseBranch, cwd, argv: nArgv }), true);
+    return;
+  }
+  const blockersDesc = (pz.blockers ?? []).map((b) => `${b.model} 5h ${b.percent}%≥${b.threshold}%`).join(", ");
+  // The human resume hint reuses the run's ORIGINAL audit argv + --resume (SSOT with the JSON
+  // resume.argv via buildResumeArgv), so a copied stderr line keeps --usage-ceiling / --max-passes /
+  // etc. instead of the flag-less `audit fix --loop --resume` it printed before (grok-hint / F).
+  const self = process.argv[1] ?? "council-companion.mjs";
+  // Shell-quote any token containing whitespace so a copied resume line survives paths with spaces
+  // (e.g. --doc-path "C:/My Reports/a.md") in PowerShell/sh — the JSON resume.argv keeps token
+  // boundaries on its own, this is the human line's equivalent (F).
+  const shellQuote = (tok) => (/\s/.test(String(tok)) ? `"${tok}"` : String(tok));
+  const resumeHint = `node ${shellQuote(self)} ${buildResumeArgv(nArgv).map(shellQuote).join(" ")}`;
+  // A schedulable pause resumes at a known time. An UNSCHEDULABLE one (schedulable:false) is one of two
+  // different things and must not be mislabelled: a THRASH stop (resume→re-pause on the SAME still-full
+  // 5h window with no new progress) vs a genuinely unschedulable reset timestamp (grok-thrash / E).
+  const tail = pz.schedulable
+    ? `resume ${pz.resumeAt}; resume with: ${resumeHint}`
+    : pz.thrash
+      ? `resume manually — the same 5h window is still over threshold with no new progress; resume with: ${resumeHint}`
+      : `resume manually — reset time not schedulable; resume with: ${resumeHint}`;
+  console.error(`⏸ Paused safely after pass ${out.passesRun ?? 0}: ${blockersDesc}; ${tail}${out.stranded ? ` (note: could not return to ${baseBranch} — a resume will continue on ${out.branch})` : ""}`);
+}
+
+/**
+ * Finalize a review/fix loop's live telemetry (progress.json), shared by BOTH loops (SSOT). A
+ * --pause-at-5h stop is NEITHER a completion NOR a crash — it is SUSPENDED, exiting 75 pending a
+ * --resume. Reporting it done+ok (the old order ran reporter.done BEFORE the out.pause branch) made the
+ * dashboard show a paused run as finished-green (codex-5). On a pause we stamp a distinct terminal
+ * "paused" phase with ok:null (NOT done+ok) so a watcher reads SUSPENDED yet still stops polling;
+ * otherwise the run finalizes done with the caller's ok. PURE w.r.t. the reporter (it just forwards).
+ */
+export function finalizeLoopReporter(reporter, out, { ok = null, stopReason = null } = {}) {
+  if (out && out.pause) {
+    reporter.done({ ok: null, stopReason: stopReason ?? out.stopReason ?? null, phase: "paused" });
+    return;
+  }
+  reporter.done({ ok, stopReason: stopReason ?? out?.stopReason ?? null });
 }
 
 async function handleAudit(argv) {
@@ -2576,7 +2640,9 @@ async function handleAudit(argv) {
         out.stranded = co.status !== 0;
       }
       recordAuditMetrics(cwd, "fixloop", { wallClockMs: Date.now() - tLoop, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, proposed: out.proposed?.length ?? 0, passes: out.passesRun ?? 0, spent: out.spent ?? 0 }, nowIso());
-      reporter.done({ ok: !out.stranded && !supervisorCrashed, stopReason: out.stopReason });
+      // B: finalize telemetry via the shared helper — a --pause-at-5h stop (out.pause, below) is recorded
+      // as a distinct "paused" phase, NOT done+ok, so the dashboard never shows a suspended run as done.
+      finalizeLoopReporter(reporter, out, { ok: !out.stranded && !supervisorCrashed, stopReason: out.stopReason });
       // A crash or a failed return-to-base is a HARD failure: non-zero exit so automation never reads it
       // as success. On a crash, surface it and stop before the report renderers (which assume loop fields).
       if (supervisorCrashed) {
@@ -2592,16 +2658,7 @@ async function handleAudit(argv) {
       // crashed. Do NOT print the normal fix-loop report (that would imply completion). The plugin only
       // EMITS the contract — the orchestrator (not the plugin) creates any durable resume cron.
       if (out.pause) {
-        process.exitCode = 75;
-        const pz = out.pause;
-        if (options.json) {
-          outputResult(buildPausePayload(out, { baseBranch, cwd, argv: normalizeArgv(argv) }), true);
-          return;
-        }
-        const blockersDesc = (pz.blockers ?? []).map((b) => `${b.model} 5h ${b.percent}%≥${b.threshold}%`).join(", ");
-        const resumeCmd = `node ${process.argv[1] ?? "council-companion.mjs"} audit fix --loop --resume`;
-        const tail = pz.schedulable ? `resume ${pz.resumeAt}; resume with: ${resumeCmd}` : "resume manually — reset time not schedulable";
-        console.error(`⏸ Paused safely after pass ${out.passesRun ?? 0}: ${blockersDesc}; ${tail}${out.stranded ? ` (note: could not return to ${baseBranch} — a resume will continue on ${out.branch})` : ""}`);
+        emitPauseContract(out, { baseBranch, cwd, argv, json: options.json });
         return;
       }
       if (out.stranded) process.exitCode = 1;
@@ -2806,6 +2863,27 @@ async function handleAudit(argv) {
       if (!Number.isFinite(n) || n < 1) throw new Error("--dry-streak must be a positive number");
       dryStreak = Math.floor(n);
     }
+    // --usage-ceiling / --pause-at-5h: the SAME two quota guards the fix `--loop` path honours, now wired
+    // into the review-only endless loop (mirrors the fix path: same parsers, same default-on 85% pause,
+    // same two note lines). Present-but-empty ("") = the bare flag → the default; absent --usage-ceiling
+    // → no ceiling. The bare-flag → `=` normalization ran once up front (preArgv), so it already applies
+    // to this subcommand. parseUsageCeiling / parsePause5hOption validate + throw fail-fast here.
+    const endlessUsageCeiling = options["usage-ceiling"] != null ? parseUsageCeiling(options["usage-ceiling"]) : undefined;
+    if (endlessUsageCeiling && !options.json) {
+      console.error(`note: --usage-ceiling active — the loop STOPS between passes on a confirmed quota breach (claude ${endlessUsageCeiling.claude}% / codex ${endlessUsageCeiling.codex}% / grok ${endlessUsageCeiling.grok}%). Unknown/unavailable usage never stops it.`);
+    }
+    const endlessPause5h = parsePause5hOption(options["pause-at-5h"]);
+    if (!options.json) {
+      if (endlessPause5h.enabled) {
+        console.error(`note: --pause-at-5h active — the loop PAUSES between passes when an available model's 5h window is ≥ ${endlessPause5h.threshold}% (${endlessPause5h.autonomous ? "AUTONOMOUS: waits in-process to the reset then resumes itself" : "safe stop with a manual-resume contract, exit 75"}). Disable with --pause-at-5h off. Unknown/unavailable usage never pauses.`);
+      } else {
+        console.error("note: --pause-at-5h off — the 5h soft-pause safety is DISABLED for this run (the run will not pause when the 5h window fills).");
+      }
+    }
+    // A best-effort current branch for the resume contract's runId + the paused message (endless writes
+    // no code, so this is only a label — a detached HEAD / non-git dir degrades to "" harmlessly).
+    const endlessBB = await runCommandAsync("git", ["branch", "--show-current"], { cwd, timeoutMs: 10_000 });
+    const endlessBaseBranch = endlessBB.status === 0 ? endlessBB.stdout.trim() : "";
     // Each pass advances the hotspot window (progressive coverage) and skips the global reduce after
     // pass 1 (its input is the static map — identical every pass — so re-running it just re-charges
     // budget). With --groups the pass is the cell-granular grouped review whose passComplete gates the
@@ -2838,7 +2916,9 @@ async function handleAudit(argv) {
         reporter: passReporter // live per-unit/cell progress inside a pass; findings folding stays with runEndless
       });
     const tEndless = Date.now();
-    const endlessOpts = { budget, maxPasses, dryStreak, reporter, onProgress: reporter.line };
+    // usageSince (captured at handleAudit entry) bounds the token scan to spend SINCE the run began;
+    // runId keys the pause contract's pauseId. Both guards ride into runEndless via the shared helper.
+    const endlessOpts = { budget, maxPasses, dryStreak, usageCeiling: endlessUsageCeiling, usageSince, pause5h: endlessPause5h, runId: endlessBaseBranch, reporter, onProgress: reporter.line };
     // C3/M10: --supervise survives rate-limit resets across a multi-hour endless review.
     const out = options.supervise
       ? await runSupervised(
@@ -2850,7 +2930,16 @@ async function handleAudit(argv) {
     // A clean convergence (max passes / budget / diminishing returns) is ok; an endless run that ended
     // on a review-error / did-not-run / failed stopReason is NOT — mirror how plan/build derive ok from
     // the outcome rather than hardcoding true (which would flag a dead run green on the dashboard).
-    reporter.done({ ok: endlessRunOk(out.stopReason), stopReason: out.stopReason });
+    // B: finalize via the shared helper — a --pause-at-5h stop (out.pause, below) is recorded as a
+    // distinct "paused" phase, NOT done+ok, so a suspended run never reads finished-green on the dashboard.
+    finalizeLoopReporter(reporter, out, { ok: endlessRunOk(out.stopReason), stopReason: out.stopReason });
+    // --pause-at-5h clean stop: emit the SAME council.pause.v1 contract + EXIT 75 as the fix path (shared
+    // emitter). NOT a completion → do NOT write the doc or print the normal report. endless writes no
+    // code, so a --resume is a plain checkpoint resume (no branch to reconcile).
+    if (out.pause) {
+      emitPauseContract(out, { baseBranch: endlessBaseBranch, cwd, argv, json: options.json });
+      return;
+    }
     if (options.doc) {
       const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: `endless (${out.passesRun} passes)` }, { docPath: options["doc-path"] });
       if (!options.json) console.log(`Wrote proposals to ${docPath}`);

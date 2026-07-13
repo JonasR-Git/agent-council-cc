@@ -186,6 +186,38 @@ test("--pause-at-5h anti-thrash: a resume that re-pauses the SAME 5h window with
   assert.match(out.stopReason, /no progress/);
 });
 
+// --- C (codex-4): the between-pass guards must NOT run after an already-terminal FINAL pass -----------
+
+test("C: --max-passes 1 + over-threshold 5h → stops on max-passes with NO pause and NO in-process sleep", async () => {
+  // Before C the pause guard ran AFTER the last allowed pass, so an already-terminal autonomous run would
+  // pointlessly sleep for hours. Now the loop breaks on the terminal stop BEFORE the guard runs.
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: "bug" })], coverage: { budgetSpent: 1 } });
+  const fix = async (actionable) => ({ fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], branch: "council/x", changedFiles: ["a.mjs"], spent: 1 });
+  const sleeps = [];
+  const out = await runFixLoop(
+    "/x",
+    { budget: 40, maxPasses: 1, dryStreak: 5, pause5h: PAUSE_AUTO },
+    { review, fix, readUsage: async () => over5h(), now: () => NOWMS, sleep: async (ms) => sleeps.push(ms), checkpoint: noCheckpoint }
+  );
+  assert.equal(out.passesRun, 1);
+  assert.match(out.stopReason, /max passes/);
+  assert.equal(out.pause, undefined, "an already-terminal final pass must not pause (exit 75)");
+  assert.equal(sleeps.length, 0, "no pointless multi-hour sleep on a run that was ending anyway");
+});
+
+test("C: --max-passes 1 + over-CEILING snapshot → stops on max-passes, NOT usage-ceiling (no exit-75 on the terminal pass)", async () => {
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: "bug" })], coverage: { budgetSpent: 1 } });
+  const fix = async (actionable) => ({ fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], branch: "council/x", changedFiles: ["a.mjs"], spent: 1 });
+  const out = await runFixLoop(
+    "/x",
+    { budget: 40, maxPasses: 1, dryStreak: 5, usageCeiling: CEILING },
+    { review, fix, readUsage: async () => overCodexSnap(), checkpoint: noCheckpoint }
+  );
+  assert.equal(out.passesRun, 1);
+  assert.match(out.stopReason, /max passes/);
+  assert.ok(!/usage-ceiling/.test(out.stopReason ?? ""), "the ceiling guard does not run on an already-terminal final pass");
+});
+
 // --- reporter.usage round-trip (progress.mjs writer side) ---------------------
 test("reporter.usage round-trips a compact snapshot + ceiling; a bare call keeps the earlier ceiling", () => {
   const reporter = makeProgressReporter({ kind: "audit-fix-loop", stateDir: null });

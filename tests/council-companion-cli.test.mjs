@@ -7,6 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { makeProgressReporter } from "../plugins/council/scripts/lib/progress.mjs";
+
 // council-companion.mjs is a CLI entry point, so most findings can only be pinned by spawning it as
 // a subprocess - matching the pattern used by tests/release-fixes.test.mjs, tests/phase-d.test.mjs
 // and tests/setup-init.test.mjs (which this file does not modify). It additionally exports a few
@@ -542,6 +544,114 @@ test("buildPausePayload marks an UNSCHEDULABLE pause as manual_stop and never du
   assert.equal(p.resumeAt, null);
   assert.equal(p.blockers[0].usedPercent, 99);
   assert.deepEqual(p.resume.argv, ["audit", "fix", "--loop", "--resume"], "an already-present --resume is not doubled (idempotent)");
+});
+
+// --- B (codex-5): a paused run is NOT finalized as done+ok on the dashboard --------------------------
+
+test("B: finalizeLoopReporter records a paused run as a distinct 'paused' phase, NEVER done+ok", async () => {
+  const { finalizeLoopReporter } = await import(pathToFileURL(COMPANION).href);
+  const reporter = makeProgressReporter({ kind: "audit-fix-loop", stateDir: null });
+  const out = {
+    stopReason: "quota-pause: claude 5h 92%≥85% — resume 2026-07-13T02:02:00Z",
+    pause: { schedulable: true, resumeAt: "2026-07-13T02:02:00Z", blockers: [], pauseId: "x" }
+  };
+  // The caller passes ok:true (the fix path's !stranded && !crashed) — the helper must OVERRIDE it for a pause.
+  finalizeLoopReporter(reporter, out, { ok: true, stopReason: out.stopReason });
+  const s = reporter.snapshot();
+  assert.notDeepEqual({ done: s.done, ok: s.ok }, { done: true, ok: true }, "a paused run must never be recorded done+ok");
+  assert.notEqual(s.ok, true, "not finished-green");
+  assert.equal(s.phase, "paused", "the dashboard shows the run as SUSPENDED, not completed");
+  assert.equal(s.stopReason, out.stopReason);
+});
+
+test("B: finalizeLoopReporter finalizes a NON-paused run done with the caller's ok (unchanged behaviour)", async () => {
+  const { finalizeLoopReporter } = await import(pathToFileURL(COMPANION).href);
+  const reporter = makeProgressReporter({ kind: "audit-endless", stateDir: null });
+  finalizeLoopReporter(reporter, { stopReason: "reached max passes (3)" }, { ok: true, stopReason: "reached max passes (3)" });
+  const s = reporter.snapshot();
+  assert.equal(s.done, true);
+  assert.equal(s.ok, true);
+  assert.equal(s.phase, "done");
+  assert.equal(s.stopReason, "reached max passes (3)");
+});
+
+// --- E (grok-thrash): the pause payload/emitter distinguishes a thrash stop from an unschedulable one --
+
+test("E: buildPausePayload carries a `thrash` flag (thrash vs unschedulable-timestamp are both manual_stop)", async () => {
+  const { buildPausePayload } = await import(pathToFileURL(COMPANION).href);
+  const thrash = buildPausePayload(
+    { branch: "b", passesRun: 2, pause: { schedulable: false, thrash: true, resumeAt: null, blockers: [], pauseId: "t" } },
+    { baseBranch: "m", cwd: "/w", argv: ["fix", "--loop"] }
+  );
+  assert.equal(thrash.state, "manual_stop");
+  assert.equal(thrash.thrash, true, "a thrash stop is flagged in the machine payload");
+  const unsched = buildPausePayload(
+    { branch: "b", passesRun: 1, pause: { schedulable: false, resumeAt: null, blockers: [], pauseId: "u" } },
+    { baseBranch: "m", cwd: "/w", argv: ["fix", "--loop"] }
+  );
+  assert.equal(unsched.state, "manual_stop");
+  assert.equal(unsched.thrash, false, "a plain unschedulable-timestamp stop is NOT a thrash");
+  const sched = buildPausePayload(
+    { branch: "b", passesRun: 1, pause: { schedulable: true, resumeAt: "2026-07-13T02:02:00Z", blockers: [], pauseId: "s" } },
+    { baseBranch: "m", cwd: "/w", argv: [] }
+  );
+  assert.equal(sched.thrash, false, "a schedulable pause is not a thrash either");
+});
+
+// --- F (grok-hint): the human resume hint reuses the run's ORIGINAL flags (== JSON resume.argv) -------
+
+test("F: buildResumeArgv reuses the original audit argv + --resume, and is the SSOT for both hint + JSON", async () => {
+  const { buildResumeArgv, buildPausePayload } = await import(pathToFileURL(COMPANION).href);
+  const argv = ["fix", "--loop", "--usage-ceiling", "40/50/40", "--max-passes", "9"];
+  assert.deepEqual(
+    buildResumeArgv(argv),
+    ["audit", "fix", "--loop", "--usage-ceiling", "40/50/40", "--max-passes", "9", "--resume"],
+    "the run's original flags are preserved and --resume appended (not the flag-less hint of before)"
+  );
+  // The human hint (emitPauseContract builds `node <self> <buildResumeArgv...>`) and the JSON resume.argv
+  // now derive from ONE function — so a copied stderr line matches the machine contract exactly.
+  const p = buildPausePayload(
+    { branch: "b", passesRun: 1, pause: { schedulable: true, resumeAt: "t", blockers: [], pauseId: "x" } },
+    { baseBranch: "m", cwd: "/w", argv }
+  );
+  assert.deepEqual(p.resume.argv, buildResumeArgv(argv), "machine resume.argv and the human hint share one source (SSOT)");
+  assert.deepEqual(
+    buildResumeArgv(["endless", "--pause-at-5h", "auto:90"]),
+    ["audit", "endless", "--pause-at-5h", "auto:90", "--resume"],
+    "the endless subcommand's flags are preserved too"
+  );
+  assert.deepEqual(buildResumeArgv(["fix", "--loop", "--resume"]), ["audit", "fix", "--loop", "--resume"], "an existing --resume is idempotent");
+});
+
+// --- `audit endless` accepts + normalizes the two quota-guard flags at the CLI boundary -------------
+// The endless block's reviewer preflight throws BEFORE any spend when no seat is reachable, so a spawn
+// with all seats forced unreachable proves the flags PARSE and the endless path is reached — a bare
+// `--usage-ceiling`/`--pause-at-5h` normalized to `=` (not a "Missing value" parse error), a valued
+// `50/50/50` / `auto:90` accepted (not an unknown/invalid-value error). The parse→thread→honour path
+// itself is proven end-to-end at the library level in tests/audit-endless-usage.test.mjs.
+test("audit endless: valued --usage-ceiling 50/50/50 + --pause-at-5h auto:90 parse (reach the reviewer preflight)", (t) => {
+  withCli((workDir, baseEnv) => {
+    const fakeClaudeBin = makeAllSeatsUnreachable(workDir);
+    const env = { ...baseEnv, CLAUDE_BIN: fakeClaudeBin };
+    const res = spawnSync(process.execPath, [COMPANION, "audit", "endless", "--usage-ceiling", "50/50/50", "--pause-at-5h", "auto:90"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    if (isSandboxBlocked(res)) { t.skip("spawn blocked in this sandbox"); return; }
+    const err = String(res.stderr ?? "");
+    assert.match(err, /no callable reviewers/, "the flags parsed; endless reached its reviewer preflight");
+    assert.doesNotMatch(err, /Missing value|Unknown option|must be between|must be one of/, "no parse/validation error on the guard flags");
+    assert.notEqual(res.status, 0);
+  });
+});
+
+test("audit endless: BARE --usage-ceiling + --pause-at-5h are normalized (no 'Missing value' parse error)", (t) => {
+  withCli((workDir, baseEnv) => {
+    const fakeClaudeBin = makeAllSeatsUnreachable(workDir);
+    const env = { ...baseEnv, CLAUDE_BIN: fakeClaudeBin };
+    const res = spawnSync(process.execPath, [COMPANION, "audit", "endless", "--usage-ceiling", "--pause-at-5h"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    if (isSandboxBlocked(res)) { t.skip("spawn blocked in this sandbox"); return; }
+    const err = String(res.stderr ?? "");
+    assert.doesNotMatch(err, /Missing value for --usage-ceiling|Missing value for --pause-at-5h/, "the bare-flag → `=` normalization applies to the endless path too");
+    assert.match(err, /no callable reviewers/);
+  });
 });
 
 test("audit fix --loop --resume FAILS CLOSED on a dirty tree (resume_blocked, tree left untouched)", (t) => {

@@ -219,8 +219,10 @@ export function mergeProgressEvent(state, event) {
       next.done = true;
       next.ok = e.ok ?? null;
       next.stopReason = e.stopReason ?? null;
-      // Terminal phase mirrors the outcome; ok=null (unknown) still reads "done".
-      next.phase = e.ok === false ? "failed" : "done";
+      // Terminal phase mirrors the outcome; ok=null (unknown) still reads "done". An explicit
+      // `phase` overrides that default so a terminal-but-not-completed state (e.g. "paused": a
+      // --pause-at-5h suspend that exits 75 pending --resume) reads as SUSPENDED, not finished-green.
+      next.phase = e.phase ?? (e.ok === false ? "failed" : "done");
       break;
     default:
       break;
@@ -367,7 +369,7 @@ export function makeProgressReporter({
     }
     return apply({ type: "line", line: msg, max: maxRecentLines });
   };
-  reporter.done = ({ ok = null, stopReason = null } = {}) => apply({ type: "done", ok, stopReason });
+  reporter.done = ({ ok = null, stopReason = null, phase = null } = {}) => apply({ type: "done", ok, stopReason, phase });
   /** Deep copy of the current state - safe to hand out, never aliases internals. */
   reporter.snapshot = () => structuredClone(state);
 

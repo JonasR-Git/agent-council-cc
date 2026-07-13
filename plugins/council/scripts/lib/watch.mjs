@@ -422,7 +422,7 @@ export function colorize(text) {
 const COUNTER_KEYS = ["fixed", "proposed", "reverted", "skipped", "committed"];
 const SEAT_EMOJI = { reviewing: "🟢", done: "✅", idle: "⚪", voting: "🗳️", error: "🔴" };
 const GATE_EMOJI = { running: "🟡", pass: "✅", veto: "⛔" };
-const RUN_EMOJI = { running: "🟡", done: "🟢", failed: "🔴" };
+const RUN_EMOJI = { running: "🟡", done: "🟢", failed: "🔴", paused: "⏸️" };
 // What one "unit" means per kind (a build/plan reports steps; the rest report
 // generic work units). Unknown kinds fall back to "units".
 const UNIT_NOUN = { build: "steps", plan: "steps" };
@@ -504,6 +504,9 @@ function normalizeProgressState(state) {
     : [];
   const phase = asStr(s.phase, 32);
   const failed = s.ok === false || phase === "failed";
+  // A --pause-at-5h suspend is terminal-for-polling (done:true so watchers stop) but reads SUSPENDED,
+  // not finished-green — surface a distinct "paused" status so the dashboard shows ⏸️, not 🟢 (B residual).
+  const paused = !failed && phase === "paused";
   const done = failed || s.done === true || phase === "done";
   return {
     kind: asStr(s.kind, 40),
@@ -522,7 +525,7 @@ function normalizeProgressState(state) {
     etaMs: asNum(s.etaMs),
     recent,
     done,
-    status: failed ? "failed" : done ? "done" : "running",
+    status: failed ? "failed" : paused ? "paused" : done ? "done" : "running",
     stopReason: asStr(s.stopReason, 100)
   };
 }

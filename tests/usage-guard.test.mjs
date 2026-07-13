@@ -44,6 +44,12 @@ test("parseUsageCeiling: invalid inputs throw a clear Error", () => {
 
 // --- readUsageSnapshot: fake readers (incl. a throwing one) → fail-soft per model --
 
+// readUsageSnapshot became time-aware for the D stale-window fix (a window whose reset is clearly in the
+// past is dropped). These fixtures assert EXACT reset strings, so pin a `nowMs` BEFORE the fixture resets
+// (05:00Z / 07-20) → they stay FRESH and the normalization assertions remain deterministic regardless of
+// the real wall clock. This is not because the assertions were wrong — it pins the newly-added clock.
+const FRESH_NOW = Date.parse("2026-07-13T00:00:00Z");
+
 const fakeReaders = () => ({
   fetchClaudeLimits: async () => ({ fiveHour: { usedPercent: 6, resetsAt: "2026-07-13T05:00:00Z" }, sevenDay: { usedPercent: 1, resetsAt: "2026-07-20T00:00:00Z" } }),
   collectCodexRateLimits: () => ({ planType: "prolite", primary: { window: "weekly", usedPercent: 14, resetsAt: "2026-07-20T00:00:00Z" }, secondary: null }),
@@ -56,7 +62,7 @@ const fakeReaders = () => ({
 });
 
 test("readUsageSnapshot: all-available snapshot from fake readers is fully normalized", async () => {
-  const snap = await readUsageSnapshot({ homeDir: "/home/x", sinceMs: 0, readers: fakeReaders() });
+  const snap = await readUsageSnapshot({ homeDir: "/home/x", sinceMs: 0, readers: fakeReaders(), nowMs: FRESH_NOW });
   assert.equal(snap.claude.available, true);
   assert.equal(snap.claude.weekPercent, 1);
   assert.equal(snap.claude.fiveHourPercent, 6);
@@ -115,10 +121,57 @@ test("readUsageSnapshot: codex weekly window is picked even when it is the SECON
     primary: { window: "5h", usedPercent: 3, resetsAt: "2026-07-13T05:00:00Z" },
     secondary: { window: "weekly", usedPercent: 22, resetsAt: "2026-07-20T00:00:00Z" }
   });
-  const snap = await readUsageSnapshot({ homeDir: "/home/x", sinceMs: 0, readers });
+  const snap = await readUsageSnapshot({ homeDir: "/home/x", sinceMs: 0, readers, nowMs: FRESH_NOW });
   assert.equal(snap.codex.weekPercent, 22, "weekly comes from whichever window is labelled weekly");
   assert.equal(snap.codex.fiveHourPercent, 3, "the 5h window's percent is picked from whichever slot is labelled 5h");
   assert.equal(snap.codex.fiveHourResetsAt, "2026-07-13T05:00:00Z", "the active codex 5h window's reset clock is plumbed");
+});
+
+// --- D: STALE local quota windows fail-soft at the SNAPSHOT layer (SSOT — both evaluators inherit it) --
+// An OLD local record (window reset already in the past) must NEVER stop --usage-ceiling or force a
+// --pause-at-5h — stale == unknown for guard purposes. Fixed where the snapshot is assembled so the pure
+// evaluators stay untouched. The fix is CONSERVATIVE: only a PRESENT timestamp clearly past-grace is stale.
+
+const STALE_NOW = Date.parse("2026-07-13T12:00:00Z");
+const pastReset = "2026-07-13T00:00:00Z"; // 12h before STALE_NOW → clearly past the 15m grace → stale
+const futureReset = "2026-07-14T00:00:00Z"; // after STALE_NOW → fresh
+
+// codex WEEKLY at 80% (over a 50 ceiling) + claude 5h at 95% (over an 85 pause threshold); the two
+// window resets are parameterized so a test can make either window stale, fresh, or missing.
+const staleReaders = (weekReset, fiveReset) => ({
+  fetchClaudeLimits: async () => ({ fiveHour: { usedPercent: 95, resetsAt: fiveReset }, sevenDay: { usedPercent: 5, resetsAt: futureReset } }),
+  collectCodexRateLimits: () => ({ planType: "pro", primary: { window: "weekly", usedPercent: 80, resetsAt: weekReset }, secondary: null }),
+  collectGrokLimits: () => null,
+  collectAllTokenUsage: () => ({ claude: {}, codex: {}, grok: {} })
+});
+const CEIL = { claude: 40, codex: 50, grok: 40 };
+
+test("D stale window: a codex WEEKLY reset in the past drops weekPercent → evaluateCeiling does NOT breach", async () => {
+  const snap = await readUsageSnapshot({ homeDir: "/x", sinceMs: 0, readers: staleReaders(pastReset, futureReset), nowMs: STALE_NOW });
+  assert.equal(snap.codex.weekPercent, null, "a stale weekly window's percent is dropped (it is from a bygone window)");
+  assert.equal(snap.codex.available, true, "the provider stays available — only the dead window is dropped, not the model");
+  assert.equal(evaluateCeiling(snap, CEIL).breached, false, "a stale 80% weekly can never hard-stop the loop (fail-soft)");
+});
+
+test("D stale window: a claude 5h reset in the past drops fiveHourPercent → evaluatePause5h does NOT pause", async () => {
+  const snap = await readUsageSnapshot({ homeDir: "/x", sinceMs: 0, readers: staleReaders(futureReset, pastReset), nowMs: STALE_NOW });
+  assert.equal(snap.claude.fiveHourPercent, null, "a stale 5h window's percent is dropped");
+  assert.equal(evaluatePause5h(snap, 85, { nowMs: STALE_NOW }).paused, false, "a stale 95% 5h can never pause the loop (fail-soft)");
+});
+
+test("D FRESH data is unchanged: future resets still breach the ceiling and pause the 5h window (live path intact)", async () => {
+  const snap = await readUsageSnapshot({ homeDir: "/x", sinceMs: 0, readers: staleReaders(futureReset, futureReset), nowMs: STALE_NOW });
+  assert.equal(snap.codex.weekPercent, 80, "a future weekly reset is fresh → percent retained");
+  assert.equal(snap.claude.fiveHourPercent, 95, "a future 5h reset is fresh → percent retained");
+  assert.equal(evaluateCeiling(snap, CEIL).breached, true, "fresh over-ceiling still breaches exactly as before");
+  assert.equal(evaluatePause5h(snap, 85, { nowMs: STALE_NOW }).paused, true, "fresh over-threshold 5h still pauses exactly as before");
+});
+
+test("D conservative: a MISSING reset timestamp is NOT stale (missing != expired → percent retained)", async () => {
+  const snap = await readUsageSnapshot({ homeDir: "/x", sinceMs: 0, readers: staleReaders(null, null), nowMs: STALE_NOW });
+  assert.equal(snap.codex.weekPercent, 80, "no weekly reset timestamp → NOT treated as stale");
+  assert.equal(snap.claude.fiveHourPercent, 95, "no 5h reset timestamp → NOT treated as stale");
+  assert.equal(evaluateCeiling(snap, CEIL).breached, true, "a missing-timestamp breach still stops (behaviour unchanged)");
 });
 
 // --- evaluateCeiling: below / at / above, claude 5h, and unavailable-not-breached --
