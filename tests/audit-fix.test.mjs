@@ -650,3 +650,55 @@ test("runAuditFix never auto-fixes cross-cutting findings even in a real run", a
   assert.ok(!out.branch);
   assert.ok(out.rejected.some((r) => /cross-cutting/.test(r.reason)));
 });
+
+// --- M9 structure pass (double-consented, fail-closed) ------------------------
+
+const structural = (o) => ({ severity: "P1", scope: "cross-cutting", lens: "architecture_ssot", file: "a.mjs", title: "dedup the SSOT violation", ...o });
+
+test("M9: a structural finding stays PROPOSE-ONLY without the structureAutoApply consent (no transform runs)", async () => {
+  const git = fakeGit();
+  let ran = 0;
+  const out = await runAuditFix(tmp(), [structural()], {}, {}, baseDeps(git, {
+    runStructureTransform: async () => { ran += 1; return { ok: true, commit: "x" }; }
+  }));
+  assert.equal(ran, 0, "no consent → the transform runner is never even called");
+  assert.equal(out.fixed.length, 0);
+  assert.ok(out.rejected.some((r) => /propose-only/.test(r.reason)), "it stays a visible proposal");
+});
+
+test("M9: a structural finding stays PROPOSE-ONLY when no transform runner is injected (fail-closed)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [structural()], {}, { structureAutoApply: true }, baseDeps(git, {}));
+  assert.equal(out.fixed.length, 0, "consent alone does nothing without the machinery");
+  assert.ok(out.rejected.some((r) => /propose-only/.test(r.reason)));
+});
+
+test("M9: with BOTH the consent and the runner, an approved transform is APPLIED (and leaves the proposal list)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [structural()], {}, { structureAutoApply: true }, baseDeps(git, {
+    runStructureTransform: async () => ({ ok: true, commit: "s0m3c0mm1t", gates: { council: { approved: true } } })
+  }));
+  assert.equal(out.fixed.length, 1, "the structural finding was applied under the full gate ladder");
+  assert.equal(out.fixed[0].commit, "s0m3c0mm1t");
+  assert.equal(out.rejected.filter((r) => r.finding?.lens === "architecture_ssot").length, 0, "it is no longer a proposal");
+});
+
+test("M9: a transform the gate REFUSED keeps the finding proposed, with the reason appended (never silently dropped)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [structural()], {}, { structureAutoApply: true }, baseDeps(git, {
+    runStructureTransform: async () => ({ ok: false, reason: "§6 council not unanimous (dissent: grok)" })
+  }));
+  assert.equal(out.fixed.length, 0);
+  const entry = out.rejected.find((r) => r.finding?.lens === "architecture_ssot");
+  assert.ok(entry, "still surfaced as a proposal");
+  assert.match(entry.reason, /council not unanimous/, "the operator learns WHY it was not applied");
+});
+
+test("M9: a transform that cannot restore the tree ABORTS the run as stranded (never continues on a dirty tree)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [structural()], {}, { structureAutoApply: true }, baseDeps(git, {
+    runStructureTransform: async () => ({ ok: false, stranded: true, reason: "reset --hard failed" })
+  }));
+  assert.equal(out.ok, false);
+  assert.equal(out.stranded, true, "an unrestorable tree is fatal — a later fix must never stage un-reviewed bytes");
+});

@@ -7,6 +7,7 @@ import { fingerprintFinding, resolveLedgerEntry } from "./ledger.mjs";
 import { runCommand, runCommandAsync } from "./process.mjs";
 import { snapshotViolation } from "./audit-snapshot.mjs";
 import { evaluatePatchVerdicts } from "./audit-council-gate.mjs";
+import { isStructureClass } from "./structure-gate.mjs";
 import { requiredPatchSeats } from "./seats.mjs";
 import { retryOnRateLimit } from "./audit-retry.mjs";
 import { coverageOfLines, ingestCoverage, parseDiffLines } from "./audit-coverage-ingest.mjs";
@@ -561,7 +562,15 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     }
     return { ok: true, dryRun: true, branch: null, planned: plannedTasks, rejected, capped, fixed: [], failed: [], skipped: [], gated };
   }
-  if (!tasks.length) {
+  // M9: a run whose ONLY work is a STRUCTURAL transform has no single-file `tasks` (a structural finding
+  // is cross-cutting, so classifyFixable rejected it as propose-only) — but it is still real, consented
+  // work. Returning early here would silently skip it, so the early exit only applies when there is
+  // nothing to do at ALL.
+  const structuralPending =
+    typeof deps.runStructureTransform === "function" &&
+    options.structureAutoApply === true &&
+    rejected.some((r) => isStructureClass(r?.finding));
+  if (!tasks.length && !structuralPending) {
     return { ok: true, branch: null, fixed: [], failed: [], rejected, skipped: [], capped, gated, note: "no auto-fixable findings" };
   }
 
@@ -843,6 +852,45 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           }
           failed.push({ finding, file: task.file, reason: `fix error: ${String(err?.message ?? err)}` });
           log(`  reverted — ${String(err?.message ?? err)}`);
+        }
+      }
+    }
+
+    // M9 STRUCTURE PASS (opt-in, DOUBLE-consented): architecture_ssot / logical_sense findings are
+    // cross-cutting, so classifyFixable rejected them as propose-only above — the single-file writer
+    // could never apply a multi-file consolidation safely. deps.runStructureTransform (structure-wiring)
+    // now can: it plans the transform, applies it through the build-step machinery (declared file set =
+    // capability boundary, tests must stay green, §6 must be UNANIMOUS on the exact staged multi-file
+    // diff) and judges the result with evaluateStructureGate.
+    //
+    // FAIL-CLOSED + consent: nothing runs unless the transform runner is INJECTED *and* the operator set
+    // structureAutoApply === true (strict; a truthy string never grants it). structure-wiring itself
+    // enforces the SECOND consent (a structural finding that is also §6-sensitive additionally needs
+    // sensitiveAutoApply === true) and reverts on any gate failure. Without all of that, the finding
+    // stays exactly where it was: a visible proposal.
+    if (!fatalAbort && typeof deps.runStructureTransform === "function" && options.structureAutoApply === true) {
+      for (let i = rejected.length - 1; i >= 0; i -= 1) {
+        const entry = rejected[i];
+        if (!isStructureClass(entry?.finding)) continue;
+        const snapshot = git.head();
+        let res;
+        try {
+          res = await withLimitRetry(() => deps.runStructureTransform({ finding: entry.finding, snapshot }, { git, options, now: deps.now }));
+        } catch (err) {
+          res = { ok: false, reason: `structure transform error: ${String(err?.message ?? err)}` };
+        }
+        if (res?.stranded) {
+          fatalAbort = `structure transform left the tree unrestorable: ${res.reason ?? "unknown"}`;
+          log(`  ABORT — ${fatalAbort}`);
+          break;
+        }
+        if (res?.ok && res.commit) {
+          rejected.splice(i, 1); // it is no longer a proposal — it was applied under the full gate ladder
+          fixed.push({ finding: entry.finding, file: entry.finding.file ?? null, commit: res.commit, verified: true, structure: res.gates ?? null });
+          log(`  structure transform applied (${String(res.commit).slice(0, 8)}) — §6 unanimous, tests green`);
+        } else {
+          entry.reason = `${entry.reason} · structure transform not applied: ${res?.reason ?? "gate not satisfied"}`;
+          log(`  structure transform NOT applied — ${res?.reason ?? "gate not satisfied"}`);
         }
       }
     }
