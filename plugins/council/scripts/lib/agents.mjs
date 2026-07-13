@@ -328,10 +328,30 @@ async function runCodexCli(cwd, backends, options, prompt) {
   // on the user's ~/.codex/config.toml sandbox policy — so `council plan` (documented READ-ONLY) could
   // have let codex run model-generated shell commands with write access. read-only makes the three seats
   // symmetric: a review/plan seat may inspect the repo but never mutate it.
-  const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only"];
+  //
+  // --output-last-message writes ONLY the model's final message to a file, so we parse that instead of
+  // scraping it out of `codex exec`'s human stdout (session id / "user"/"codex" banners / "tokens used").
+  // --color never keeps the stream free of ANSI. `codex exec` is the reliable one-shot path — the
+  // codex-companion's app-server turn mode hangs with newer codex-cli versions (see runCodexStructured).
+  const lastMsgFile = path.join(os.tmpdir(), `council-codex-out-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+  const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never", "--output-last-message", lastMsgFile];
   if (options.codexModel) args.push("--model", options.codexModel);
   const result = await runCommandAsync(bin, args, { cwd, input: String(prompt ?? ""), timeoutMs: options.agentTimeoutMs });
-  return buildAgentResult("codex", "codex-cli-exec", result, { model: options.codexModel ?? "(default)" });
+  let finalMessage = "";
+  try {
+    finalMessage = fs.readFileSync(lastMsgFile, "utf8");
+  } catch {
+    /* fall back to stdout below */
+  } finally {
+    try {
+      fs.unlinkSync(lastMsgFile);
+    } catch {
+      /* ignore */
+    }
+  }
+  // Prefer the clean final-message file; fall back to raw stdout if codex wrote nothing to it.
+  const effective = finalMessage.trim() ? { ...result, stdout: finalMessage } : result;
+  return buildAgentResult("codex", "codex-cli-exec", effective, { model: options.codexModel ?? "(default)" });
 }
 
 /**
@@ -341,9 +361,18 @@ async function runCodexCli(cwd, backends, options, prompt) {
  * (it casts no vote and manufactures no review) rather than silently returning an empty "clean" result.
  */
 export async function runCodexStructured(cwd, backends, options, prompt, label) {
+  const cliReady = Boolean(backends.codex?.cli?.available);
+  // PREFER the standalone `codex exec` CLI when it is present. It is the reliable one-shot,
+  // non-interactive path (structured stdout, our own read-only sandbox). The codex-companion's `task`
+  // runs codex in APP-SERVER turn mode, which HANGS indefinitely with newer codex-cli versions
+  // (protocol/version drift — measured in this repo: the companion `task` timed out at 600s while
+  // `codex exec` returned in seconds). Set options.codexPreferCompanion to force the companion (e.g. a
+  // flow that genuinely needs its persistent-thread resume); by default the CLI wins whenever available.
+  if (cliReady && !options.codexPreferCompanion) return runCodexCli(cwd, backends, options, prompt);
+
   if (!backends.codex?.companionAvailable) {
     // No companion — but the standalone CLI is a first-class path, not a degraded one.
-    if (backends.codex?.cli?.available) return runCodexCli(cwd, backends, options, prompt);
+    if (cliReady) return runCodexCli(cwd, backends, options, prompt);
     return {
       agent: "codex",
       skipped: true,
