@@ -105,7 +105,8 @@ function printUsage() {
       "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
       "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
       "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--structure-auto-apply] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
-      "    audit fix --loop [--supervise] [--flat] [--chartest] [--max-passes <n>] [--dry-streak <n>] [--resume] [--allow-untested]   (autonomous fix-until-dry on an isolated branch)",
+      "    audit fix --loop [--deep] [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume]   (autonomous fix-until-dry on an isolated branch)",
+      "      --deep : ONE flag for max analysis depth — grouped six-eyes over the full lens partition (incl. SSOT/architecture), completeness critic, char-test gate, budget auto-sized to a full sweep. Auto-apply stays explicit (--structure-auto-apply/--sensitive-auto-apply).",
       "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume]   (bounded review/propose loop)",
       "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/council-companion.mjs cancel [job-id]",
@@ -1968,8 +1969,27 @@ async function computeFixReportMeta(cwd, out, ctx = {}) {
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest"]
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep"]
   });
+  // --deep: ONE flag for maximum ANALYSIS depth, so a thorough run needs no long flag list. It turns on
+  // the grouped six-eyes review over a FULL lens partition (every lens — incl. SSOT/architecture — gets
+  // its own deep pass, so none is starved), the completeness critic, and the char-test gate; and it
+  // auto-scales --budget to cover one full sweep (groups × units × 3 seats) so the agent-call budget
+  // never runs out before the later lenses. It deliberately does NOT enable any AUTO-APPLY consent
+  // (--structure-auto-apply / --sensitive-auto-apply stay explicit) — depth of analysis and permission
+  // to mutate are separate decisions. Each piece is only defaulted when not already set, so an explicit
+  // --groups fine / --budget still wins.
+  if (options.deep) {
+    if (options.groups == null) options.groups = "lens";
+    options.chartest = true;
+    options["completeness-critic"] = true;
+    if (options.budget == null) {
+      const GROUP_COUNT = { tier: 4, lens: 13, fine: 30 };
+      const groupN = GROUP_COUNT[String(options.groups)] ?? 13;
+      const maxU = options["max-units"] != null && Number.isFinite(Number(options["max-units"])) ? Math.max(1, Number(options["max-units"])) : 12;
+      options.budget = String(groupN * maxU * 3); // one full sweep: every lens group × every hotspot unit × 3 seats
+    }
+  }
   const cwd = process.cwd();
   // Validate the grouped-review preset + cap ONCE, up front — before any preflight/coverage/spend, for
   // EVERY audit subcommand (council R9 Codex P2 fail-fast + one-shot consistency). resolveLensGroups
