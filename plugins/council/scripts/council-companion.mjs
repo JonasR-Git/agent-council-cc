@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { READONLY_DISALLOWED_TOOLS, runDeliberation } from "./lib/deliberate.mjs";
-import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover.mjs";
+import { councilPluginRoot, findClaudeBinary, findGrokBinary, probeBackends } from "./lib/discover.mjs";
 import {
   DEFAULT_POLICY,
   loadPolicy,
@@ -46,7 +46,7 @@ import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
 import { runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
-import { makePatchReviewer, patchReviewerReady } from "./lib/audit-patch-reviewer.mjs";
+import { buildClaudeReviewArgs, makePatchReviewer, patchReviewerReady } from "./lib/audit-patch-reviewer.mjs";
 import { detectLogical } from "./lib/audit-logical.mjs";
 import { nodesFromGraph } from "./lib/import-graph.mjs";
 import { resolveAutonomy } from "./lib/audit-autonomy.mjs";
@@ -55,18 +55,20 @@ import { runEndless } from "./lib/audit-endless.mjs";
 import { runSupervised } from "./lib/supervisor.mjs";
 import { runAudit } from "./lib/audit-run.mjs";
 import { toSarif } from "./lib/audit-sarif.mjs";
-import { buildAgentResult, runStructuredWithRetry, withTempPrompt } from "./lib/agents.mjs";
+import { buildAgentResult, runCodexStructured, runGrokStructured, runStructuredWithRetry, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { writeFixReportHtml } from "./lib/fix-report-html.mjs";
 import { assembleFixMeta, changedFilesShape } from "./lib/fix-report-meta.mjs";
-import { openRouterBackend } from "./lib/openrouter-agent.mjs";
+import { openRouterBackend, runOpenRouterStructured } from "./lib/openrouter-agent.mjs";
 import { makeCharTestGate } from "./lib/chartest-wiring.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { runPlanDeliberation } from "./lib/plan-deliberate.mjs";
 import { isPlanTestPath, parsePlanSpec, planStepTouched, planSpecDigest, renderPlanMarkdown, requestDigest, validatePlanSpec } from "./lib/plan-spec.mjs";
 import { makeBuildGit, makeStepPorts, renderBuildReport, runBuild } from "./lib/build.mjs";
 import { buildReviewerReady, makeBuildStepReviewer } from "./lib/build-step-reviewer.mjs";
-import { activeSeatNames, makeSeatRunners } from "./lib/seats.mjs";
+import { activeSeatNames, makeSeatRunners, seatActive } from "./lib/seats.mjs";
+import { runStructureTransform } from "./lib/structure-wiring.mjs";
+import { snapshotViolation } from "./lib/audit-snapshot.mjs";
 import { buildPoisonedSource, changedLinesCovered } from "./lib/chartest-node-harness.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
 import {
@@ -101,7 +103,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs audit run|review|fix|endless [flags] (see below)",
       "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
       "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
-      "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
+      "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--structure-auto-apply] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
       "    audit fix --loop [--supervise] [--flat] [--chartest] [--max-passes <n>] [--dry-streak <n>] [--resume] [--allow-untested]   (autonomous fix-until-dry on an isolated branch)",
       "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume]   (bounded review/propose loop)",
       "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
@@ -1848,7 +1850,7 @@ async function computeFixReportMeta(cwd, out, ctx = {}) {
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest"]
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest"]
   });
   const cwd = process.cwd();
   // Validate the grouped-review preset + cap ONCE, up front — before any preflight/coverage/spend, for
@@ -2002,6 +2004,21 @@ async function handleAudit(argv) {
       fixMinSeverity = (SEVRANK[options["min-severity"]] ?? 2) <= (SEVRANK[auto.minSeverity] ?? 2) ? options["min-severity"] : auto.minSeverity;
     }
     if (!auto.apply && !options["dry-run"]) throw new Error("--autonomy propose-only: use `audit run` for a review-only pass (audit fix applies fixes)");
+
+    // M9 structure transform (opt-in --structure-auto-apply, strict === true): the ONE door to the
+    // multi-file structure transform (structure-wiring.mjs). Applies to BOTH the single-shot and the
+    // --loop path. Without the flag, NOTHING is threaded — the default runAuditFix options/deps stay
+    // byte-identical and structural findings remain propose-only proposals, exactly as before.
+    const structureAutoApply = options["structure-auto-apply"] === true;
+    if (structureAutoApply) {
+      console.error(
+        "M9 structure auto-apply ENABLED — cross-cutting architecture_ssot/logical_sense findings may be applied AUTONOMOUSLY as MULTI-FILE consolidations. Every transform must clear the full ladder (plan-declared file boundary, full test suite green, public API provably unchanged, UNANIMOUS §6 council over the exact staged multi-file diff) or it is reverted to a proposal."
+      );
+      console.error(
+        "⚠ SECURITY: the transform planner/author and the §6 reviewers run LLM CLIs inside this repository. --structure-auto-apply does NOT imply --sensitive-auto-apply — a structural finding that is ALSO §6-sensitive still needs BOTH consents. Enable --structure-auto-apply ONLY on repositories you trust."
+      );
+    }
+    const structureTransformRunner = structureAutoApply ? makeStructureTransformRunner(workspaceRoot(cwd), cwd, backends, merged) : null;
 
     // `audit fix --loop` (M3): the autonomous fix-until-dry loop. Reviews -> Tier-0
     // gates -> fixes the localized set on ONE isolated branch -> re-scopes to the blast
@@ -2175,7 +2192,15 @@ async function handleAudit(argv) {
         // ancestor and falsely promotes it to durable 'fixed' though it was never merged to base
         // (council Opus O7). Pin the real base for the ledger.
         ledgerBaseBranch: baseBranch
-      });
+      }, structureTransformRunner ? {
+        // M9: every loop pass fixes through runAuditFix — thread the structure consent + the
+        // transform runner into EACH pass exactly like the single-shot path does (mirrors how
+        // sensitiveAutoApply/reviewPatch ride the options above; makeFixLoopDeps itself threads
+        // only the §6 keys, so this impl seam is the loop's door). Absent the flag, no impl is
+        // passed at all and the loop's fix calls stay byte-identical.
+        runAuditFix: (fixCwd, fixFindings, fixBackends, fixOptions, fixDeps) =>
+          runAuditFix(fixCwd, fixFindings, fixBackends, { ...fixOptions, structureAutoApply: true }, { ...fixDeps, runStructureTransform: structureTransformRunner })
+      } : {});
       const tLoop = Date.now();
       // A12: bracket the loop with a token snapshot so the --html report can diff it into per-seat tokens
       // + an ≈cost. Only taken when a report will consume it (the scan reads session logs); the same
@@ -2319,8 +2344,14 @@ async function handleAudit(argv) {
       maxFixes,
       retryOnLimit: options["retry-on-limit"],
       retryLimit: singleRetryLimit,
+      // M9: the structure consent is added ONLY when --structure-auto-apply was passed, so the
+      // default options object stays byte-identical (structure-wiring re-checks === true anyway).
+      ...(structureTransformRunner ? { structureAutoApply: true } : {}),
       onProgress: options.json ? undefined : (m) => console.error(m)
-    }, singleCharTestGate ? { charTestGate: singleCharTestGate } : {});
+    }, {
+      ...(singleCharTestGate ? { charTestGate: singleCharTestGate } : {}),
+      ...(structureTransformRunner ? { runStructureTransform: structureTransformRunner } : {})
+    });
     if (!options["dry-run"]) {
       recordAuditMetrics(cwd, "fix", { wallClockMs: Date.now() - tFix, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, rejected: out.rejected?.length ?? 0, ledgerResolved: out.ledgerResolved ?? 0, integrationFailed: Boolean(out.integrationFailed) }, nowIso());
     }
@@ -3118,6 +3149,192 @@ export function makeBuildStepDeps(root, cwd, backends, options, buildGit) {
     // staged diff. Note the options are passed through UNTOUCHED — makeBuildStepReviewer itself
     // refuses under any skip flag and build-step computes the required set with EMPTY options.
     reviewStep: makeBuildStepReviewer(cwd, backends, options)
+  };
+}
+
+// --- M9 `audit fix --structure-auto-apply` REAL adapters (the CLI-owned deps of runStructureTransform)
+// structure-wiring.mjs owns the whole gate ladder (double consent → plan → author → drift → full
+// suite → public API → §6 unanimity → evaluateStructureGate → reviewed-byte binding → commit);
+// THIS wiring supplies its side-effect ports, all FAIL-CLOSED — a missing/erroring adapter surfaces
+// as a failed gate + verified rollback inside runStructureTransform, never as a soft-skipped gate.
+
+/**
+ * Parse a transform-PLAN reply into a plain object (raw JSON, fenced, or brace-extracted), or null.
+ * The reply is DATA — structure-wiring's validateTransformPlan is the sole judge of the content;
+ * this only rescues the transport shape (same salvage discipline as parseAuthoredFilesMap), and
+ * anything unparseable stays null so the finding remains propose-only (fail-closed).
+ */
+function parseTransformPlanObject(stdout) {
+  const raw = String(stdout ?? "").trim();
+  if (!raw) return null;
+  const candidates = [raw];
+  const fence = raw.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+  if (fence) candidates.push(fence[1].trim());
+  const first = raw.indexOf("{");
+  const last = raw.lastIndexOf("}");
+  if (first !== -1 && last > first) candidates.push(raw.slice(first, last + 1));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+      /* try the next extraction */
+    }
+  }
+  return null;
+}
+
+/**
+ * Build the CLI-owned deps for runStructureTransform (structure-wiring.mjs). Mirrors
+ * makeBuildStepDeps — and deliberately REUSES its pieces (makeStepPorts containment, the
+ * one-active-seat author pattern over makeSeatRunners, parseAuthoredFilesMap, the §6 seat
+ * postures) rather than inventing parallel ones. Exported so an integration test can drive the
+ * REAL adapters with only the model-facing ports faked.
+ */
+export function makeStructureTransformDeps(root, cwd, backends, options, buildGit) {
+  // Repo-contained fail-closed fs ports (the same construction makeBuildStepDeps uses): a symlink
+  // target or a path resolving outside the repo THROWS — structure-wiring turns that throw into a
+  // failed gate + verified rollback, never a read/write through a link out of the repo.
+  const ports = makeStepPorts(root);
+
+  // The ONE planning/authoring seat: the first ACTIVE seat, exactly how makeBuildStepDeps picks
+  // its author (model pins + agent timeout honoured via the merged options; skip flags honoured).
+  // The reply is DATA — the seat runners give the model no repo write/exec tools, and the reply is
+  // parsed, never executed. A skipped/timed-out/truncated/non-zero reply yields null, which
+  // structure-wiring rejects fail-closed (the finding stays propose-only).
+  const authorOpts = { ...options, agentTimeoutMs: options.agentTimeoutMs ?? STEP_AUTHOR_TIMEOUT_MS };
+  const runners = makeSeatRunners(cwd, backends, authorOpts);
+  const authorSeat = activeSeatNames(backends, authorOpts).find((s) => typeof runners[s] === "function") ?? null;
+  const seatData = async (prompt, parse) => {
+    if (!authorSeat) return null; // no reachable seat → null → structure-wiring fails closed
+    const res = await runStructuredWithRetry(
+      (p) => runners[authorSeat](p),
+      prompt,
+      (stdout) => ({ parseOk: parse(stdout) != null }),
+      { maxRetries: 1 }
+    );
+    if (!res || res.skipped || res.timedOut || res.truncated || res.status !== 0) return null;
+    return parse(res.stdout);
+  };
+  const proposePlan = (prompt) => seatData(prompt, parseTransformPlanObject);
+  const authorTransform = (prompt) => seatData(prompt, parseAuthoredFilesMap);
+
+  // The ONLY write path the transform gets — the same containment-guarded writer makeBuildStepDeps
+  // uses. The plan-declared set is enforced mechanically by structure-wiring (authored keys must
+  // EQUAL plannedTouched; its drift gate re-checks the tree); here we re-guard CONTAINMENT with the
+  // makeStepPorts guard: fileExists THROWS on a symlink or an escaping resolution — before any byte
+  // lands, so a write can never follow a link out of the repo.
+  const writeFiles = (map) => {
+    for (const [rel, content] of Object.entries(map && typeof map === "object" ? map : {})) {
+      ports.fileExists(rel);
+      const full = path.join(root, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, String(content ?? ""), "utf8");
+    }
+  };
+
+  // Half of the behaviour oracle: the project's OWN full suite, UNSANDBOXED (it is the user's
+  // trusted suite — same posture as build.mjs's realRunTests), DETECTED, never accepted from
+  // options. No detectable suite → { ok:false } → the transform reverts: a structure transform
+  // without a test gate must never land (fail-closed, no --allow-untested equivalent here).
+  const testCmd = detectTestCmd(root);
+  const runFullSuite = async () => {
+    if (!testCmd) return { ok: false, reason: "no test command detected — a structure transform requires the full-suite gate" };
+    const res = await runCommandAsync(testCmd.cmd, testCmd.args, { cwd: root, timeoutMs: options.testTimeoutMs ?? 600_000 });
+    return { ok: res.status === 0 && !res.timedOut };
+  };
+
+  // The other half: the export-surface check, built on audit-snapshot's snapshotViolation over the
+  // transform's edited files (structure-wiring supplies the exact before/after sources). Definite
+  // semantics, fail-closed: `false` ONLY when every edited file's surface is PROVABLY unchanged;
+  // `true` (changed → blocked) for any removal/rename/default-flip AND for any surface that cannot
+  // be enumerated (star re-export, whole-module CJS — snapshotViolation reports those as
+  // violations by design); `null` (unknown → blocked) when there is nothing to judge.
+  // allowAdditions is audit-snapshot's documented Structure-tier mode: an extract-shared/
+  // consolidate transform legitimately ADDS exports (a new shared module); removals still block.
+  const checkPublicApi = ({ files, before, after }) => {
+    const list = Array.isArray(files) ? files.filter((f) => typeof f === "string" && f) : [];
+    if (!list.length) return null; // cannot tell → structure-wiring blocks (only `false` passes)
+    for (const p of list) {
+      const violation = snapshotViolation(String(before?.[p] ?? ""), String(after?.[p] ?? ""), { allowAdditions: true });
+      if (violation != null) return true;
+    }
+    return false;
+  };
+
+  // §6 vote TRANSPORT for structure-wiring's council gate: (seat, prompt) → runner result. The
+  // REQUIRED set is computed inside structure-wiring via requiredPatchSeats (built-ins + every
+  // configured OpenRouter seat — the runner factory below strips the shrink flags from the options
+  // it forwards, so that set is UNSHRINKABLE). Seat postures mirror makeBuildStepReviewer's:
+  //   - claude: buildClaudeReviewArgs — --safe-mode + Read/Grep/Glob-only (hard-isolated seat);
+  //   - codex/grok: instruction-isolated EMPTY temp cwd (their CLIs auto-load repo instruction
+  //     files, and the diff under review is MODEL-written), grok pinned to its read-only sandbox;
+  //   - or-*: API-only, cwd inert.
+  // Fail-closed: a skipped (seatActive) or unreachable seat returns null → casts NO vote → the
+  // unanimity gate VETOES. A flag can abort a transform; it can never shrink its council.
+  const grokOpts = { ...authorOpts, grokSandbox: options.grokSandbox ?? "read-only" };
+  let isolated = null;
+  const isolatedCwd = () => (isolated ??= fs.mkdtempSync(path.join(os.tmpdir(), "council-structure-review-")));
+  const reviewRunners = {
+    claude: async (prompt) => {
+      const bin = backends?.claude?.bin || findClaudeBinary();
+      return runCommandAsync(bin, buildClaudeReviewArgs(authorOpts), { cwd, input: prompt, timeoutMs: authorOpts.agentTimeoutMs });
+    },
+    codex: (prompt) => runCodexStructured(isolatedCwd(), backends, authorOpts, prompt, "structure-review"),
+    grok: (prompt) => runGrokStructured(isolatedCwd(), backends, grokOpts, prompt)
+  };
+  for (const s of backends?.openrouter?.seats ?? []) {
+    reviewRunners[s.id] = (prompt) => runOpenRouterStructured(cwd, backends, authorOpts, prompt, s.id);
+  }
+  const reviewSeat = (seat, prompt) => {
+    if (!seatActive(seat, backends, options)) return null; // skipped/unreachable seat: NO vote → veto
+    const run = reviewRunners[seat];
+    return run ? run(prompt) : null;
+  };
+
+  return {
+    authorSeat, // surfaced for logs; runStructureTransform ignores non-port keys
+    git: buildGit,
+    proposePlan,
+    authorTransform,
+    writeFiles,
+    runFullSuite,
+    checkPublicApi,
+    reviewSeat,
+    readFile: ports.readFile,
+    fileExists: ports.fileExists,
+    backends,
+    options,
+    now: Date.now
+    // limits: deliberately not set — structure-wiring's own bounded defaults apply
+  };
+}
+
+/**
+ * Compose the CLI deps with runStructureTransform for runAuditFix's M9 structure pass. The pass
+ * invokes the runner as (args, { git, options, now }); three adaptations happen at this seam —
+ * each documented, none weakening a gate:
+ *   - git: audit-fix's realGit is the SINGLE-file adapter (stageAndDiffCached) and lacks the
+ *     multi-file stageSet/diffCachedSet/tree-bound commitIndex surface structure-wiring's gate 0
+ *     requires. The makeBuildGit adapter over the SAME repo root supplies them and WINS on
+ *     overlap, so its reviewed-tree commit binding stays armed by its own diffCachedSet.
+ *   - options: the consent flags (structureAutoApply / sensitiveAutoApply, strict === true) ride
+ *     along from audit-fix, but the §6 SHRINK flags do NOT (skipOpenRouter/skipSeats stripped):
+ *     the structure council is UNSHRINKABLE — requiredPatchSeats stays built-ins + every
+ *     configured OpenRouter seat. A skipped seat still casts NO vote, which VETOES.
+ *   - result: audit-fix's structure pass consumes { ok, commit, stranded, reason };
+ *     structure-wiring reports `applied` — ok maps to true ONLY for an applied+committed
+ *     transform (a rename, not a semantic change; stranded/reason pass through untouched).
+ */
+function makeStructureTransformRunner(root, cwd, backends, options) {
+  const base = makeStructureTransformDeps(root, cwd, backends, options, makeBuildGit(root));
+  return async (args, d = {}) => {
+    const git = { ...(d.git ?? {}), ...base.git };
+    const opts = { ...(d.options ?? base.options ?? {}) };
+    delete opts.skipOpenRouter;
+    delete opts.skipSeats;
+    const res = await runStructureTransform(args, { ...base, ...d, git, options: opts });
+    return res && typeof res === "object" ? { ...res, ok: res.applied === true } : res;
   };
 }
 

@@ -312,3 +312,164 @@ test("the authored-test runner rejects a NON-assertion failure as an invalid RED
     assert.equal(r.assertionFailure, false, `must reject as invalid RED: ${JSON.stringify(invalid).slice(0, 80)}`);
   }
 });
+
+// --- M9 `audit fix --structure-auto-apply` CLI contracts --------------------------------------
+// The structure transform commits MULTI-FILE consolidations autonomously, so its CLI door is
+// pinned here at the subprocess boundary: the flag must parse + warn loudly; WITHOUT it the
+// default path must stay transform-free; WITH it the transform runner must actually be reached
+// (and fail CLOSED when no seat can plan); and the flag must never imply the §6 sensitive consent.
+
+/** A git-repo workDir with one committed source file, EVERY seat forced unreachable, and a
+ *  --from findings file — the cheapest real substrate runAuditFix's M9 structure pass runs on.
+ *  Returns null (→ caller skips) when git is unavailable in this environment. */
+function makeStructureFixRepo(findings) {
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "council-structure-cli-"));
+  const git = (...args) => spawnSync("git", args, { cwd: workDir, encoding: "utf8", timeout: 30_000 });
+  const init = git("init");
+  if (init.error || init.status !== 0) {
+    fs.rmSync(workDir, { recursive: true, force: true });
+    return null;
+  }
+  fs.writeFileSync(path.join(workDir, "index.mjs"), "export const value = 1;\n", "utf8");
+  const fakeClaudeBin = makeAllSeatsUnreachable(workDir);
+  fs.writeFileSync(path.join(workDir, "findings.json"), JSON.stringify(findings), "utf8");
+  git("add", "-A");
+  const commit = git("-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-m", "init", "--no-verify");
+  if (commit.error || commit.status !== 0) {
+    fs.rmSync(workDir, { recursive: true, force: true });
+    return null;
+  }
+  return { workDir, fakeClaudeBin };
+}
+
+/** A structural (architecture_ssot, cross-cutting) finding — the class the M9 pass consumes. */
+function structuralFinding(overrides = {}) {
+  return {
+    severity: "P1",
+    scope: "cross-cutting",
+    lens: "architecture_ssot",
+    category: "maintainability",
+    file: "index.mjs",
+    title: "duplicate constant should live in one module",
+    detail: "the same constant is defined in two places",
+    ...overrides
+  };
+}
+
+/** Spawn single-shot `audit fix --from findings.json --allow-untested --json [...extraArgs]`. */
+function runStructureFixCli(repo, extraArgs) {
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-structure-state-"));
+  try {
+    return spawnSync(
+      process.execPath,
+      [COMPANION, "audit", "fix", "--from", "findings.json", "--allow-untested", "--json", ...extraArgs],
+      {
+        cwd: repo.workDir,
+        env: { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot, CLAUDE_BIN: repo.fakeClaudeBin },
+        encoding: "utf8",
+        timeout: 120_000
+      }
+    );
+  } finally {
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  }
+}
+
+test("audit fix --structure-auto-apply is a KNOWN flag and warns LOUDLY (M9 CLI door)", (t) => {
+  const repo = makeStructureFixRepo([]);
+  if (!repo) {
+    t.skip("git is unavailable in this environment");
+    return;
+  }
+  try {
+    const res = runStructureFixCli(repo, ["--structure-auto-apply"]);
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.equal(res.status, 0, res.stderr);
+    assert.doesNotMatch(`${res.stdout}${res.stderr}`, /Unknown flag/i, "--structure-auto-apply must parse on `audit fix`");
+    assert.match(res.stderr, /structure auto-apply ENABLED/i, "the autonomy warning must be printed loudly at startup");
+    assert.match(res.stderr, /does NOT imply --sensitive-auto-apply/, "the warning must state the double-consent boundary");
+  } finally {
+    fs.rmSync(repo.workDir, { recursive: true, force: true });
+  }
+});
+
+test("WITHOUT --structure-auto-apply no structure transform is attempted (default path unchanged)", (t) => {
+  const repo = makeStructureFixRepo([structuralFinding()]);
+  if (!repo) {
+    t.skip("git is unavailable in this environment");
+    return;
+  }
+  try {
+    const res = runStructureFixCli(repo, []);
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.equal(res.status, 0, res.stderr);
+    assert.doesNotMatch(res.stderr, /structure auto-apply ENABLED/i, "no consent → no autonomy warning");
+    const out = JSON.parse(res.stdout);
+    const entry = (out.rejected ?? []).find((r) => r.finding?.lens === "architecture_ssot");
+    assert.ok(entry, "the structural finding stays a visible proposal");
+    assert.doesNotMatch(String(entry.reason ?? ""), /structure transform/, "without the flag the transform must never even be attempted");
+    assert.equal((out.fixed ?? []).length, 0, "nothing may be applied on the default path");
+  } finally {
+    fs.rmSync(repo.workDir, { recursive: true, force: true });
+  }
+});
+
+test("WITH --structure-auto-apply the M9 transform is REACHED end-to-end from the CLI (and fails CLOSED without seats)", (t) => {
+  const repo = makeStructureFixRepo([structuralFinding()]);
+  if (!repo) {
+    t.skip("git is unavailable in this environment");
+    return;
+  }
+  try {
+    const res = runStructureFixCli(repo, ["--structure-auto-apply"]);
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.equal(res.status, 0, res.stderr);
+    const out = JSON.parse(res.stdout);
+    const entry = (out.rejected ?? []).find((r) => r.finding?.lens === "architecture_ssot");
+    assert.ok(entry, "the finding is surfaced, not dropped");
+    // The appended reason is emitted ONLY by runAuditFix's M9 structure pass after the injected
+    // runStructureTransform returned — i.e. the CLI wiring reached structure-wiring's gate ladder,
+    // which then failed CLOSED at the plan gate (every seat is unreachable → null plan).
+    assert.match(String(entry.reason ?? ""), /structure transform not applied/, "the transform path must actually run under the flag");
+    assert.equal((out.fixed ?? []).length, 0, "no reachable seat → no plan → nothing may be applied");
+    assert.notEqual(out.stranded, true, "the failed transform must leave a restored tree");
+  } finally {
+    fs.rmSync(repo.workDir, { recursive: true, force: true });
+  }
+});
+
+test("--structure-auto-apply does NOT imply --sensitive-auto-apply (double consent enforced end-to-end)", (t) => {
+  const repo = makeStructureFixRepo([structuralFinding({ category: "auth", title: "duplicated auth check should live in one module" })]);
+  if (!repo) {
+    t.skip("git is unavailable in this environment");
+    return;
+  }
+  try {
+    const res = runStructureFixCli(repo, ["--structure-auto-apply"]);
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.equal(res.status, 0, res.stderr);
+    const out = JSON.parse(res.stdout);
+    const entry = (out.rejected ?? []).find((r) => r.finding?.lens === "architecture_ssot");
+    assert.ok(entry, "the structural+sensitive finding stays a visible proposal");
+    assert.match(
+      String(entry.reason ?? ""),
+      /sensitiveAutoApply/,
+      "a structural finding that is ALSO §6-sensitive must demand the SECOND consent, not ride on --structure-auto-apply alone"
+    );
+    assert.equal((out.fixed ?? []).length, 0, "nothing may be applied under single consent");
+  } finally {
+    fs.rmSync(repo.workDir, { recursive: true, force: true });
+  }
+});

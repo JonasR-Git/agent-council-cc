@@ -598,3 +598,13 @@ test("the wall-clock budget aborts the transform fail-closed (never a partial ap
   assert.match(res.reason, /wall-clock budget exceeded/);
   assert.equal(world.commits.length, 0);
 });
+
+test("the runner result exposes `ok` as the SAME fact as `applied` (contract drift made impossible)", async () => {
+  // audit-fix's structure pass reads `ok`; structure-wiring returned only `applied`. The two modules
+  // disagreed, so an APPLIED transform would have been committed and then reported "not applied" — the
+  // CLI seam had to paper over it. Deriving `ok` from `applied` makes them impossible to drift apart.
+  const refused = await runStructureTransform({ finding: { lens: "architecture_ssot", file: "a.mjs" }, snapshot: "s" }, {});
+  assert.equal(refused.applied, false, "no consent / no deps → not applied");
+  assert.equal(refused.ok, refused.applied, "`ok` mirrors `applied` exactly");
+  assert.equal(refused.ok, false);
+});

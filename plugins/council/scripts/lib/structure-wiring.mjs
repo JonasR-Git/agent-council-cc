@@ -301,20 +301,28 @@ export async function runStructureTransform({ finding = null, snapshot = null } 
   let rolledBack = false;
   let stranded = false;
   let modelCalls = 0;
-  const result = (extra) => ({
-    applied: false,
-    proposeOnly: true, // every non-applied outcome of an eligible structural finding stays propose-only
-    structural: true,
-    disposition,
-    gates,
-    gate: null,
-    commit: null,
-    reason: null,
-    rolledBack,
-    stranded,
-    modelCalls,
-    ...extra
-  });
+  const result = (extra) => {
+    const base = {
+      applied: false,
+      proposeOnly: true, // every non-applied outcome of an eligible structural finding stays propose-only
+      structural: true,
+      disposition,
+      gates,
+      gate: null,
+      commit: null,
+      reason: null,
+      rolledBack,
+      stranded,
+      modelCalls,
+      ...extra
+    };
+    // `ok` is the SAME fact as `applied`, mirrored because runAuditFix's structure pass (and any other
+    // caller of a runner) reads `ok` — the two modules previously disagreed on the runner contract, so an
+    // APPLIED transform would have been committed and then reported "not applied" (the CLI seam had to
+    // paper over it). Deriving it here — never storing it independently — makes the two impossible to
+    // drift apart: a caller may read either name and get the same answer.
+    return { ...base, ok: base.applied === true };
+  };
 
   // 0. Deps completeness — fail-closed: a missing side-effect port must never soft-skip a gate.
   const git = deps.git ?? {};
