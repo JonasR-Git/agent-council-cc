@@ -55,7 +55,7 @@ import { runEndless } from "./lib/audit-endless.mjs";
 import { runSupervised } from "./lib/supervisor.mjs";
 import { runAudit } from "./lib/audit-run.mjs";
 import { toSarif } from "./lib/audit-sarif.mjs";
-import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
+import { buildAgentResult, runStructuredWithRetry, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { writeFixReportHtml } from "./lib/fix-report-html.mjs";
 import { assembleFixMeta, changedFilesShape } from "./lib/fix-report-meta.mjs";
@@ -63,9 +63,11 @@ import { openRouterBackend } from "./lib/openrouter-agent.mjs";
 import { makeCharTestGate } from "./lib/chartest-wiring.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { runPlanDeliberation } from "./lib/plan-deliberate.mjs";
-import { parsePlanSpec, planStepTouched, planSpecDigest, renderPlanMarkdown, requestDigest, validatePlanSpec } from "./lib/plan-spec.mjs";
-import { makeBuildGit, renderBuildReport, runBuild } from "./lib/build.mjs";
-import { buildReviewerReady } from "./lib/build-step-reviewer.mjs";
+import { isPlanTestPath, parsePlanSpec, planStepTouched, planSpecDigest, renderPlanMarkdown, requestDigest, validatePlanSpec } from "./lib/plan-spec.mjs";
+import { makeBuildGit, makeStepPorts, renderBuildReport, runBuild } from "./lib/build.mjs";
+import { buildReviewerReady, makeBuildStepReviewer } from "./lib/build-step-reviewer.mjs";
+import { activeSeatNames, makeSeatRunners } from "./lib/seats.mjs";
+import { buildPoisonedSource, changedLinesCovered } from "./lib/chartest-node-harness.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
 import {
   appendLogLine,

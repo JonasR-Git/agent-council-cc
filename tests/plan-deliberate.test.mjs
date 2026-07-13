@@ -159,6 +159,29 @@ test("every active seat proposes AND critiques (incl. an or-* OpenRouter seat); 
   assert.ok(run.planSpec, "a valid synthesis emits a PlanSpec");
 });
 
+test("R1 is FIREWALLED: no seat's proposal prompt carries another seat's proposal content", async () => {
+  const seats = ["codex", "grok", "claude"];
+  const calls = [];
+  const run = await runPlanDeliberation(TMP, REQUEST, seatBackends(), {}, recordingDeps(calls, seats));
+  assert.ok(run.planSpec);
+
+  // Every proposal summary is "<seat>'s design" — if R1 were sequentialized and fed earlier
+  // proposals to later seats, that marker would leak into a peer's R1 prompt.
+  for (const call of calls.filter((c) => c.kind === "proposal")) {
+    for (const other of seats.filter((s) => s !== call.seat)) {
+      assert.equal(
+        call.prompt.includes(`${other}'s design`),
+        false,
+        `${call.seat}'s R1 prompt must never contain ${other}'s proposal`
+      );
+    }
+  }
+  // Negative control: the probe text IS how proposal content surfaces in later-round prompts —
+  // R2/R3 prompts do carry it, so the assertions above test the firewall, not a stale marker.
+  assert.ok(calls.find((c) => c.kind === "critique" && c.seat === "codex").prompt.includes("grok's design"));
+  assert.ok(calls.find((c) => c.kind === "synthesis").prompt.includes("codex's design"));
+});
+
 test("R1 identity is runner-bound: a lying model-echoed `agent` field is ignored", async () => {
   const seats = ["codex", "grok", "claude"];
   const calls = [];
@@ -315,6 +338,23 @@ test("a valid synthesis emits the PlanSpec with RUNNER-computed binding fields (
   assert.equal(synth.length, 1);
   assert.equal(synth[0].seat, "claude");
   assert.match(run.report, /PlanSpec synthesized/);
+});
+
+test("a malformed R3 reply is parse-repaired IN-attempt — not lost, and the bounded validation retry is not burned", async () => {
+  const seats = ["codex", "grok", "claude"];
+  const calls = [];
+  const deps = recordingDeps(calls, seats, (seat, kind, callNo) =>
+    kind === "synthesis" && callNo === 1 ? "sorry, prose instead of a PlanSpec" : null
+  );
+  const run = await runPlanDeliberation(TMP, REQUEST, seatBackends(), {}, deps);
+
+  assert.ok(run.planSpec, "the repaired reply still synthesizes");
+  assert.equal(calls.filter((c) => c.kind === "synthesis").length, 2, "exactly one parse-repair call");
+  assert.equal(
+    run.synthesis.attempts.length,
+    1,
+    "the repair happens INSIDE attempt 1 — a parse miss must not consume the single validation retry"
+  );
 });
 
 test("an INVALID synthesis retries once with the validation errors appended, then fails CLOSED", async () => {

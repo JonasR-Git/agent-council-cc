@@ -3,10 +3,12 @@
 // One PlanSpec step = one capability-bounded unit of autonomous work: a separate call authors ONLY
 // the step's declared test files (TEST-FIRST), the test must fail at ASSERTION level on the
 // pre-implementation tree (RED-before), a second call authors ONLY the impl files, the IDENTICAL
-// hash-bound test must then pass (GREEN-after), the full suite must stay green, every required §6
-// seat must unanimously confirm the COMPLETE staged multi-file diff, and the commit is bound
-// byte-for-byte to what the council reviewed. ANY gate failure rolls the tree back to the step
-// snapshot and aborts (steps are DEPENDENT — a later step must never build on a half-applied one).
+// hash-bound test must then pass (GREEN-after) AND have EXECUTED every added/modified impl line
+// (changed-line coverage — an uncalled new function is a false green the RED→GREEN pair cannot
+// see), the full suite must stay green, every required §6 seat must unanimously confirm the
+// COMPLETE staged multi-file diff, and the commit is bound byte-for-byte to what the council
+// reviewed. ANY gate failure rolls the tree back to the step snapshot and aborts (steps are
+// DEPENDENT — a later step must never build on a half-applied one).
 //
 // Design invariants (docs/plan-build-design.md):
 //   - PURE + INJECTABLE: every side effect — git, the two model calls, the test runs, fs — arrives
@@ -22,6 +24,9 @@
 //     included — every test file must also appear in files[] with role:"test"). The writers may
 //     touch exactly that set and the commit is bound to exactly that set (structure-gate's
 //     enforcePlannedTouched, the multi-file drift check).
+//   - NO REDUCED COUNCIL: the §6 required set is built-ins + EVERY configured OpenRouter seat;
+//     the seat-skipping options audit-fix honours (skipOpenRouter/skipSeats) are deliberately not
+//     consulted here — no caller-controlled flag may lower the unanimity bar (Safety v1).
 //   - Untrusted data (step fields, sources, model-authored tests) is nonce-fenced in every prompt.
 //
 // NOT this module's job (build.mjs, the orchestrator): preflight (clean tree, HEAD===baseCommit,
@@ -115,6 +120,46 @@ const PROTECTED_RE = [
 const TEST_PATH_RE = [/(^|\/)[^/]*\.(test|spec)\.[cm]?[jt]sx?$/i, /(^|\/)(tests?|__tests__|specs?)\//i];
 
 const isTestPath = (p) => TEST_PATH_RE.some((re) => re.test(p));
+
+// --- Safety v1 eligibility (the mechanical slice) ------------------------------------------------
+// Autonomous steps are pure Node ESM LIBRARY changes; auth/crypto, concurrency, network, process/
+// environment and dynamic-code features are HUMAN-gated (design "Safety v1"). Full semantic
+// membership in those classes is undecidable statically — that judgement is the §6 council's
+// charter — but the cheap STRUCTURAL markers are vetoed here, before a byte is written. An edit
+// that merely PRESERVES an existing human-gated import is equally vetoed: autonomously changing
+// crypto/network/process code is the gated class, not just introducing it.
+const HUMAN_GATED_IMPORTS = new Map([
+  ["child_process", "process execution"],
+  ["worker_threads", "concurrency"],
+  ["cluster", "concurrency"],
+  ["net", "network"],
+  ["http", "network"],
+  ["https", "network"],
+  ["http2", "network"],
+  ["tls", "network"],
+  ["dgram", "network"],
+  ["dns", "network"],
+  ["crypto", "crypto/auth"],
+  ["vm", "dynamic code execution"],
+  ["inspector", "debugger control"],
+  ["repl", "dynamic code execution"],
+  ["process", "process/environment control"]
+]);
+
+/** Veto reason when authored impl content carries a human-gated structural marker, else null. */
+function implSafetyReason(code) {
+  const specRe = /(?:\bfrom\s*|\brequire\s*\(\s*|^\s*import\s*)['"]([^'"]+)['"]/gm;
+  let m;
+  while ((m = specRe.exec(code))) {
+    const base = m[1].replace(/^node:/, "").split("/")[0];
+    const cls = HUMAN_GATED_IMPORTS.get(base);
+    if (cls) return `imports ${m[1]} — ${cls} features are HUMAN-gated (Safety v1), never built autonomously`;
+  }
+  if (/\beval\s*\(|\bnew\s+Function\s*\(/.test(code)) return "uses eval / new Function — dynamic code execution is HUMAN-gated (Safety v1)";
+  if (/\bimport\s*\(/.test(code)) return "uses dynamic import() — runtime module loading is HUMAN-gated (Safety v1)";
+  if (/\bprocess\s*\.\s*(?:env|exit|kill|chdir)\b/.test(code)) return "touches process/environment control (process.env/exit/kill/chdir) — HUMAN-gated (Safety v1)";
+  return null;
+}
 
 // --- the capability boundary -------------------------------------------------------------------
 
@@ -310,12 +355,15 @@ export function buildImplAuthorPrompt(step, testCode, context = {}) {
 
 /**
  * Revalidate the step AGAINST THE TREE (ladder 2): paths safe + unprotected, actions known,
- * create ⇒ absent, edit ⇒ present, test/impl split consistent + disjoint, ≥1 test AND ≥1 impl
+ * create ⇒ absent, edit ⇒ present AND a REGULAR file (a symlinked/dir/special edit target could
+ * write through the repo boundary — writes would follow it, git would report no declared change,
+ * and rollback could not restore the external bytes), impl files are .mjs ES modules (Safety v1:
+ * pure Node ESM library steps only), test/impl split consistent + disjoint, ≥1 test AND ≥1 impl
  * file, and no edit target already carrying protected content (checked BEFORE any prompt is built
  * so protected material never leaks to an author). Returns { ok, errors, implFiles, testFiles,
  * touched } — the entry lists carry { path, action, role }.
  */
-function revalidateStep(step, { fileExists, readFile }) {
+function revalidateStep(step, { fileExists, readFile, isRegularFile }) {
   const errors = [];
   if (!step || typeof step !== "object") return { ok: false, errors: ["step is not an object"], implFiles: [], testFiles: [], touched: [] };
   if (!/^[a-z][a-z0-9-]{0,63}$/.test(String(step.id ?? ""))) errors.push(`invalid step id ${JSON.stringify(step.id ?? null)}`);
@@ -350,8 +398,17 @@ function revalidateStep(step, { fileExists, readFile }) {
     // file, and a role:"test" file must be a recognized test path (both sides fail-closed).
     if (isTestPath(p) && role !== "test") errors.push(`test path ${p} not declared role:"test" — test paths are allowed ONLY as declared step tests`);
     if (role === "test" && !isTestPath(p)) errors.push(`role:"test" file ${p} is not a recognized test path (*.test/*.spec or tests/ dir)`);
+    // Safety v1: autonomous steps are pure Node ESM LIBRARY changes — an impl file that is not a
+    // .mjs ES module (.js/.cjs/.ts/config/asset) belongs to a class this tool hands to a human.
+    if (role === "source" && !/\.mjs$/i.test(p)) errors.push(`impl file ${p} is not a .mjs ES module — Safety v1 builds ONLY pure Node ESM library steps autonomously`);
     if (action === "create" && fileExists(p)) errors.push(`create target already exists: ${p}`);
-    if (action === "edit" && !fileExists(p)) errors.push(`edit target does not exist: ${p}`);
+    if (action === "edit") {
+      if (!fileExists(p)) errors.push(`edit target does not exist: ${p}`);
+      // lstat-truth via the injected port, `!== true` so a weird return fails closed: a symlink
+      // (or dir/device) edit target is rejected BEFORE readFile could follow it out of the repo
+      // and leak external bytes into an author prompt (Safety v1: symlinks are human-gated).
+      else if (isRegularFile(p) !== true) errors.push(`edit target ${p} is not a regular file (symlink/dir/special) — a non-regular target can escape the repo; HUMAN-gated (Safety v1)`);
+    }
     (role === "test" ? testFiles : implFiles).push({ path: p, action, role });
   }
   // test.files ⊆ files[role:test] AND files[role:test] ⊆ test.files — the runnable-test set and the
@@ -418,6 +475,46 @@ function readBack(readFile, paths) {
   return map;
 }
 
+/** Canonical one-string rendering of the authored test files — the reviewer's `testCode` payload
+ *  (makeBuildStepReviewer's size gate + prompt consume exactly this). One file → its exact bytes;
+ *  several → a path-labelled concatenation in sorted path order. */
+function canonicalTestCode(files) {
+  const paths = Object.keys(files).sort();
+  if (paths.length === 1) return String(files[paths[0]] ?? "");
+  return paths.map((p) => `// ===== ${p} =====\n${String(files[p] ?? "")}`).join("\n");
+}
+
+/**
+ * The 1-based line numbers of an impl file the step test MUST have EXECUTED: every ADDED or
+ * MODIFIED coverage-bearing line (blank and comment-only lines carry no execution to attest).
+ * "Added/modified" is computed against the pre-step content as a line MULTISET: a line whose
+ * exact text already existed is not demanded (it may merely have moved); every line with no
+ * pre-existing counterpart is. The caller fails CLOSED on an empty result — a changed impl file
+ * with NO computable coverage-bearing line (comment-only / pure-reorder change) cannot be
+ * attested, and a reorder CAN change behaviour, so it is a veto rather than a vacuous pass.
+ */
+function requiredCoverageLines(newContent, oldContent) {
+  const oldCounts = new Map();
+  for (const l of String(oldContent ?? "").split("\n")) {
+    const t = l.trim();
+    if (t) oldCounts.set(t, (oldCounts.get(t) ?? 0) + 1);
+  }
+  const lines = [];
+  const newLines = String(newContent ?? "").split("\n");
+  for (let i = 0; i < newLines.length; i += 1) {
+    const t = newLines[i].trim();
+    if (!t) continue; // blank — never coverage-bearing
+    if (t.startsWith("//") || t.startsWith("/*") || t.startsWith("*")) continue; // comment-only line
+    const have = oldCounts.get(t) ?? 0;
+    if (have > 0) {
+      oldCounts.set(t, have - 1); // existed before (unchanged, or moved verbatim)
+      continue;
+    }
+    lines.push(i + 1);
+  }
+  return lines;
+}
+
 function driftReason(what, d) {
   const parts = [];
   if (d.unexpected.length) parts.push(`unexpected: ${d.unexpected.join(", ")}`);
@@ -441,19 +538,30 @@ function commitMessage(step) {
  *
  * `deps` (all required unless noted; git + fs adapters are synchronous like audit-fix's realGit,
  * model/test/review calls are awaited):
- *   - git: { head(), changedFiles(), resetHard(ref) (MUST include clean -fd semantics — mirror
- *     audit-fix realGit), stageSet(paths), diffCachedSet(paths, ref), commitIndex(message) }
+ *   - git: { head(), changedFiles() (MUST report EVERY divergence from HEAD — tracked, untracked
+ *     AND ignored, i.e. `git status --porcelain --ignored`: an ignored artifact a step or suite
+ *     run created is still an undeclared divergence the drift + rollback checks must see),
+ *     resetHard(ref) (MUST include clean -fd semantics — mirror audit-fix realGit),
+ *     stageSet(paths), diffCachedSet(paths, ref), commitIndex(message) }
  *   - authorTests(prompt) -> files    (model output as DATA; {files:{path:content}} or a bare map)
  *   - authorImpl(prompt) -> files
  *   - writeFiles(map)                 (the ONLY write path; confined by the drift + hash gates)
  *   - runStepTest() -> { ok, assertionFailure, stdout }   (runs the step's declared test files;
  *     assertionFailure MUST distinguish an assertion-level failure from syntax/loader/crash/timeout)
+ *   - coverChangedLines(changed) -> { ok, uncovered? }   (changed = { path: [1-based lines] };
+ *     run the HASHED step test under coverage and answer whether EVERY listed line executed —
+ *     chartest-node-harness's changedLinesCovered with innermost-wins semantics is the reference)
  *   - runFullSuite() -> { ok }
- *   - reviewStep({ step, diff, test, evidence }) -> verdicts   (one verdict per §6 seat; the diff
- *     handed over is the COMPLETE staged multi-file diff — never truncated)
+ *   - reviewStep({ step, diff, testCode, test, evidence }) -> verdicts   (one verdict per §6
+ *     seat; the diff handed over is the COMPLETE staged multi-file diff — never truncated;
+ *     testCode is the canonical test-byte string makeBuildStepReviewer consumes, test the
+ *     structured { files, sha256, contents } binding — identical bytes, two shapes)
  *   - readFile(path) -> string, fileExists(path) -> bool
+ *   - isRegularFile(path) -> bool     (lstat, never stat: true ONLY for an existing REGULAR file —
+ *     the symlink-escape gate on edit targets rides on this being lstat-truth)
  *   - now?() -> ms                    (injected clock for the wall-clock bound; default Date.now)
- *   - limits?, backends?, options?    (bounds; the §6 seat registry inputs for requiredPatchSeats)
+ *   - limits?, backends?              (bounds; the §6 seat registry input. deps.options is
+ *     deliberately NOT consulted for the required §6 set — no reduced council in a build)
  *
  * Returns { ok, commit?, reason?, gates, rolledBack, stranded }. `stranded: true` means a gate
  * failed AND the rollback could not verifiably restore the snapshot — the caller MUST abort the
@@ -469,7 +577,7 @@ export async function runBuildStep({ step, planSpec = null, snapshot = null } = 
   for (const k of ["head", "changedFiles", "resetHard", "stageSet", "diffCachedSet", "commitIndex"]) {
     if (typeof git[k] !== "function") missing.push(`git.${k}`);
   }
-  for (const k of ["authorTests", "authorImpl", "writeFiles", "runStepTest", "runFullSuite", "reviewStep", "readFile", "fileExists"]) {
+  for (const k of ["authorTests", "authorImpl", "writeFiles", "runStepTest", "coverChangedLines", "runFullSuite", "reviewStep", "readFile", "fileExists", "isRegularFile"]) {
     if (typeof deps[k] !== "function") missing.push(k);
   }
   if (missing.length) {
@@ -531,7 +639,7 @@ export async function runBuildStep({ step, planSpec = null, snapshot = null } = 
   let phase = "revalidate";
   try {
     // 2. Revalidate the step against the ACTUAL tree (the plan may be stale by now).
-    const reval = revalidateStep(step, { fileExists: deps.fileExists, readFile: deps.readFile });
+    const reval = revalidateStep(step, { fileExists: deps.fileExists, readFile: deps.readFile, isRegularFile: deps.isRegularFile });
     if (!reval.ok) return fail("revalidate", `step failed revalidation: ${reval.errors.join("; ")}`);
     gates.revalidate = { ok: true };
     const touched = reval.touched; // the capability boundary (sorted posix)
@@ -613,6 +721,10 @@ export async function runBuildStep({ step, planSpec = null, snapshot = null } = 
       if (Buffer.byteLength(code, "utf8") > limits.maxFileBytes) return fail("implAuthor", `impl content for ${p} exceeds ${limits.maxFileBytes} bytes`);
       const cprot = contentProtectionReason(code);
       if (cprot) return fail("implAuthor", `impl content for ${p} matches a protected shape (${cprot}) — never auto-written`);
+      // Safety v1 eligibility over the EXACT bytes that would be written: human-gated feature
+      // classes (crypto/network/process/concurrency/dynamic code) veto before a write happens.
+      const safety = implSafetyReason(code);
+      if (safety) return fail("implAuthor", `Safety v1 eligibility: impl content for ${p} ${safety}`);
     }
     await deps.writeFiles(authoredImpl);
     if (hashFiles(readBack(deps.readFile, testSet)) !== testHash) {
@@ -647,6 +759,27 @@ export async function runBuildStep({ step, planSpec = null, snapshot = null } = 
     }
     gates.greenAfter = { ok: true, runs: limits.greenRuns };
 
+    // 7b. CHANGED-LINE COVERAGE (the second half of design ladder 7): the hashed test must have
+    // EXECUTED every added/modified impl line. This is what makes an existence-only sham test
+    // mechanically insufficient: `assert.equal(typeof target.fn, "function")` flips RED→GREEN on
+    // an `export function fn(){}` stub, but the never-CALLED body lines stay innermost-uncovered
+    // and veto here. The port measures (NODE_V8_COVERAGE); THIS module owns WHAT must be covered.
+    phase = "coverage";
+    const requiredCoverage = {};
+    for (const f of reval.implFiles) {
+      const lines = requiredCoverageLines(authoredImpl[f.path], f.action === "edit" ? context.sources[f.path] : "");
+      if (!lines.length) return fail("coverage", `no coverage-bearing added/modified line computable for ${f.path} (comment-only or pure-reorder impl change) — the step test cannot be attested to exercise it; split the step or hand it to a human`);
+      requiredCoverage[f.path] = lines;
+    }
+    const cov = await deps.coverChangedLines(requiredCoverage);
+    b = budgetGate("the coverage check");
+    if (b) return b;
+    if (cov?.ok !== true) {
+      const detail = Array.isArray(cov?.uncovered) && cov.uncovered.length ? ` (uncovered: ${cov.uncovered.slice(0, 12).join(", ")})` : "";
+      return fail("coverage", `changed-line coverage failed: the hashed test did not execute every added/modified impl line${detail} — a line the test never runs is a line the RED→GREEN proof says nothing about`);
+    }
+    gates.coverage = { ok: true, files: Object.keys(requiredCoverage) };
+
     // 8. Full suite green on the candidate — the step must not regress anything outside its test.
     phase = "fullSuite";
     const suite = await deps.runFullSuite();
@@ -673,11 +806,26 @@ export async function runBuildStep({ step, planSpec = null, snapshot = null } = 
       fullSuite: { ok: true },
       testSha256: testHash
     };
-    const verdicts = await deps.reviewStep({ step, diff: reviewedDiff, test: { files: [...testSet], sha256: testHash, contents: authoredTests }, evidence });
+    const verdicts = await deps.reviewStep({
+      step,
+      diff: reviewedDiff,
+      // BOTH shapes, deliberately: `testCode` is the canonical string makeBuildStepReviewer's
+      // size gate + prompt destructure (an absent testCode would size-veto EVERY real build);
+      // `test` is the structured binding (files + sha256 + per-file contents) for evidence-grade
+      // consumers. Identical bytes either way.
+      testCode: canonicalTestCode(authoredTests),
+      test: { files: [...testSet], sha256: testHash, contents: authoredTests },
+      evidence
+    });
     b = budgetGate("the council review");
     if (b) return b;
-    // The DYNAMIC required set (built-ins + configured OpenRouter seats) — never a hardcoded triple.
-    const council = evaluatePatchVerdicts(verdicts, { required: requiredPatchSeats(deps.backends ?? {}, deps.options ?? {}) });
+    // The DYNAMIC required set (built-ins + EVERY configured OpenRouter seat) — never a hardcoded
+    // triple, and never SHRINKABLE from here: `council build` has no reduced-council mode (Safety
+    // v1: no escape hatches), so the seat-skipping options audit-fix legitimately honours
+    // (skipOpenRouter / skipSeats) are deliberately NOT forwarded to requiredPatchSeats. A
+    // caller-controlled flag must not lower the unanimity bar; a skipped-but-configured seat
+    // simply never votes — and a required seat that casts no vote is a VETO, not a pass.
+    const council = evaluatePatchVerdicts(verdicts, { required: requiredPatchSeats(deps.backends ?? {}, {}) });
     gates.council = { ok: council.approved, summary: council.summary, confirms: council.confirms, dissents: council.dissents, abstains: council.abstains, missing: council.missing };
     if (!council.approved) return fail("council", `§6 council not unanimous (${council.summary}) — veto`);
 
@@ -694,6 +842,13 @@ export async function runBuildStep({ step, planSpec = null, snapshot = null } = 
     git.stageSet([...touched]);
     const stagedNow = String(git.diffCachedSet([...touched], snapshotRef) ?? "");
     if (stagedNow !== reviewedDiff) return fail("binding", "staged diff is no longer byte-identical to the diff the council reviewed — reviewed-byte binding failed; reverted");
+    // LAST look before the irreversible act: commitIndex commits the WHOLE index, and the byte
+    // compare above is SCOPED to the declared set — a file that appeared (or was staged by a
+    // concurrent process) after the compare would ride into the commit unseen by any gate.
+    // Re-checking the changed set here narrows that window to the single commit call itself; what
+    // actually EXCLUDES concurrent writers is the orchestrator's repo lock (ladder 0).
+    const finalSet = enforceStepTouched(git.changedFiles(), step);
+    if (!finalSet.ok) return fail("binding", `changed set drifted between the reviewed-byte check and the commit — ${driftReason("pre-commit", finalSet)}`);
     gates.binding = { ok: true };
 
     phase = "commit";

@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { makeBuildGit, planShapeReason, renderBuildReport, runBuild } from "../plugins/council/scripts/lib/build.mjs";
+import { makeBuildGit, makeStepPorts, planShapeReason, renderBuildReport, runBuild } from "../plugins/council/scripts/lib/build.mjs";
+import { resolveStateDir } from "../plugins/council/scripts/lib/state.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "council-build-"));
 
@@ -83,6 +84,9 @@ function baseDeps(git, over = {}) {
     testCmd: { cmd: "node", args: ["--version"] },
     runTests: async () => ({ ok: true }),
     seatsReady: () => ({ ready: true, reasons: {} }),
+    // The REAL default is plan-spec's validatePlanSpec (pinned by its own test below); the
+    // fixtures here use readable placeholder hashes, so unit tests inject a green verdict.
+    validatePlan: () => ({ valid: true }),
     acquireLock: () => "lock-token",
     releaseLock: () => {},
     runStep: okStep(git),
@@ -254,13 +258,93 @@ test("preflight refuses when the build lock is already held", async () => {
   assert.deepEqual(c.spend, { steps: 0, tests: 0 });
 });
 
-test("preflight refuses when the build branch already exists (a build always starts fresh)", async () => {
+test("preflight refuses when the build branch already exists — BEFORE the baseline suite is spent", async () => {
   const git = fakeGit();
   git.branchExists = () => true;
-  const out = await runBuild(tmp(), plan(), {}, {}, baseDeps(git));
+  const c = spendCounters();
+  const out = await runBuild(tmp(), plan(), {}, {}, baseDeps(git, c));
   assert.equal(out.ok, false);
   assert.match(out.error, /already exists/);
   assert.equal(git.calls.filter((x) => x[0] === "createAndCheckout").length, 0);
+  assert.deepEqual(c.spend, { steps: 0, tests: 0 }, "the cheap branch check comes before the expensive baseline run");
+});
+
+test("preflight runs the REAL plan-spec validator by default (defense-in-depth) and spends nothing", async () => {
+  // The fixture plan carries a placeholder requestHash/baseCommit — the real validatePlanSpec
+  // MUST reject it. Discriminating: without the preflight validation call this run completes.
+  const git = fakeGit();
+  const c = spendCounters();
+  const out = await runBuild(tmp(), plan(), {}, {}, baseDeps(git, { ...c, validatePlan: undefined }));
+  assert.equal(out.ok, false);
+  assert.equal(out.stopReason, "preflight");
+  assert.match(out.error, /PlanSpec validation failed/);
+  assert.deepEqual(c.spend, { steps: 0, tests: 0 });
+  assert.equal(git.calls.length, 0, "no branch created, nothing checked out");
+});
+
+test("an injected plan validator is honored FAIL-CLOSED: invalid, malformed, and throwing all refuse", async () => {
+  const bad = await runBuild(tmp(), plan(), {}, {}, baseDeps(fakeGit(), { validatePlan: () => ({ valid: false, errors: ["edit target does not exist: lib/x.mjs"] }) }));
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /PlanSpec validation failed: edit target does not exist/);
+  const malformed = await runBuild(tmp(), plan(), {}, {}, baseDeps(fakeGit(), { validatePlan: () => null }));
+  assert.match(malformed.error, /PlanSpec validation failed/);
+  const throwing = await runBuild(
+    tmp(),
+    plan(),
+    {},
+    {},
+    baseDeps(fakeGit(), {
+      validatePlan: () => {
+        throw new Error("validator exploded");
+      }
+    })
+  );
+  assert.match(throwing.error, /validator exploded/);
+});
+
+test("options.testCmd is NOT honored — an arbitrary shell test command is a forbidden escape hatch", async () => {
+  // A caller-supplied noop oracle (`node -e process.exit(0)`) must never replace the DETECTED
+  // suite: on a repo with no detectable test command the build refuses instead of going
+  // permanently green. Discriminating: with options.testCmd honored this run completes.
+  const git = fakeGit();
+  const out = await runBuild(tmp(), plan(), {}, { testCmd: { cmd: "node", args: ["-e", "process.exit(0)"] } }, baseDeps(git, { testCmd: null }));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /no test command/);
+});
+
+test("§6 council-reducing options are refused outright (unweakenable by ANY flag)", async () => {
+  // seatsReady is injected ready:true, so ONLY the flag refusal can stop these runs.
+  const c = spendCounters();
+  for (const options of [{ skipOpenRouter: true }, { skipSeats: ["or-fast"] }, { skipSeats: "grok" }]) {
+    const out = await runBuild(tmp(), plan(), {}, options, baseDeps(fakeGit(), c));
+    assert.equal(out.ok, false, `must refuse ${JSON.stringify(options)}`);
+    assert.equal(out.stopReason, "preflight");
+    assert.match(out.error, /reduce the §6 council/);
+  }
+  assert.deepEqual(c.spend, { steps: 0, tests: 0 });
+  // ...but an EMPTY skipSeats list reduces nothing and passes.
+  const ok = await runBuild(tmp(), plan(), {}, { skipSeats: [] }, baseDeps(fakeGit()));
+  assert.equal(ok.ok, true);
+});
+
+test("the default lock also refuses while an `audit fix` holds this repo (shared working tree)", async () => {
+  const cwd = tmp();
+  const prev = process.env.AGENT_COUNCIL_STATE_DIR;
+  process.env.AGENT_COUNCIL_STATE_DIR = tmp();
+  try {
+    const stateDir = resolveStateDir(cwd);
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, "audit-fix.lock"), "999");
+    const c = spendCounters();
+    const out = await runBuild(cwd, plan(), {}, {}, baseDeps(fakeGit(), { ...c, acquireLock: undefined }));
+    assert.equal(out.ok, false);
+    assert.match(out.error, /lock held/);
+    assert.deepEqual(c.spend, { steps: 0, tests: 0 });
+    assert.equal(fs.existsSync(path.join(stateDir, "build.lock")), false, "no build.lock left behind");
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_COUNCIL_STATE_DIR;
+    else process.env.AGENT_COUNCIL_STATE_DIR = prev;
+  }
 });
 
 // --- the run: ordered steps, first-failure abort, final gate ---------------------
@@ -456,6 +540,48 @@ test("an OK step that leaves a dirty tree is scrubbed to its commit and the run 
   assert.equal(out.returnedToBase, true);
 });
 
+test("a failed final return to base is NOT reported as a completed build (fail-closed)", async () => {
+  const git = fakeGit();
+  git.checkout = () => false; // e.g. an index/worktree error at the final checkout
+  const out = await runBuild(tmp(), plan(), {}, {}, baseDeps(git));
+  assert.equal(out.ok, false, "a run that leaves the operator on the build branch is not complete");
+  assert.equal(out.stopReason, "return-to-base-failed");
+  assert.equal(out.returnedToBase, false);
+  assert.equal(out.committed, 2, "the branch and its commits stay intact for review");
+});
+
+test("an unexpected mid-run crash attempts a safe return to base (clean tree only), then RETHROWS", async () => {
+  const git = fakeGit();
+  let calls = 0;
+  const deps = baseDeps(git, {
+    runTests: async () => {
+      calls += 1;
+      if (calls === 2) throw new Error("suite runner exploded"); // the final integration call
+      return { ok: true };
+    }
+  });
+  await assert.rejects(() => runBuild(tmp(), plan(), {}, {}, deps), /exploded/, "an unexpected error surfaces as an error, never a result");
+  assert.deepEqual(
+    git.calls.filter((x) => x[0] === "checkout"),
+    [["checkout", "master"]],
+    "the operator is put back on base before the error surfaces"
+  );
+});
+
+test("without an injected runStep the REAL build-step runner is wired and fails CLOSED on missing model ports", async () => {
+  // No deps.stepDeps: the model-facing ports (authorTests/authorImpl/writeFiles/runStepTest/
+  // reviewStep) are unwired, so the lazily imported runBuildStep must abort step 1 loudly —
+  // an incompletely wired run may never soft-skip a gate. Discriminating: a fake runStep that
+  // ignores its ports would commit both steps here.
+  const git = fakeGit();
+  const out = await runBuild(tmp(), plan(), {}, {}, baseDeps(git, { runStep: undefined }));
+  assert.equal(out.ok, false);
+  assert.equal(out.stopReason, "step-failed:step-one");
+  assert.match(out.steps[0].reason, /incomplete deps/);
+  assert.match(out.steps[0].reason, /authorTests/);
+  assert.equal(out.committed, 0);
+});
+
 // --- run budgets (whole-run bounds) ----------------------------------------------
 
 test("wall-clock budget stops the run BETWEEN steps and keeps prior commits", async () => {
@@ -567,6 +693,85 @@ test("makeBuildGit: stageSet/diffCachedSet/commitIndex bind a FILE SET; resetHar
   assert.equal(fs.existsSync(path.join(dir, "c.txt")), false, "untracked junk is cleaned");
 
   assert.throws(() => git.stageSet([]), /empty path set/, "an empty set can never stage anything (fail-closed)");
+});
+
+test("makeBuildGit: commitIndex lands ONLY the reviewed index tree — unreviewed drift is refused", () => {
+  const dir = tmp();
+  const raw = (args) => {
+    const r = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`);
+    return r.stdout;
+  };
+  raw(["init", "-q"]);
+  raw(["config", "user.email", "council@test.invalid"]);
+  raw(["config", "user.name", "council-test"]);
+  raw(["config", "core.autocrlf", "false"]);
+  fs.writeFileSync(path.join(dir, "a.txt"), "one\n");
+  raw(["add", "-A"]);
+  raw(["commit", "-q", "-m", "init", "--no-verify"]);
+
+  const git = makeBuildGit(dir);
+  const base = git.head();
+
+  // 1) commitIndex WITHOUT a preceding diffCachedSet review refuses outright.
+  fs.writeFileSync(path.join(dir, "a.txt"), "two\n");
+  git.stageSet(["a.txt"]);
+  assert.throws(() => git.commitIndex("unreviewed"), /nothing was reviewed/i);
+  assert.equal(git.head(), base, "no commit landed");
+
+  // 2) an UNDECLARED file staged by an outside writer AFTER the review is refused, even though
+  //    the declared-path diff stayed byte-identical (the classic unscoped-index sweep).
+  git.diffCachedSet(["a.txt"], base);
+  fs.writeFileSync(path.join(dir, "evil.txt"), "evil\n");
+  raw(["add", "evil.txt"]);
+  assert.throws(() => git.commitIndex("swept"), /unreviewed bytes/i);
+  assert.equal(git.head(), base, "no commit landed");
+
+  // 3) even re-staged DIFFERENT bytes on the DECLARED path are caught (identical name set!).
+  raw(["reset", "-q", "HEAD", "--", "evil.txt"]);
+  fs.unlinkSync(path.join(dir, "evil.txt"));
+  git.diffCachedSet(["a.txt"], base);
+  fs.writeFileSync(path.join(dir, "a.txt"), "TAMPERED\n");
+  raw(["add", "a.txt"]);
+  assert.throws(() => git.commitIndex("tampered"), /unreviewed bytes/i);
+  assert.equal(git.head(), base, "no commit landed");
+
+  // 4) a fresh review of the CURRENT index then commits cleanly.
+  git.diffCachedSet(["a.txt"], base);
+  const sha = git.commitIndex("now reviewed");
+  assert.notEqual(sha, base);
+  assert.equal(git.isClean(), true);
+});
+
+// --- makeStepPorts: repo-contained fail-closed FS ports ------------------------------
+
+test("makeStepPorts: reads fail CLOSED (no empty-string lie) and never resolve outside the repo", () => {
+  const dir = tmp();
+  fs.mkdirSync(path.join(dir, "lib"));
+  fs.writeFileSync(path.join(dir, "lib", "a.mjs"), "export const a = 1;\n");
+  const ports = makeStepPorts(dir);
+
+  assert.equal(ports.fileExists("lib/a.mjs"), true);
+  assert.equal(ports.fileExists("lib/missing.mjs"), false);
+  assert.equal(ports.readFile("lib/a.mjs"), "export const a = 1;\n");
+  assert.throws(() => ports.readFile("lib/missing.mjs"), /ENOENT|no such file/i, "a read miss THROWS — never an empty-string that reads as an empty file");
+  assert.throws(() => ports.readFile("../outside.mjs"), /escapes the repository/);
+  assert.throws(() => ports.fileExists("../outside.mjs"), /escapes the repository/);
+  assert.throws(() => ports.readFile(path.join(os.tmpdir(), "abs.mjs")), /escapes the repository/, "absolute paths are refused");
+
+  // An ancestor junction/symlink pointing OUTSIDE the repo must not smuggle reads/edit targets
+  // out (git would see no change there and rollback could not restore the external file).
+  // Junctions need no privilege on Windows; on POSIX the type arg is ignored (plain symlink).
+  const outside = tmp();
+  fs.writeFileSync(path.join(outside, "secret.mjs"), "SECRET\n");
+  try {
+    fs.symlinkSync(outside, path.join(dir, "vendor"), "junction");
+  } catch {
+    return; // cannot create links in this environment — the lexical + lstat guards above are pinned
+  }
+  assert.throws(() => ports.readFile("vendor/secret.mjs"), /outside the repository/, "ancestor link escape is refused");
+  assert.throws(() => ports.fileExists("vendor/secret.mjs"), /outside the repository/);
+  assert.throws(() => ports.fileExists("vendor"), /symlink/, "the link itself is refused as an edit/create target");
 });
 
 // --- report ------------------------------------------------------------------------

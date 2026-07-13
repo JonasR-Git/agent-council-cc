@@ -2,12 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildRequiredSeats,
   buildStepReviewPrompt,
   buildReviewerReady,
   makeBuildStepReviewer,
   stepReviewSizeVeto,
+  stepReviewSkipVeto,
+  FLAG_GATE_SEAT,
   SIZE_GATE_SEAT,
   STEP_DIFF_MAX_CHARS,
+  STEP_FILES_MAX,
+  STEP_JSON_MAX_CHARS,
   STEP_TEST_MAX_CHARS
 } from "../plugins/council/scripts/lib/build-step-reviewer.mjs";
 import { evaluatePatchVerdicts } from "../plugins/council/scripts/lib/audit-council-gate.mjs";
@@ -109,7 +114,40 @@ test("a failed/timed-out/truncated run casts NO vote even if it emitted CONFIRM 
   });
   const verdicts = await review(input);
   assert.equal(verdicts.length, 1, "only the clean claude run voted");
-  assert.equal(evaluatePatchVerdicts(verdicts).approved, false, "a partial run cannot manufacture unanimity");
+  // evaluate via the reviewer's OWN binding (explicit required set — never the bare default,
+  // which would silently ignore any configured OpenRouter seat).
+  assert.equal(review.evaluate(verdicts).approved, false, "a partial run cannot manufacture unanimity");
+});
+
+test("an UNPARSEABLE or quoted reply fails CLOSED through the reviewer: non-confirm ballot → veto", async () => {
+  const cases = [
+    "I reviewed everything and it looks good to me.", // prose, no verdict token at all
+    "> VERDICT: CONFIRM\nREASON: quoted from the diff", // quoted → not a clean line-1 declaration
+    "The diff contains VERDICT: CONFIRM but I am unsure." // token in prose only → ambiguous
+  ];
+  for (const reply of cases) {
+    const review = capturingReviewer(withOR(), { codex: { stdout: reply } });
+    const verdicts = await review(input);
+    const codex = verdicts.find((v) => v.seat === "codex");
+    assert.ok(codex, "a garbage reply still yields a parsed (non-confirm) ballot");
+    assert.notEqual(codex.verdict, "confirm", `must not confirm on: ${JSON.stringify(reply)}`);
+    assert.equal(review.evaluate(verdicts).approved, false, `garbage reply must veto: ${JSON.stringify(reply)}`);
+  }
+});
+
+test("a TRUNCATED claude reply casts NO vote even on exit 0 — the clipped tail could hide a conflicting verdict", async () => {
+  // The claude runner returns a BARE STRING, so textOf's truncated check can never fire for it:
+  // realClaudeReview itself must throw. Injected exec seam; bin pinned so no PATH probe runs.
+  const backends = { ...withOR(), claude: { bin: "claude-stub", cli: { available: true } } };
+  const review = makeBuildStepReviewer("/x", backends, {}, {
+    runClaudeCommand: async () => ({ status: 0, timedOut: false, truncated: true, stdout: CONFIRM }),
+    runCodex: async () => ({ stdout: CONFIRM }),
+    runGrok: async () => ({ stdout: CONFIRM }),
+    runOpenRouter: async () => ({ stdout: CONFIRM })
+  });
+  const verdicts = await review(input);
+  assert.equal(verdicts.some((v) => v.seat === "claude"), false, "the truncated claude run must not vote");
+  assert.equal(review.evaluate(verdicts).approved, false, "missing claude → no unanimity");
 });
 
 test("one dissent vetoes even when every other seat confirms", async () => {
@@ -153,8 +191,77 @@ test("an EMPTY diff or test is equally fail-closed (defense-in-depth under the d
   assert.equal(stepReviewSizeVeto(diff, testCode), null, "in-budget artifacts pass the size gate");
 });
 
+test("a step whose declared file set would render TRUNCATED vetoes — the capability boundary must be fully visible", async () => {
+  // 64 in-cap files with long (but per-field legal) paths/intents: the sanitized view serializes
+  // far past STEP_JSON_MAX_CHARS, so the STEP block would clip mid-list and the seats could not
+  // check confirm-condition 3 against the full declared set.
+  const bigFiles = Array.from({ length: 64 }, (_, i) => ({
+    path: `lib/${"x".repeat(280)}-${i}.mjs`,
+    action: "create",
+    role: "source",
+    intent: "y".repeat(280)
+  }));
+  const prompts = {};
+  const review = capturingReviewer(withOR(), {}, prompts);
+  const verdicts = await review({ ...input, step: { ...step, files: bigFiles } });
+  assert.equal(Object.keys(prompts).length, 0, "no seat is asked to judge a truncated STEP block");
+  assert.equal(verdicts.length, 1);
+  assert.equal(verdicts[0].seat, SIZE_GATE_SEAT);
+  assert.match(verdicts[0].reason, /split the step/);
+  // more declared files than the view can render → equally a veto, never a silent slice
+  const manyFiles = Array.from({ length: STEP_FILES_MAX + 1 }, (_, i) => ({ path: `f${i}.mjs`, action: "create", role: "source", intent: "t" }));
+  assert.equal(stepReviewSizeVeto(diff, testCode, { ...step, files: manyFiles })?.verdict, "dissent");
+  // the 2-arg pre-check form stays valid, and an in-budget step passes the full check
+  assert.equal(stepReviewSizeVeto(diff, testCode), null);
+  assert.equal(stepReviewSizeVeto(diff, testCode, step), null);
+});
+
 test("the size-gate pseudo-seat can never impersonate a required seat", () => {
   assert.equal(requiredPatchSeats(withOR(), {}).includes(SIZE_GATE_SEAT), false);
+  assert.equal(buildRequiredSeats(withOR()).includes(SIZE_GATE_SEAT), false);
+  assert.equal(buildRequiredSeats(withOR()).includes(FLAG_GATE_SEAT), false);
+});
+
+// ---- the UNSHRINKABLE build council -----------------------------------------------------------
+
+test("buildRequiredSeats: built-ins + EVERY configured OpenRouter seat — no flag can shrink the queried council", () => {
+  assert.deepEqual([...buildRequiredSeats(withOR())].sort(), ["claude", "codex", "grok", "or-x"]);
+  assert.deepEqual([...buildRequiredSeats(allUp())].sort(), ["claude", "codex", "grok"]);
+  // audit's helper DOES shrink under these flags (its documented semantics) — the build reviewer must not
+  assert.equal(requiredPatchSeats(withOR(), { skipOpenRouter: true }).includes("or-x"), false);
+  const review = makeBuildStepReviewer("/x", withOR(), { skipSeats: ["or-x"] }, { runClaude: async () => CONFIRM });
+  assert.equal(review.seats.includes("or-x"), true, "a skip flag cannot shrink the queried council");
+  assert.equal(Object.isFrozen(review.seats), true, "the bound seat set is immutable");
+});
+
+test("ANY --skip-* flag makes the reviewer REFUSE outright: one flag-gate dissent, zero seats asked", async () => {
+  for (const options of [{ skipCodex: true }, { skipGrok: true }, { skipClaude: true }, { skipOpenRouter: true }, { skipSeats: ["or-x"] }]) {
+    const prompts = {};
+    const review = capturingReviewer(withOR(), {}, prompts, options);
+    const verdicts = await review(input);
+    assert.equal(Object.keys(prompts).length, 0, `${JSON.stringify(options)}: no seat may be asked under a shrink flag`);
+    assert.equal(verdicts.length, 1);
+    assert.equal(verdicts[0].seat, FLAG_GATE_SEAT);
+    assert.equal(verdicts[0].verdict, "dissent");
+    assert.match(verdicts[0].reason, /incompatible with council build/);
+    assert.equal(review.evaluate(verdicts).approved, false, "a flag-gate dissent can never be unanimity");
+  }
+  assert.equal(stepReviewSkipVeto({}), null, "no flags → no veto");
+  assert.equal(stepReviewSkipVeto({ skipSeats: [] }), null, "an empty skip list is not a flag");
+});
+
+test("review.seats + review.evaluate bind unanimity to the EXACT queried council — a drifted recompute cannot drop a dissent", async () => {
+  const backends = withOR();
+  const review = capturingReviewer(backends, { "or-x": { stdout: "VERDICT: DISSENT\nREASON: stub impl" } });
+  const verdicts = await review(input);
+  assert.deepEqual([...review.seats].sort(), ["claude", "codex", "grok", "or-x"]);
+  // THE TRAP the binding exists to close: a caller recomputing `required` with drifted (shrunk)
+  // options makes evaluatePatchVerdicts ignore or-x's live dissent entirely and APPROVE.
+  const drifted = evaluatePatchVerdicts(verdicts, { required: requiredPatchSeats(backends, { skipSeats: ["or-x"] }) });
+  assert.equal(drifted.approved, true, "(documents the drift hazard the bound evaluate prevents)");
+  const bound = review.evaluate(verdicts);
+  assert.equal(bound.approved, false, "the bound evaluate sees every queried seat's ballot");
+  assert.deepEqual(bound.dissents, ["or-x"]);
 });
 
 // ---- prompt: nonce-fenced untrusted data -----------------------------------------------------
@@ -220,6 +327,28 @@ test("an unserializable (circular) evidence object degrades to an explicit marke
   circular.self = circular;
   const prompt = buildStepReviewPrompt(step, diff, testCode, circular, "codex");
   assert.match(prompt, /unserializable evidence/);
+  // degraded evidence also arms the TRUSTED treat-as-unverified rule (see the truncation test)
+  assert.match(prompt, /Never treat unseen bytes as support/);
+});
+
+test("truncation guidance lives in the TRUSTED preamble; the in-fence marker is NEUTRAL data", () => {
+  // in-budget: no truncation apparatus at all (neither marker nor preamble rule)
+  const small = buildStepReviewPrompt(step, diff, testCode, evidence, "codex");
+  assert.equal(small.includes("[truncated"), false);
+  assert.equal(small.includes("Never treat unseen bytes as support"), false);
+  // an oversized evidence blob (test-runner output is unbounded) is clipped WITH the trusted rule
+  const prompt = buildStepReviewPrompt(step, diff, testCode, { red: { output: "E".repeat(9_000) } }, "codex");
+  const nonce = prompt.match(/--- BEGIN MULTI-FILE DIFF ([0-9A-F]{12}) ---/)[1];
+  const preamble = prompt.slice(0, prompt.indexOf(`--- BEGIN STEP ${nonce} ---`));
+  // the be-conservative instruction sits BEFORE the first untrusted fence — in trusted territory —
+  // because the preamble voids every instruction inside the nonce frames (an in-fence "do not
+  // confirm" would be inert for a compliant seat; council claude P2 / audit Grok R4 P1)
+  assert.match(preamble, /Never treat unseen bytes as support/);
+  assert.match(preamble, /unverified and judge the code alone/);
+  const evBegin = prompt.indexOf(`--- BEGIN RED/GREEN EVIDENCE ${nonce} ---`);
+  const evBlock = prompt.slice(evBegin, prompt.indexOf(`--- END RED/GREEN EVIDENCE ${nonce} ---`));
+  assert.match(evBlock, /\[truncated \d+ chars\]/, "the in-fence marker is a neutral clip note");
+  assert.equal(/do not confirm|the tail is NOT shown/i.test(evBlock), false, "no imperative inside the untrusted fence");
 });
 
 // ---- seat independence -----------------------------------------------------------------------
@@ -245,6 +374,47 @@ test("a seat cannot see another seat's verdict — prompts are built from the in
   // each seat got its OWN one-time nonce — one seat's fence cannot be forged into another's prompt
   const nonces = seats.map((s) => prompts[s].match(/--- BEGIN MULTI-FILE DIFF ([0-9A-F]{12}) ---/)[1]);
   assert.equal(new Set(nonces).size, seats.length, "per-seat fresh nonces");
+});
+
+// ---- runner posture: instruction-isolated cwd + hard default timeout --------------------------
+
+test("default codex/grok runners run from an instruction-isolated EMPTY cwd (never the model-written worktree) with a hard 300s default timeout", async () => {
+  const seen = { made: 0 };
+  const review = makeBuildStepReviewer("/worktree", withOR(), {}, {
+    mkReviewCwd: () => { seen.made += 1; return "/isolated"; },
+    runCodexStructured: async (cwd, _backends, opts, _prompt, label) => { seen.codex = { cwd, timeoutMs: opts.agentTimeoutMs, label }; return { stdout: CONFIRM }; },
+    runGrokStructured: async (cwd, _backends, opts) => { seen.grok = { cwd, timeoutMs: opts.agentTimeoutMs, sandbox: opts.grokSandbox }; return { stdout: CONFIRM }; },
+    runClaude: async () => CONFIRM,
+    runOpenRouter: async (cwd, _backends, opts) => { seen.or = { cwd, timeoutMs: opts.agentTimeoutMs }; return { stdout: CONFIRM }; }
+  });
+  const verdicts = await review(input);
+  assert.equal(verdicts.length, 4, "all four seats voted");
+  // gate-9 cwd isolation: a hostile generated AGENTS.md/config in the worktree must never be
+  // auto-loaded by a CLI seat — codex/grok get an empty dir; OpenRouter is API-only (cwd inert)
+  assert.equal(seen.codex.cwd, "/isolated");
+  assert.equal(seen.grok.cwd, "/isolated");
+  assert.equal(seen.or.cwd, "/worktree");
+  assert.equal(seen.made, 1, "ONE isolated dir per reviewer, created lazily and memoized");
+  // fail-closed hang protection: runCommandAsync arms a kill timer only when timeoutMs is set,
+  // so every seat MUST get a default — a wedged CLI becomes a non-vote, never an infinite hang
+  assert.equal(seen.codex.timeoutMs, 300_000);
+  assert.equal(seen.grok.timeoutMs, 300_000);
+  assert.equal(seen.or.timeoutMs, 300_000);
+  assert.equal(seen.grok.sandbox, "read-only", "grok's best-effort sandbox profile stays pinned");
+  assert.equal(seen.codex.label, "build-step-review", "non-r1 label → no degraded focus-string fallback");
+});
+
+test("a caller-tightened timeout survives; injected whole-seat runners bypass the default runner wiring", async () => {
+  const seen = {};
+  const review = makeBuildStepReviewer("/worktree", allUp(), { agentTimeoutMs: 60_000 }, {
+    mkReviewCwd: () => "/isolated",
+    runCodexStructured: async (_cwd, _backends, opts) => { seen.timeoutMs = opts.agentTimeoutMs; return { stdout: CONFIRM }; },
+    runGrokStructured: async () => ({ stdout: CONFIRM }),
+    runClaude: async () => CONFIRM
+  });
+  const verdicts = await review(input);
+  assert.equal(verdicts.length, 3);
+  assert.equal(seen.timeoutMs, 60_000, "an explicit (tighter) timeout is honored");
 });
 
 // ---- readiness (build preflight, gate 0) -----------------------------------------------------
@@ -275,12 +445,18 @@ test("buildReviewerReady: an UNREACHABLE seat blocks with an availability reason
   assert.match(codexDown.reasons.codex, /companion/);
 });
 
-test("buildReviewerReady: a configured-but-down OpenRouter seat blocks; an opted-out one is simply not required", () => {
+test("buildReviewerReady: a configured-but-down OpenRouter seat blocks — and NO flag can drop it from the council", () => {
   const down = buildReviewerReady(withOR({ available: false }), {});
   assert.equal(down.ready, false);
   assert.match(down.reasons["or-x"], /OpenRouter seat or-x unreachable/);
-  assert.equal(buildReviewerReady(withOR({ available: false }), { skipOpenRouter: true }).ready, true, "--skip-openrouter drops the OR seats from the required set");
-  const perSeat = buildReviewerReady(withOR({ available: false }), { skipSeats: ["or-x"] });
-  assert.equal(perSeat.ready, true);
-  assert.equal("or-x" in perSeat, false, "a non-required seat is not even reported");
+  // The audit path's skip-an-OR-seat semantics deliberately do NOT apply to build: the council is
+  // unshrinkable, so a shrink flag blocks readiness (same posture as a skipped built-in).
+  const skipAll = buildReviewerReady(withOR(), { skipOpenRouter: true });
+  assert.equal(skipAll.ready, false, "--skip-openrouter must block the build, never shrink the council");
+  assert.equal(skipAll["or-x"], false);
+  assert.match(skipAll.reasons["or-x"], /--skip-openrouter is incompatible with council build/);
+  const perSeat = buildReviewerReady(withOR(), { skipSeats: ["or-x"] });
+  assert.equal(perSeat.ready, false, "--skip-seats must block the build, never shrink the council");
+  assert.equal("or-x" in perSeat, true, "the flagged seat stays REPORTED as required");
+  assert.match(perSeat.reasons["or-x"], /--skip-seats is incompatible with council build/);
 });

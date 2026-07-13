@@ -125,6 +125,11 @@ export function makeBuildGit(root) {
     if (!list.length) throw new Error("empty path set — a build step must declare at least one file");
     return list;
   };
+  // The index TREE the last diffCachedSet showed a reviewer. `git commit` sweeps the WHOLE index,
+  // so an outside writer (a concurrent process staging undeclared bytes between review and commit)
+  // would otherwise be committed unreviewed even though the declared-path diff stayed byte-identical.
+  // commitIndex therefore refuses to land any tree but this one (council C5).
+  let reviewedTree = null;
   return {
     isRepo: () => g(["rev-parse", "--is-inside-work-tree"]).status === 0,
     isClean: () => g(["status", "--porcelain"]).stdout.trim() === "",
@@ -138,6 +143,7 @@ export function makeBuildGit(root) {
     checkout: (ref) => g(["checkout", ref]).status === 0,
     changedFiles: () => parsePorcelainZ(g(["status", "--porcelain", "-z"]).stdout),
     resetHard: (ref) => {
+      reviewedTree = null; // any reset invalidates a pending review binding
       const r = g(["reset", "--hard", String(ref)]);
       // clean -fd removes UNTRACKED output (files a step created) but NOT ignored files:
       // `-x` would delete the user's gitignored .env/node_modules on the first rollback
@@ -157,18 +163,134 @@ export function makeBuildGit(root) {
     },
     // The STAGED (index) diff of the set vs `ref` — the exact bytes a §6 review judges and
     // the exact bytes commitIndex will land (closes the TOCTOU between review and commit).
-    diffCachedSet: (paths, ref) => g(["diff", "--cached", String(ref), "--", ...posixSet(paths)]).stdout,
-    // Commit the ALREADY-STAGED index (no re-add): one commit per step, byte-bound.
+    // The index tree is captured (git write-tree) so commitIndex can PROVE it commits this
+    // exact reviewed state and nothing else.
+    diffCachedSet: (paths, ref) => {
+      const out = g(["diff", "--cached", String(ref), "--", ...posixSet(paths)]).stdout;
+      const t = g(["write-tree"]);
+      if (t.status !== 0) throw new Error(`git write-tree failed: ${t.stderr.trim()} — cannot bind the reviewed index (fail-closed)`);
+      reviewedTree = t.stdout.trim();
+      return out;
+    },
+    // Commit the ALREADY-STAGED index (no re-add): one commit per step, byte-bound. `--no-verify`
+    // is deliberate and load-bearing: a pre-commit hook may MUTATE the index (formatters), which
+    // would land bytes the §6 council never saw — hooks are an unreviewed write path here, not a
+    // protection. The tree binding below would catch such a mutation as a hard failure anyway.
     commitIndex: (message) => {
+      // Reviewed-byte binding, adapter half: only an index a diffCachedSet call has SHOWN may be
+      // committed, and it must still be tree-identical NOW (nothing swept in after the review).
+      if (!reviewedTree) throw new Error("commitIndex refused: no diffCachedSet preceded this commit — nothing was reviewed (fail-closed)");
+      const pre = g(["write-tree"]);
+      if (pre.status !== 0 || pre.stdout.trim() !== reviewedTree) {
+        reviewedTree = null;
+        throw new Error("the index changed after the reviewed diff was taken — refusing to commit unreviewed bytes (fail-closed)");
+      }
       const res = g(["commit", "-m", message, "--no-verify"]);
       if (res.status !== 0) throw new Error(`git commit failed: ${res.stderr.trim()}`);
-      return g(["rev-parse", "HEAD"]).stdout.trim();
+      const sha = g(["rev-parse", "HEAD"]).stdout.trim();
+      // Close the check→commit race too: the LANDED tree must BE the reviewed tree, or the commit
+      // is dropped on the spot (fail loud; the caller treats a throwing commit as a failed step).
+      const landed = g(["rev-parse", `${sha}^{tree}`]).stdout.trim();
+      const bound = landed === reviewedTree;
+      reviewedTree = null;
+      if (!bound) {
+        g(["reset", "--hard", `${sha}~1`]);
+        throw new Error("the committed tree is not the reviewed tree — commit dropped (fail-closed)");
+      }
+      return sha;
     }
+  };
+}
+
+// --- repo-contained filesystem ports -------------------------------------------
+
+/** realpath with the OS-native resolver (falls back to the plain one; throws when `p` is gone). */
+function realPathOf(p) {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return fs.realpathSync(p);
+  }
+}
+
+/**
+ * lstat `rel` STRICTLY inside `root` → false | "file" | "dir" | "symlink" | "escapes-root" |
+ * "special". Fail-closed path discipline for everything the orchestrator reads on behalf of a
+ * step: the path must be repo-relative (no absolute, no ".."), the final component must not be a
+ * symlink (lstat, never stat), and the nearest EXISTING ancestor directory must RESOLVE
+ * (realpath — catches symlinked/junction ancestors) inside the repo root. Any I/O error other
+ * than "does not exist" THROWS — never a silent false (fail-closed).
+ */
+function containedKind(root, rel) {
+  const p = String(rel ?? "");
+  if (!p || path.isAbsolute(p) || p.split(/[\\/]+/).includes("..")) {
+    throw new Error(`path escapes the repository (absolute or ..): ${p}`);
+  }
+  const full = path.join(root, p);
+  let st = null;
+  try {
+    st = fs.lstatSync(full);
+  } catch (err) {
+    if (err?.code !== "ENOENT" && err?.code !== "ENOTDIR") throw err;
+  }
+  if (st?.isSymbolicLink()) return "symlink";
+  // The nearest EXISTING ancestor must resolve inside the repo — a symlinked/junction ancestor
+  // resolves elsewhere. Walk up ONLY past not-yet-created directories (a create step's new folder);
+  // any other realpath error propagates (an unreadable dir must never read as contained).
+  let dir = path.dirname(full);
+  let real = null;
+  for (;;) {
+    try {
+      real = realPathOf(dir);
+      break;
+    } catch (err) {
+      if (err?.code !== "ENOENT") throw err;
+      const parent = path.dirname(dir);
+      if (parent === dir) throw err;
+      dir = parent;
+    }
+  }
+  const fromRoot = path.relative(realPathOf(root), real);
+  if (fromRoot.startsWith("..") || path.isAbsolute(fromRoot)) return "escapes-root";
+  if (!st) return false;
+  if (st.isFile()) return "file";
+  if (st.isDirectory()) return "dir";
+  return "special";
+}
+
+/**
+ * The orchestrator-owned per-step FS ports (build-step's readFile/fileExists, ladder step 2).
+ * Every access is repo-contained and fail-CLOSED: a symlink target, an escaping resolution, or an
+ * unreadable file THROWS (build-step converts a throwing port into a failed gate + verified
+ * rollback) instead of returning a fail-open "" / false that would let a step read the wrong
+ * bytes or edit through a link to a file OUTSIDE the repo — where git sees no change and a
+ * rollback cannot restore anything. Exported for tests.
+ */
+export function makeStepPorts(root) {
+  const guard = (rel) => {
+    const kind = containedKind(root, rel);
+    if (kind === "symlink" || kind === "escapes-root") {
+      throw new Error(`refusing ${rel}: ${kind === "symlink" ? "path is a symlink" : "path resolves outside the repository"} (fail-closed)`);
+    }
+    return kind;
+  };
+  return {
+    // ENOENT/EISDIR THROW — a read miss must never be indistinguishable from an empty file.
+    readFile: (rel) => {
+      guard(rel);
+      return fs.readFileSync(path.join(root, rel), "utf8");
+    },
+    fileExists: (rel) => guard(rel) !== false
   };
 }
 
 // --- real adapters (injectable) ----------------------------------------------
 
+// NOTE on containment: this runs the repo's DETECTED suite command as-is. The baseline pass runs
+// BEFORE any model-authored byte exists; the per-step RED/GREEN runs go through the CLI-wired
+// runStepTest port, which owns test sandboxing (a generic NODE_OPTIONS --permission wrap of an
+// npm-based suite needs --allow-child-process and would contain nothing). Platforms without
+// proven test containment stay human-gated per Safety v1.
 async function realRunTests(root, testCmd, options) {
   const res = await runCommandAsync(testCmd.cmd, testCmd.args, {
     cwd: root,
@@ -201,8 +323,8 @@ function tryResetHard(git, ref) {
  * (ladder 1–11, injected or lazily imported) -> final integration + return-to-base
  * (ladder step 12). Returns a structured report; the ONLY durable side effects of a
  * successful run are commits on the isolated branch. `deps` lets tests inject
- * { git, testCmd, runTests, seatsReady, runStep, stepDeps, acquireLock, releaseLock, now }
- * so the whole machine runs without a repo, a network, or a model.
+ * { git, testCmd, runTests, seatsReady, validatePlan, runStep, stepDeps, acquireLock,
+ * releaseLock, now } so the whole machine runs without a repo, a network, or a model.
  */
 export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps = {}) {
   const root = workspaceRoot(cwd);
@@ -233,6 +355,13 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
   // --- preflight (ladder step 0): ANY miss refuses the WHOLE run — no partial build ---
   const shape = planShapeReason(planSpec, { maxSteps });
   if (shape) return refuse(`invalid PlanSpec: ${shape} — re-run \`council plan\` (build never repairs a plan)`);
+  // §6 is unweakenable BY ANY FLAG (Safety v1: "no reduced council"): options that shrink the
+  // required seat set are refused OUTRIGHT, never silently ignored — a caller asking for a smaller
+  // council must not quietly get one. (Skipping a BUILT-IN seat needs no special case here:
+  // requiredPatchSeats always keeps the built-ins, so such a flag just fails seat readiness below.)
+  if (options.skipOpenRouter || (Array.isArray(options.skipSeats) ? options.skipSeats.length > 0 : Boolean(options.skipSeats))) {
+    return refuse("skipOpenRouter/skipSeats reduce the §6 council and are not honored by `council build` — unanimity over EVERY required seat (built-ins + configured OpenRouter) is non-negotiable; remove the flag");
+  }
   if (!git.isRepo()) return refuse("not a git repository — build needs git for branch isolation + rollback");
   const baseBranch = git.currentBranch();
   if (!baseBranch || typeof baseBranch !== "string") {
@@ -247,7 +376,33 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
   if (baseRef !== planSpec.baseCommit) {
     return refuse(`HEAD ${String(baseRef).slice(0, 8)} does not match the plan's baseCommit ${String(planSpec.baseCommit).slice(0, 8)} — the plan was made against a different tree; re-run \`council plan\``);
   }
-  const testCmd = deps.testCmd ?? options.testCmd ?? detectTestCmd(root);
+  // FULL contract validation (defense-in-depth): planShapeReason above only guards the
+  // orchestrator's own invariants. Path safety, protected paths, create/edit vs the tree at the
+  // (just verified) baseCommit, and the role:test relaxation are plan-spec's validatePlanSpec —
+  // run HERE too, so a caller that skips the CLI wiring cannot skip path safety. Lazy import
+  // (same pattern as build-step): an unloadable validator is a REFUSAL, never a skipped check.
+  const validatePlan =
+    deps.validatePlan ??
+    (async () => {
+      const { validatePlanSpec } = await import("./plan-spec.mjs");
+      // plan-spec's fileExists contract: "file" | "dir" | false, plus "symlink"/"escapes-root"
+      // for paths whose resolution leaves the repo — any non-"file" kind blocks create AND edit.
+      return validatePlanSpec(planSpec, { root, fileExists: (rel) => containedKind(root, rel) });
+    });
+  let planCheck = null;
+  try {
+    planCheck = await validatePlan(planSpec, root);
+  } catch (err) {
+    return refuse(`PlanSpec validation failed: ${String(err?.message ?? err)}`);
+  }
+  if (!planCheck || planCheck.valid !== true) {
+    const why = Array.isArray(planCheck?.errors) && planCheck.errors.length ? planCheck.errors.slice(0, 5).join("; ") : "the validator returned no verdict (fail-closed)";
+    return refuse(`PlanSpec validation failed: ${why}`);
+  }
+  // The test command is DETECTED, never accepted from options: a caller-supplied command is the
+  // "arbitrary shell test command" escape hatch Safety v1 forbids (a noop would turn the baseline
+  // and final gates permanently green). deps.testCmd is the unit-test seam only.
+  const testCmd = deps.testCmd ?? detectTestCmd(root);
   if (!testCmd) return refuse("no test command detected — build REQUIRES a test gate (there is no --allow-untested)");
   // Every required §6 seat (built-ins + configured OpenRouter — the dynamic registry, never
   // a hardcoded triple) must be reachable BEFORE any model spend: a down seat can never
@@ -267,7 +422,12 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
     deps.acquireLock ??
     (() => {
       ensureStateDir(cwd);
-      const lockPath = path.join(resolveStateDir(cwd), "build.lock");
+      const stateDir = resolveStateDir(cwd);
+      // An `audit fix` shares this working tree's git surface (staging/reset/commit) — a fix
+      // writer racing a build would break the reviewed-byte binding, so its lock excludes a
+      // build too (one-way here; audit-fix's own preflight guards its side).
+      if (fs.existsSync(path.join(stateDir, "audit-fix.lock"))) throw new Error("audit-fix.lock held");
+      const lockPath = path.join(stateDir, "build.lock");
       fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
       return lockPath;
     });
@@ -284,11 +444,20 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
   try {
     lockToken = acquireLock() ?? "held";
   } catch {
-    return refuse("another `council build` is already running in this repo (lock held) — wait for it to finish or remove a stale build.lock");
+    return refuse("another `council build` (or an `audit fix`) is already running in this repo (lock held) — wait for it to finish or remove a stale build.lock/audit-fix.lock");
   }
 
+  let leftBase = false;
   try {
     const runTests = deps.runTests ?? (() => realRunTests(root, testCmd, options));
+
+    // Isolated branch off the CLEAN base. Always fresh: an existing branch of the same name
+    // means a previous run left artifacts a human has not reviewed yet. Checked BEFORE the
+    // baseline suite — refusing cheaply beats burning a full test run on a doomed run.
+    const branch = options.branch ?? `council/build-${requestSlug(planSpec.request)}-${String(baseRef).slice(0, 8)}`;
+    if (typeof git.branchExists === "function" && git.branchExists(branch)) {
+      return refuse(`branch ${branch} already exists — a build always starts fresh; review/delete it (or pass a different branch name)`);
+    }
 
     // GREEN baseline on the base commit: with a red base, RED-before/GREEN-after and the
     // full-suite gates are unreadable (every step would be judged against noise).
@@ -302,17 +471,12 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
       );
     }
 
-    // Isolated branch off the CLEAN base. Always fresh: an existing branch of the same
-    // name means a previous run left artifacts a human has not reviewed yet.
-    const branch = options.branch ?? `council/build-${requestSlug(planSpec.request)}-${String(baseRef).slice(0, 8)}`;
-    if (typeof git.branchExists === "function" && git.branchExists(branch)) {
-      return refuse(`branch ${branch} already exists — a build always starts fresh; review/delete it (or pass a different branch name)`);
-    }
     try {
       git.createAndCheckout(branch, baseRef);
     } catch (err) {
       return refuse(`could not create the isolated build branch: ${String(err?.message ?? err)}`);
     }
+    leftBase = true;
 
     // --- run budget (whole-run bounds; per-step bounds live in build-step, ladder 1) ---
     // Fail-closed spend accounting: a step result that does not report modelCalls is
@@ -328,17 +492,12 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
 
     // The ports the orchestrator owns; the CLI layer merges in the model-facing ports
     // (authorTests / authorImpl / writeFiles / runStepTest / reviewStep) via deps.stepDeps.
+    // readFile/fileExists are the repo-CONTAINED fail-closed ports (see makeStepPorts): a
+    // symlink/escape/read-miss THROWS into build-step's gate machinery, never fails open.
     const stepDeps = {
       git,
       runFullSuite: runTests,
-      readFile: (rel) => {
-        try {
-          return fs.readFileSync(path.join(root, rel), "utf8");
-        } catch {
-          return "";
-        }
-      },
-      fileExists: (rel) => fs.existsSync(path.join(root, rel)),
+      ...makeStepPorts(root),
       now,
       backends,
       options,
@@ -465,6 +624,10 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
     if (!stranded && (typeof git.isClean !== "function" || git.isClean())) {
       returnedToBase = Boolean(git.checkout(baseBranch));
     }
+    // A run that cannot put the operator back on base is NOT complete: reporting "completed"
+    // while the working tree sits on the build branch would be exactly the false success
+    // fail-closed forbids. The branch and its commits stay intact either way.
+    if (!returnedToBase && stopReason === "completed") stopReason = "return-to-base-failed";
 
     return {
       ok: stopReason === "completed",
@@ -482,6 +645,18 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
       budget: { modelCallsSpent, maxModelCalls, wallClockMs: now() - startMs, maxWallClockMs },
       merged: false
     };
+  } catch (err) {
+    // No throw below preflight is EXPECTED — this is salvage, not success: put the operator back
+    // on base, but ONLY over a clean tree (a checkout over dirt could destroy evidence), then
+    // RETHROW. An unexpected error must surface as an error, never as a fabricated result.
+    if (leftBase) {
+      try {
+        if (typeof git.isClean !== "function" || git.isClean()) git.checkout(baseBranch);
+      } catch {
+        /* leave the tree as evidence */
+      }
+    }
+    throw err;
   } finally {
     if (lockToken != null) releaseLock(lockToken);
   }

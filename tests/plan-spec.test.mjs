@@ -429,19 +429,43 @@ test("planStepTouched is the EXACT sorted files[].path set (tests included, noth
   const spec = makeSpec();
   assert.deepEqual(planStepTouched(spec.steps[0]), ["lib/widget.mjs", "tests/widget.test.mjs"]);
   assert.deepEqual(planStepTouched(spec.steps[1]), ["lib/widget.mjs", "tests/widget-render.test.mjs"]);
-  // dedupe + defensive on shape
-  assert.deepEqual(planStepTouched({ files: [{ path: "a" }, { path: "a" }, { path: "b" }] }), ["a", "b"]);
-  assert.deepEqual(planStepTouched({}), []);
-  assert.deepEqual(planStepTouched(null), []);
   // NOT widened by test.files: an undeclared test path stays OUTSIDE the boundary
-  const malformed = { files: [{ path: "lib/a.mjs" }], test: { files: ["tests/ghost.test.mjs"] } };
-  assert.deepEqual(planStepTouched(malformed), ["lib/a.mjs"]);
+  const step = {
+    files: [{ path: "lib/a.mjs", action: "edit", role: "source", intent: "x" }],
+    test: { files: ["tests/ghost.test.mjs"] }
+  };
+  assert.deepEqual(planStepTouched(step), ["lib/a.mjs"]);
 });
 
 test("planStepTestFiles / planStepImplFiles split the boundary by role", () => {
   const step = makeSpec().steps[0];
   assert.deepEqual(planStepTestFiles(step), ["tests/widget.test.mjs"]);
   assert.deepEqual(planStepImplFiles(step), ["lib/widget.mjs"]);
+});
+
+test("the boundary helpers THROW on unvalidated step shapes — skipped validation crashes, never collapses to [] (council G3/G4)", () => {
+  // parsePlanSpec accepts any plain object (parse ≠ validate); the footgun closes HERE: a spec
+  // that never went through validatePlanSpec must be unusable as a capability boundary.
+  const unvalidated = [
+    null,
+    {}, // no files at all — must NOT read as "no writes required"
+    { files: [] },
+    { files: "later" },
+    { files: [{ path: "a" }] }, // action/role missing
+    { files: [{ path: "../escape.mjs", action: "edit", role: "source" }] }, // traversal path
+    { files: [{ path: "lib/a.mjs", action: "chmod", role: "source" }] }, // unknown action
+    { files: [{ path: "lib/a.mjs", action: "edit", role: "doc" }] } // unknown role
+  ];
+  for (const helper of [planStepTouched, planStepTestFiles, planStepImplFiles]) {
+    for (const step of unvalidated) {
+      assert.throws(() => helper(step), /run validatePlanSpec first/, `${helper.name} must throw for ${JSON.stringify(step)}`);
+    }
+  }
+  // and the VALIDATED (normalized) shape keeps working
+  const ok = validatePlanSpec(makeSpec(), OPTS).value;
+  assert.deepEqual(planStepTouched(ok.steps[0]), ["lib/widget.mjs", "tests/widget.test.mjs"]);
+  assert.deepEqual(planStepTestFiles(ok.steps[0]), ["tests/widget.test.mjs"]);
+  assert.deepEqual(planStepImplFiles(ok.steps[0]), ["lib/widget.mjs"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -556,7 +580,8 @@ test("protected paths include manifests, Dockerfiles, build output, git control 
     "vendor/lib.mjs",
     "coverage/report.mjs",
     "migrations/001-init.mjs",
-    "db/migrations/002.mjs"
+    "db/migrations/002.mjs",
+    "certs/server.crt" // key-material sync with audit-fix's PROTECTED_RE (.crt was audit-fix-only)
   ];
   for (const p of protectedNow) assert.equal(isPlanProtectedPath(p), true, `expected protected: ${p}`);
   // segment-anchored: lookalike names stay writable
@@ -628,6 +653,28 @@ test("classifyStep catches jwt/bearer/injection/xss/csrf/sandbox/privilege wordi
   assert.equal(classifyStep(makeSpec().steps[0]).sensitive, false);
 });
 
+test("classifyStep second widening: cors/mfa/saml/nonce/KDF/sql/corruption/data-loss/reentrancy wording is sensitive (council G2/C6)", () => {
+  const mk = (title, intent) => ({ title, intent, files: [{ path: "lib/x.mjs", role: "source", action: "create", intent: "x" }] });
+  const cases = [
+    [mk("Cross-origin", "Relax the CORS allowlist"), "security"],
+    [mk("Response hardening", "Emit a strict CSP header"), "security"],
+    [mk("Second factor", "Add TOTP-based MFA enrollment"), "auth"],
+    [mk("Enterprise login", "Wire the SAML assertion consumer"), "auth"],
+    [mk("Replay defence", "Reject a reused nonce"), "crypto"],
+    [mk("Password storage", "Move hashing to argon2id"), "crypto"],
+    [mk("Key stretching", "Bump the PBKDF2 iteration count"), "crypto"],
+    [mk("Store layer", "Compose sql statements for the report"), "data-integrity"],
+    [mk("Recovery", "Detect corrupted ledger entries"), "data-integrity"],
+    [mk("Durability", "Guard against data loss on crash"), "data-integrity"],
+    [mk("Shared state", "Make the cache reentrant"), "concurrency"]
+  ];
+  for (const [step, cls] of cases) {
+    const r = classifyStep(step);
+    assert.equal(r.sensitive, true, `expected sensitive: '${step.intent}'`);
+    assert.ok(r.classes.includes(cls), `expected class '${cls}' for '${step.intent}', got [${r.classes}]`);
+  }
+});
+
 test("a probe reporting 'symlink' (or any out-of-root kind) blocks BOTH create and edit — the containment plumbing is fail-closed", () => {
   // plan-spec cannot realpath (pure); the CONTRACT is: any kind other than exactly "file"/false
   // blocks both actions, so an adapter that reports ancestor-symlink/junction escapes as a
@@ -651,4 +698,39 @@ test("isPlanTestPath recognizes the test conventions (and only them)", () => {
   assert.equal(isPlanTestPath("__tests__/y.mjs"), true);
   assert.equal(isPlanTestPath("lib/widget.mjs"), false);
   assert.equal(isPlanTestPath("attest/x.mjs"), false);
+});
+
+test("boundary helpers REFUSE a protected path even on an unvalidated step (council Codex P1 — the boundary must not authorise CI)", () => {
+  // Path SHAPE is not enough: a syntactically fine path can still be protected. A caller who skipped
+  // validatePlanSpec could otherwise hand in a step declaring `.github/workflows/pwn.mjs`, and
+  // planStepTouched would hand it back as the step's CAPABILITY BOUNDARY — the boundary itself would
+  // authorise writing a CI workflow. These helpers are the last line before the writer.
+  const evil = {
+    files: [{ path: ".github/workflows/pwn.mjs", action: "edit", role: "source", intent: "x" }],
+    test: { files: [] }
+  };
+  assert.throws(() => planStepTouched(evil), /PROTECTED path/, "a protected path is never a capability boundary");
+  assert.throws(() => planStepImplFiles(evil), /PROTECTED path/);
+  assert.throws(() => planStepTestFiles(evil), /PROTECTED path/);
+
+  for (const p of ["package.json", "Dockerfile", "package-lock.json", ".env", "dist/out.mjs", ".git/config"]) {
+    assert.throws(
+      () => planStepTouched({ files: [{ path: p, action: "edit", role: "source", intent: "x" }] }),
+      /PROTECTED path/,
+      `${p} must never reach the capability boundary`
+    );
+  }
+});
+
+test("boundary helpers enforce role/test coherence on an unvalidated step (no smuggling past the TEST-FIRST boundary)", () => {
+  // role:"test" on a non-test path (or role:"source" on a test path) would let a step move a file across
+  // the author boundary the RED-before-GREEN gate depends on.
+  assert.throws(
+    () => planStepTouched({ files: [{ path: "lib/x.mjs", action: "create", role: "test", intent: "x" }] }),
+    /role:"test" but is not a test path/
+  );
+  assert.throws(
+    () => planStepTouched({ files: [{ path: "tests/x.test.mjs", action: "create", role: "source", intent: "x" }] }),
+    /role:"source" but IS a test path/
+  );
 });

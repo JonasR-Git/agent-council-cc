@@ -13,7 +13,9 @@
 //    declared files[].path set (which INCLUDES the test files — every test file must also appear
 //    in files[] with role:"test") and the commit is later bound to exactly that set. It is the
 //    EXACT declared set — never widened (a malformed step must fail the drift gate, not be
-//    accommodated by a defensive union).
+//    accommodated by a defensive union). The boundary helpers THROW on a step that is not shaped
+//    like a validated one (council G3/G4): a caller that skipped validatePlanSpec crashes instead
+//    of receiving an empty/narrowed "boundary" it could misread as "nothing to write".
 //  - Path safety + protected classes mirror structure-gate.mjs. The ONE narrow relaxation: a path
 //    matching a test convention is allowed ONLY when it is declared in files[] with role:"test"
 //    (and then it must ALSO be listed in test.files). Every other protection (CI/git/deps/
@@ -97,9 +99,10 @@ const TEST_PATH_RE = [
 // Paths a plan must NEVER touch, regardless of role: repo/CI/git internals, deps + manifests,
 // lockfiles, secrets, key material, build output, council state. Superset of structure-gate.mjs
 // STRUCTURE_PROTECTED_RE (minus the test patterns above, which get the narrow role:"test"
-// relaxation) AND of build-step.mjs PROTECTED_RE — a spec must never validate a path the build
+// relaxation), of build-step.mjs PROTECTED_RE — a spec must never validate a path the build
 // gate would later reject (council G1/C3: package.json / Dockerfile / dist|build|vendor|coverage
-// were build-blocked but plan-validatable). Git CONTROL FILES (.gitmodules can re-point a
+// were build-blocked but plan-validatable) — AND of audit-fix.mjs PROTECTED_RE's path classes
+// (which add `.crt` to the key-material formats). Git CONTROL FILES (.gitmodules can re-point a
 // submodule at an external URL; .gitattributes rewires filters/diff; .gitignore can hide
 // artifacts from the drift rescan) and migrations (Safety v1 defers ALL migration work) are
 // blocked here too — build-step should mirror both (see module notes).
@@ -127,7 +130,7 @@ const PLAN_PROTECTED_RE = [
   /(^|\/)\.docker(\/|$)/i,
   /(^|\/)\.dockercfg$/i,
   /(^|\/)(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\.|$)/i,
-  /\.(pem|key|p12|pfx|keystore|jks|p8|gpg|pgp|asc)$/i,
+  /\.(pem|key|crt|p12|pfx|keystore|jks|p8|gpg|pgp|asc)$/i,
   /(^|\/)(\.npmrc|\.pypirc|\.netrc|\.envrc)$/i
 ];
 
@@ -195,7 +198,10 @@ export function requestDigest(request) {
 /**
  * Parse PlanSpec input (JSON text or an already-parsed plain object) → { ok, spec, error }.
  * Strict: bounded size, JSON only, plain-object root. Parsing does NOT validate — callers must
- * run validatePlanSpec before trusting anything in the result.
+ * run validatePlanSpec before trusting anything in the result. That is not comment-only (council
+ * G3): a parse-only spec is UNUSABLE as a write boundary, because the capability-boundary helpers
+ * (planStepTouched / planStepTestFiles / planStepImplFiles) THROW on steps that were never
+ * validated. Only the deliberately-total display/digest helpers accept an unvalidated spec.
  */
 export function parsePlanSpec(input) {
   if (isPlainObject(input)) return { ok: true, spec: input, error: null };
@@ -514,34 +520,70 @@ function normalizeStep(step) {
   };
 }
 
+// The boundary helpers interpret ONLY validated steps. A step failing these shape checks means a
+// caller SKIPPED validatePlanSpec (council G3/G4 — the parse-without-validate footgun): answering
+// [] (or quietly dropping entries) there would hand downstream logic an empty/narrowed "boundary"
+// it could misread as "nothing to write". Fail-closed: THROW, so a skipped validation becomes a
+// crash, never a silent boundary collapse. (planSpecDigest stays total by design — a digest must
+// never throw mid-gate — and renderPlanMarkdown is display-only with every value scrubbed.)
+function validatedStepFiles(step, helper) {
+  if (!isPlainObject(step) || !Array.isArray(step.files) || step.files.length === 0) {
+    throw new Error(`${helper}: step is not a validated PlanSpec step — run validatePlanSpec first (fail-closed)`);
+  }
+  for (const f of step.files) {
+    if (!isPlainObject(f) || pathShapeReason(f.path) !== null || !ACTIONS.includes(f.action) || !ROLES.includes(f.role)) {
+      throw new Error(`${helper}: files[] entry '${scrub(f?.path, 200)}' is not a validated PlanSpec file — run validatePlanSpec first (fail-closed)`);
+    }
+    // PATH SHAPE IS NOT ENOUGH (council Codex P1): a syntactically fine path can still be a PROTECTED
+    // one. Without this check a caller who skipped validatePlanSpec could hand in a step declaring
+    // `.github/workflows/pwn.mjs` and planStepTouched would hand that path back as the step's CAPABILITY
+    // BOUNDARY — i.e. the boundary itself would authorise writing a CI workflow. The boundary helpers are
+    // the last line before the writer, so they must refuse a protected path outright, not merely a
+    // malformed one.
+    if (isPlanProtectedPath(f.path)) {
+      throw new Error(`${helper}: files[] entry '${scrub(f.path, 200)}' is a PROTECTED path (CI/git/deps/lockfiles/secrets/manifests) — a validated PlanSpec can never declare one (fail-closed)`);
+    }
+    // Role/test coherence: a role:"test" file must look like a test path, and a role:"source" file must
+    // not — otherwise a step could smuggle an impl file past the TEST-FIRST author boundary (or vice
+    // versa) on an unvalidated shape.
+    const looksTest = isPlanTestPath(f.path);
+    if (f.role === "test" && !looksTest) {
+      throw new Error(`${helper}: files[] entry '${scrub(f.path, 200)}' has role:"test" but is not a test path — run validatePlanSpec first (fail-closed)`);
+    }
+    if (f.role === "source" && looksTest) {
+      throw new Error(`${helper}: files[] entry '${scrub(f.path, 200)}' has role:"source" but IS a test path — run validatePlanSpec first (fail-closed)`);
+    }
+  }
+  return step.files;
+}
+
 /**
  * The step's CAPABILITY BOUNDARY: the EXACT set of files[].path (sorted, deduped) — which
  * already INCLUDES the test files (every test file must appear in files[] with role:"test").
  * Deliberately NOT widened with test.files: on a malformed step a defensive union would let the
- * writer touch an undeclared path the drift gate should catch instead.
+ * writer touch an undeclared path the drift gate should catch instead. Throws on an unvalidated
+ * step shape (never returns [] for garbage — an empty boundary must be impossible to fabricate).
  */
 export function planStepTouched(step) {
   const set = new Set();
-  for (const f of Array.isArray(step?.files) ? step.files : []) {
-    if (typeof f?.path === "string" && f.path) set.add(f.path);
-  }
+  for (const f of validatedStepFiles(step, "planStepTouched")) set.add(f.path);
   return [...set].sort(byString);
 }
 
-/** The step's test-file subset (role:"test"), sorted — the TEST-FIRST author's boundary. */
+/** The step's test-file subset (role:"test"), sorted — the TEST-FIRST author's boundary. Throws on an unvalidated step shape. */
 export function planStepTestFiles(step) {
   const set = new Set();
-  for (const f of Array.isArray(step?.files) ? step.files : []) {
-    if (f?.role === "test" && typeof f?.path === "string" && f.path) set.add(f.path);
+  for (const f of validatedStepFiles(step, "planStepTestFiles")) {
+    if (f.role === "test") set.add(f.path);
   }
   return [...set].sort(byString);
 }
 
-/** The step's impl-file subset (everything not role:"test"), sorted — the IMPL author's boundary. */
+/** The step's impl-file subset (everything not role:"test"), sorted — the IMPL author's boundary. Throws on an unvalidated step shape. */
 export function planStepImplFiles(step) {
   const set = new Set();
-  for (const f of Array.isArray(step?.files) ? step.files : []) {
-    if (f?.role !== "test" && typeof f?.path === "string" && f.path) set.add(f.path);
+  for (const f of validatedStepFiles(step, "planStepImplFiles")) {
+    if (f.role !== "test") set.add(f.path);
   }
   return [...set].sort(byString);
 }
@@ -576,13 +618,16 @@ export function planSpecDigest(spec) {
 // intents. Over-matching is SAFE here (a false "sensitive" only adds scrutiny/consent); a false
 // negative is the dangerous direction, so the patterns are moderately broad. Council G2/C6:
 // the real review demonstrated concrete false negatives (jwt/bearer, injection, xss/csrf/ssrf,
-// sandboxing, privilege escalation), so those vocabularies are matched explicitly now.
+// sandboxing, privilege escalation), so those vocabularies are matched explicitly now — plus a
+// second widening pass (cors/csp/clickjacking/traversal/spoofing/tampering, saml/oidc/mfa/otp,
+// nonce/salt/keypair/KDFs/named ciphers, reentrancy/synchronization, sql/corruption/data-loss/
+// backup): each is a §6 vocabulary a synthesizer plausibly uses without any earlier keyword.
 const SENSITIVE_CLASS_RE = Object.freeze([
-  ["security", /\b(secrets?|credentials?|tokens?|api[-_]?keys?|passwords?|passwd|csrf|xss|ssrf|injections?|sanitiz\w*|sandbox\w*|privileges?|escalat\w*|vulnerabilit\w*|exploits?|cves?)\b/i],
-  ["auth", /\b(auth|authn|authz|authenticat\w*|authoriz\w*|login|logout|sessions?|oauth|sso|rbac|acl|permissions?|jwts?|bearer|cookies?)\b/i],
-  ["crypto", /\b(crypto\w*|ciphers?|encrypt\w*|decrypt\w*|hmac|sha-?\d+|md5|signatures?|signing|certificates?|tls|ssl)\b/i],
-  ["concurrency", /\b(concurren\w*|race|mutex|semaphores?|locks?|locking|atomic\w*|threads?|deadlocks?)\b/i],
-  ["data-integrity", /\b(integrity|migrations?|transactions?|checksums?|persistence|databases?|db)\b/i]
+  ["security", /\b(secrets?|credentials?|tokens?|api[-_]?keys?|passwords?|passwd|csrf|xss|ssrf|cors|csp|clickjack\w*|injections?|traversal|spoof\w*|tamper\w*|sanitiz\w*|sandbox\w*|privileges?|escalat\w*|vulnerabilit\w*|exploits?|cves?)\b/i],
+  ["auth", /\b(auth|authn|authz|authenticat\w*|authoriz\w*|login|logout|sessions?|oauth|sso|saml|oidc|mfa|2fa|otp|totp|rbac|acl|permissions?|jwts?|bearer|cookies?)\b/i],
+  ["crypto", /\b(crypto\w*|ciphers?|encrypt\w*|decrypt\w*|hmac|sha-?\d+|md5|aes|rsa|ecdsa|ed25519|nonces?|salts?|key-?pairs?|private[-_ ]?keys?|bcrypt|scrypt|argon2\w*|pbkdf2|csprngs?|prngs?|entropy|signatures?|signing|certificates?|tls|ssl)\b/i],
+  ["concurrency", /\b(concurren\w*|races?|mutex\w*|semaphores?|locks?|locking|atomic\w*|threads?|deadlocks?|re-?entran\w*|synchroniz\w*)\b/i],
+  ["data-integrity", /\b(integrity|migrations?|transactions?|checksums?|persistence|databases?|db|sql|corrupt\w*|data[- ]loss|backups?)\b/i]
 ]);
 
 /**
