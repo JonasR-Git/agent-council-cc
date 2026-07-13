@@ -39,47 +39,49 @@ const CEILING = { claude: 40, codex: 50, grok: 40 };
 
 test("renderRunDashboard: full state+usage+ceiling → seat quota/token/ceiling table, lens table, ceiling OK", () => {
   const md = renderRunDashboard(fullState(), { usage: fullUsage(), ceiling: CEILING, nowMs: Date.parse("2026-07-13T00:05:00Z") });
-  // Header with kind, status and pass counter.
-  assert.match(md, /### 🟡 audit fix loop · running · Pass 2\/8/);
-  // The quota-aware seat table header.
-  assert.match(md, /\| Seat \| raised \| Quota wk \| 5h \| Tokens \(run\) \| Ceiling \|/);
+  // Header (h2) with the pretty kind label + a status line carrying the pass counter.
+  assert.match(md, /## 🟡 Audit Fix · Loop/);
+  assert.match(md, /Pass 2\/8/);
+  // The quota-aware seat table header (polished labels).
+  assert.match(md, /\| Seat \| raised \| week \| 5h \| tokens \| vs ceiling \|/);
   // Codex row: weekly quota 14%, compact tokens 1.2M, ceiling bar `.../14/50`.
-  assert.match(md, /codex .*14% .*1\.2M/);
+  assert.match(md, /codex .*14%.*1\.2M/);
   assert.match(md, /14\/50/);
   // Claude row shows BOTH weekly (1%) and 5h (6%), tokens 45k.
-  assert.match(md, /claude .*1% .*6% .*45k/);
+  assert.match(md, /claude .*1%.*6%.*45k/);
   // Grok weekly 11%, ceiling bar over 40.
   assert.match(md, /grok .*11%/);
   assert.match(md, /11\/40/);
   // An unknown/OpenRouter seat has no provider quota → all dashes.
   assert.match(md, /or-deepseek \| 0 \| – \| – \| – \| – \|/);
-  // Lens table including architecture_ssot; a 0 cell renders as `·`.
-  assert.match(md, /\| Lens \| tot \| P0 \| P1 \| P2 \| nit \|/);
-  assert.match(md, /architecture_ssot \| 2 \| · \| · \| 1 \| 1 \|/);
-  assert.match(md, /correctness \| 3 \| 1 \| 2 \| · \| · \|/);
-  // Counters + gate + ceiling OK status.
-  assert.match(md, /🛠 fixed 3 · proposed 5 · committed 2/);
+  // Findings block: severity-emoji headers (🟥 present because correctness has a P0); Σ is bold.
+  assert.match(md, /\*\*Findings · 5\*\*/);
+  assert.match(md, /\| Lens \| 🟥 \| 🟧 \| 🟨 \| ▫️ \| Σ \|/);
+  assert.match(md, /architecture_ssot \| · \| · \| 1 \| 1 \| \*\*2\*\* \|/);
+  assert.match(md, /correctness \| 1 \| 2 \| · \| · \| \*\*3\*\* \|/);
+  // Applied counters (emoji) + gate + ceiling OK status.
+  assert.match(md, /\*\*Applied\*\* ✅ 3 · 📋 5 · 📦 2/);
   assert.match(md, /\*\*Gate\*\* .*§6/);
-  assert.match(md, /📊 Ceiling 40\/50\/40 — OK/);
+  assert.match(md, /\*\*Ceiling\*\* 40\/50\/40 ✓/);
   // Honest footer while running.
-  assert.match(md, /_live over completed units · no token streaming_/);
+  assert.match(md, /_live über fertige Einheiten · kein Token-Streaming_/);
 });
 
 test("renderRunDashboard: a breach shows the ⛔ ceiling line with model/percent/ceiling", () => {
   const usage = fullUsage();
   usage.codex = { available: true, weekPercent: 88, weekResetsAt: null, tokens: { total: 5 } };
   const md = renderRunDashboard(fullState(), { usage, ceiling: CEILING });
-  assert.match(md, /⛔ Ceiling 40\/50\/40 —/);
-  assert.match(md, /codex 88% ≥ 50% \(weekly\)/);
-  assert.ok(!/📊 Ceiling .* OK/.test(md), "a breach never also prints the OK line");
+  assert.match(md, /⛔ \*\*Ceiling\*\* 40\/50\/40 —/);
+  assert.match(md, /codex 88%≥50% \(weekly\)/);
+  assert.ok(!/\*\*Ceiling\*\* 40\/50\/40 ✓/.test(md), "a breach never also prints the OK line");
 });
 
 test("renderRunDashboard: claude 5h breach is surfaced on the ceiling line", () => {
   const usage = fullUsage();
   usage.claude = { available: true, weekPercent: 2, fiveHourPercent: 55, weekResetsAt: null, tokens: { total: 10 } };
   const md = renderRunDashboard(fullState(), { usage, ceiling: CEILING });
-  assert.match(md, /⛔ Ceiling/);
-  assert.match(md, /claude 55% ≥ 40% \(5h\)/);
+  assert.match(md, /⛔ \*\*Ceiling\*\*/);
+  assert.match(md, /claude 55%≥40% \(5h\)/);
 });
 
 test("renderRunDashboard: null usage degrades to the plain box (no quota columns)", () => {
@@ -96,7 +98,7 @@ test("renderRunDashboard: an unavailable model shows dashes and never breaches",
   const md = renderRunDashboard(fullState(), { usage, ceiling: CEILING });
   // codex row quota/ceiling are dashes despite the stray 99%.
   assert.match(md, /codex \| 4 \| – \| – \| 0 \| – \|/);
-  assert.match(md, /📊 Ceiling 40\/50\/40 — OK/, "unavailable usage is never a breach");
+  assert.match(md, /\*\*Ceiling\*\* 40\/50\/40 ✓/, "unavailable usage is never a breach");
 });
 
 test("renderRunDashboard: never throws on garbage input", () => {
@@ -111,7 +113,7 @@ test("renderRunDashboard: never throws on garbage input", () => {
 test("renderRunDashboard: a prior snapshot yields a Δ line (pass + counter moves)", () => {
   const prior = { ...fullState(), progress: { passesDone: 1, passesTotal: 8 }, counters: { fixed: 1, proposed: 5, committed: 1 } };
   const md = renderRunDashboard(fullState(), { usage: fullUsage(), ceiling: CEILING, prior });
-  assert.match(md, /Δ since last update/);
-  assert.match(md, /pass 1→2/);
+  assert.match(md, /Δ seit letztem Update/);
+  assert.match(md, /Pass 1→2/);
   assert.match(md, /\+2 fixed/);
 });

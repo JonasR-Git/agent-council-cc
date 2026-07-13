@@ -804,93 +804,128 @@ function usageForSeat(usage, name) {
   return { key: null, model: null };
 }
 
+// Pretty run-kind labels + per-counter emoji for the polished markdown box.
+const RUN_KIND_LABEL = {
+  "audit-fix-loop": "Audit Fix · Loop",
+  "audit-review": "Audit Review",
+  "audit-endless": "Audit Endless",
+  build: "Build",
+  plan: "Plan",
+  deliberate: "Deliberate"
+};
+const COUNTER_EMOJI = { fixed: "✅", proposed: "📋", reverted: "↩", committed: "📦", skipped: "⏭" };
+
+function prettyRunKind(kind, title) {
+  const base =
+    RUN_KIND_LABEL[kind] ?? String(kind ?? "run").replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  return typeof title === "string" && /--deep\b/.test(title) ? `${base} + Deep` : base;
+}
+
+// "seit letztem Update"-Delta: phase/pass moves, counter deltas, findings-total delta, and per-model
+// weekly-quota moves (prior usage comes from the prior progress.json's stashed `usage`). TOTAL.
+function buildRunDelta(n, usage, prior) {
+  if (prior == null || typeof prior !== "object" || Array.isArray(prior)) return null;
+  const p = normalizeProgressState(prior);
+  const d = [];
+  if (p.phase && n.phase && p.phase !== n.phase) d.push(`Phase ${p.phase}→${n.phase}`);
+  const pp = p.progress?.passesDone;
+  const cp = n.progress?.passesDone;
+  if (pp != null && cp != null && pp !== cp) d.push(`Pass ${pp}→${cp}`);
+  for (const k of COUNTER_KEYS) {
+    const a = p.counters[k];
+    const b = n.counters[k];
+    if (a != null && b != null && b !== a) d.push(`${b - a > 0 ? "+" : ""}${b - a} ${k}`);
+  }
+  const pf = (p.lenses || []).reduce((s, l) => s + (l.total || 0), 0);
+  const cf = (n.lenses || []).reduce((s, l) => s + (l.total || 0), 0);
+  if (cf !== pf) d.push(`${cf - pf > 0 ? "+" : ""}${cf - pf} Funde`);
+  const priorUsage = prior.usage && typeof prior.usage === "object" ? prior.usage : null;
+  if (priorUsage && usage && typeof usage === "object") {
+    for (const k of ["claude", "codex", "grok"]) {
+      const a = Number(priorUsage[k]?.weekPercent);
+      const b = Number(usage[k]?.weekPercent);
+      if (Number.isFinite(a) && Number.isFinite(b) && a !== b) d.push(`${k[0].toUpperCase()}${k.slice(1)} ${a}→${b}%`);
+    }
+  }
+  return d.length ? d.join(" · ") : null;
+}
+
 function renderRunDashboardMarkdown(progressState, { usage, ceiling, prior, nowMs }) {
   const n = normalizeProgressState(progressState);
-  const kindLabel = (n.kind ?? "run").replace(/-/g, " ");
   const L = [];
 
-  // Header: emoji · kind · status · Pass p/N · elapsed (+ ETA while running).
-  const passPart = hasPasses(n) ? `Pass ${n.progress.passesDone ?? 0}/${n.progress.passesTotal ?? "?"}` : null;
-  const header = [`${RUN_EMOJI[n.status] ?? "⚪"} ${kindLabel}`, n.status, passPart, ...progressTimeParts(n, nowMs)].filter(Boolean).join(" · ");
-  L.push(`### ${header}`);
-  if (n.title) L.push(`_${n.title}_`);
-  if (n.phase || n.phaseDetail) L.push(`phase \`${n.phase ?? "?"}\`${n.phaseDetail ? ` — ${n.phaseDetail}` : ""}`);
+  // Header (h2) + a single status line: state · pass · elapsed/ETA · units bar · phase detail.
+  L.push(`## ${RUN_EMOJI[n.status] ?? "⚪"} ${prettyRunKind(n.kind, n.title)}`);
+  const status = [`\`${n.status}\``];
+  if (hasPasses(n)) status.push(`**Pass ${n.progress.passesDone ?? 0}/${n.progress.passesTotal ?? "?"}**`);
+  status.push(...progressTimeParts(n, nowMs));
+  if (hasUnits(n)) status.push(`\`${progressBar(n.progress.unitsDone ?? 0, n.progress.unitsTotal ?? 0, 8)}\` ${unitsText(n.progress.unitsDone, n.progress.unitsTotal, "?")}`);
+  if (n.phaseDetail) status.push(n.phaseDetail);
+  L.push(status.join(" · "));
   L.push("");
 
-  // Seat table with quota + tokens + a per-seat ceiling bar.
-  L.push("| Seat | raised | Quota wk | 5h | Tokens (run) | Ceiling |");
-  L.push("|---|--:|--:|--:|--:|:--|");
+  // Seats & Quota — raised, weekly quota, Claude 5h, tokens this run, and a bar vs the ceiling.
+  L.push("**Seats & Quota**");
+  L.push("| Seat | raised | week | 5h | tokens | vs ceiling |");
+  L.push("|:--|--:|--:|--:|--:|:--|");
   for (const seat of n.seats) {
     const { key, model } = usageForSeat(usage, seat.name);
     const avail = model != null && model.available === true; // quota columns only trust an AVAILABLE model
     const raised = seat.raised != null ? seat.raised : "–";
-    const wk = avail && model.weekPercent != null ? fmtPct(model.weekPercent) : "–";
-    const fiveH = key === "claude" && avail && model.fiveHourPercent != null ? fmtPct(model.fiveHourPercent) : "–";
-    // Tokens are from a SEPARATE reader — shown regardless of quota availability.
+    const wk = avail && model.weekPercent != null ? `\`${fmtPct(model.weekPercent)}\`` : "–";
+    const fiveH = key === "claude" && avail && model.fiveHourPercent != null ? `\`${fmtPct(model.fiveHourPercent)}\`` : "–";
     const tok = model && model.tokens ? compactTokens(model.tokens.total) : "–";
     let ceil = "–";
-    if (ceiling && model && model.available === true) {
+    if (ceiling && avail) {
       const limit = Number(ceiling[key]);
       const used = Number(model.weekPercent);
-      if (Number.isFinite(limit) && limit > 0 && Number.isFinite(used)) ceil = `${tinyBar(used, limit)} ${Math.round(used)}/${limit}`;
+      if (Number.isFinite(limit) && limit > 0 && Number.isFinite(used)) ceil = `\`${tinyBar(used, limit)}\` ${Math.round(used)}/${limit}`;
     }
     L.push(`| ${SEAT_EMOJI[seat.state] ?? "⚪"} ${seat.name} | ${raised} | ${wk} | ${fiveH} | ${tok} | ${ceil} |`);
   }
   L.push("");
 
-  // Lens table (only lenses with a finding; a 0 cell shows `·`).
+  // Findings — severity-emoji column headers, Σ bold; the 🟥 P0 column only when a P0 exists.
   if (n.lenses.length) {
+    const totalFindings = n.lenses.reduce((s, l) => s + (l.total || 0), 0);
+    const anyP0 = n.lenses.some((l) => l.P0 > 0);
     const cell = (v) => (v > 0 ? String(v) : "·");
-    L.push("| Lens | tot | P0 | P1 | P2 | nit |");
-    L.push("|---|--:|--:|--:|--:|--:|");
-    for (const l of n.lenses) L.push(`| ${l.name} | ${l.total} | ${cell(l.P0)} | ${cell(l.P1)} | ${cell(l.P2)} | ${cell(l.nit)} |`);
+    L.push(`**Findings · ${totalFindings}**`);
+    L.push(`| Lens |${anyP0 ? " 🟥 |" : ""} 🟧 | 🟨 | ▫️ | Σ |`);
+    L.push(`|:--|${anyP0 ? "--:|" : ""}--:|--:|--:|--:|`);
+    for (const l of n.lenses) {
+      L.push(`| ${l.name} |${anyP0 ? ` ${cell(l.P0)} |` : ""} ${cell(l.P1)} | ${cell(l.P2)} | ${cell(l.nit)} | **${l.total}** |`);
+    }
     L.push("");
   }
 
-  // Counters + gate.
-  const counterEntries = COUNTER_KEYS.filter((k) => k in n.counters).map((k) => `${k} ${n.counters[k]}`);
-  if (counterEntries.length) L.push(`🛠 ${counterEntries.join(" · ")}`);
-  if (hasGate(n)) L.push(`**Gate** ${GATE_EMOJI[n.gate.state] ?? "⚪"} \`${n.gate.name ?? "gate"}\`${n.gate.target ? ` → \`${n.gate.target}\`` : ""}${n.gate.state ? ` — ${n.gate.state}` : ""}`);
-
-  // Ceiling status line (breach ⛔ vs OK 📊) — computed via evaluateCeiling.
+  // Applied · Ceiling · Gate on one line.
+  const parts = [];
+  const applied = COUNTER_KEYS.filter((k) => k in n.counters).map((k) => `${COUNTER_EMOJI[k] ?? ""} ${n.counters[k]}`.trim());
+  if (applied.length) parts.push(`**Applied** ${applied.join(" · ")}`);
   if (ceiling && typeof ceiling === "object") {
     const c = ["claude", "codex", "grok"].map((k) => (Number.isFinite(Number(ceiling[k])) ? Number(ceiling[k]) : "–")).join("/");
     const { breached, breaches } = evaluateCeiling(usage, ceiling);
-    if (breached) L.push(`⛔ Ceiling ${c} — ${breaches.map((b) => `${b.model} ${fmtPct(b.percent)} ≥ ${b.ceiling}% (${b.window})`).join(", ")}`);
-    else L.push(`📊 Ceiling ${c} — OK`);
+    parts.push(
+      breached
+        ? `⛔ **Ceiling** ${c} — ${breaches.map((b) => `${b.model} ${fmtPct(b.percent)}≥${b.ceiling}% (${b.window})`).join(", ")}`
+        : `**Ceiling** ${c} ✓`
+    );
   }
+  if (hasGate(n)) parts.push(`**Gate** ${GATE_EMOJI[n.gate.state] ?? "⚪"} ${n.gate.name ?? "gate"}${n.gate.state ? ` ${n.gate.state}` : ""}`);
+  if (parts.length) L.push(parts.join("  ·  "));
   if (n.stopReason) L.push(`**Stopped** — ${n.stopReason}`);
 
-  // Recent (last ~2) + honest footer.
+  // Δ since last update (counters + findings + quota moves).
+  const delta = buildRunDelta(n, usage, prior);
+  if (delta) L.push(`_Δ seit letztem Update: ${delta}_`);
+
+  // Recent (last ~2, as quotes) + honest footer while running.
   if (n.recent.length) {
     L.push("");
-    L.push("**Recent**");
-    for (const l of n.recent.slice(-2)) L.push(`- ${l}`);
+    for (const l of n.recent.slice(-2)) L.push(`> ${l}`);
   }
-
-  // Δ vs the caller-persisted prior snapshot (phase / pass / counter moves).
-  if (prior != null && typeof prior === "object" && !Array.isArray(prior)) {
-    const p = normalizeProgressState(prior);
-    const d = [];
-    if (p.phase && n.phase && p.phase !== n.phase) d.push(`phase \`${p.phase}\` → \`${n.phase}\``);
-    const pp = p.progress?.passesDone;
-    const cp = n.progress?.passesDone;
-    if (pp != null && cp != null && pp !== cp) d.push(`pass ${pp}→${cp}`);
-    for (const k of COUNTER_KEYS) {
-      const a = p.counters[k];
-      const b = n.counters[k];
-      if (a != null && b != null && a !== b) d.push(`${b - a > 0 ? "+" : ""}${b - a} ${k}`);
-    }
-    if (d.length) {
-      L.push("");
-      L.push(`_Δ since last update: ${d.join(" · ")}_`);
-    }
-  }
-
-  if (!n.done) {
-    L.push("");
-    L.push("_live over completed units · no token streaming_");
-  }
+  if (!n.done) L.push("\n_live über fertige Einheiten · kein Token-Streaming_");
   return L.join("\n");
 }
 
