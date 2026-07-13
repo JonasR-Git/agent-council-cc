@@ -1,7 +1,7 @@
 {
   "name": "council",
-  "version": "2.1.0",
-  "description": "Multi-agent code review for Claude Code: independent review then peer critique across Claude + Codex + Grok, with consensus/verification, a findings ledger, solve, benchmarking, and a live dashboard.",
+  "version": "3.0.0",
+  "description": "Multi-agent council for Claude Code: six-eyes review (Claude + Codex + Grok, independent then peer critique) with consensus/verification and a findings ledger, whole-project audit + safe test-gated autonomous auto-fix, plan/build, solve, benchmarking, and a live dashboard.",
   "author": {
     "name": "JonasR-Git"
   },
