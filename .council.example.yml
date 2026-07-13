@@ -103,8 +103,8 @@ budget_guard: 0
 #   - myid=vendor/model                 → custom seat id (or-myid)
 #   - myid=vendor/model@high            → + reasoning effort
 # openrouter_models:
-#   - tencent/hy3:free                  # a FREE model — good for a wiring test
-#   - deepseek/deepseek-chat
+#   - deepseek/deepseek-v4-flash        # recommended: fast (16-31s), cheap (~$0.09/M), 1M ctx
 #   - coder=qwen/qwen-2.5-coder-32b-instruct@high
+#   # avoid free tiers (e.g. tencent/hy3:free): deprioritised + slow, large verdicts time out
 openrouter_api_key_env: OPENROUTER_API_KEY
 # openrouter_base_url: https://openrouter.ai/api/v1   # default; only openrouter.ai or a loopback proxy

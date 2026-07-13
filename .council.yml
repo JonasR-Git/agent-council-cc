@@ -39,9 +39,11 @@ agent_timeout_minutes: 90
 
 # OpenRouter extra seats (join six-eyes + raise the §6 bar). The API key is read ONLY
 # from $OPENROUTER_API_KEY — never from this file. Without the key these stay inactive.
-# Add up to 5. Verified working end-to-end with tencent/hy3:free (a free model).
+# Add up to 5. Default seat: deepseek/deepseek-v4-flash — verified fast (16-31s full
+# JSON verdict, ~$0.09/M, 1M ctx). Avoid free tiers like tencent/hy3:free: deprioritised
+# and slow (~32s for a few sentences), so large design verdicts blow the 120s timeout.
 openrouter_api_key_env: OPENROUTER_API_KEY
 openrouter_models:
-  - tencent/hy3:free
-  # - deepseek/deepseek-chat
+  - deepseek/deepseek-v4-flash
+  # - tencent/hy3:free   # FREE, but too slow for large verdicts (times out)
   # - coder=qwen/qwen-2.5-coder-32b-instruct@high
