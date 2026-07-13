@@ -1,6 +1,14 @@
 // Live-dashboard helpers for `council watch <job>`: derive per-agent progress
 // from the job's phase log + merged findings, and render a tidy boxed table.
 // Pure and testable - no I/O, no clock reads (caller passes nowMs).
+// Also home of the UNIVERSAL progress renderer (the reader side of the shared
+// progress.json contract, schemaVersion 1) at the bottom of this file. Same
+// purity rule; readProgressState is the one deliberate exception (a fail-soft
+// fs read whose readFile is injectable for tests).
+
+import fs from "node:fs";
+import path from "node:path";
+import { PROGRESS_SCHEMA_VERSION, SEVERITY_BUCKETS } from "./progress.mjs";
 
 const AGENTS = ["codex", "grok", "claude"];
 const W = 58; // inner box width (all glyphs used are single display-width)
@@ -400,4 +408,375 @@ export function colorize(text) {
     .replace(/\bnit\b/g, (m) => wrap(m, ANSI.dim))
     .replace(/must-fix {2}(\d+)/g, (m, n) => (n === "0" ? wrap(m, ANSI.dim) : `must-fix  ${wrap(n, ANSI.bold + ANSI.red)}`))
     .replace(/[║╔╗╚╝╟╢═─]+/g, (m) => wrap(m, ANSI.gray));
+}
+
+// --- Universal progress dashboard (reader side of the progress.json contract) --
+// Renders a progress.json snapshot of ANY kind (audit review/fix/loop/endless,
+// build, plan, deliberate). TOTAL by design: every field is optional, wrong
+// types are coerced or dropped, and an unknown schemaVersion yields a minimal
+// safe header - a dashboard that crashes is worse than none.
+
+// PROGRESS_SCHEMA_VERSION + SEVERITY_BUCKETS are imported from progress.mjs (the
+// writer) so a schema bump on one side can never silently desync the reader.
+const COUNTER_KEYS = ["fixed", "proposed", "reverted", "skipped", "committed"];
+const SEAT_EMOJI = { reviewing: "🟢", done: "✅", idle: "⚪", voting: "🗳️", error: "🔴" };
+const GATE_EMOJI = { running: "🟡", pass: "✅", veto: "⛔" };
+const RUN_EMOJI = { running: "🟡", done: "🟢", failed: "🔴" };
+// What one "unit" means per kind (a build/plan reports steps; the rest report
+// generic work units). Unknown kinds fall back to "units".
+const UNIT_NOUN = { build: "steps", plan: "steps" };
+
+// Type-strict coercers: anything of the wrong type becomes null (= omitted),
+// never a NaN/`[object Object]` leaking into the dashboard. Strings run through
+// flat() so untrusted reporter text can't inject markdown or control chars.
+const asStr = (v, max = 120) => {
+  if (typeof v !== "string") return null;
+  const s = flat(v, max);
+  return s || null;
+};
+const asNum = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+const asTs = (v) => {
+  if (typeof v !== "string") return null;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : null;
+};
+const unitsText = (done, total, dash) => (total != null && total > 0 ? `${done ?? 0}/${total}` : done != null ? String(done) : dash);
+
+/** Coerce an arbitrary parsed progress.json into a safe, fully-typed shape. */
+function normalizeProgressState(state) {
+  const s = state && typeof state === "object" && !Array.isArray(state) ? state : {};
+  const seats = Array.isArray(s.seats)
+    ? s.seats
+        .filter((x) => x && typeof x === "object" && !Array.isArray(x))
+        .slice(0, 16)
+        .map((x) => ({
+          name: asStr(x.name, 24) ?? "?",
+          state: asStr(x.state, 16) ?? "idle",
+          unitsDone: asNum(x.unitsDone),
+          unitsTotal: asNum(x.unitsTotal),
+          raised: asNum(x.raised)
+        }))
+    : [];
+  const p = s.progress && typeof s.progress === "object" && !Array.isArray(s.progress) ? s.progress : null;
+  const progress = p
+    ? { unitsDone: asNum(p.unitsDone), unitsTotal: asNum(p.unitsTotal), passesDone: asNum(p.passesDone), passesTotal: asNum(p.passesTotal) }
+    : null;
+  const counters = {};
+  if (s.counters && typeof s.counters === "object" && !Array.isArray(s.counters)) {
+    for (const k of COUNTER_KEYS) {
+      const v = asNum(s.counters[k]);
+      if (v != null) counters[k] = v;
+    }
+  }
+  // Per-lens finding matrix (findingsByLens[lens] = {total, P0, P1, P2, nit}).
+  // Only lenses with >=1 finding survive; each cell is type-strict, capped at 24
+  // lenses so a garbage payload can't blow up the table.
+  const lenses = [];
+  if (s.findingsByLens && typeof s.findingsByLens === "object" && !Array.isArray(s.findingsByLens)) {
+    for (const [rawLens, rawCell] of Object.entries(s.findingsByLens)) {
+      if (lenses.length >= 24) break;
+      if (!rawCell || typeof rawCell !== "object" || Array.isArray(rawCell)) continue;
+      const name = asStr(rawLens, 40);
+      if (!name) continue;
+      const cell = { P0: 0, P1: 0, P2: 0, nit: 0 };
+      let bySeverity = 0;
+      for (const k of SEVERITY_BUCKETS) {
+        const v = asNum(rawCell[k]);
+        if (v != null && v > 0) cell[k] = v;
+        bySeverity += cell[k];
+      }
+      const declared = asNum(rawCell.total);
+      const total = declared != null && declared > bySeverity ? declared : bySeverity;
+      if (total > 0) lenses.push({ name, total, ...cell });
+    }
+    lenses.sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
+  }
+  const g = s.gate && typeof s.gate === "object" && !Array.isArray(s.gate) ? s.gate : null;
+  const gate = g ? { name: asStr(g.name, 40), target: asStr(g.target, 80), state: asStr(g.state, 16) } : null;
+  const b = s.budget && typeof s.budget === "object" && !Array.isArray(s.budget) ? s.budget : null;
+  const budget = b ? { spent: asNum(b.spent), total: asNum(b.total) } : null;
+  const recent = Array.isArray(s.recentLines)
+    ? s.recentLines
+        .filter((l) => typeof l === "string" && l.trim())
+        .slice(-3)
+        .map((l) => flat(l, 100))
+    : [];
+  const phase = asStr(s.phase, 32);
+  const failed = s.ok === false || phase === "failed";
+  const done = failed || s.done === true || phase === "done";
+  return {
+    kind: asStr(s.kind, 40),
+    jobId: asStr(s.jobId, 60),
+    title: asStr(s.title, 100),
+    startedAt: asTs(s.startedAt),
+    updatedAt: asTs(s.updatedAt),
+    phase,
+    phaseDetail: asStr(s.phaseDetail, 96),
+    seats,
+    progress,
+    counters,
+    lenses,
+    gate,
+    budget,
+    etaMs: asNum(s.etaMs),
+    recent,
+    done,
+    status: failed ? "failed" : done ? "done" : "running",
+    stopReason: asStr(s.stopReason, 100)
+  };
+}
+
+// Elapsed (startedAt -> nowMs, frozen at updatedAt once done) + remaining ETA,
+// as separate meta parts so each renderer joins them with its own separator.
+function progressTimeParts(n, nowMs) {
+  const now = Number.isFinite(nowMs) ? nowMs : n.updatedAt;
+  const end = n.done && n.updatedAt != null ? n.updatedAt : now;
+  const parts = [];
+  if (n.startedAt != null && end != null) parts.push(formatDuration(end - n.startedAt));
+  if (!n.done && n.etaMs != null) parts.push(`~${formatDuration(n.etaMs)} left`);
+  return parts;
+}
+
+const hasUnits = (n) => n.progress != null && (n.progress.unitsTotal != null || n.progress.unitsDone != null);
+const hasPasses = (n) => n.progress != null && (n.progress.passesTotal != null || n.progress.passesDone != null);
+const hasGate = (n) => n.gate != null && (n.gate.name != null || n.gate.state != null);
+const hasBudget = (n) => n.budget != null && (n.budget.spent != null || n.budget.total != null);
+
+// Greedy-pack short entries into rows no longer than maxLen (so e.g. five
+// counters with big numbers wrap to a second box row instead of truncating).
+function packRows(entries, sep, maxLen) {
+  const rows = [];
+  let cur = "";
+  for (const e of entries) {
+    const next = cur ? cur + sep + e : e;
+    if (cur && next.length > maxLen) {
+      rows.push(cur);
+      cur = e;
+    } else {
+      cur = next;
+    }
+  }
+  if (cur) rows.push(cur);
+  return rows;
+}
+
+// Width-parameterized twin of the fixed-width box helpers above (same ASCII-only
+// content rule: no emoji/ambiguous-width glyphs inside the box).
+function boxParts(inner) {
+  return {
+    top: `╔${"═".repeat(inner)}╗`,
+    sep: `╟${"─".repeat(inner)}╢`,
+    bot: `╚${"═".repeat(inner)}╝`,
+    row: (content = "") => {
+      const c = `  ${content}`;
+      return `║${c.length > inner ? c.slice(0, inner) : c.padEnd(inner)}║`;
+    }
+  };
+}
+
+function renderProgressBox(state, { nowMs, width } = {}) {
+  const inner = Math.max(44, Math.min(140, Number.isFinite(width) ? width : 60)) - 2;
+  const { top, sep, bot, row } = boxParts(inner);
+  if (state == null || typeof state !== "object" || Array.isArray(state)) {
+    return [top, row("COUNCIL PROGRESS"), row("no progress data yet"), bot].join("\n");
+  }
+  const version = state.schemaVersion;
+  const n = normalizeProgressState(state);
+  if (version != null && version !== PROGRESS_SCHEMA_VERSION) {
+    const lines = [top, row("COUNCIL PROGRESS")];
+    if (n.jobId) lines.push(row(n.jobId));
+    lines.push(row(`unsupported progress schema (v${flat(String(version), 20)})`));
+    lines.push(bot);
+    return lines.join("\n");
+  }
+
+  const kindLabel = (n.kind ?? "progress").replace(/-/g, " ");
+  const lines = [top];
+  lines.push(row(`COUNCIL ${kindLabel.toUpperCase()}`));
+  if (n.title) lines.push(row(n.title));
+  lines.push(row([n.jobId ?? "-", n.status, ...progressTimeParts(n, nowMs)].join("  │  ")));
+  if (n.phase || n.phaseDetail) lines.push(row(`phase  ${[n.phase ?? "?", n.phaseDetail].filter(Boolean).join(" — ")}`));
+  if (n.stopReason) lines.push(row(`stop   ${n.stopReason}`));
+
+  if (n.seats.length) {
+    lines.push(sep);
+    lines.push(row(`${col("seat", 13)}${col("state", 11)}${col("units", 8)}raised`));
+    for (const seat of n.seats) {
+      lines.push(row(`${col(seat.name, 13)}${col(seat.state, 11)}${col(unitsText(seat.unitsDone, seat.unitsTotal, "-"), 8)}${seat.raised ?? "-"}`));
+    }
+  }
+
+  if (n.lenses.length) {
+    lines.push(sep);
+    lines.push(row(`${col("lens (completed units)", 22)}${col("P0", 4)}${col("P1", 4)}${col("P2", 4)}${col("nit", 5)}tot`));
+    for (const l of n.lenses) {
+      lines.push(row(`${col(l.name, 22)}${col(String(l.P0), 4)}${col(String(l.P1), 4)}${col(String(l.P2), 4)}${col(String(l.nit), 5)}${l.total}`));
+    }
+  }
+
+  const statLines = [];
+  if (hasUnits(n) || hasPasses(n)) {
+    const noun = UNIT_NOUN[n.kind] ?? "units";
+    const segs = [];
+    if (hasUnits(n)) segs.push(`${noun}  ${progressBar(n.progress.unitsDone ?? 0, n.progress.unitsTotal ?? 0, 12)} ${unitsText(n.progress.unitsDone, n.progress.unitsTotal, "?")}`);
+    if (hasPasses(n)) segs.push(`pass ${n.progress.passesDone ?? 0}/${n.progress.passesTotal ?? "?"}`);
+    statLines.push(segs.join("   "));
+  }
+  if (hasGate(n)) {
+    statLines.push(`gate   ${[n.gate.name ?? "gate", n.gate.target ? `-> ${n.gate.target}` : null].filter(Boolean).join(" ")}  [${n.gate.state ?? "?"}]`);
+  }
+  const counterEntries = COUNTER_KEYS.filter((k) => k in n.counters).map((k) => `${k} ${n.counters[k]}`);
+  if (counterEntries.length) statLines.push(...packRows(counterEntries, "  ", inner - 2));
+  if (hasBudget(n)) {
+    const bTotal = n.budget.total;
+    statLines.push(`budget ${bTotal != null && bTotal > 0 ? `${progressBar(n.budget.spent ?? 0, bTotal, 10)} ` : ""}${n.budget.spent ?? 0}/${bTotal ?? "?"}`);
+  }
+  if (statLines.length) {
+    lines.push(sep);
+    for (const l of statLines) lines.push(row(l));
+  }
+
+  if (n.recent.length) {
+    lines.push(sep);
+    for (const l of n.recent) lines.push(row(`· ${l}`));
+  }
+  lines.push(bot);
+  return lines.join("\n");
+}
+
+function renderProgressMarkdown(state, { prior, nowMs } = {}) {
+  if (state == null || typeof state !== "object" || Array.isArray(state)) return "_no council progress yet_";
+  const version = state.schemaVersion;
+  const n = normalizeProgressState(state);
+  const kindLabel = (n.kind ?? "progress").replace(/-/g, " ");
+  if (version != null && version !== PROGRESS_SCHEMA_VERSION) {
+    return [
+      `### ⚪ Council ${kindLabel}${n.jobId ? ` · \`${n.jobId}\`` : ""}`,
+      `_unsupported progress schema (v${flat(String(version), 20)}) — update the council plugin to render this run_`
+    ].join("\n");
+  }
+
+  const L = [];
+  L.push(`### ${RUN_EMOJI[n.status] ?? "⚪"} Council ${kindLabel}${n.jobId ? ` · \`${n.jobId}\`` : ""}`);
+  if (n.title) L.push(`_${n.title}_`);
+  const meta = [`**${n.status}**`, ...progressTimeParts(n, nowMs)];
+  if (n.phase || n.phaseDetail) meta.push(`phase \`${n.phase ?? "?"}\`${n.phaseDetail ? ` — ${n.phaseDetail}` : ""}`);
+  L.push(meta.join(" · "));
+  L.push("");
+
+  if (hasUnits(n) || hasPasses(n)) {
+    const noun = UNIT_NOUN[n.kind] ?? "units";
+    const segs = [];
+    if (hasUnits(n)) segs.push(`\`${progressBar(n.progress.unitsDone ?? 0, n.progress.unitsTotal ?? 0, 12)}\` ${unitsText(n.progress.unitsDone, n.progress.unitsTotal, "?")} ${noun}`);
+    if (hasPasses(n)) segs.push(`pass ${n.progress.passesDone ?? 0}/${n.progress.passesTotal ?? "?"}`);
+    L.push(`**Progress** ${segs.join(" · ")}`);
+    L.push("");
+  }
+
+  if (n.seats.length) {
+    L.push("| Seat | State | Units | Raised |");
+    L.push("|---|---|--:|--:|");
+    for (const seat of n.seats) {
+      L.push(`| ${SEAT_EMOJI[seat.state] ?? "⚪"} ${seat.name} | ${seat.state} | ${unitsText(seat.unitsDone, seat.unitsTotal, "–")} | ${seat.raised ?? "–"} |`);
+    }
+    L.push("");
+  }
+
+  if (n.lenses.length) {
+    const cell = (v) => (v > 0 ? String(v) : "·");
+    L.push("**Findings by lens** _(live over completed units)_");
+    L.push("| Lens | Total | 🟥 P0 | 🟧 P1 | 🟨 P2 | ▫️ nit |");
+    L.push("|---|--:|--:|--:|--:|--:|");
+    for (const l of n.lenses) {
+      L.push(`| ${l.name} | ${l.total} | ${cell(l.P0)} | ${cell(l.P1)} | ${cell(l.P2)} | ${cell(l.nit)} |`);
+    }
+    L.push("");
+  }
+
+  if (hasGate(n)) {
+    L.push(`**Gate** ${GATE_EMOJI[n.gate.state] ?? "⚪"} \`${n.gate.name ?? "gate"}\`${n.gate.target ? ` → \`${n.gate.target}\`` : ""}${n.gate.state ? ` — ${n.gate.state}` : ""}`);
+  }
+  const counterEntries = COUNTER_KEYS.filter((k) => k in n.counters).map((k) => `${k} ${n.counters[k]}`);
+  if (counterEntries.length) L.push(`**Counters** ${counterEntries.join(" · ")}`);
+  if (hasBudget(n)) {
+    const bTotal = n.budget.total;
+    L.push(`**Budget** ${bTotal != null && bTotal > 0 ? `\`${progressBar(n.budget.spent ?? 0, bTotal, 10)}\` ` : ""}${n.budget.spent ?? 0}/${bTotal ?? "?"} spent`);
+  }
+  if (n.stopReason) L.push(`**Stopped** — ${n.stopReason}`);
+
+  if (n.recent.length) {
+    L.push("");
+    L.push("**Recent**");
+    for (const l of n.recent) L.push(`- ${l}`);
+  }
+
+  // Δ vs the caller-persisted previous snapshot (a prior progress.json). Prior
+  // runs through the same normalizer, so a garbage prior degrades to "no delta".
+  if (prior != null && typeof prior === "object" && !Array.isArray(prior)) {
+    const p = normalizeProgressState(prior);
+    const d = [];
+    if (p.phase && n.phase && p.phase !== n.phase) d.push(`phase \`${p.phase}\` → \`${n.phase}\``);
+    const pu = p.progress?.unitsDone;
+    const cu = n.progress?.unitsDone;
+    if (pu != null && cu != null && pu !== cu) d.push(`${UNIT_NOUN[n.kind] ?? "units"} ${pu}→${cu}`);
+    const pp = p.progress?.passesDone;
+    const cp = n.progress?.passesDone;
+    if (pp != null && cp != null && pp !== cp) d.push(`pass ${pp}→${cp}`);
+    for (const k of COUNTER_KEYS) {
+      const a = p.counters[k];
+      const b = n.counters[k];
+      if (a != null && b != null && a !== b) d.push(`${b - a > 0 ? "+" : ""}${b - a} ${k}`);
+    }
+    if (d.length) {
+      L.push("");
+      L.push(`_Δ since last update: ${d.join(" · ")}_`);
+    }
+  }
+
+  // Honest limit: aggregation is over COMPLETED units/cells — a single model's
+  // review streams no partials (the subprocess returns one block at the end).
+  // Say so rather than implying token-level liveness the pipeline can't give.
+  if ((n.seats.length || n.lenses.length) && !n.done) {
+    L.push("");
+    L.push("_live over completed units · no token streaming during a single review_");
+  }
+  return L.join("\n");
+}
+
+/**
+ * Universal dashboard for a progress.json state of ANY kind.
+ * `renderProgressDashboard(progressState, { md = false, prior = null, nowMs, width } = {})`
+ * md=false: a plain ASCII box for a TTY (pipe through colorize() for ANSI accents;
+ * `width` is the total box width incl. borders, clamped 44..140, default 60).
+ * md=true: a chat markdown snapshot (emoji seat table, gate, counters, budget,
+ * ETA, and a `Δ since last update` line vs the `prior` snapshot).
+ * TOTAL: never throws - partial/null/garbage input renders what it can, and an
+ * unknown schemaVersion renders a minimal safe header.
+ */
+export function renderProgressDashboard(progressState, opts = {}) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const md = o.md === true;
+  try {
+    return md
+      ? renderProgressMarkdown(progressState, { prior: o.prior ?? null, nowMs: o.nowMs })
+      : renderProgressBox(progressState, { nowMs: o.nowMs, width: o.width });
+  } catch {
+    // Last-resort totality: a dashboard render error must never take down the watcher.
+    return md ? "_council progress unavailable (render error)_" : "council progress unavailable (render error)";
+  }
+}
+
+/**
+ * Read+parse `${stateDir}/progress.json`. Fail-soft: null on any read/parse
+ * error or a non-object payload (progress is best-effort telemetry, never load-
+ * bearing). `readFile` is injectable so tests run with no real filesystem.
+ */
+export function readProgressState(stateDir, opts = {}) {
+  try {
+    const readFile = (opts && typeof opts === "object" ? opts.readFile : null) ?? ((p) => fs.readFileSync(p, "utf8"));
+    const parsed = JSON.parse(readFile(path.join(String(stateDir ?? ""), "progress.json")));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
