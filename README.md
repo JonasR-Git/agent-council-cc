@@ -193,9 +193,11 @@ Design rationale and phasing: [docs/audit-design.md](docs/audit-design.md).
 
 ## Trying it on your project
 
-Works on **any language / any git repo**: `/council:review` (diff), `/council:deliberate`,
-and the agent-based `/council:audit review` / `endless` (the agents read your real
-source, so language doesn't matter).
+Works on **any language / any git repo**: `/council:review` (diff — 3-way deliberate by
+default; the companion's canonical selector is `review --mode quick|deliberate|adversarial`,
+with `deliberate`/`adversarial` kept as legacy alias verbs), and the agent-based
+`/council:audit review` / `endless` (the agents read your real source, so language doesn't
+matter).
 
 Two things are currently **JS/npm-tuned** — know this before you rely on them:
 

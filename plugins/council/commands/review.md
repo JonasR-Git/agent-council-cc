@@ -18,7 +18,17 @@ lighter or looped mode with a flag:
 | `--adversarial` | challenge design/direction | Codex + Grok adversarial pass + focus text |
 | `--loop` | drive to approval | review → fix → re-review until ≥2 approve (max 3 rounds; you are the writer) |
 
-Raw arguments: `$ARGUMENTS` (strip the mode flag; the rest is focus text + review flags).
+Under the hood the companion exposes a single canonical `review --mode quick|deliberate|adversarial`
+selector. The bare `review` verb **is** that canonical entry point (`review` ≡ `review --mode quick`);
+`deliberate` and `adversarial` are equivalent **legacy alias verbs** (`deliberate` ≡ `review --mode
+deliberate`, `adversarial` ≡ `review --mode adversarial`). This skill keeps **deliberate** as its
+default and runs Phase A first — do not collapse it to a raw quick command.
+
+The mode flags above are **mutually exclusive**: if the raw arguments contain more than one
+(e.g. `--quick --adversarial`), or a flag that disagrees with an explicit `--mode`, treat it as a
+conflict — do not silently pick one; ask the user which mode they meant.
+
+Raw arguments: `$ARGUMENTS` (strip the single mode flag; the rest is focus text + review flags).
 
 Rules: review-only (except `--loop`, which fixes); prefer `--background` for
 non-trivial diffs; use **separate** `--codex-model`/`--grok-model` (not one

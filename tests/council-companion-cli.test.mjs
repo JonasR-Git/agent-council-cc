@@ -599,3 +599,179 @@ test("council build binds the plan to the operator's request when one is given (
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// `review --mode` consolidation (surface-only). The internal protocol machinery
+// is untouched — these pin the mode RESOLUTION, the conflict rejection, and that
+// the persisted job.kind on disk is byte-identical to the pre-consolidation verbs.
+// ---------------------------------------------------------------------------
+
+// Read every persisted council job under a state root (files live in <stateRoot>/<slug-hash>/jobs/*.json).
+// Restricting to files whose parent dir is "jobs" avoids picking up progress.json / other state files.
+function readCouncilJobs(stateRoot) {
+  const jobs = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (path.basename(dir) === "jobs" && e.name.endsWith(".json")) {
+        try {
+          jobs.push(JSON.parse(fs.readFileSync(p, "utf8")));
+        } catch {
+          /* a file caught mid atomic-rename — skip; kind is stable across the rename anyway */
+        }
+      }
+    }
+  };
+  walk(stateRoot);
+  return jobs;
+}
+
+test("resolveReviewMode: verb aliases and --mode resolve to the right protocol booleans", async () => {
+  const { resolveReviewMode } = await import(pathToFileURL(COMPANION).href);
+  // Bare review verb (both params false, no --mode) => quick — the byte-identical CLI default.
+  assert.deepEqual(resolveReviewMode({}), { mode: "quick", adversarial: false, deliberate: false });
+  // The alias verbs keep resolving to their own mode (dispatch unchanged).
+  assert.equal(resolveReviewMode({ deliberate: true }).mode, "deliberate");
+  assert.equal(resolveReviewMode({ adversarial: true }).mode, "adversarial");
+  // --mode on the neutral review verb selects freely and derives the booleans the rest of handleReview uses.
+  assert.deepEqual(resolveReviewMode({ modeOption: "deliberate" }), { mode: "deliberate", adversarial: false, deliberate: true });
+  assert.deepEqual(resolveReviewMode({ modeOption: "adversarial" }), { mode: "adversarial", adversarial: true, deliberate: false });
+  assert.equal(resolveReviewMode({ modeOption: "quick" }).mode, "quick");
+  // An equivalent/duplicate selector is fine (no throw), and case/whitespace tolerant.
+  assert.equal(resolveReviewMode({ deliberate: true, modeOption: "deliberate" }).mode, "deliberate");
+  assert.equal(resolveReviewMode({ modeOption: " Deliberate " }).mode, "deliberate");
+});
+
+test("resolveReviewMode: a --mode disagreeing with the verb alias throws, naming the conflict", async () => {
+  const { resolveReviewMode } = await import(pathToFileURL(COMPANION).href);
+  assert.throws(() => resolveReviewMode({ deliberate: true, modeOption: "adversarial" }), /Conflicting review mode.*deliberate.*adversarial/s);
+  assert.throws(() => resolveReviewMode({ adversarial: true, modeOption: "quick" }), /Conflicting review mode.*adversarial.*quick/s);
+  assert.throws(() => resolveReviewMode({ adversarial: true, modeOption: "deliberate" }), /Conflicting review mode/);
+});
+
+test("resolveReviewMode: an unknown --mode throws with the allowed list", async () => {
+  const { resolveReviewMode } = await import(pathToFileURL(COMPANION).href);
+  assert.throws(() => resolveReviewMode({ modeOption: "wat" }), /Invalid --mode "wat".*quick, deliberate, adversarial/s);
+});
+
+test("resolveReviewMode is pure — sequential calls with different modes do not leak state", async () => {
+  const { resolveReviewMode } = await import(pathToFileURL(COMPANION).href);
+  const a = resolveReviewMode({ modeOption: "deliberate" });
+  const b = resolveReviewMode({ modeOption: "adversarial" });
+  const c = resolveReviewMode({});
+  assert.equal(a.mode, "deliberate");
+  assert.equal(b.mode, "adversarial");
+  assert.equal(c.mode, "quick");
+});
+
+test("incompatibleReviewFlags: deliberate-only flags are flagged only outside deliberate mode", async () => {
+  const { incompatibleReviewFlags } = await import(pathToFileURL(COMPANION).href);
+  assert.deepEqual(incompatibleReviewFlags("deliberate", { "debate-rounds": "2", resume: true }), []);
+  assert.deepEqual(incompatibleReviewFlags("quick", { "debate-rounds": "2", resume: true }), ["debate-rounds", "resume"]);
+  assert.deepEqual(incompatibleReviewFlags("adversarial", { "budget-guard": "80" }), ["budget-guard"]);
+  assert.deepEqual(incompatibleReviewFlags("quick", {}), []);
+});
+
+test("CLI: a --mode conflicting with the verb alias is rejected before any job is created", (t) => {
+  withCli((workDir, baseEnv) => {
+    const res = spawnSync(process.execPath, [COMPANION, "deliberate", "--mode", "adversarial", "--background", "--json"], {
+      cwd: workDir,
+      env: baseEnv,
+      encoding: "utf8",
+      timeout: 30_000
+    });
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.notEqual(res.status, 0, "a mode conflict must fail loud (non-zero exit)");
+    assert.match(res.stderr, /Conflicting review mode/);
+    assert.equal(readCouncilJobs(baseEnv.AGENT_COUNCIL_STATE_DIR).length, 0, "no job file may be persisted on a rejected mode");
+  });
+});
+
+test("CLI: an invalid --mode is rejected with the allowed list, no job created", (t) => {
+  withCli((workDir, baseEnv) => {
+    const res = spawnSync(process.execPath, [COMPANION, "review", "--mode", "wat", "--background", "--json"], {
+      cwd: workDir,
+      env: baseEnv,
+      encoding: "utf8",
+      timeout: 30_000
+    });
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.notEqual(res.status, 0);
+    assert.match(res.stderr, /Invalid --mode "wat".*quick, deliberate, adversarial/s);
+    assert.equal(readCouncilJobs(baseEnv.AGENT_COUNCIL_STATE_DIR).length, 0);
+  });
+});
+
+// The --background path spawns a DETACHED worker whose cwd is the temp workDir; on Windows that briefly
+// locks the dir, so an immediate recursive rmdir hits EBUSY. Cleanup is best-effort (retry with a short
+// sleep, then give up — the OS reaps %TEMP%). Never throws, so a green test can't be turned red by cleanup.
+function rmBestEffort(dir) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if (err && (err.code === "EBUSY" || err.code === "ENOTEMPTY" || err.code === "EPERM")) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50); // ~50ms; let the detached worker exit
+        continue;
+      }
+      return; // any other error: leave the temp dir for the OS
+    }
+  }
+}
+
+test("CLI: persisted job.kind is unchanged — bare review=review, --mode maps 1:1, alias verb still stores deliberate", (t) => {
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-cli-state-"));
+  const workDir = makeWorkDir();
+  // reviewers:[claude] + a CLAUDE_BIN that exits non-zero ⇒ every seat unreachable, so any spawned
+  // background worker fails fast (no real Codex/Grok/Claude call). The kind is persisted by the PARENT
+  // at job-creation time — before and independent of the worker — so this reads it straight off disk.
+  const fakeClaudeBin = makeAllSeatsUnreachable(workDir);
+  const env = { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot, CLAUDE_BIN: fakeClaudeBin };
+  try {
+    const kindFor = (args) => {
+      const res = spawnSync(process.execPath, [COMPANION, ...args, "--background", "--json"], {
+        cwd: workDir,
+        env,
+        encoding: "utf8",
+        timeout: 30_000
+      });
+      if (isSandboxBlocked(res)) return { skip: true };
+      let jobId = null;
+      try {
+        jobId = JSON.parse(res.stdout).jobId;
+      } catch {
+        /* fall back to the newest job below */
+      }
+      const jobs = readCouncilJobs(stateRoot);
+      const job = (jobId && jobs.find((j) => j.id === jobId)) || jobs[jobs.length - 1];
+      return { kind: job?.kind };
+    };
+
+    const bare = kindFor(["review"]);
+    if (bare.skip) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.equal(bare.kind, "review", "the bare review verb still persists kind review (quick)");
+    assert.equal(kindFor(["review", "--mode", "deliberate"]).kind, "deliberate", "review --mode deliberate persists kind deliberate");
+    assert.equal(kindFor(["review", "--mode", "adversarial"]).kind, "adversarial", "review --mode adversarial persists kind adversarial");
+    assert.equal(kindFor(["deliberate"]).kind, "deliberate", "the deliberate alias verb still persists kind deliberate — unchanged on disk");
+  } finally {
+    rmBestEffort(workDir);
+    rmBestEffort(stateRoot);
+  }
+});

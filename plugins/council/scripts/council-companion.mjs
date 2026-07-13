@@ -96,7 +96,11 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/council-companion.mjs setup [--json]",
-      "  node scripts/council-companion.mjs review|adversarial|deliberate [flags] [focus text]",
+      "  node scripts/council-companion.mjs review [--mode quick|deliberate|adversarial] [flags] [focus text]",
+      "      e.g.  review --mode quick        parallel Codex + Grok, single round (the CLI default)",
+      "      e.g.  review --mode deliberate   R1 independent -> R2 peer critique (+ optional Claude file)",
+      "      e.g.  review --mode adversarial  same as quick, adversarial framing",
+      "      legacy aliases (still work): `adversarial` = review --mode adversarial; `deliberate` = review --mode deliberate",
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
@@ -126,6 +130,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs worktree add|remove|list <slug> [--base <ref>] [--force]",
       "",
       "Flags:",
+      "  --mode quick|deliberate|adversarial  (canonical review-mode selector; the alias verbs are legacy sugar)",
       "  --background  --base <ref>  --scope auto|working-tree|branch",
       "  --codex-model <id>  --grok-model <id>  --codex-effort <l>  --grok-effort <l>",
       "  --skip-codex  --skip-grok  --claude-findings <path>  --claude-findings-wait <path>",
@@ -133,11 +138,11 @@ function printUsage() {
       "  --budget-guard <percent>  --force-budget  --json",
       "  solve only: --problem-file <path>  --claude-plan <path>  --claude-plan-wait <path>",
       "",
-      "Modes:",
-      "  review       - parallel Codex + Grok review (single round)",
+      "Modes (review --mode <x>):",
+      "  quick        - parallel Codex + Grok review (single round) [default]",
       "  adversarial  - same, adversarial framing",
       "  deliberate   - Round1 independent -> Round2 peer critique (+ optional Claude file)",
-      "  solve        - independent solution plans -> cross-critique with scores -> ranking",
+      "  solve        - separate verb: independent solution plans -> cross-critique with scores -> ranking",
       "",
       "Policy file (repo root): .council.yml | .council.json",
       "Models default from policy or ~/.codex/config.toml + ~/.grok/config.toml"
@@ -898,6 +903,69 @@ function secondsToMs(value, flagName) {
   return Math.round(seconds * 1000);
 }
 
+// The three review modes the single `review` surface exposes. `solve` is a SEPARATE protocol (its own
+// verb), not a review mode. These strings are the CLI surface only — the persisted job.kind stays
+// review|deliberate|adversarial (see the `kind` derivation in handleReview), so watch/history/metrics
+// on disk are unaffected.
+export const REVIEW_MODES = ["quick", "deliberate", "adversarial"];
+
+// Flags that only affect the deliberate protocol. Passing them under quick/adversarial is silently
+// ineffective today, so handleReview warns once. Value/boolean both land in `options` (a value flag
+// as a string, a boolean flag as `true`); an absent flag is `undefined`, so `!= null` selects exactly
+// the ones the user actually passed. Keyed on the raw CLI flag names as they appear in `options`.
+export const DELIBERATE_ONLY_FLAGS = [
+  "debate-rounds",
+  "debate-resume",
+  "claude-findings",
+  "claude-findings-wait",
+  "resume",
+  "budget-guard"
+];
+
+/**
+ * Resolve the single effective review mode from the verb-alias params and an optional `--mode`.
+ * Pure + exported for unit tests. Precedence:
+ *   1. the verb alias encoded by the dispatch params (a `deliberate`/`adversarial` dispatch, or a
+ *      skill passing them) — highest. A bare `review` verb encodes NO alias (both params false), so
+ *      `--mode` selects freely there.
+ *   2. an explicit `--mode quick|deliberate|adversarial`.
+ * An explicit `--mode` that DISAGREES with the verb alias is a conflict and throws BEFORE any job is
+ * created; an equivalent/duplicate selector (e.g. `deliberate --mode deliberate`) is fine. Returns
+ * the resolved `mode` plus the `adversarial`/`deliberate` booleans the rest of handleReview consumes.
+ * Byte-identical defaults: no `--mode` + no alias ⇒ "quick"; the deliberate/adversarial verbs keep
+ * resolving to their own mode.
+ */
+export function resolveReviewMode({ adversarial = false, deliberate = false, modeOption = null } = {}) {
+  const aliasMode = deliberate ? "deliberate" : adversarial ? "adversarial" : null;
+
+  let requested = null;
+  if (modeOption != null) {
+    requested = String(modeOption).trim().toLowerCase();
+    if (!REVIEW_MODES.includes(requested)) {
+      throw new Error(`Invalid --mode "${modeOption}". Expected one of: ${REVIEW_MODES.join(", ")}.`);
+    }
+  }
+
+  if (aliasMode && requested && requested !== aliasMode) {
+    throw new Error(
+      `Conflicting review mode: the "${aliasMode}" verb (legacy alias for review --mode ${aliasMode}) ` +
+        `cannot be combined with --mode ${requested}. Use a single selector, e.g. "review --mode ${requested}".`
+    );
+  }
+
+  const mode = aliasMode ?? requested ?? "quick";
+  return { mode, adversarial: mode === "adversarial", deliberate: mode === "deliberate" };
+}
+
+/**
+ * The deliberate-only flags the user passed while NOT in deliberate mode (they would be silently
+ * ignored). Pure + exported for unit tests. Empty in deliberate mode.
+ */
+export function incompatibleReviewFlags(mode, options = {}) {
+  if (mode === "deliberate") return [];
+  return DELIBERATE_ONLY_FLAGS.filter((flag) => options[flag] != null);
+}
+
 async function handleReview(argv, adversarial, deliberate = false, solve = false) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: [
@@ -920,6 +988,7 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
       "reviewers",
       "claude-backend",
       "claude-model",
+      "mode",
       "cwd"
     ],
     // "wait" is accepted (but unused) for backward compatibility with docs/slash-commands that mention
@@ -928,6 +997,32 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
     // companion-cli nit).
     booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "skip-claude", "debate-resume", "force-budget", "resume", "verify"]
   });
+
+  // Consolidate the verb aliases + the canonical `--mode` into a single effective mode BEFORE any job
+  // is created. The verb-alias params (a deliberate/adversarial dispatch, or the /council:review skill
+  // passing them) stay highest precedence; a disagreeing `--mode` is rejected here. `solve` is its own
+  // protocol, not a review mode, so `--mode` does not apply to it. Reassigning the adversarial/deliberate
+  // params flows the resolved mode into the request, the budget guard, and the persisted `kind` below.
+  let mode;
+  if (solve) {
+    if (options.mode != null) {
+      throw new Error(`solve does not support --mode (solve is its own mode); drop --mode ${String(options.mode)}.`);
+    }
+    mode = "solve";
+  } else {
+    const resolved = resolveReviewMode({ adversarial, deliberate, modeOption: options.mode });
+    mode = resolved.mode;
+    adversarial = resolved.adversarial;
+    deliberate = resolved.deliberate;
+    const incompatible = incompatibleReviewFlags(mode, options);
+    if (incompatible.length) {
+      console.error(
+        `Note: ${incompatible.map((flag) => `--${flag}`).join(", ")} only apply to --mode deliberate; ` +
+          `ignored under --mode ${mode}.`
+      );
+    }
+  }
+
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const focusText = positionals.join(" ").trim();
   const waitTimeoutMs = secondsToMs(options["wait-timeout"], "--wait-timeout");
