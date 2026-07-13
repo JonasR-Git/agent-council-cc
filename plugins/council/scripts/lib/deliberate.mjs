@@ -34,6 +34,7 @@ import { verifyFindings } from "./verify.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 import { formatExit } from "./util.mjs";
 import { skippedAgents } from "./policy.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
 
 export { READONLY_DISALLOWED_TOOLS };
 
@@ -239,7 +240,14 @@ function r1ContextKey(backends, options) {
  * and no network; the same fakes serve both rounds (the round is evident from the prompt).
  */
 export async function runDeliberation(cwd, backends, options = {}, deps = {}) {
-  const onPhase = typeof options.onPhase === "function" ? options.onPhase : () => {};
+  const reporter = options.reporter ?? NOOP_REPORTER; // best-effort live telemetry (additive)
+  const userPhase = typeof options.onPhase === "function" ? options.onPhase : () => {};
+  // Every deliberation milestone (context → r1 → r2 → verify → debate) both notifies the caller
+  // and drives the live progress phase — a natural seam, no extra call sites.
+  const onPhase = (msg) => {
+    reporter.phase("deliberate", String(msg));
+    userPhase(msg);
+  };
   onPhase("collecting-context");
   const target = resolveReviewTarget(cwd, { base: options.base, scope: options.scope });
   const context = collectReviewContext(cwd, target, { skipPaths: options.skipPaths ?? [] });

@@ -173,6 +173,49 @@ export function mergeProgressEvent(state, event) {
 }
 
 /**
+ * A do-nothing reporter with the exact method surface of a real one, so lib
+ * functions can write `const reporter = options.reporter ?? NOOP_REPORTER`
+ * and call it unconditionally — zero null-checks, zero behavior change when
+ * no reporter is wired. Every method is chainable; snapshot() returns null
+ * (there is no state to snapshot).
+ */
+export const NOOP_REPORTER = Object.freeze({
+  phase() {
+    return NOOP_REPORTER;
+  },
+  seat() {
+    return NOOP_REPORTER;
+  },
+  counter() {
+    return NOOP_REPORTER;
+  },
+  gate() {
+    return NOOP_REPORTER;
+  },
+  progress() {
+    return NOOP_REPORTER;
+  },
+  findings() {
+    return NOOP_REPORTER;
+  },
+  budget() {
+    return NOOP_REPORTER;
+  },
+  eta() {
+    return NOOP_REPORTER;
+  },
+  line() {
+    return NOOP_REPORTER;
+  },
+  done() {
+    return NOOP_REPORTER;
+  },
+  snapshot() {
+    return null;
+  }
+});
+
+/**
  * Create the shared progress reporter a long-running command feeds. Every
  * mutating call merges into the in-memory state, stamps updatedAt via now(),
  * and persists the snapshot to `${stateDir}/progress.json` via writeFile —

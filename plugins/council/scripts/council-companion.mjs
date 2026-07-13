@@ -36,7 +36,8 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
-import { colorize, formatDashboard, formatDashboardMarkdown, summarizeCouncilExtras, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
+import { colorize, formatDashboard, formatDashboardMarkdown, pickFreshestWatchSource, readProgressState, renderProgressDashboard, summarizeCouncilExtras, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
+import { makeProgressReporter } from "./lib/progress.mjs";
 import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
@@ -138,6 +139,29 @@ function printUsage() {
       "Models default from policy or ~/.codex/config.toml + ~/.grok/config.toml"
     ].join("\n")
   );
+}
+
+/**
+ * One progress reporter per long-running command, writing the current-run `progress.json` slot in
+ * this workspace's state dir (the universal live-dashboard contract read by `council watch`). In a
+ * non-json run it forwards every line to stderr byte-identically to the old inline `onProgress` AND
+ * persists it; in a --json run the sink is silent but progress.json is STILL written (a JSON/file
+ * consumer can watch it). Best-effort: the reporter is fail-soft, so a plain call never affects the
+ * command's outcome. Non-json runs also print a one-line pointer to the live dashboard.
+ */
+function makeRunReporter(cwd, { kind, title, jobId = null, json = false }) {
+  const stateDir = resolveStateDir(cwd);
+  const reporter = makeProgressReporter({
+    kind,
+    title,
+    jobId,
+    stateDir,
+    logSink: json ? () => {} : (m) => console.error(m)
+  });
+  if (!json) {
+    console.error(`  ▶ live dashboard: council watch${jobId ? ` ${jobId}` : ""}  (add --md for a chat snapshot)`);
+  }
+  return reporter;
 }
 
 function normalizeArgv(argv) {
@@ -697,6 +721,9 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
 
   if (deliberate) {
     appendLogLine(job.logFile, "Deliberate protocol: R1 independent -> R2 peer critique");
+    // Phase 2: live-dashboard reporter for the deliberation (phase per R1/R2/verify/debate milestone,
+    // threaded ALONGSIDE the existing job phase reporter — see runDeliberation's onPhase wrapper).
+    const reporter = makeRunReporter(cwd, { kind: "deliberate", title: "council deliberate", jobId: job.id, json: Boolean(options.json) });
     const deliberation = await runDeliberation(cwd, backends, {
       ...mergedOpts,
       skipCodex: mergedOpts.skipCodex,
@@ -713,10 +740,12 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       jobId: job.id,
       nowIso: nowIso(),
       nowMs: Date.now(),
+      reporter,
       onPhase: makePhaseReporter(root, job)
     });
     const r1Failed = deliberation.r1.some((r) => !r.skipped && r.status !== 0);
     const allSkipped = deliberation.r1.every((r) => r.skipped && r.agent !== "claude");
+    reporter.done({ ok: !allSkipped });
     // Agents can exit 0 with unparsable JSON - that must not look like success.
     const r1ParseFailures = deliberation.r1.filter(
       (r) => !r.skipped && r.findings && r.findings.parseOk === false
@@ -1693,10 +1722,23 @@ async function handleWatch(argv) {
   });
   const cwd = process.cwd();
   const root = workspaceRoot(cwd);
-  const jobId = positionals[0] ?? listJobs(root)[0]?.id;
-  if (!jobId) throw new Error("No council jobs found.");
-  let job = readJobFile(root, jobId);
-  if (!job) throw new Error(`Job not found: ${jobId}`);
+  const requestedId = positionals[0];
+  let job = requestedId ? readJobFile(root, requestedId) : null;
+  if (requestedId && !job) throw new Error(`Job not found: ${requestedId}`);
+
+  // Phase 2: with no explicit job requested, watch the FRESHEST source. Every long-running command
+  // now writes a universal progress.json; a stale legacy job must not shadow a live run.
+  if (!requestedId) {
+    const prog = readProgressState(resolveStateDir(cwd));
+    const latestId = listJobs(root)[0]?.id;
+    job = latestId ? readJobFile(root, latestId) : null;
+    if (pickFreshestWatchSource(prog, job).kind === "progress") {
+      await watchProgress(cwd, prog, options);
+      return;
+    }
+  }
+  if (!job) throw new Error("No council jobs found.");
+  const jobId = job.id;
   const ctx = watchContext(cwd, job); // computed once - stable across redraws
 
   if (options.json) {
@@ -1736,6 +1778,50 @@ async function handleWatch(argv) {
     if (Date.now() >= deadline) {
       // Mirror `wait`: a watch that hits its deadline is not a clean finish.
       console.log(`\nwatch timed out after ${Math.round(timeoutMs / 1000)}s (job still ${job.status}).`);
+      process.exitCode = 1;
+      return;
+    }
+    await delay(intervalMs);
+  }
+}
+
+/**
+ * Watch the universal progress.json (Phase 2) — the fallback path for `council watch` when there is
+ * no legacy job. Mirrors handleWatch's json / --md / --once / TTY-loop shape, but renders the
+ * kind-agnostic dashboard (renderProgressDashboard, TOTAL/never-throws) and re-reads the file each
+ * interval, terminating on `prog.done`. `initial` is the state that was present when the fallback
+ * fired; a subsequent read failure falls back to it rather than blanking the screen.
+ */
+async function watchProgress(cwd, initial, options) {
+  const stateDir = resolveStateDir(cwd);
+  const reread = () => readProgressState(stateDir) ?? initial;
+
+  if (options.json) {
+    const prog = reread();
+    outputResult({ kind: prog?.kind ?? null, done: Boolean(prog?.done), dashboard: renderProgressDashboard(prog, { nowMs: Date.now() }) }, true);
+    return;
+  }
+  if (options.md) {
+    console.log(renderProgressDashboard(reread(), { md: true, nowMs: Date.now() }));
+    return;
+  }
+  const paint = (s) => (process.stdout.isTTY ? colorize(s) : s);
+  // Single snapshot for --once or non-TTY stdout (no live redraw).
+  if (options.once || !process.stdout.isTTY) {
+    const prog = reread();
+    console.log(paint(renderProgressDashboard(prog, { nowMs: Date.now() })));
+    if (!prog?.done) console.log("\n(snapshot; re-run or use a TTY for a live view)");
+    return;
+  }
+  const intervalMs = secondsToMs(options.interval, "--interval") ?? 2000;
+  const timeoutMs = secondsToMs(options.timeout, "--timeout") ?? 3_600_000;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const prog = reread();
+    process.stdout.write(`\x1b[2J\x1b[H${paint(renderProgressDashboard(prog, { nowMs: Date.now() }))}\n`);
+    if (prog?.done) return;
+    if (Date.now() >= deadline) {
+      console.log(`\nwatch timed out after ${Math.round(timeoutMs / 1000)}s (progress still running).`);
       process.exitCode = 1;
       return;
     }
@@ -1939,6 +2025,9 @@ async function handleAudit(argv) {
     // chunk) CELL is reviewed by all reachable seats, coverage measured cell-granularly. The default
     // per-file path is unchanged. --max-cells bounds the matrix (overflow is reported, never silent).
     let out;
+    // Phase 2: the live-dashboard reporter for `audit review` (per-file OR grouped). onProgress is
+    // reporter.line so today's stderr stays byte-identical (non-json) AND is now persisted.
+    const reporter = makeRunReporter(cwd, { kind: "audit-review", title: "audit review", json: options.json });
     if (options.groups) {
       // Grouped cost is bounded by CELLS, not the agent-call --budget. A default fine run is already
       // ~1080 cells (12 files × 30 groups × 3 seats); the library backstop is 4000. Use a lower CLI
@@ -1961,7 +2050,8 @@ async function handleAudit(argv) {
         completenessCritic, // M8: opt-in thoroughness critic (adds 1 call; surfaces coverage gaps)
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
-        onProgress: options.json ? undefined : (m) => console.error(m)
+        reporter,
+        onProgress: reporter.line
       });
     } else {
       out = await runAuditReview(cwd, model, backends, {
@@ -1969,9 +2059,12 @@ async function handleAudit(argv) {
         budget,
         maxUnits,
         skipCodex: merged.skipCodex,
-        skipGrok: merged.skipGrok
+        skipGrok: merged.skipGrok,
+        reporter,
+        onProgress: reporter.line
       });
     }
+    reporter.done({ ok: true });
     recordAuditMetrics(cwd, "review", { wallClockMs: Date.now() - t0, findings: out.findings.length, coverage: out.coverage }, nowIso());
     if (options.doc) {
       const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: "deep review" }, { docPath: options["doc-path"] });
@@ -2160,6 +2253,11 @@ async function handleAudit(argv) {
           console.error(`⚠ --sensitive-auto-apply requested but seats unreachable (${missing.join(", ")}) — §6 stays propose-only.`);
         }
       }
+      // Phase 2: ONE reporter for the whole fix-loop run. It rides into makeFixLoopDeps (so each
+      // pass's runAuditReview feeds the live lens table + unit progress AND runAuditFix feeds the
+      // fix counters/gate) and into loopOpts (so runFixLoop emits pass-level phase/progress) — all
+      // onto the same progress.json slot.
+      const reporter = makeRunReporter(cwd, { kind: "audit-fix-loop", title: "audit fix --loop", json: options.json });
       const deps = makeFixLoopDeps(cwd, model, backends, {
         maxUnits,
         minSeverity: fixMinSeverity,
@@ -2191,7 +2289,8 @@ async function handleAudit(argv) {
         // as the integration branch — reconcilePendingFixes then trivially finds the commit an
         // ancestor and falsely promotes it to durable 'fixed' though it was never merged to base
         // (council Opus O7). Pin the real base for the ledger.
-        ledgerBaseBranch: baseBranch
+        ledgerBaseBranch: baseBranch,
+        reporter // Phase 2: threaded into the review + fix closures (see makeFixLoopDeps)
       }, structureTransformRunner ? {
         // M9: every loop pass fixes through runAuditFix — thread the structure consent + the
         // transform runner into EACH pass exactly like the single-shot path does (mirrors how
@@ -2212,7 +2311,7 @@ async function handleAudit(argv) {
       // opts out (single flat convergence). --per-tier explicitly affirms the default; passing BOTH is
       // a contradiction, so reject it loudly instead of silently letting one win (council F2).
       if (options["per-tier"] && options.flat) throw new Error("--per-tier and --flat are contradictory (per-tier staging vs one flat convergence) — pass at most one");
-      const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) };
+      const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, reporter, onProgress: reporter.line };
       // C3/M10: --supervise wraps the loop in the endless supervisor so a multi-hour autonomous run
       // survives rate-limit resets — a resumable stop (throttled/backends-down/did-not-run) waits
       // reset-aware then --resumes from the checkpoint; a terminal convergence returns as normal.
@@ -2231,6 +2330,7 @@ async function handleAudit(argv) {
         out.stranded = co.status !== 0;
       }
       recordAuditMetrics(cwd, "fixloop", { wallClockMs: Date.now() - tLoop, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, proposed: out.proposed?.length ?? 0, passes: out.passesRun ?? 0, spent: out.spent ?? 0 }, nowIso());
+      reporter.done({ ok: !out.stranded, stopReason: out.stopReason });
       if (options.json) {
         outputResult(out, true);
         return;
@@ -2263,6 +2363,9 @@ async function handleAudit(argv) {
     }
 
     let findings;
+    // Phase 2: ONE reporter for the whole single-shot `audit fix` run — it covers the fresh review
+    // (when no --from) AND the fix itself, so the live dashboard shows unit progress then fix counters.
+    const reporter = makeRunReporter(cwd, { kind: "audit-fix-loop", title: "audit fix", json: options.json });
     if (options.from) {
       // Confine --from to the project root (no absolute/.. escape) the same way
       // --doc-path is confined: it is read and JSON-parsed, so a stray path could
@@ -2297,10 +2400,11 @@ async function handleAudit(argv) {
           completenessCritic,
           skipCodex: merged.skipCodex,
           skipGrok: merged.skipGrok,
-          onProgress: options.json ? undefined : (m) => console.error(m)
+          reporter,
+          onProgress: reporter.line
         });
       } else {
-        rev = await runAuditReview(cwd, model, backends, { ...merged, budget, maxUnits, skipCodex: merged.skipCodex, skipGrok: merged.skipGrok });
+        rev = await runAuditReview(cwd, model, backends, { ...merged, budget, maxUnits, skipCodex: merged.skipCodex, skipGrok: merged.skipGrok, reporter, onProgress: reporter.line });
       }
       findings = rev.findings;
     }
@@ -2347,7 +2451,8 @@ async function handleAudit(argv) {
       // M9: the structure consent is added ONLY when --structure-auto-apply was passed, so the
       // default options object stays byte-identical (structure-wiring re-checks === true anyway).
       ...(structureTransformRunner ? { structureAutoApply: true } : {}),
-      onProgress: options.json ? undefined : (m) => console.error(m)
+      reporter,
+      onProgress: reporter.line
     }, {
       ...(singleCharTestGate ? { charTestGate: singleCharTestGate } : {}),
       ...(structureTransformRunner ? { runStructureTransform: structureTransformRunner } : {})
@@ -2355,6 +2460,7 @@ async function handleAudit(argv) {
     if (!options["dry-run"]) {
       recordAuditMetrics(cwd, "fix", { wallClockMs: Date.now() - tFix, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, rejected: out.rejected?.length ?? 0, ledgerResolved: out.ledgerResolved ?? 0, integrationFailed: Boolean(out.integrationFailed) }, nowIso());
     }
+    reporter.done({ ok: out.ok !== false, stopReason: out.aborted ?? null });
     if (options.json) {
       outputResult(out, true);
       return;
@@ -2449,7 +2555,10 @@ async function handleAudit(argv) {
         skipGrok: merged.skipGrok
       });
     const tEndless = Date.now();
-    const endlessOpts = { budget, maxPasses, dryStreak, onProgress: options.json ? undefined : (m) => console.error(m) };
+    // Phase 2: live-dashboard reporter for the endless review loop (phase/progress/budget/findings
+    // per pass — see runEndless). onProgress is reporter.line so today's stderr stays byte-identical.
+    const reporter = makeRunReporter(cwd, { kind: "audit-endless", title: "audit endless", json: options.json });
+    const endlessOpts = { budget, maxPasses, dryStreak, reporter, onProgress: reporter.line };
     // C3/M10: --supervise survives rate-limit resets across a multi-hour endless review.
     const out = options.supervise
       ? await runSupervised(
@@ -2458,6 +2567,7 @@ async function handleAudit(argv) {
         )
       : await runEndless(cwd, { ...endlessOpts, resume: options.resume }, { review });
     recordAuditMetrics(cwd, "endless", { wallClockMs: Date.now() - tEndless, passesRun: out.passesRun, spent: out.spent, findings: out.findings.length, stopReason: out.stopReason }, nowIso());
+    reporter.done({ ok: true, stopReason: out.stopReason });
     if (options.doc) {
       const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: `endless (${out.passesRun} passes)` }, { docPath: options["doc-path"] });
       if (!options.json) console.log(`Wrote proposals to ${docPath}`);
@@ -2854,12 +2964,16 @@ async function handlePlan(argv) {
     throw new Error("no callable seats (Codex/Grok/Claude all unavailable or skipped) — `council plan` needs at least one to propose");
   }
 
+  // Phase 2: live-dashboard reporter for the plan deliberation (phase per R1/R2/R3 milestone).
+  const reporter = makeRunReporter(cwd, { kind: "plan", title: "council plan", json: options.json });
   const out = await runPlanDeliberation(cwd, request, backends, {
     ...merged,
     synthesizer: options.synthesizer,
     budget: options.budget != null ? Number(options.budget) : undefined,
+    reporter,
     onPhase: options.json ? undefined : (m) => console.error(m)
   });
+  reporter.done({ ok: Boolean(out?.planSpec) });
   if (!out?.planSpec) throw new Error("the council could not synthesize a VALID PlanSpec (fail-closed: an invalid plan is never emitted)");
 
   // Persist BOTH artifacts so `council build --from <path>` works, and print the path.
@@ -3400,10 +3514,15 @@ async function handleBuild(argv) {
   if (!options.json && stepDeps.authorSeat) {
     console.error(`build: authoring seat = ${stepDeps.authorSeat} (first active seat; §6 reviews with EVERY required seat)`);
   }
+  // Phase 2: live-dashboard reporter for the build (phase + step progress + a gate per committed/
+  // failed step — see runBuild). onProgress is reporter.line so today's stderr stays byte-identical.
+  const reporter = makeRunReporter(cwd, { kind: "build", title: "council build", json: options.json });
   const out = await runBuild(cwd, planSpec, backends, {
     ...merged,
-    onProgress: options.json ? undefined : (m) => console.error(m)
+    reporter,
+    onProgress: reporter.line
   }, { git: buildGit, stepDeps });
+  reporter.done({ ok: out?.ok === true, stopReason: out?.stopReason });
 
   if (options.json) {
     outputResult(out, true);

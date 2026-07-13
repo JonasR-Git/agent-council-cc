@@ -780,3 +780,22 @@ export function readProgressState(stateDir, opts = {}) {
     return null;
   }
 }
+
+/**
+ * `council watch` with no explicit job must render whichever source is LIVE, not whichever
+ * legacy job happens to be newest-created. Every long-running command now writes a universal
+ * progress.json; a stale legacy job must never shadow a running command's progress. Returns
+ * `{ kind: "progress" }` when the progress.json is at least as fresh as the newest job (ties
+ * and untimestamped/absent jobs go to progress.json), else `{ kind: "job", job }`.
+ * `progressState`/`job` may be null; `parseTs(v)` is injectable for tests (defaults to Date.parse).
+ */
+export function pickFreshestWatchSource(progressState, job, { parseTs = (v) => Date.parse(v) } = {}) {
+  const tsOf = (v) => {
+    const t = typeof v === "string" ? parseTs(v) : NaN;
+    return Number.isFinite(t) ? t : null;
+  };
+  if (!progressState || typeof progressState !== "object") return { kind: "job", job: job ?? null };
+  const progTs = tsOf(progressState.updatedAt) ?? 0;
+  const jobTs = job ? tsOf(job.updatedAt) ?? tsOf(job.createdAt) ?? 0 : -1;
+  return progTs >= jobTs ? { kind: "progress" } : { kind: "job", job };
+}

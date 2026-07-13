@@ -6,6 +6,7 @@ import { patchReviewerReady } from "./audit-patch-reviewer.mjs";
 import { requiredPatchSeats } from "./seats.mjs";
 import { runCommand, runCommandAsync } from "./process.mjs";
 import { ensureStateDir, resolveStateDir, workspaceRoot } from "./state.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
 
 // `council build` — the run ORCHESTRATOR (gate-ladder steps 0 and 12 of
 // docs/plan-build-design.md). It MIRRORS runAuditFix's outer discipline without calling it:
@@ -366,6 +367,7 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
   const root = workspaceRoot(cwd);
   const git = deps.git ?? makeBuildGit(root);
   const log = typeof options.onProgress === "function" ? options.onProgress : () => {};
+  const reporter = options.reporter ?? NOOP_REPORTER; // best-effort live telemetry (additive)
   const now = deps.now ?? (() => Date.now());
   const maxSteps = Number.isFinite(options.maxSteps) ? Math.max(1, Math.floor(options.maxSteps)) : DEFAULT_MAX_STEPS;
 
@@ -545,9 +547,13 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
     let stranded = false;
     let stopReason = "completed";
 
+    reporter.phase("build", `${planSpec.steps.length} steps`);
+    reporter.progress({ unitsDone: 0, unitsTotal: planSpec.steps.length });
+
     // Steps are DEPENDENT: declared order, abort on the FIRST failure, never skip ahead.
     for (let i = 0; i < planSpec.steps.length; i += 1) {
       const step = planSpec.steps[i];
+      reporter.phase("build", `step ${i + 1}/${planSpec.steps.length}`);
       // Budgets are checked BETWEEN steps (a step is never torn mid-flight — its own
       // bounds cap it internally); commits made so far stay on the branch for review.
       if (now() - startMs > maxWallClockMs) {
@@ -616,6 +622,8 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
           break;
         }
         steps.push(record);
+        reporter.gate({ name: step.id, state: "pass" });
+        reporter.progress({ unitsDone: steps.filter((s) => s.ok && s.commit).length, unitsTotal: planSpec.steps.length });
         log(`  committed ${String(record.commit ?? "").slice(0, 8)}`);
         continue;
       }
@@ -636,6 +644,7 @@ export async function runBuild(cwd, planSpec, backends = {}, options = {}, deps 
         record.note = "step rollback was incomplete — orchestrator restored the snapshot";
       }
       steps.push(record);
+      reporter.gate({ name: step.id, state: "veto" });
       stopReason = `step-failed:${step.id}`;
       log(`  step failed (${record.reason}) — aborting the run (steps are dependent); prior commits stay on ${branch}`);
       break;

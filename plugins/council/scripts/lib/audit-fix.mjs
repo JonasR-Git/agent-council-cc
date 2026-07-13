@@ -13,6 +13,7 @@ import { retryOnRateLimit } from "./audit-retry.mjs";
 import { coverageOfLines, ingestCoverage, parseDiffLines } from "./audit-coverage-ingest.mjs";
 import { ensureStateDir, nowIso, resolveStateDir, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
 
 // Audit V3 - the SAFE auto-fix path. The council's hard-won rule holds:
 //   detect -> propose -> verify -> fix ONLY what is provably safe + tested.
@@ -594,6 +595,17 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
   const failed = [];
   const skipped = [];
   const log = typeof options.onProgress === "function" ? options.onProgress : () => {};
+  // Best-effort live telemetry (Phase 2). Additive: a reporter call never changes an outcome.
+  const reporter = options.reporter ?? NOOP_REPORTER;
+  // Every post-apply revert flows through here, so the "reverted" counter is bumped in exactly
+  // one place (a gate that failed AFTER the patch was applied). Pre-apply propose-only rejects
+  // (too large / content-protected / char-test not accepted) never call this — they are "proposed".
+  const revert = (snap) => {
+    reporter.counter("reverted");
+    return git.resetHard(snap);
+  };
+  // Findings surfaced but never auto-applied (classification propose-only + file-not-found).
+  if (rejected.length) reporter.counter("proposed", rejected.length);
 
   try {
     try {
@@ -607,6 +619,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     } catch (err) {
       return { ok: false, error: `could not open integration branch: ${String(err?.message ?? err)}` };
     }
+    reporter.phase("fix", `${tasks.length} targets`);
 
     // Oracle state (docs/enterprise-fix-design.md §6): none (no oracle) | disabled
     // (baseline not green / opted out) | active. Only gate when the tree is green to
@@ -618,6 +631,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
       let ok = false;
       for (let i = 0; i < ORACLE_BASELINE_TRIES && !ok; i += 1) ok = Boolean((await runOracle()).ok);
       oracleState = ok ? "active" : "disabled";
+      reporter.gate({ name: "oracle", target: oracleName, state: oracleState === "active" ? "pass" : "veto" });
       if (!ok) log(`oracle (${oracleName}) baseline not green after ${ORACLE_BASELINE_TRIES} tries — oracle gate disabled for this run`);
     }
 
@@ -631,6 +645,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         const source = readFile(task.file);
         if (source.length > MAX_FIX_BYTES) {
           rejected.push({ finding, reason: `file too large for safe auto-fix (${Math.round(source.length / 1024)}KB) — propose-only` });
+          reporter.counter("proposed");
           continue;
         }
         // Content-shape protection: skip BEFORE building the prompt so protected
@@ -638,6 +653,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         const cprot = contentProtectionReason(source);
         if (cprot) {
           rejected.push({ finding, reason: `protected by content: ${cprot}` });
+          reporter.counter("proposed");
           log(`  skipped — protected by content (${cprot})`);
           continue;
         }
@@ -656,6 +672,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           }
           if (!charAccepted.accepted) {
             rejected.push({ finding, reason: `§5 char-test: ${charAccepted.reason} → propose-only` });
+            reporter.counter("proposed");
             log(`  propose-only — §5 char-test not accepted (${charAccepted.reason})`);
             continue;
           }
@@ -670,7 +687,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           }
           const guard = enforceTouched(changed, task.file);
           if (!guard.ok) {
-            git.resetHard(snapshot);
+            revert(snapshot);
             rejected.push({ finding, reason: `touched files outside target: ${guard.violations.join(", ")}` });
             log(`  reverted — touched ${guard.violations.join(", ")}`);
             continue;
@@ -681,7 +698,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           // couldn't have seen. Revert if it did.
           const cAfter = contentProtectionReason(afterSource);
           if (cAfter) {
-            git.resetHard(snapshot);
+            revert(snapshot);
             rejected.push({ finding, reason: `fix introduced protected content: ${cAfter}` });
             log(`  reverted — fix introduced protected content (${cAfter})`);
             continue;
@@ -693,7 +710,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           if (options.snapshotGate !== false) {
             const viol = snapshotViolation(source, afterSource);
             if (viol) {
-              git.resetHard(snapshot);
+              revert(snapshot);
               rejected.push({ finding, reason: `export surface changed (${viol})` });
               log(`  reverted — export surface changed (${viol})`);
               continue;
@@ -711,7 +728,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             // chartest only enforces coverage when new lines exist) — mirror them here (council audit P1/P2).
             const cov = changedLines.length === 0 ? { allCovered: true, uncovered: [] } : coverageOfLines(options.coverage, task.file, changedLines);
             if (!cov.allCovered) {
-              git.resetHard(snapshot);
+              revert(snapshot);
               rejected.push({ finding, reason: `changed lines not executed by any test (${cov.uncovered.length} uncovered) → propose-only` });
               log(`  reverted — changed lines uncovered (coverage gate)`);
               continue;
@@ -727,7 +744,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               if (o.timedOut) {
                 log(`  oracle timed out — gate skipped for this fix`);
               } else {
-                git.resetHard(snapshot);
+                revert(snapshot);
                 rejected.push({ finding, reason: `oracle regression (${oracleName})` });
                 log(`  reverted — oracle regression (${oracleName})`);
                 continue;
@@ -737,7 +754,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           if (gated) {
             const t = await runTests();
             if (!t.ok) {
-              git.resetHard(snapshot);
+              revert(snapshot);
               failed.push({ finding, file: task.file, reason: t.timedOut ? "tests timed out after fix" : "tests failed after fix", output: String(t.output ?? "").slice(-800) });
               log("  reverted — tests failed");
               continue;
@@ -755,7 +772,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               verdict = { pass: false, reason: `char-test verify error: ${String(err?.message ?? err)}` };
             }
             if (!verdict.pass) {
-              git.resetHard(snapshot);
+              revert(snapshot);
               rejected.push({ finding, reason: `§5 char-test: ${verdict.reason} → propose-only` });
               log(`  reverted — §5 char-test failed (${verdict.reason})`);
               continue;
@@ -769,10 +786,11 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           let councilVerdict = null;
           let councilCommitStaged = false;
           if (sensitiveAutoApply && isSensitiveClass(finding)) {
+            reporter.gate({ name: "§6-council", state: "running" });
             // The reviewers judge the EXACT patch; without a real diff we fail closed
             // rather than hand them the whole file as if it were the change.
             if (typeof git.diffText !== "function") {
-              git.resetHard(snapshot);
+              revert(snapshot);
               rejected.push({ finding, reason: "§6 council: cannot produce a diff to review → propose-only" });
               log(`  reverted — §6 no diff available for council review`);
               continue;
@@ -782,7 +800,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             try {
               verdicts = await withLimitRetry(() => reviewPatch({ file: task.file, finding, diff, before: source, after: afterSource }));
             } catch (err) {
-              git.resetHard(snapshot);
+              revert(snapshot);
               rejected.push({ finding, reason: `§6 council review error: ${String(err?.message ?? err)} → propose-only` });
               log(`  reverted — §6 council review error`);
               continue;
@@ -791,7 +809,8 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             // OpenRouter seats) — an OR seat RAISES the bar and a missing vote vetoes (fail-closed).
             councilVerdict = evaluatePatchVerdicts(verdicts, { required: requiredPatchSeats(backends, options) });
             if (!councilVerdict.approved) {
-              git.resetHard(snapshot);
+              reporter.gate({ name: "§6-council", state: "veto" });
+              revert(snapshot);
               rejected.push({ finding, reason: `§6 council not unanimous (${councilVerdict.summary}) → propose-only`, council: councilVerdict });
               log(`  reverted — §6 council not unanimous (${councilVerdict.summary})`);
               continue;
@@ -801,7 +820,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             // the reviewed bytes are stale — revert rather than commit something unseen.
             const postReview = enforceTouched(git.changedFiles(), task.file);
             if (!postReview.ok) {
-              git.resetHard(snapshot);
+              revert(snapshot);
               rejected.push({ finding, reason: `§6 changed set drifted during review (${postReview.violations.join(", ")}) → propose-only`, council: councilVerdict });
               log(`  reverted — §6 changed set drifted during review`);
               continue;
@@ -814,24 +833,27 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             // lacks staging.
             if (typeof git.stageAndDiffCached === "function" && typeof git.commitIndex === "function") {
               if (git.stageAndDiffCached(task.file, snapshot) !== diff) {
-                git.resetHard(snapshot);
+                revert(snapshot);
                 rejected.push({ finding, reason: "§6 reviewed bytes changed during review (staged diff drift) → propose-only", council: councilVerdict });
                 log(`  reverted — §6 reviewed bytes drifted during review`);
                 continue;
               }
               councilCommitStaged = true;
             } else if (git.diffText(task.file, snapshot) !== diff) {
-              git.resetHard(snapshot);
+              revert(snapshot);
               rejected.push({ finding, reason: "§6 reviewed bytes changed during review (diff drift) → propose-only", council: councilVerdict });
               log(`  reverted — §6 reviewed bytes drifted during review`);
               continue;
             }
+            reporter.gate({ name: "§6-council", state: "pass" });
             log(`  §6 council unanimous (${councilVerdict.summary}) — auto-apply approved`);
           }
           const commit = councilCommitStaged
             ? git.commitIndex(`audit-fix: ${finding.title} (${task.file})`)
             : git.commitFile(task.file, `audit-fix: ${finding.title} (${task.file})`);
           fixed.push({ finding, file: task.file, commit, verified: gated, council: councilVerdict });
+          reporter.counter("fixed");
+          reporter.counter("committed");
           log(`  committed ${String(commit).slice(0, 8)}${gated ? " (tests green)" : " (UNVERIFIED)"}${councilVerdict ? " (§6 council ✓)" : ""}`);
         } catch (err) {
           // Any error in apply/enforce/gate/commit reverts this unit and is recorded.
@@ -840,7 +862,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           // could stage un-reviewed bytes. Abort the run and let it be reported stranded.
           let restored = true;
           try {
-            git.resetHard(snapshot);
+            revert(snapshot);
           } catch {
             restored = false;
           }
@@ -887,6 +909,8 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         if (res?.ok && res.commit) {
           rejected.splice(i, 1); // it is no longer a proposal — it was applied under the full gate ladder
           fixed.push({ finding: entry.finding, file: entry.finding.file ?? null, commit: res.commit, verified: true, structure: res.gates ?? null });
+          reporter.counter("fixed");
+          reporter.counter("committed");
           log(`  structure transform applied (${String(res.commit).slice(0, 8)}) — §6 unanimous, tests green`);
         } else {
           entry.reason = `${entry.reason} · structure transform not applied: ${res?.reason ?? "gate not satisfied"}`;

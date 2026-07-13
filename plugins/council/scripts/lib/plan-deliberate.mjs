@@ -45,6 +45,7 @@ import { runCommand } from "./process.mjs";
 import { activeSeatNames, makeSeatRunners } from "./seats.mjs";
 import { parsePlanCritique, parsePlanDoc, rankPlans } from "./solve.mjs";
 import { isObject } from "./util.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
 
 const REPO_HINT_MAX_FILES = 200;
 const README_HEAD_CHARS = 2000;
@@ -612,7 +613,14 @@ function renderPlanReport({
  * synthesis failed closed (the report says why); it is NEVER an unvalidated object.
  */
 export async function runPlanDeliberation(cwd, request, backends, options = {}, deps = {}) {
-  const onPhase = typeof options.onPhase === "function" ? options.onPhase : () => {};
+  const reporter = options.reporter ?? NOOP_REPORTER; // best-effort live telemetry (additive)
+  const userPhase = typeof options.onPhase === "function" ? options.onPhase : () => {};
+  // Every deliberation milestone (proposals → critiques → synthesis) both notifies the caller
+  // and drives the live progress phase — a natural seam, no extra call sites.
+  const onPhase = (msg) => {
+    reporter.phase("plan", String(msg));
+    userPhase(msg);
+  };
   const req = String(request ?? "");
   if (!req.trim()) {
     throw new Error("council plan: provide a non-empty feature request.");

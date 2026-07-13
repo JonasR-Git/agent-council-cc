@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { runDeliberation } from "../plugins/council/scripts/lib/deliberate.mjs";
 import {
+  NOOP_REPORTER,
   PROGRESS_FILE,
   PROGRESS_SCHEMA_VERSION,
   initialProgressState,
@@ -301,6 +302,27 @@ test(".findings aggregates a batch by lens+severity and bumps the named seat's r
   const snap2 = reporter.snapshot();
   assert.deepEqual(snap2.findingsByLens.correctness, { total: 3, P0: 1, P1: 1, P2: 1, nit: 0 });
   assert.equal(snap2.seats.find((s) => s.name === "codex").raised, 5);
+});
+
+test("NOOP_REPORTER has the full reporter surface: every method callable + chainable, snapshot() null", () => {
+  const real = makeProgressReporter({ now: makeClock(), writeFile: () => {} });
+  for (const method of Object.keys(real)) {
+    assert.equal(typeof NOOP_REPORTER[method], "function", `NOOP_REPORTER.${method} exists`);
+  }
+  assert.doesNotThrow(() => {
+    const chained = NOOP_REPORTER.phase("review", "detail")
+      .seat("codex", { state: "reviewing" })
+      .counter("fixed", 2)
+      .gate({ name: "g", state: "running" })
+      .progress({ unitsDone: 1, unitsTotal: 2 })
+      .findings([{ lens: "correctness", severity: "P0" }], { seat: "codex" })
+      .budget(1, 10)
+      .eta(1000)
+      .line("hello")
+      .done({ ok: true });
+    assert.equal(chained, NOOP_REPORTER, "every method returns the reporter (chainable)");
+  });
+  assert.equal(NOOP_REPORTER.snapshot(), null, "no state to snapshot");
 });
 
 test(".findings tolerates junk and an unknown severity buckets to nit; no seat = no raised", () => {

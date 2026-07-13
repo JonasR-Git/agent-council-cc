@@ -10,6 +10,7 @@ import { buildEvidence } from "./deliberate.mjs";
 import { verifyFindings } from "./verify.mjs";
 import { nowIso, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
 
 // Audit v2 - deep, agent-driven review of the hotspots the static model
 // surfaced, plus a global SSOT/architecture reduce. BOTH passes run on EVERY active
@@ -339,8 +340,11 @@ export async function globalReduce(cwd, backends, options, model, budget, deps =
  * more depth; the endless loop amortizes breadth across passes regardless.
  */
 export async function runAuditReview(cwd, model, backends, options = {}, deps = {}) {
+  const reporter = options.reporter ?? NOOP_REPORTER;
   const budget = makeBudget(options.budget ?? 30);
   const units = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
+  reporter.phase("review", `${units.length} units`);
+  reporter.progress({ unitsDone: 0, unitsTotal: units.length });
   const concurrency = Math.max(1, Math.min(4, options.concurrency ?? 3));
   const costPerUnit = activeReviewerCount(backends, options);
   // Reserve for the global reduce ONLY when it will actually run: skipReduce (every pass after the
@@ -366,7 +370,13 @@ export async function runAuditReview(cwd, model, backends, options = {}, deps = 
       try {
         // Fence reviewUnit's dynamic repair spend below the reduce reserve so a reformat/retry
         // can't starve the SSOT/architecture pass (council A5: grok-2/claude-1).
-        results.push(await reviewUnit(cwd, backends, options, unitId, model, reserveFloorBudget(budget, reduceReserve), deps));
+        const r = await reviewUnit(cwd, backends, options, unitId, model, reserveFloorBudget(budget, reduceReserve), deps);
+        results.push(r);
+        // Live progress: units completed so far + fold this unit's findings into the
+        // per-lens matrix (category=lens, severity bucketed). Best-effort telemetry.
+        const done = results.filter((x) => x.reviewed).length;
+        reporter.progress({ unitsDone: done, unitsTotal: units.length });
+        reporter.findings(r.merged.all);
       } catch (err) {
         failed.push({ unitId, error: String(err?.message ?? err) });
       }
@@ -377,6 +387,7 @@ export async function runAuditReview(cwd, model, backends, options = {}, deps = 
   // The global reduce is over the whole (static) map, so re-running it every pass
   // of an endless loop just re-charges budget for identical input; callers past
   // the first pass pass skipReduce to spend their budget on fresh unit coverage.
+  reporter.phase("review", "global reduce");
   const reduce = options.skipReduce ? { all: [], consensus: [], unique: [], ran: false } : await globalReduce(cwd, backends, options, model, budget, deps);
 
   // Per-unit merges + the global reduce can each surface the same issue; dedupe by

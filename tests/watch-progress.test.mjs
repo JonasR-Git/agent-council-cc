@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { readProgressState, renderProgressDashboard } from "../plugins/council/scripts/lib/watch.mjs";
+import { pickFreshestWatchSource, readProgressState, renderProgressDashboard } from "../plugins/council/scripts/lib/watch.mjs";
 import { makeProgressReporter } from "../plugins/council/scripts/lib/progress.mjs";
 
 // A full audit-fix-loop snapshot exercising every section of the contract.
@@ -332,4 +332,30 @@ test("round-trip: reported units/counters/findings DO render (bar, counters, len
   const box = renderProgressDashboard(state, {});
   assert.match(box, /lens/);
   assert.match(box, /correctness/);
+});
+
+// --- pickFreshestWatchSource: a stale legacy job must never shadow a live progress.json ---
+
+test("pickFreshestWatchSource prefers the more recently updated source", () => {
+  const prog = { updatedAt: "2026-07-13T10:09:00Z" };
+  const staleJob = { id: "j1", updatedAt: "2026-07-13T09:55:00Z" };
+  const freshJob = { id: "j2", updatedAt: "2026-07-13T10:20:00Z" };
+
+  // The exact bug found in live verification: a 13-min-old deliberate job shadowed a running review.
+  assert.deepEqual(pickFreshestWatchSource(prog, staleJob), { kind: "progress" });
+  assert.deepEqual(pickFreshestWatchSource(prog, freshJob), { kind: "job", job: freshJob });
+  // Tie -> progress.json wins (it is the current-run slot).
+  assert.deepEqual(pickFreshestWatchSource({ updatedAt: staleJob.updatedAt }, staleJob), { kind: "progress" });
+});
+
+test("pickFreshestWatchSource falls back sensibly for missing/absent inputs", () => {
+  const job = { id: "j1", updatedAt: "2026-07-13T10:00:00Z" };
+  // No progress.json -> the job wins.
+  assert.deepEqual(pickFreshestWatchSource(null, job), { kind: "job", job });
+  // No job -> progress.json wins even with a zero/garbage timestamp.
+  assert.deepEqual(pickFreshestWatchSource({ updatedAt: "garbage" }, null), { kind: "progress" });
+  // Neither -> job branch with null (handleWatch then throws "No council jobs found").
+  assert.deepEqual(pickFreshestWatchSource(null, null), { kind: "job", job: null });
+  // A job with only createdAt (never updated) is still compared.
+  assert.deepEqual(pickFreshestWatchSource({ updatedAt: "2026-07-13T10:00:00Z" }, { id: "j", createdAt: "2026-07-13T09:00:00Z" }), { kind: "progress" });
 });

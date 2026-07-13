@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { dedupeNew, endlessKey, endlessStopReason } from "./audit-endless.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
 import { retryOnRateLimit } from "./audit-retry.mjs";
 import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
@@ -88,6 +89,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const totalBudget = clamp(options.budget ?? 60, 2, 100000);
   const perPassBudget = clamp(options.perPassBudget ?? Math.max(4, Math.round(totalBudget / Math.min(maxPasses, 4))), 2, totalBudget);
   const onProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
+  const reporter = options.reporter ?? NOOP_REPORTER; // best-effort live telemetry (additive)
   const review = deps.review;
   const fix = deps.fix;
   if (typeof review !== "function") throw new Error("runFixLoop requires deps.review");
@@ -212,6 +214,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     if (stopReason) break;
 
     passNo += 1;
+    reporter.phase("fix", `pass ${passNo}`);
+    reporter.progress({ passesDone: passNo, passesTotal: maxPasses });
+    reporter.budget(spent, totalBudget);
     const passBudget = Math.min(perPassBudget, totalBudget - spent);
     onProgress(`pass ${passNo}: review+fix (budget ${passBudget}, ${spent}/${totalBudget}, dry ${dryStreak}/${dryStop})…`);
 

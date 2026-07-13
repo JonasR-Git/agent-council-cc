@@ -169,6 +169,9 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     const rev = await doReview(cwd, scopedModel, backends, {
       // A5: model/effort/timeout pins first — every explicit key below still wins.
       ...agentPins,
+      // Phase 2: the loop's ONE reporter (audit-fix-loop) also gets each pass's review so the live
+      // per-lens matrix + unit progress land on the same progress.json the fix counters do (additive).
+      reporter: options.reporter,
       budget,
       maxUnits,
       unitOffset: offset,
@@ -254,6 +257,9 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
         // model and the default timeout even when the run was pinned. The codex/grok/openrouter pins ride
         // along for the seats runAuditFix's §6 gate reaches; unset pins stay undefined (CLI defaults).
         ...agentPins,
+        // Phase 2: thread the loop's reporter so runAuditFix's live fix counters (fixed/proposed/
+        // reverted/committed) + gate state land on the SAME progress.json the review progress does.
+        reporter: options.reporter,
         branch: ctx.branch,
         stayOnBranch: ctx.stayOnBranch,
         minSeverity: options.minSeverity ?? "P2",
