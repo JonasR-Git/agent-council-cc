@@ -10,10 +10,12 @@
 // effect (review/gate/fix/expandScope/checkpoint) is injectable and unit-tested.
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { dedupeNew, endlessKey, endlessStopReason } from "./audit-endless.mjs";
 import { NOOP_REPORTER } from "./progress.mjs";
+import { evaluateCeiling, readUsageSnapshot } from "./usage-guard.mjs";
 import { retryOnRateLimit } from "./audit-retry.mjs";
 import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
@@ -90,6 +92,15 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const perPassBudget = clamp(options.perPassBudget ?? Math.max(4, Math.round(totalBudget / Math.min(maxPasses, 4))), 2, totalBudget);
   const onProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
   const reporter = options.reporter ?? NOOP_REPORTER; // best-effort live telemetry (additive)
+  // --usage-ceiling: STOP the loop between passes on a CONFIRMED per-model provider-quota breach
+  // (real Claude 5h/7d, Codex weekly, Grok weekly %). null = no ceiling. readUsage is injectable
+  // (default binds the real snapshot reader to this machine's home + the run-start sinceMs); tests
+  // trip it on a chosen pass. FAIL-SOFT is load-bearing: a usage read must NEVER crash the loop or
+  // stop it on unknown usage — only an available model at/over its ceiling stops it.
+  const usageCeiling = options.usageCeiling ?? null;
+  const readUsage = typeof deps.readUsage === "function"
+    ? deps.readUsage
+    : () => readUsageSnapshot({ homeDir: os.homedir(), sinceMs: options.usageSince });
   const review = deps.review;
   const fix = deps.fix;
   if (typeof review !== "function") throw new Error("runFixLoop requires deps.review");
@@ -343,6 +354,26 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     reporter.budget(spent, totalBudget);
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
     checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason: null, done: false });
+
+    // Between passes: honor --usage-ceiling on a CONFIRMED provider-quota breach. FAIL-SOFT —
+    // a usage-read failure is treated as "not breached" (the loop continues); only an available
+    // model at/over its ceiling stops the loop, never unknown/unavailable usage. Stash the snapshot
+    // into progress.json (reporter.usage) so the live dashboard shows real quota without its own I/O.
+    if (usageCeiling) {
+      try {
+        const snap = await readUsage();
+        reporter.usage?.(snap, usageCeiling);
+        const { breached, breaches } = evaluateCeiling(snap, usageCeiling);
+        if (breached) {
+          stopReason = `usage-ceiling: ${breaches.map((b) => `${b.model} ${b.percent}%≥${b.ceiling}% (${b.window})`).join(", ")}`;
+          onProgress(stopReason);
+          reporter.line(`⛔ ${stopReason}`);
+          break;
+        }
+      } catch {
+        /* fail-soft: a usage-read failure never stops (or crashes) the loop */
+      }
+    }
   }
 
   checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason, done: true });

@@ -48,10 +48,52 @@ export function initialProgressState({ kind = null, title = null, jobId = null, 
     budget: null,
     etaMs: null,
     recentLines: [],
+    usage: null,
+    usageCeiling: null,
     done: false,
     ok: null,
     stopReason: null
   };
+}
+
+// Compact a per-model usage snapshot (from usage-guard's readUsageSnapshot) into the
+// small, fully-typed shape progress.json stashes so the live dashboard can render real
+// quota without doing its own I/O. Anything of the wrong type is dropped (never a
+// NaN/garbage into the file). Returns null when nothing usable survives.
+function compactUsageSnapshot(u) {
+  if (!u || typeof u !== "object" || Array.isArray(u)) return null;
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const modelOf = (m) => {
+    if (!m || typeof m !== "object" || Array.isArray(m)) return null;
+    const out = { available: m.available === true, weekPercent: num(m.weekPercent), weekResetsAt: typeof m.weekResetsAt === "string" ? m.weekResetsAt : null };
+    if (m.fiveHourPercent !== undefined) out.fiveHourPercent = num(m.fiveHourPercent);
+    if (m.tokens && typeof m.tokens === "object" && !Array.isArray(m.tokens)) {
+      const t = {};
+      for (const k of ["out", "in", "total"]) {
+        const v = num(m.tokens[k]);
+        if (v != null) t[k] = v;
+      }
+      out.tokens = t;
+    }
+    return out;
+  };
+  const res = {};
+  for (const k of ["claude", "codex", "grok"]) {
+    const mm = modelOf(u[k]);
+    if (mm) res[k] = mm;
+  }
+  return Object.keys(res).length ? res : null;
+}
+
+// Compact a `{claude,codex,grok}` ceiling map to finite numbers only.
+function compactCeiling(c) {
+  if (!c || typeof c !== "object" || Array.isArray(c)) return null;
+  const out = {};
+  for (const k of ["claude", "codex", "grok"]) {
+    const v = Number(c[k]);
+    if (Number.isFinite(v)) out[k] = v;
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 /** The severity buckets a lens finding is aggregated into (order = display order). */
@@ -155,6 +197,14 @@ export function mergeProgressEvent(state, event) {
     case "budget":
       next.budget = { spent: e.spent ?? 0, total: e.total ?? 0 };
       break;
+    case "usage":
+      // Stash the latest per-model quota/token snapshot (+ the active ceiling, if given) so a
+      // watcher renders real usage without re-reading providers. null clears it; a compact null
+      // (all-garbage payload) leaves the field null. The ceiling is only overwritten when supplied,
+      // so a bare usage(snapshot) call never wipes an earlier ceiling.
+      next.usage = compactUsageSnapshot(e.usage);
+      if (e.ceiling != null) next.usageCeiling = compactCeiling(e.ceiling);
+      break;
     case "eta":
       next.etaMs = Number.isFinite(e.ms) ? e.ms : null;
       break;
@@ -210,6 +260,9 @@ export const NOOP_REPORTER = Object.freeze({
   eta() {
     return NOOP_REPORTER;
   },
+  usage() {
+    return NOOP_REPORTER;
+  },
   line() {
     return NOOP_REPORTER;
   },
@@ -240,6 +293,7 @@ export function mutedFindingsReporter(reporter) {
     findings: () => wrapper, // muted: the outer loop folds this pass's findings itself
     budget: (...a) => (base.budget(...a), wrapper),
     eta: (...a) => (base.eta(...a), wrapper),
+    usage: (...a) => (base.usage?.(...a), wrapper),
     line: (...a) => (base.line(...a), wrapper),
     done: (...a) => (base.done(...a), wrapper),
     snapshot: () => base.snapshot()
@@ -302,6 +356,9 @@ export function makeProgressReporter({
   reporter.findings = (list, { seat = null } = {}) => apply({ type: "findings", list, seat });
   reporter.budget = (spent, total) => apply({ type: "budget", spent, total });
   reporter.eta = (ms) => apply({ type: "eta", ms });
+  // Stash the latest per-model usage snapshot (+ optional active ceiling) into progress.json so the
+  // live dashboard renders real quota without its own I/O. Additive + fail-soft like every other event.
+  reporter.usage = (snapshot, ceiling) => apply({ type: "usage", usage: snapshot, ceiling });
   reporter.line = (msg) => {
     try {
       logSink(msg); // verbatim - byte-compatible with today's onProgress

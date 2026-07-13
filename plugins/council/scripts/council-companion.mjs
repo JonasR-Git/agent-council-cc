@@ -36,7 +36,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
-import { colorize, formatDashboard, formatDashboardMarkdown, pickFreshestWatchSource, readProgressState, renderProgressDashboard, summarizeCouncilExtras, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
+import { colorize, formatDashboard, formatDashboardMarkdown, pickFreshestWatchSource, readProgressState, renderProgressDashboard, renderRunDashboard, summarizeCouncilExtras, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
 import { makeProgressReporter, mutedFindingsReporter } from "./lib/progress.mjs";
 import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
@@ -47,6 +47,7 @@ import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
 import { runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
+import { parseUsageCeiling } from "./lib/usage-guard.mjs";
 import { buildClaudeReviewArgs, makePatchReviewer, patchReviewerReady } from "./lib/audit-patch-reviewer.mjs";
 import { detectLogical } from "./lib/audit-logical.mjs";
 import { nodesFromGraph } from "./lib/import-graph.mjs";
@@ -1828,21 +1829,31 @@ async function handleWatch(argv) {
 async function watchProgress(cwd, initial, options) {
   const stateDir = resolveStateDir(cwd);
   const reread = () => readProgressState(stateDir) ?? initial;
+  // Phase 2 + usage guard: when the run stashed a per-model usage snapshot (a `--usage-ceiling`
+  // fix loop), render the RICH quota/token/ceiling markdown box (renderRunDashboard); otherwise the
+  // plain kind-agnostic dashboard, byte-identical to before. renderRunDashboard is markdown-only, so
+  // it also serves the live redraw here (paint() still adds harmless ANSI accents).
+  const renderUniversal = (state, md) => {
+    const usage = state && typeof state === "object" && state.usage && typeof state.usage === "object" ? state.usage : null;
+    return usage
+      ? renderRunDashboard(state, { usage, ceiling: state.usageCeiling ?? null, nowMs: Date.now() })
+      : renderProgressDashboard(state, { md, nowMs: Date.now() });
+  };
 
   if (options.json) {
     const prog = reread();
-    outputResult({ kind: prog?.kind ?? null, done: Boolean(prog?.done), dashboard: renderProgressDashboard(prog, { nowMs: Date.now() }) }, true);
+    outputResult({ kind: prog?.kind ?? null, done: Boolean(prog?.done), dashboard: renderUniversal(prog, false) }, true);
     return;
   }
   if (options.md) {
-    console.log(renderProgressDashboard(reread(), { md: true, nowMs: Date.now() }));
+    console.log(renderUniversal(reread(), true));
     return;
   }
   const paint = (s) => (process.stdout.isTTY ? colorize(s) : s);
   // Single snapshot for --once or non-TTY stdout (no live redraw).
   if (options.once || !process.stdout.isTTY) {
     const prog = reread();
-    console.log(paint(renderProgressDashboard(prog, { nowMs: Date.now() })));
+    console.log(paint(renderUniversal(prog, false)));
     if (!prog?.done) console.log("\n(snapshot; re-run or use a TTY for a live view)");
     return;
   }
@@ -1851,7 +1862,7 @@ async function watchProgress(cwd, initial, options) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const prog = reread();
-    process.stdout.write(`\x1b[2J\x1b[H${paint(renderProgressDashboard(prog, { nowMs: Date.now() }))}\n`);
+    process.stdout.write(`\x1b[2J\x1b[H${paint(renderUniversal(prog, false))}\n`);
     if (prog?.done) return;
     if (Date.now() >= deadline) {
       console.log(`\nwatch timed out after ${Math.round(timeoutMs / 1000)}s (progress still running).`);
@@ -1967,8 +1978,19 @@ async function computeFixReportMeta(cwd, out, ctx = {}) {
 }
 
 async function handleAudit(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats"],
+  // Capture the run-start clock BEFORE any work so --usage-ceiling's token scan (tokens spent SINCE
+  // the run began) and the loop's usage snapshots share one honest baseline. Date.now() is allowed
+  // in the companion (this is not a workflow script).
+  const usageSince = Date.now();
+  // --usage-ceiling accepts an OPTIONAL value: `--usage-ceiling` alone means "use the default
+  // 40/50/40", `--usage-ceiling 40/50/40` (or `=45` / `=claude=40,codex=50`) overrides it, and an
+  // absent flag means no ceiling. The arg parser errors on a value-option given no value, so rewrite
+  // a BARE occurrence to an empty inline value up front — parseUsageCeiling("") returns the default.
+  const preArgv = normalizeArgv(argv).map((tok, i, a) =>
+    tok === "--usage-ceiling" && (a[i + 1] == null || String(a[i + 1]).startsWith("-")) ? "--usage-ceiling=" : tok
+  );
+  const { options, positionals } = parseCommandInput(preArgv, {
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats", "usage-ceiling"],
     booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep"]
   });
   // --deep: ONE flag for maximum ANALYSIS depth, so a thorough run needs no long flag list. It turns on
@@ -2223,6 +2245,13 @@ async function handleAudit(argv) {
         if (!Number.isFinite(n) || n < 1) throw new Error("--dry-streak must be a positive number");
         dryStreak = Math.floor(n);
       }
+      // --usage-ceiling: stop the loop between passes on a CONFIRMED per-model provider-quota breach
+      // (Claude 5h/7d, Codex weekly, Grok weekly). Present-but-empty ("") means the bare flag → default
+      // 40/50/40; absent → undefined → no ceiling. parseUsageCeiling validates + throws fail-fast here.
+      const usageCeiling = options["usage-ceiling"] != null ? parseUsageCeiling(options["usage-ceiling"]) : undefined;
+      if (usageCeiling && !options.json) {
+        console.error(`note: --usage-ceiling active — the loop STOPS between passes on a confirmed quota breach (claude ${usageCeiling.claude}% / codex ${usageCeiling.codex}% / grok ${usageCeiling.grok}%). Unknown/unavailable usage never stops it.`);
+      }
       // R9: --groups drives the loop off the GROUPED six-eyes review (cell-granular coverage feeds the
       // convergence guard). Validate the preset + cap up front so a bad value fails before any spend.
       let loopLensGroups;
@@ -2363,7 +2392,7 @@ async function handleAudit(argv) {
       // opts out (single flat convergence). --per-tier explicitly affirms the default; passing BOTH is
       // a contradiction, so reject it loudly instead of silently letting one win (council F2).
       if (options["per-tier"] && options.flat) throw new Error("--per-tier and --flat are contradictory (per-tier staging vs one flat convergence) — pass at most one");
-      const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, reporter, onProgress: reporter.line };
+      const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, usageCeiling, usageSince, reporter, onProgress: reporter.line };
       // C3/M10: --supervise wraps the loop in the endless supervisor so a multi-hour autonomous run
       // survives rate-limit resets — a resumable stop (throttled/backends-down/did-not-run) waits
       // reset-aware then --resumes from the checkpoint; a terminal convergence returns as normal.

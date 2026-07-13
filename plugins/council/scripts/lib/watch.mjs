@@ -9,6 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { PROGRESS_SCHEMA_VERSION, SEVERITY_BUCKETS } from "./progress.mjs";
+import { evaluateCeiling } from "./usage-guard.mjs";
 
 const AGENTS = ["codex", "grok", "claude"];
 const W = 58; // inner box width (all glyphs used are single display-width)
@@ -763,6 +764,153 @@ export function renderProgressDashboard(progressState, opts = {}) {
   } catch {
     // Last-resort totality: a dashboard render error must never take down the watcher.
     return md ? "_council progress unavailable (render error)_" : "council progress unavailable (render error)";
+  }
+}
+
+// --- Rich run dashboard (progress.json + live per-model provider USAGE) --------
+// The markdown box the user approved for a long `audit fix --loop`: the plain
+// kind-agnostic progress markdown PLUS a per-seat quota/token/ceiling table and a
+// ceiling status line. usage/ceiling are PASSED IN (no I/O here) so this stays PURE
+// + TOTAL. Without a usage snapshot it degrades to the plain progress box.
+
+const RUN_SEAT_KEYS = new Set(["claude", "codex", "grok"]);
+
+// Compact a token count: 45000 -> "45k", 1_200_000 -> "1.2M", small stays exact.
+function compactTokens(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "–";
+  const fmt = (x, suffix) => `${x.toFixed(1).replace(/\.0$/, "")}${suffix}`;
+  const abs = Math.abs(n);
+  if (abs >= 1e6) return fmt(n / 1e6, "M");
+  if (abs >= 1e3) return fmt(n / 1e3, "k");
+  return String(Math.round(n));
+}
+
+// A percent rendered with at most one decimal (14 -> "14%", 6.5 -> "6.5%").
+const fmtPct = (p) => (Number.isFinite(Number(p)) ? `${Math.round(Number(p) * 10) / 10}%` : "–");
+
+// A tiny 5-cell usage bar (used/limit) for the seat table's Ceiling column.
+function tinyBar(used, limit, width = 5) {
+  if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return "";
+  const filled = Math.max(0, Math.min(width, Math.round((used / limit) * width)));
+  return "▓".repeat(filled) + "░".repeat(width - filled);
+}
+
+// Map a seat name onto its provider usage record ({key,model}); unknown/OpenRouter
+// seats have no provider quota → {key:null, model:null} so their row shows dashes.
+function usageForSeat(usage, name) {
+  const key = String(name ?? "").trim().toLowerCase();
+  if (RUN_SEAT_KEYS.has(key) && usage && typeof usage[key] === "object" && usage[key]) return { key, model: usage[key] };
+  return { key: null, model: null };
+}
+
+function renderRunDashboardMarkdown(progressState, { usage, ceiling, prior, nowMs }) {
+  const n = normalizeProgressState(progressState);
+  const kindLabel = (n.kind ?? "run").replace(/-/g, " ");
+  const L = [];
+
+  // Header: emoji · kind · status · Pass p/N · elapsed (+ ETA while running).
+  const passPart = hasPasses(n) ? `Pass ${n.progress.passesDone ?? 0}/${n.progress.passesTotal ?? "?"}` : null;
+  const header = [`${RUN_EMOJI[n.status] ?? "⚪"} ${kindLabel}`, n.status, passPart, ...progressTimeParts(n, nowMs)].filter(Boolean).join(" · ");
+  L.push(`### ${header}`);
+  if (n.title) L.push(`_${n.title}_`);
+  if (n.phase || n.phaseDetail) L.push(`phase \`${n.phase ?? "?"}\`${n.phaseDetail ? ` — ${n.phaseDetail}` : ""}`);
+  L.push("");
+
+  // Seat table with quota + tokens + a per-seat ceiling bar.
+  L.push("| Seat | raised | Quota wk | 5h | Tokens (run) | Ceiling |");
+  L.push("|---|--:|--:|--:|--:|:--|");
+  for (const seat of n.seats) {
+    const { key, model } = usageForSeat(usage, seat.name);
+    const avail = model != null && model.available === true; // quota columns only trust an AVAILABLE model
+    const raised = seat.raised != null ? seat.raised : "–";
+    const wk = avail && model.weekPercent != null ? fmtPct(model.weekPercent) : "–";
+    const fiveH = key === "claude" && avail && model.fiveHourPercent != null ? fmtPct(model.fiveHourPercent) : "–";
+    // Tokens are from a SEPARATE reader — shown regardless of quota availability.
+    const tok = model && model.tokens ? compactTokens(model.tokens.total) : "–";
+    let ceil = "–";
+    if (ceiling && model && model.available === true) {
+      const limit = Number(ceiling[key]);
+      const used = Number(model.weekPercent);
+      if (Number.isFinite(limit) && limit > 0 && Number.isFinite(used)) ceil = `${tinyBar(used, limit)} ${Math.round(used)}/${limit}`;
+    }
+    L.push(`| ${SEAT_EMOJI[seat.state] ?? "⚪"} ${seat.name} | ${raised} | ${wk} | ${fiveH} | ${tok} | ${ceil} |`);
+  }
+  L.push("");
+
+  // Lens table (only lenses with a finding; a 0 cell shows `·`).
+  if (n.lenses.length) {
+    const cell = (v) => (v > 0 ? String(v) : "·");
+    L.push("| Lens | tot | P0 | P1 | P2 | nit |");
+    L.push("|---|--:|--:|--:|--:|--:|");
+    for (const l of n.lenses) L.push(`| ${l.name} | ${l.total} | ${cell(l.P0)} | ${cell(l.P1)} | ${cell(l.P2)} | ${cell(l.nit)} |`);
+    L.push("");
+  }
+
+  // Counters + gate.
+  const counterEntries = COUNTER_KEYS.filter((k) => k in n.counters).map((k) => `${k} ${n.counters[k]}`);
+  if (counterEntries.length) L.push(`🛠 ${counterEntries.join(" · ")}`);
+  if (hasGate(n)) L.push(`**Gate** ${GATE_EMOJI[n.gate.state] ?? "⚪"} \`${n.gate.name ?? "gate"}\`${n.gate.target ? ` → \`${n.gate.target}\`` : ""}${n.gate.state ? ` — ${n.gate.state}` : ""}`);
+
+  // Ceiling status line (breach ⛔ vs OK 📊) — computed via evaluateCeiling.
+  if (ceiling && typeof ceiling === "object") {
+    const c = ["claude", "codex", "grok"].map((k) => (Number.isFinite(Number(ceiling[k])) ? Number(ceiling[k]) : "–")).join("/");
+    const { breached, breaches } = evaluateCeiling(usage, ceiling);
+    if (breached) L.push(`⛔ Ceiling ${c} — ${breaches.map((b) => `${b.model} ${fmtPct(b.percent)} ≥ ${b.ceiling}% (${b.window})`).join(", ")}`);
+    else L.push(`📊 Ceiling ${c} — OK`);
+  }
+  if (n.stopReason) L.push(`**Stopped** — ${n.stopReason}`);
+
+  // Recent (last ~2) + honest footer.
+  if (n.recent.length) {
+    L.push("");
+    L.push("**Recent**");
+    for (const l of n.recent.slice(-2)) L.push(`- ${l}`);
+  }
+
+  // Δ vs the caller-persisted prior snapshot (phase / pass / counter moves).
+  if (prior != null && typeof prior === "object" && !Array.isArray(prior)) {
+    const p = normalizeProgressState(prior);
+    const d = [];
+    if (p.phase && n.phase && p.phase !== n.phase) d.push(`phase \`${p.phase}\` → \`${n.phase}\``);
+    const pp = p.progress?.passesDone;
+    const cp = n.progress?.passesDone;
+    if (pp != null && cp != null && pp !== cp) d.push(`pass ${pp}→${cp}`);
+    for (const k of COUNTER_KEYS) {
+      const a = p.counters[k];
+      const b = n.counters[k];
+      if (a != null && b != null && a !== b) d.push(`${b - a > 0 ? "+" : ""}${b - a} ${k}`);
+    }
+    if (d.length) {
+      L.push("");
+      L.push(`_Δ since last update: ${d.join(" · ")}_`);
+    }
+  }
+
+  if (!n.done) {
+    L.push("");
+    L.push("_live over completed units · no token streaming_");
+  }
+  return L.join("\n");
+}
+
+/**
+ * `renderRunDashboard(progressState, { usage = null, ceiling = null, prior = null, nowMs } = {})`
+ * The rich markdown run box: the plain progress markdown PLUS a per-seat quota/token/ceiling
+ * table and a ceiling status line, for a long `audit fix --loop`. usage/ceiling are the caller's
+ * snapshot + parsed ceiling (no I/O here). PURE + TOTAL: with no usage it degrades to the plain
+ * progress markdown, and any render error falls back to a safe one-liner (never throws).
+ */
+export function renderRunDashboard(progressState, opts = {}) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const usage = o.usage && typeof o.usage === "object" && !Array.isArray(o.usage) ? o.usage : null;
+  const ceiling = o.ceiling && typeof o.ceiling === "object" && !Array.isArray(o.ceiling) ? o.ceiling : null;
+  try {
+    // No usage snapshot → the plain kind-agnostic box (no quota columns).
+    if (!usage) return renderProgressMarkdown(progressState, { prior: o.prior ?? null, nowMs: o.nowMs });
+    return renderRunDashboardMarkdown(progressState, { usage, ceiling, prior: o.prior ?? null, nowMs: o.nowMs });
+  } catch {
+    return "_council run dashboard unavailable (render error)_";
   }
 }
 
