@@ -799,6 +799,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             // The reviewers judge the EXACT patch; without a real diff we fail closed
             // rather than hand them the whole file as if it were the change.
             if (typeof git.diffText !== "function") {
+              reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
               revert(snapshot);
               rejected.push({ finding, reason: "§6 council: cannot produce a diff to review → propose-only" });
               log(`  reverted — §6 no diff available for council review`);
@@ -809,6 +810,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             try {
               verdicts = await withLimitRetry(() => reviewPatch({ file: task.file, finding, diff, before: source, after: afterSource }));
             } catch (err) {
+              reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
               revert(snapshot);
               rejected.push({ finding, reason: `§6 council review error: ${String(err?.message ?? err)} → propose-only` });
               log(`  reverted — §6 council review error`);
@@ -829,6 +831,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             // the reviewed bytes are stale — revert rather than commit something unseen.
             const postReview = enforceTouched(git.changedFiles(), task.file);
             if (!postReview.ok) {
+              reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
               revert(snapshot);
               rejected.push({ finding, reason: `§6 changed set drifted during review (${postReview.violations.join(", ")}) → propose-only`, council: councilVerdict });
               log(`  reverted — §6 changed set drifted during review`);
@@ -842,6 +845,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             // lacks staging.
             if (typeof git.stageAndDiffCached === "function" && typeof git.commitIndex === "function") {
               if (git.stageAndDiffCached(task.file, snapshot) !== diff) {
+                reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
                 revert(snapshot);
                 rejected.push({ finding, reason: "§6 reviewed bytes changed during review (staged diff drift) → propose-only", council: councilVerdict });
                 log(`  reverted — §6 reviewed bytes drifted during review`);
@@ -849,6 +853,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               }
               councilCommitStaged = true;
             } else if (git.diffText(task.file, snapshot) !== diff) {
+              reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
               revert(snapshot);
               rejected.push({ finding, reason: "§6 reviewed bytes changed during review (diff drift) → propose-only", council: councilVerdict });
               log(`  reverted — §6 reviewed bytes drifted during review`);
@@ -918,6 +923,9 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         if (res?.ok && res.commit) {
           rejected.splice(i, 1); // it is no longer a proposal — it was applied under the full gate ladder
           fixed.push({ finding: entry.finding, file: entry.finding.file ?? null, commit: res.commit, verified: true, structure: res.gates ?? null });
+          // This structural finding was already counted as "proposed" (the pre-loop rejected batch);
+          // now that it applied, undo that count so it isn't shown as BOTH proposed AND fixed.
+          reporter.counter("proposed", -1);
           reporter.counter("fixed");
           reporter.counter("committed");
           log(`  structure transform applied (${String(res.commit).slice(0, 8)}) — §6 unanimous, tests green`);

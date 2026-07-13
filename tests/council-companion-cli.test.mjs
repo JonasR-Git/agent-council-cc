@@ -313,6 +313,29 @@ test("the authored-test runner rejects a NON-assertion failure as an invalid RED
   }
 });
 
+test("finding 7: endlessRunOk maps a clean convergence to ok and an error/did-not-run/failed stop to NOT ok", async () => {
+  const { endlessRunOk } = await import(pathToFileURL(COMPANION).href);
+  // Clean convergences → ok (the endless dashboard is green).
+  for (const clean of [
+    "reached max passes (10)",
+    "budget exhausted (60/60 agent calls)",
+    "diminishing returns — 2 consecutive passes found nothing new",
+    null,
+    undefined
+  ]) {
+    assert.equal(endlessRunOk(clean), true, `clean stop should be ok: ${clean}`);
+  }
+  // A dead run (review error / did-not-run / failed) → NOT ok, so watch never shows it green.
+  for (const bad of [
+    "review error on pass 3: seat exploded",
+    "review did not run on pass 1 (backends unavailable or rate-limited)",
+    "the review FAILED to produce output",
+    "unexpected Error mid-pass"
+  ]) {
+    assert.equal(endlessRunOk(bad), false, `dead-run stop should be NOT ok: ${bad}`);
+  }
+});
+
 // --- M9 `audit fix --structure-auto-apply` CLI contracts --------------------------------------
 // The structure transform commits MULTI-FILE consolidations autonomously, so its CLI door is
 // pinned here at the subprocess boundary: the flag must parse + warn loudly; WITHOUT it the

@@ -153,6 +153,55 @@ test("runAuditFix reporter: a green oracle baseline records the oracle gate as p
   assert.equal(snap.gate.state, "pass");
 });
 
+test("finding 5: a §6 review ERROR drives the gate to a terminal veto (never left stuck on 'running')", async () => {
+  const git = sensitiveGit();
+  const { reporter } = reporterWithSink();
+  const out = await runAuditFix(tmp(), [race()], {}, { sensitiveAutoApply: true, reporter }, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    reviewPatch: async () => {
+      throw new Error("reviewer network error");
+    }
+  }));
+  assert.equal(out.fixed.length, 0, "the patch is reverted to propose-only");
+  const snap = reporter.snapshot();
+  assert.equal(snap.gate.name, "§6-council");
+  assert.equal(snap.gate.state, "veto", "the review-error exit emits a terminal veto, not a stuck 'running'");
+  assert.equal(snap.counters.reverted, 1, "and the reverted counter moves");
+});
+
+test("finding 5: a §6 with no reviewable diff drives the gate to a terminal veto too", async () => {
+  const git = fakeGit(); // no diffText → the §6 block cannot produce a diff to review
+  const { reporter } = reporterWithSink();
+  // reviewPatch must be present for the §6 path to be enabled at all (sensitiveAutoApply gate); it is
+  // never called here because the no-diff guard trips first.
+  const out = await runAuditFix(tmp(), [race()], {}, { sensitiveAutoApply: true, reporter }, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    reviewPatch: async () => [{ seat: "claude", verdict: "confirm" }, { seat: "codex", verdict: "confirm" }, { seat: "grok", verdict: "confirm" }]
+  }));
+  assert.equal(out.fixed.length, 0);
+  const snap = reporter.snapshot();
+  assert.equal(snap.gate.name, "§6-council");
+  assert.equal(snap.gate.state, "veto", "the no-diff exit is terminal, not stuck 'running'");
+});
+
+test("finding 4: a structural finding promoted to a successful apply is de-counted from proposed (not both proposed AND fixed)", async () => {
+  const git = fakeGit();
+  const { reporter } = reporterWithSink();
+  // A cross-cutting structural finding → classifyFixable makes it propose-only (counted as `proposed`),
+  // then the M9 structure pass applies it under the full gate ladder.
+  const structural = { file: "a.mjs", title: "consolidate the duplicated config SSOT", lens: "architecture_ssot", category: "architecture_ssot", severity: "P1", scope: "cross-cutting" };
+  const out = await runAuditFix(tmp(), [structural], {}, { structureAutoApply: true, reporter }, baseDeps(git, {
+    runStructureTransform: async () => ({ ok: true, commit: "struct1234abcd" })
+  }));
+  assert.equal(out.fixed.length, 1, "the structural transform applied");
+  const snap = reporter.snapshot();
+  assert.equal(snap.counters.fixed, 1, "counted as fixed");
+  assert.equal(snap.counters.committed, 1, "and committed");
+  // Pre-counted as proposed (pre-loop rejected batch), then de-counted on the successful apply so it is
+  // not reported as BOTH a standing proposal AND a fix.
+  assert.equal(snap.counters.proposed ?? 0, 0, "the earlier 'proposed' count is undone on success");
+});
+
 test("runAuditFix without a reporter is unchanged (NOOP fallback, no throw)", async () => {
   const git = fakeGit();
   const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix me" })], {}, {}, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]) }));

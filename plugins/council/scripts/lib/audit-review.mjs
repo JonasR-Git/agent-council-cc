@@ -372,13 +372,16 @@ export async function runAuditReview(cwd, model, backends, options = {}, deps = 
         // can't starve the SSOT/architecture pass (council A5: grok-2/claude-1).
         const r = await reviewUnit(cwd, backends, options, unitId, model, reserveFloorBudget(budget, reduceReserve), deps);
         results.push(r);
-        // Live progress: units completed so far + fold this unit's findings into the
-        // per-lens matrix (category=lens, severity bucketed). Best-effort telemetry.
-        const done = results.filter((x) => x.reviewed).length;
-        reporter.progress({ unitsDone: done, unitsTotal: units.length });
+        // Live progress: advance by ATTEMPTED units (finished OK + failed), not just successfully-
+        // reviewed ones — a unit that reviewed empty or threw must still move the bar toward
+        // unitsTotal, else it stalls forever. Then fold this unit's findings into the per-lens
+        // matrix (category=lens, severity bucketed). Best-effort telemetry.
+        reporter.progress({ unitsDone: results.length + failed.length, unitsTotal: units.length });
         reporter.findings(r.merged.all);
       } catch (err) {
         failed.push({ unitId, error: String(err?.message ?? err) });
+        // Advance the bar on the failure path too — an errored unit is still an attempted one.
+        reporter.progress({ unitsDone: results.length + failed.length, unitsTotal: units.length });
       }
     }
   }
@@ -389,6 +392,17 @@ export async function runAuditReview(cwd, model, backends, options = {}, deps = 
   // the first pass pass skipReduce to spend their budget on fresh unit coverage.
   reporter.phase("review", "global reduce");
   const reduce = options.skipReduce ? { all: [], consensus: [], unique: [], ran: false } : await globalReduce(cwd, backends, options, model, budget, deps);
+  // Fold the reduce's findings into the live per-lens matrix too — otherwise the dashboard's lens
+  // table only ever reflects per-unit merges and under-reports the reduce's UNIQUE (SSOT/architecture)
+  // findings vs the final output. Fold only reduce findings NOT already surfaced per-unit, using the
+  // SAME fingerprint the final dedup uses, so a reduce that merely re-raises unit findings can't
+  // double-count. No-op when skipped/empty. Best-effort (the endless loop passes a muted-findings
+  // reporter here so it never double-counts against runEndless's own per-pass fold).
+  if (reduce.all?.length) {
+    const unitFps = new Set(results.flatMap((r) => r.merged.all).map((f) => fingerprintFinding(f)));
+    const reduceFresh = reduce.all.filter((f) => !unitFps.has(fingerprintFinding(f)));
+    if (reduceFresh.length) reporter.findings(reduceFresh);
+  }
 
   // Per-unit merges + the global reduce can each surface the same issue; dedupe by
   // ledger fingerprint before annotating/recording so one finding isn't counted (or

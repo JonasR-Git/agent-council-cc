@@ -139,6 +139,53 @@ test("`council watch --json` emits the progress dashboard payload from progress.
   });
 });
 
+// --- Finding 9 (write side): a handler that THROWS after makeRunReporter still marks the run done ----
+
+test("finding 9: a run that throws after makeRunReporter still marks progress.json done (watch never hangs on a dead run)", (t) => {
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-progress-abort-state-"));
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "council-progress-abort-work-"));
+  try {
+    fs.writeFileSync(path.join(workDir, "index.mjs"), "export const value = 1;\n", "utf8");
+    fs.writeFileSync(path.join(workDir, ".council.yml"), "version: 1\nreviewers: [claude]\n", "utf8");
+    const env = { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot };
+    // A committed, CLEAN git tree so the fix-loop preflight guards pass and the handler reaches
+    // makeRunReporter; --per-tier + --flat is then a contradiction it throws on AFTER the reporter exists.
+    const git = (args) => spawnSync("git", args, { cwd: workDir, env, encoding: "utf8", timeout: 30_000 });
+    const init = git(["init", "-q"]);
+    if (isSandboxBlocked(init) || init.status !== 0) {
+      t.skip("git/spawn is unavailable in this sandbox");
+      return;
+    }
+    git(["config", "core.autocrlf", "false"]);
+    git(["add", "-A"]);
+    const commit = git(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-qm", "init"]);
+    if (commit.status !== 0) {
+      t.skip("git commit unavailable in this sandbox");
+      return;
+    }
+
+    const res = spawnSync(process.execPath, [COMPANION, "audit", "fix", "--loop", "--per-tier", "--flat", "--allow-untested"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.notEqual(res.status, 0, "the contradictory flags fail the command (the throw still propagates to the exit code)");
+    assert.match(res.stderr, /contradictory/, "the handler threw its contradiction error…");
+    assert.match(res.stderr, /live dashboard/, "…AFTER makeRunReporter had announced the run (so progress.json exists, done:false at throw time)");
+
+    const file = path.join(stateDirFor(workDir, env.AGENT_COUNCIL_STATE_DIR), "progress.json");
+    assert.ok(fs.existsSync(file), "progress.json was written");
+    const prog = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(prog.kind, "audit-fix-loop");
+    assert.equal(prog.done, true, "main()'s finally marked the aborted run done — watch won't hang on it");
+    assert.equal(prog.ok, false, "and NOT ok");
+    assert.equal(prog.stopReason, "aborted");
+  } finally {
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
 test("`council watch` still errors when there is neither a job NOR a progress.json", (t) => {
   withCli((workDir, env) => {
     const res = spawnSync(process.execPath, [COMPANION, "watch", "--once"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });

@@ -37,6 +37,20 @@ test("runFixLoop drives pass-level phase/progress/budget from the reporter", asy
   assert.ok(writes.length > 0, "progress.json was persisted through the injected writeFile");
 });
 
+test("finding 6: the budget is re-emitted AFTER each pass's charges, not only pre-charge at pass start", async () => {
+  const reporter = makeProgressReporter({ kind: "audit-fix-loop", stateDir: null, now: () => "2026-07-13T00:00:00.000Z" });
+  // One pass that SPENDS on review (budgetSpent 3) then converges (dry). The pass-start budget emit is
+  // PRE-charge (spent 0); only the post-charge re-emit reflects the 3 this pass actually spent — so the
+  // final progress.json budget must read 3, not 0.
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 3, complete: true } });
+  const fix = async () => ({ ok: true, fixed: [], failed: [], rejected: [], branch: "council/x", changedFiles: [], spent: 0 });
+  const out = await runFixLoop("/x", { budget: 40, dryStreak: 1, maxPasses: 7, reporter }, { review, fix, checkpoint: noCheckpoint });
+  assert.equal(out.spent, 3, "the run really spent 3");
+  const snap = reporter.snapshot();
+  assert.equal(snap.budget.total, 40);
+  assert.equal(snap.budget.spent, 3, "progress.json carries the POST-charge spend, not the pre-charge 0");
+});
+
 test("makeFixLoopDeps threads the SAME reporter into BOTH the per-pass runAuditReview and runAuditFix", async () => {
   const sentinel = makeProgressReporter({ stateDir: null }); // in-memory only; identity is what matters
   const model = { files: [{ id: "a.mjs", isTest: false }], graph: { importers: {} }, dupClusters: [] };

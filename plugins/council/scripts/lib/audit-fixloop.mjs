@@ -338,6 +338,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     }
 
     passes.push({ pass: passNo, reviewed: findings.length, fresh: freshFindings.length, actionable: gated.actionable.length, fixed: freshFixed.length, failed: (fx?.failed ?? []).length, spent });
+    // Re-emit the budget AFTER this pass's review+fix charges — the pass-start emit (above) is pre-charge,
+    // so without this the dashboard/progress.json would under-report spend by a whole pass. Best-effort.
+    reporter.budget(spent, totalBudget);
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
     checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason: null, done: false });
   }

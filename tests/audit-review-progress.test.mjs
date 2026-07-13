@@ -29,15 +29,19 @@ function repoFixture() {
 test("runAuditReview feeds the progress reporter: unit progress + per-lens findings matrix", async () => {
   const dir = repoFixture();
   const model = buildCodebaseModel(dir);
-  // Two distinct lenses/severities so the aggregated matrix is meaningfully populated.
+  // Two distinct lenses/severities so the aggregated matrix is meaningfully populated. This test
+  // isolates the PER-UNIT fold, so the global reduce returns nothing (the reduce's own contribution
+  // to the live matrix has its own focused test below); that keeps the counts "one per reviewed unit".
   const deps = {
-    runClaude: async () =>
-      OK(
-        DOC([
-          F({ id: "s-1", category: "security", severity: "P0", title: "sql injection in the query builder" }),
-          F({ id: "t-1", category: "test", severity: "P2", title: "no test covers the error path" })
-        ])
-      )
+    runClaude: async (prompt) =>
+      String(prompt).includes("PROJECT-WIDE structure")
+        ? OK(DOC([]))
+        : OK(
+            DOC([
+              F({ id: "s-1", category: "security", severity: "P0", title: "sql injection in the query builder" }),
+              F({ id: "t-1", category: "test", severity: "P2", title: "no test covers the error path" })
+            ])
+          )
   };
 
   const writes = [];
@@ -74,6 +78,72 @@ test("runAuditReview feeds the progress reporter: unit progress + per-lens findi
   const persisted = JSON.parse(writes.at(-1).data);
   assert.equal(persisted.progress.unitsTotal, 2, "the persisted snapshot carries the same unit progress");
   assert.equal(persisted.findingsByLens.security.total, 2, "and the same per-lens matrix");
+});
+
+test("runAuditReview folds the global reduce's UNIQUE findings into the live matrix, without double-counting reduce dupes", async () => {
+  // Finding 3: the reduce's findings (SSOT/architecture — often the majority) were never folded into
+  // the live per-lens matrix, so the dashboard under-reported vs the final output. The fold must add
+  // the reduce's UNIQUE findings but NOT re-count a reduce finding that merely re-raises a unit one
+  // (same dedup fingerprint the final output uses).
+  const dir = repoFixture();
+  const model = buildCodebaseModel(dir);
+  const deps = {
+    runClaude: async (prompt) =>
+      String(prompt).includes("PROJECT-WIDE structure")
+        ? OK(
+            DOC([
+              // (a) a DUPLICATE of the per-unit security finding (same file+title) — must be deduped away.
+              F({ id: "s-dup", category: "security", severity: "P0", title: "sql injection in the query builder", file: "a.mjs" }),
+              // (b) a reduce-ONLY architecture finding no unit raised — must appear in the live matrix.
+              F({ id: "arch-1", category: "architecture", severity: "P1", title: "god object concentrates unrelated concerns", file: "a.mjs" })
+            ])
+          )
+        : OK(DOC([F({ id: "s-1", category: "security", severity: "P0", title: "sql injection in the query builder", file: "a.mjs" })]))
+  };
+
+  const reporter = makeProgressReporter({ kind: "audit-review", title: "audit review", now: () => "2026-07-13T00:00:00.000Z" });
+  const out = await runAuditReview(dir, model, CLAUDE_ONLY, { budget: 6, maxUnits: 2, ledger: false, verifyAudit: false, reporter }, deps);
+
+  assert.equal(out.coverage.reduceRan, true, "the global reduce actually ran this test");
+  const snap = reporter.snapshot();
+  // The reduce-only lens is now visible on the dashboard (was entirely absent before the fold).
+  assert.ok(snap.findingsByLens.architecture, "the reduce-only architecture lens is folded into the live matrix");
+  assert.equal(snap.findingsByLens.architecture.total, 1, "the unique reduce finding is counted once");
+  assert.equal(snap.findingsByLens.architecture.P1, 1);
+  // The reduce's DUPLICATE of the unit finding is NOT re-counted: two units folded security → total 2,
+  // and the fingerprint-matching reduce dupe is filtered out (a broken fold would show 3 here).
+  assert.equal(snap.findingsByLens.security.total, 2, "the reduce dupe is deduped, not double-counted");
+});
+
+test("finding 2: the unit bar advances for units that THROW (caught into failed) — never stalls at 0", async () => {
+  const dir = repoFixture();
+  const model = buildCodebaseModel(dir);
+  // Every unit review throws → each is caught into `failed`. The old code advanced the bar only for
+  // successfully-reviewed units and emitted NOTHING on the catch path, so the bar stalled at 0/2.
+  const deps = { runClaude: async () => { throw new Error("seat exploded"); } };
+  const reporter = makeProgressReporter({ kind: "audit-review", title: "audit review", now: () => "2026-07-13T00:00:00.000Z" });
+  const out = await runAuditReview(dir, model, CLAUDE_ONLY, { budget: 6, maxUnits: 2, ledger: false, verifyAudit: false, skipReduce: true, reporter }, deps);
+  // Outcome unchanged (telemetry is additive): both units were selected and both failed.
+  assert.equal(out.coverage.unitsSelected, 2);
+  assert.equal(out.coverage.unitsReviewed, 0, "nothing reviewed OK");
+  assert.equal(out.coverage.unitsFailed, 2);
+  const snap = reporter.snapshot();
+  assert.equal(snap.progress.unitsTotal, 2);
+  assert.equal(snap.progress.unitsDone, 2, "the bar reached 100% — attempted (failed) units advance it too");
+});
+
+test("finding 2: the unit bar advances for units that review EMPTY (reviewed:false) — not just successful ones", async () => {
+  const dir = repoFixture();
+  const model = buildCodebaseModel(dir);
+  // A non-zero seat run → no parseable doc → reviewUnit returns reviewed:false (dispatched but empty).
+  // Such a unit lands in `results` but the OLD bar only counted results.filter(reviewed) → stalled at 0.
+  const deps = { runClaude: async () => ({ status: 1, stdout: "", stderr: "boom", skipped: false }) };
+  const reporter = makeProgressReporter({ kind: "audit-review", title: "audit review", now: () => "2026-07-13T00:00:00.000Z" });
+  const out = await runAuditReview(dir, model, CLAUDE_ONLY, { budget: 6, maxUnits: 2, ledger: false, verifyAudit: false, skipReduce: true, reporter }, deps);
+  assert.equal(out.coverage.unitsReviewed, 0, "dispatched-but-empty units are not counted as reviewed");
+  const snap = reporter.snapshot();
+  assert.equal(snap.progress.unitsDone, 2, "empty-review units still advance the bar to unitsTotal");
+  assert.equal(snap.progress.unitsTotal, 2);
 });
 
 test("runAuditReview without a reporter is unchanged (NOOP fallback, no throw)", async () => {

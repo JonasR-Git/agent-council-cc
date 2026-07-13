@@ -245,8 +245,14 @@ export async function runDeliberation(cwd, backends, options = {}, deps = {}) {
   // Every deliberation milestone (context → r1 → r2 → verify → debate) both notifies the caller
   // and drives the live progress phase — a natural seam, no extra call sites.
   const onPhase = (msg) => {
-    reporter.phase("deliberate", String(msg));
-    userPhase(msg);
+    reporter.phase("deliberate", String(msg)); // reporter is fail-soft internally
+    // The user's phase hook is untrusted telemetry — a throw from it must NEVER abort an otherwise
+    // successful deliberation (fail-soft, exactly like the reporter).
+    try {
+      userPhase(msg);
+    } catch {
+      /* swallow: a broken progress hook must not break the run */
+    }
   };
   onPhase("collecting-context");
   const target = resolveReviewTarget(cwd, { base: options.base, scope: options.scope });

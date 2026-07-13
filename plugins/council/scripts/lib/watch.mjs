@@ -797,5 +797,15 @@ export function pickFreshestWatchSource(progressState, job, { parseTs = (v) => D
   if (!progressState || typeof progressState !== "object") return { kind: "job", job: job ?? null };
   const progTs = tsOf(progressState.updatedAt) ?? 0;
   const jobTs = job ? tsOf(job.updatedAt) ?? tsOf(job.createdAt) ?? 0 : -1;
+  // Liveness beats freshness: a FINISHED progress.json (done:true) must never shadow a still-running
+  // job, and a terminal job must never shadow a live progress.json — a completed source can be stamped
+  // a hair later than the one still doing work, so a pure updatedAt race would show a done dashboard
+  // while the run continues. Prefer whichever source is non-terminal when the other has finished; only
+  // when both agree on liveness fall back to the freshest stamp (ties/absent jobs -> progress).
+  const progDone = progressState.done === true;
+  const jobLive = job ? !isTerminal(job.status) : false;
+  const jobTerminal = job ? isTerminal(job.status) : false;
+  if (progDone && jobLive) return { kind: "job", job };
+  if (jobTerminal && !progDone) return { kind: "progress" };
   return progTs >= jobTs ? { kind: "progress" } : { kind: "job", job };
 }

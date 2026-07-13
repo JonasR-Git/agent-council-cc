@@ -348,6 +348,35 @@ test("pickFreshestWatchSource prefers the more recently updated source", () => {
   assert.deepEqual(pickFreshestWatchSource({ updatedAt: staleJob.updatedAt }, staleJob), { kind: "progress" });
 });
 
+test("finding 11: liveness beats freshness — a DONE progress.json never shadows a still-running job", () => {
+  // progress finished a hair LATER than the job's last stamp, but the job is still doing work.
+  const doneProg = { done: true, updatedAt: "2026-07-13T10:10:05Z" };
+  const runningJob = { id: "j1", status: "running", updatedAt: "2026-07-13T10:10:00Z" };
+  assert.deepEqual(pickFreshestWatchSource(doneProg, runningJob), { kind: "job", job: runningJob });
+  // A queued job counts as non-terminal too.
+  const queuedJob = { id: "j2", status: "queued", updatedAt: "2026-07-13T10:10:00Z" };
+  assert.deepEqual(pickFreshestWatchSource(doneProg, queuedJob), { kind: "job", job: queuedJob });
+});
+
+test("finding 11: a terminal job never shadows a LIVE progress.json, even when the job stamp is newer", () => {
+  const liveProg = { done: false, updatedAt: "2026-07-13T10:10:00Z" };
+  const doneJob = { id: "j1", status: "done", updatedAt: "2026-07-13T10:10:05Z" };
+  assert.deepEqual(pickFreshestWatchSource(liveProg, doneJob), { kind: "progress" });
+  const failedJob = { id: "j2", status: "failed", updatedAt: "2026-07-13T10:10:05Z" };
+  assert.deepEqual(pickFreshestWatchSource(liveProg, failedJob), { kind: "progress" });
+});
+
+test("finding 11: when both sources agree on liveness, the freshest stamp still wins", () => {
+  // Both terminal → freshest stamp wins (here the job is newer).
+  const doneProg = { done: true, updatedAt: "2026-07-13T10:00:00Z" };
+  const doneJobNewer = { id: "j1", status: "done", updatedAt: "2026-07-13T10:05:00Z" };
+  assert.deepEqual(pickFreshestWatchSource(doneProg, doneJobNewer), { kind: "job", job: doneJobNewer });
+  // Both live → freshest wins (here progress is fresher).
+  const liveProg = { done: false, updatedAt: "2026-07-13T10:05:00Z" };
+  const runningJobOlder = { id: "j2", status: "running", updatedAt: "2026-07-13T10:00:00Z" };
+  assert.deepEqual(pickFreshestWatchSource(liveProg, runningJobOlder), { kind: "progress" });
+});
+
 test("pickFreshestWatchSource falls back sensibly for missing/absent inputs", () => {
   const job = { id: "j1", updatedAt: "2026-07-13T10:00:00Z" };
   // No progress.json -> the job wins.

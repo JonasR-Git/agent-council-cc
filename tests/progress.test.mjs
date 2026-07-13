@@ -13,7 +13,8 @@ import {
   PROGRESS_SCHEMA_VERSION,
   initialProgressState,
   makeProgressReporter,
-  mergeProgressEvent
+  mergeProgressEvent,
+  mutedFindingsReporter
 } from "../plugins/council/scripts/lib/progress.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -47,10 +48,28 @@ test("runDeliberation emits ordered phase callbacks", async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("a throwing onPhase does not exist here - reporter is guarded in the companion", () => {
-  // The companion's makePhaseReporter swallows errors; runDeliberation itself
-  // calls onPhase directly, so callers must not throw. This documents the contract.
+test("finding 8: a THROWING onPhase hook never aborts runDeliberation (fail-soft telemetry)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-phase-throw-"));
+  execSync("git init -q", { cwd: dir });
+  fs.writeFileSync(path.join(dir, "a.txt"), "hello\n", "utf8");
+  const findingsFile = path.join(dir, "claude.json");
+  fs.writeFileSync(findingsFile, JSON.stringify({ agent: "claude", summary: "s", verdict: "approve", findings: [] }), "utf8");
+
+  let calls = 0;
+  // The onPhase hook is untrusted telemetry: every call throws, yet the deliberation must complete.
+  const result = await runDeliberation(dir, { codex: {}, grok: {} }, {
+    skipCodex: true,
+    skipGrok: true,
+    claudeFindingsPath: findingsFile,
+    onPhase: () => {
+      calls += 1;
+      throw new Error("telemetry hook exploded");
+    }
+  });
+  assert.equal(result.mode, "deliberate", "the run finished despite every onPhase call throwing");
+  assert.ok(calls > 0, "the throwing hook really was invoked (and swallowed, not propagated)");
   assert.ok(ROOT.length > 0);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 // --- shared progress model + reporter (progress.json writer side) -----------
@@ -323,6 +342,56 @@ test("NOOP_REPORTER has the full reporter surface: every method callable + chain
     assert.equal(chained, NOOP_REPORTER, "every method returns the reporter (chainable)");
   });
   assert.equal(NOOP_REPORTER.snapshot(), null, "no state to snapshot");
+});
+
+test("finding 1: a lens/counter literally named __proto__ or constructor is a REAL own key, never poisons the map", () => {
+  const before = initialProgressState();
+  const s = mergeProgressEvent(before, {
+    type: "findings",
+    list: [
+      { lens: "__proto__", severity: "P0" },
+      { lens: "constructor", severity: "P1" },
+      { lens: "normal", severity: "P2" }
+    ]
+  });
+  // Stored as REAL own keys — a plain {} accumulator would route "__proto__" through the prototype
+  // setter and silently drop the finding (or reparent the whole map).
+  assert.ok(Object.hasOwn(s.findingsByLens, "__proto__"), "__proto__ is an OWN key of the matrix");
+  assert.ok(Object.hasOwn(s.findingsByLens, "constructor"), "constructor is an OWN key of the matrix");
+  assert.deepEqual(s.findingsByLens["__proto__"], { total: 1, P0: 1, P1: 0, P2: 0, nit: 0 });
+  assert.deepEqual(s.findingsByLens["constructor"], { total: 1, P0: 0, P1: 1, P2: 0, nit: 0 });
+  assert.deepEqual(s.findingsByLens["normal"], { total: 1, P0: 0, P1: 0, P2: 1, nit: 0 });
+  assert.equal(Object.getPrototypeOf(s.findingsByLens), null, "the accumulator is a null-proto map, not reparented");
+  // Purity: the input state was not mutated (its matrix stays empty).
+  assert.deepEqual(before.findingsByLens, {}, "mergeProgressEvent stayed pure — input matrix untouched");
+  // The counter reducer is hardened the same way.
+  const c = mergeProgressEvent(initialProgressState(), { type: "counter", key: "__proto__", delta: 3 });
+  assert.ok(Object.hasOwn(c.counters, "__proto__"), "a __proto__ counter is an OWN key, not a dropped setter write");
+  assert.equal(c.counters["__proto__"], 3);
+  assert.equal(Object.getPrototypeOf(c.counters), null);
+  // And it survives the JSON round-trip the dashboard actually reads back.
+  const round = JSON.parse(JSON.stringify(s.findingsByLens));
+  assert.deepEqual(round["__proto__"], { total: 1, P0: 1, P1: 0, P2: 0, nit: 0 });
+});
+
+test("finding 10: mutedFindingsReporter forwards every live signal but makes .findings() a no-op", () => {
+  const real = makeProgressReporter({ now: makeClock(), writeFile: () => {} });
+  const muted = mutedFindingsReporter(real);
+  // findings() is MUTED so an inner review can't double-count against an outer loop that already folds.
+  const chained = muted.findings([{ lens: "security", severity: "P0" }], { seat: "codex" });
+  assert.equal(chained, muted, "findings() returns the wrapper (chainable) …");
+  assert.deepEqual(real.snapshot().findingsByLens, {}, "… but folds NOTHING into the real matrix");
+  // Every other signal forwards to the real reporter, so live per-unit progress still advances.
+  muted.phase("review", "12 units").progress({ unitsDone: 3, unitsTotal: 12 }).counter("proposed", 2).seat("codex", { state: "reviewing" }).gate({ name: "g", state: "running" });
+  const snap = real.snapshot();
+  assert.equal(snap.phase, "review");
+  assert.equal(snap.phaseDetail, "12 units");
+  assert.deepEqual(snap.progress, { unitsDone: 3, unitsTotal: 12 });
+  assert.equal(snap.counters.proposed, 2);
+  assert.equal(snap.seats.find((s) => s.name === "codex").state, "reviewing");
+  assert.equal(snap.gate.state, "running");
+  // snapshot() delegates to the wrapped reporter (still zero findings).
+  assert.deepEqual(muted.snapshot().findingsByLens, {}, "snapshot() delegates and findings stayed muted");
 });
 
 test(".findings tolerates junk and an unknown severity buckets to nit; no seat = no raised", () => {

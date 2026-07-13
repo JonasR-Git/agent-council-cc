@@ -96,7 +96,10 @@ export function mergeProgressEvent(state, event) {
     case "counter": {
       const key = String(e.key ?? "");
       if (!key) break;
-      const counters = { ...(base.counters && typeof base.counters === "object" ? base.counters : {}) };
+      // Null-proto accumulator so a counter literally keyed "__proto__"/"constructor" is stored
+      // as a normal own key — a plain {} would route the assignment through the __proto__ setter
+      // and silently drop the counter (or reparent the map).
+      const counters = Object.assign(Object.create(null), base.counters && typeof base.counters === "object" ? base.counters : {});
       const delta = Number.isFinite(e.delta) ? e.delta : 1;
       counters[key] = (Number.isFinite(counters[key]) ? counters[key] : 0) + delta;
       next.counters = counters;
@@ -118,7 +121,10 @@ export function mergeProgressEvent(state, event) {
       // named, bump that seat's `raised` by the batch size. Every finding is
       // counted even if its lens/severity is junk (bucketed to other/nit).
       const list = Array.isArray(e.list) ? e.list : [];
-      const byLens = { ...(base.findingsByLens && typeof base.findingsByLens === "object" ? base.findingsByLens : {}) };
+      // Null-proto accumulator so a lens/category literally named "__proto__"/"constructor" lands
+      // as a normal own key instead of hitting the prototype setter (which would reparent the map
+      // or silently drop the finding).
+      const byLens = Object.assign(Object.create(null), base.findingsByLens && typeof base.findingsByLens === "object" ? base.findingsByLens : {});
       let count = 0;
       for (const f of list) {
         if (!f || typeof f !== "object") continue;
@@ -214,6 +220,32 @@ export const NOOP_REPORTER = Object.freeze({
     return null;
   }
 });
+
+/**
+ * Wrap a reporter so it forwards every live signal EXCEPT findings folding. Used when an inner
+ * review runs inside a larger loop that ALREADY folds that pass's deduped findings itself (the
+ * endless loop calls reporter.findings(fresh) per pass): letting the inner review also fold its
+ * per-unit findings would DOUBLE-COUNT into findingsByLens. Phase/seat/progress/gate/counter/line
+ * (and budget/eta) still drive the live dashboard so per-unit/cell progress advances inside a pass;
+ * `.findings()` is a no-op. snapshot() delegates to the wrapped reporter. Chainable like a real one.
+ */
+export function mutedFindingsReporter(reporter) {
+  const base = reporter ?? NOOP_REPORTER;
+  const wrapper = {
+    phase: (...a) => (base.phase(...a), wrapper),
+    seat: (...a) => (base.seat(...a), wrapper),
+    counter: (...a) => (base.counter(...a), wrapper),
+    gate: (...a) => (base.gate(...a), wrapper),
+    progress: (...a) => (base.progress(...a), wrapper),
+    findings: () => wrapper, // muted: the outer loop folds this pass's findings itself
+    budget: (...a) => (base.budget(...a), wrapper),
+    eta: (...a) => (base.eta(...a), wrapper),
+    line: (...a) => (base.line(...a), wrapper),
+    done: (...a) => (base.done(...a), wrapper),
+    snapshot: () => base.snapshot()
+  };
+  return wrapper;
+}
 
 /**
  * Create the shared progress reporter a long-running command feeds. Every

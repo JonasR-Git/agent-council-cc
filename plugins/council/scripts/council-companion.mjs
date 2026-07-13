@@ -37,7 +37,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
 import { colorize, formatDashboard, formatDashboardMarkdown, pickFreshestWatchSource, readProgressState, renderProgressDashboard, summarizeCouncilExtras, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
-import { makeProgressReporter } from "./lib/progress.mjs";
+import { makeProgressReporter, mutedFindingsReporter } from "./lib/progress.mjs";
 import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
@@ -141,6 +141,37 @@ function printUsage() {
   );
 }
 
+// The reporter of the run currently in flight (each CLI process runs exactly one command), so a
+// throw that escapes a handler can still be marked terminal — otherwise progress.json stays
+// done:false forever and `council watch` hangs on a dead run. A handler that finishes normally has
+// already called reporter.done(), so the flush below is an idempotent no-op on the success path.
+let __activeRunReporter = null;
+
+/**
+ * If the in-flight run's reporter never reached a terminal state (its handler threw before calling
+ * done()), mark it aborted so watchers stop. Best-effort + idempotent: a run that already finished
+ * (snapshot().done) is left untouched. NEVER throws — telemetry must not perturb the exit path.
+ */
+function flushActiveRunReporter() {
+  const reporter = __activeRunReporter;
+  __activeRunReporter = null;
+  if (!reporter) return;
+  try {
+    if (!reporter.snapshot()?.done) reporter.done({ ok: false, stopReason: "aborted" });
+  } catch {
+    /* fail-soft: a telemetry flush must never change the outcome or exit code */
+  }
+}
+
+/**
+ * Whether an endless review run finished cleanly. It is ok unless it stopped on an error / did-not-run
+ * / failed reason (a review-error stopReason must not report the dashboard green). Mirrors how plan/build
+ * derive `ok` from the outcome rather than hardcoding true. Pure + exported for unit tests.
+ */
+export function endlessRunOk(stopReason) {
+  return !/error|did not run|failed/i.test(String(stopReason ?? ""));
+}
+
 /**
  * One progress reporter per long-running command, writing the current-run `progress.json` slot in
  * this workspace's state dir (the universal live-dashboard contract read by `council watch`). In a
@@ -161,6 +192,7 @@ function makeRunReporter(cwd, { kind, title, jobId = null, json = false }) {
   if (!json) {
     console.error(`  ▶ live dashboard: council watch${jobId ? ` ${jobId}` : ""}  (add --md for a chat snapshot)`);
   }
+  __activeRunReporter = reporter; // register so a thrown handler still marks the run terminal (see main())
   return reporter;
 }
 
@@ -2557,6 +2589,15 @@ async function handleAudit(argv) {
     // per-pass budget so a pass never dispatches more paid calls than it is allotted (council R9 P1).
     const nonTestUnits = Math.max(1, (model?.files ?? []).filter((f) => !f.isTest).length);
     const doEndlessReview = endlessLensGroups ? runGroupedReview : runAuditReview;
+    // Phase 2: live-dashboard reporter for the endless review loop (phase/progress/budget/findings
+    // per pass — see runEndless). onProgress is reporter.line so today's stderr stays byte-identical.
+    const reporter = makeRunReporter(cwd, { kind: "audit-endless", title: "audit endless", json: options.json });
+    // Thread a MUTED-FINDINGS reporter into each pass's review so per-unit/cell phase+progress fire
+    // LIVE inside a pass (today only pass-level phase/progress moved). findings() is a NO-OP on this
+    // wrapper: runEndless already folds each pass's deduped `fresh` findings via reporter.findings(),
+    // so an inner per-unit fold would DOUBLE-COUNT into findingsByLens. onProgress is intentionally
+    // not threaded — the endless loop owns pass-level stderr, so this keeps stderr byte-identical.
+    const passReporter = mutedFindingsReporter(reporter);
     const review = ({ budget: passBudget, pass }) =>
       doEndlessReview(cwd, model, backends, {
         ...merged,
@@ -2568,12 +2609,10 @@ async function handleAudit(argv) {
         maxCells: endlessLensGroups ? Math.max(1, Math.min(endlessMaxCells, Math.floor(passBudget))) : undefined,
         completenessCritic: completenessCritic && Boolean(endlessLensGroups), // M8: only on the grouped endless path
         skipCodex: merged.skipCodex,
-        skipGrok: merged.skipGrok
+        skipGrok: merged.skipGrok,
+        reporter: passReporter // live per-unit/cell progress inside a pass; findings folding stays with runEndless
       });
     const tEndless = Date.now();
-    // Phase 2: live-dashboard reporter for the endless review loop (phase/progress/budget/findings
-    // per pass — see runEndless). onProgress is reporter.line so today's stderr stays byte-identical.
-    const reporter = makeRunReporter(cwd, { kind: "audit-endless", title: "audit endless", json: options.json });
     const endlessOpts = { budget, maxPasses, dryStreak, reporter, onProgress: reporter.line };
     // C3/M10: --supervise survives rate-limit resets across a multi-hour endless review.
     const out = options.supervise
@@ -2583,7 +2622,10 @@ async function handleAudit(argv) {
         )
       : await runEndless(cwd, { ...endlessOpts, resume: options.resume }, { review });
     recordAuditMetrics(cwd, "endless", { wallClockMs: Date.now() - tEndless, passesRun: out.passesRun, spent: out.spent, findings: out.findings.length, stopReason: out.stopReason }, nowIso());
-    reporter.done({ ok: true, stopReason: out.stopReason });
+    // A clean convergence (max passes / budget / diminishing returns) is ok; an endless run that ended
+    // on a review-error / did-not-run / failed stopReason is NOT — mirror how plan/build derive ok from
+    // the outcome rather than hardcoding true (which would flag a dead run green on the dashboard).
+    reporter.done({ ok: endlessRunOk(out.stopReason), stopReason: out.stopReason });
     if (options.doc) {
       const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: `endless (${out.passesRun} passes)` }, { docPath: options["doc-path"] });
       if (!options.json) console.log(`Wrote proposals to ${docPath}`);
@@ -3637,6 +3679,11 @@ async function main() {
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
+  } finally {
+    // A handler that threw (or exited early) before calling reporter.done() would otherwise strand
+    // its progress.json at done:false and hang `council watch`. Mark any un-finished run terminal.
+    // Runs on the success path too, where it is a no-op (done already set).
+    flushActiveRunReporter();
   }
 }
 

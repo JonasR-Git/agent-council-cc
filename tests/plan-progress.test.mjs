@@ -115,6 +115,19 @@ test("runPlanDeliberation drives reporter.phase at each deliberation milestone",
   assert.ok(writes.length > 0, "progress.json was persisted through the injected writeFile");
 });
 
+test("finding 8: a THROWING onPhase hook never aborts runPlanDeliberation (fail-soft telemetry)", async () => {
+  const seats = ["codex", "grok", "claude"];
+  let calls = 0;
+  const run = await runPlanDeliberation(TMP, REQUEST, seatBackends(), {
+    onPhase: () => {
+      calls += 1;
+      throw new Error("telemetry hook exploded");
+    }
+  }, recordingDeps(seats));
+  assert.ok(run.planSpec, "the deliberation still produced a PlanSpec despite every onPhase throwing");
+  assert.ok(calls > 0, "the throwing hook really was invoked (and swallowed, not propagated)");
+});
+
 test("runPlanDeliberation without a reporter is unchanged (NOOP fallback)", async () => {
   const seats = ["codex", "grok", "claude"];
   const run = await runPlanDeliberation(TMP, REQUEST, seatBackends(), {}, recordingDeps(seats));
