@@ -268,9 +268,13 @@ const GROK_LOG_TAIL_BYTES = 512 * 1024;
 export function collectGrokLimits(grokDir) {
   const logFile = path.join(grokDir, "logs", "unified.jsonl");
   let tail;
+  let fromStart = false;
   try {
     const size = fs.statSync(logFile).size;
     const start = Math.max(0, size - GROK_LOG_TAIL_BYTES);
+    // When the tail begins at byte 0 the first line is COMPLETE and must be scanned; only a
+    // mid-file tail (start > 0) can slice into a partial first line that we must skip.
+    fromStart = start === 0;
     const fd = fs.openSync(logFile, "r");
     try {
       const buffer = Buffer.alloc(size - start);
@@ -283,7 +287,8 @@ export function collectGrokLimits(grokDir) {
     return null;
   }
   const lines = tail.split("\n");
-  for (let i = lines.length - 1; i > 0; i -= 1) {
+  const minIndex = fromStart ? 0 : 1;
+  for (let i = lines.length - 1; i >= minIndex; i -= 1) {
     if (!lines[i].includes("creditUsagePercent")) continue;
     try {
       const entry = JSON.parse(lines[i]);

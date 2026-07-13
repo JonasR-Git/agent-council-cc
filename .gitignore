@@ -5,6 +5,9 @@ node_modules/
 .vscode/
 .council-claude-r1.json
 .council-*.json
+# §5 char-test transient test files + coverage dirs (created/deleted per phase; listed so a hard-crash
+# residue never dirties the tree or gets picked up by tooling)
+.council-chartest-*
 .agents/
 .codex/
 

@@ -11,6 +11,7 @@ import {
   detectOracleCmd,
   enforceTouched,
   ineligibleReason,
+  isSensitiveClass,
   parsePorcelainZ,
   runAuditFix,
   scheduleFixes,
@@ -38,6 +39,27 @@ test("ineligibleReason rejects §6 sensitive classes (auth/crypto/concurrency/da
   assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "auth" }), /sensitive/);
   assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", lens: "data_integrity" }), /sensitive/);
   assert.equal(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "correctness" }), null, "ordinary bugs stay fixable");
+});
+
+test("isSensitiveClass trims + case-folds BOTH category and lens (kept in sync with structure-gate's twin)", () => {
+  // trailing-space category must still classify as sensitive (a normalizer/model slip)
+  assert.equal(isSensitiveClass({ category: "security " }), true, "trailing-space category must still be sensitive");
+  // mixed-case + surrounding whitespace lens must still classify as sensitive
+  assert.equal(isSensitiveClass({ lens: " Security_Secrets " }), true, "case/whitespace lens must still be sensitive");
+  assert.equal(isSensitiveClass({ category: "Concurrency" }), true, "case-only category variant stays sensitive");
+  assert.equal(isSensitiveClass({ category: "correctness" }), false, "an ordinary category is never sensitive");
+  // the ineligibleReason gate must reflect the same hardening end-to-end
+  assert.match(
+    ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "security " }),
+    /sensitive/,
+    "a trailing-space category must not slip an auth/crypto fix past the §6 gate into ordinary auto-apply"
+  );
+});
+
+test("ineligibleReason keeps a refuted finding propose-only (annotate-only refuter never auto-fixes disputed)", () => {
+  assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", verified: { refuted: true } }), /refuted/);
+  // an un-refuted / verified-but-not-refuted finding stays fixable
+  assert.equal(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", verified: { refuted: false } }), null);
 });
 
 test("ineligibleReason lets §6 through ONLY under consented sensitiveAutoApply; other gates still hold", () => {
@@ -134,6 +156,7 @@ test("buildFixWriteArgs enables edit tools but denies exec/network, non-interact
   assert.ok(args.includes("--strict-mcp-config"));
   assert.equal(args[args.indexOf("--permission-mode") + 1], "acceptEdits");
   assert.equal(args[args.indexOf("--model") + 1], "claude-opus-4-8");
+  assert.equal(args[args.indexOf("--effort") + 1], "xhigh", "A2: fixer reasons at xhigh by default");
 });
 
 // --- full orchestration with injected adapters -------------------------------
@@ -187,6 +210,60 @@ test("runAuditFix commits a fix when the edit is in-scope and tests pass", async
   assert.equal(out.fixed[0].verified, true);
   assert.ok(git.calls.some((c) => c[0] === "commitFile" && c[1] === "a.mjs"), "staged only the target file");
   assert.match(out.branch, /^council\/audit-fix-base0000/);
+});
+
+// --- §5 char-test gate: behaviour-preserving refactor guard ------------------
+
+const refactor = (o) => loc({ file: "a.mjs", title: "consolidate SSOT", lens: "architecture_ssot", ...o });
+
+test("runAuditFix §5: a refactor commits only after char-test ACCEPT (pre-apply) + VERIFY (post-fix) both pass", async () => {
+  const git = fakeGit();
+  const seen = [];
+  const charTestGate = {
+    eligible: (f) => f.lens === "architecture_ssot",
+    accept: async () => { seen.push("accept"); return { accepted: true, code: "TEST", reason: "pinned" }; },
+    verify: async () => { seen.push("verify"); return { pass: true, reason: "preserved" }; }
+  };
+  const out = await runAuditFix(tmp(), [refactor()], {}, {}, baseDeps(git, {
+    applyFix: async () => { seen.push("apply"); git.setChanged(["a.mjs"]); },
+    charTestGate
+  }));
+  assert.equal(out.fixed.length, 1, "committed after both phases");
+  assert.deepEqual(seen, ["accept", "apply", "verify"], "accept runs on the CLEAN tree before apply; verify after");
+});
+
+test("runAuditFix §5: a refactor whose behaviour can't be CHARACTERISED stays propose-only (no apply)", async () => {
+  const git = fakeGit();
+  let applied = 0;
+  const out = await runAuditFix(tmp(), [refactor()], {}, {}, baseDeps(git, {
+    applyFix: async () => { applied += 1; git.setChanged(["a.mjs"]); },
+    charTestGate: { eligible: () => true, accept: async () => ({ accepted: false, reason: "non-deterministic target" }), verify: async () => ({ pass: true }) }
+  }));
+  assert.equal(applied, 0, "the fix is never applied when the char-test can't be accepted");
+  assert.equal(out.fixed.length, 0);
+  assert.ok(out.rejected.some((r) => /char-test/.test(r.reason)), "surfaced as a §5 propose-only");
+});
+
+test("runAuditFix §5: a refactor that turns the pinned test RED is reverted to propose-only (behaviour changed)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [refactor()], {}, {}, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    charTestGate: { eligible: () => true, accept: async () => ({ accepted: true, code: "T" }), verify: async () => ({ pass: false, reason: "the characterization test went RED after the refactor" }) }
+  }));
+  assert.equal(out.fixed.length, 0);
+  assert.ok(git.calls.some((c) => c[0] === "resetHard"), "the refactor is reverted");
+  assert.ok(out.rejected.some((r) => /char-test.*RED|RED.*refactor/.test(r.reason)));
+});
+
+test("runAuditFix §5: a NON-refactor finding (correctness) is NOT char-test-gated", async () => {
+  const git = fakeGit();
+  let accepted = 0;
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix bug", lens: "correctness" })], {}, {}, baseDeps(git, {
+    applyFix: async () => git.setChanged(["a.mjs"]),
+    charTestGate: { eligible: (f) => f.lens === "architecture_ssot", accept: async () => { accepted += 1; return { accepted: true }; }, verify: async () => ({ pass: true }) }
+  }));
+  assert.equal(accepted, 0, "a correctness fix (intends to change behaviour) is not gated by a char-test");
+  assert.equal(out.fixed.length, 1);
 });
 
 // --- §6 council gate: sensitive-class auto-apply -----------------------------
@@ -448,6 +525,18 @@ test("coverage gate: a fix whose changed lines ARE covered commits normally", as
   assert.equal(out.fixed.length, 1);
 });
 
+test("coverage gate: a pure DELETION (no changed lines) is EXEMPT, not reverted (council audit — sibling-gate parity)", async () => {
+  // git --unified=0 emits a 0-new-side hunk for a deletion → diffLines returns []; coverageOfLines([]) is
+  // fail-closed allCovered:false, which previously reverted EVERY deletion-only fix with a "(0 uncovered)"
+  // reason. A deletion has no new line to execute → the coverage gate must not apply.
+  const git = fakeGit();
+  git.diffLines = () => []; // pure deletion
+  const coverage = new Map([["a.mjs", new Set([1, 2])]]);
+  const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "remove dead code", lens: "dead_code" })], {}, { coverage }, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]) }));
+  assert.equal(out.fixed.length, 1, "the deletion-only fix commits (coverage gate exempts it)");
+  assert.equal(out.rejected.length, 0, "not reverted with a nonsensical (0 uncovered) reason");
+});
+
 test("runAuditFix reverts + fails a fix when tests go red", async () => {
   const git = fakeGit();
   const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix" })], {}, {}, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]), runTests: async () => ({ ok: false, output: "1 failing" }) }));
@@ -560,4 +649,56 @@ test("runAuditFix never auto-fixes cross-cutting findings even in a real run", a
   assert.equal(out.fixed?.length ?? 0, 0);
   assert.ok(!out.branch);
   assert.ok(out.rejected.some((r) => /cross-cutting/.test(r.reason)));
+});
+
+// --- M9 structure pass (double-consented, fail-closed) ------------------------
+
+const structural = (o) => ({ severity: "P1", scope: "cross-cutting", lens: "architecture_ssot", file: "a.mjs", title: "dedup the SSOT violation", ...o });
+
+test("M9: a structural finding stays PROPOSE-ONLY without the structureAutoApply consent (no transform runs)", async () => {
+  const git = fakeGit();
+  let ran = 0;
+  const out = await runAuditFix(tmp(), [structural()], {}, {}, baseDeps(git, {
+    runStructureTransform: async () => { ran += 1; return { ok: true, commit: "x" }; }
+  }));
+  assert.equal(ran, 0, "no consent → the transform runner is never even called");
+  assert.equal(out.fixed.length, 0);
+  assert.ok(out.rejected.some((r) => /propose-only/.test(r.reason)), "it stays a visible proposal");
+});
+
+test("M9: a structural finding stays PROPOSE-ONLY when no transform runner is injected (fail-closed)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [structural()], {}, { structureAutoApply: true }, baseDeps(git, {}));
+  assert.equal(out.fixed.length, 0, "consent alone does nothing without the machinery");
+  assert.ok(out.rejected.some((r) => /propose-only/.test(r.reason)));
+});
+
+test("M9: with BOTH the consent and the runner, an approved transform is APPLIED (and leaves the proposal list)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [structural()], {}, { structureAutoApply: true }, baseDeps(git, {
+    runStructureTransform: async () => ({ ok: true, commit: "s0m3c0mm1t", gates: { council: { approved: true } } })
+  }));
+  assert.equal(out.fixed.length, 1, "the structural finding was applied under the full gate ladder");
+  assert.equal(out.fixed[0].commit, "s0m3c0mm1t");
+  assert.equal(out.rejected.filter((r) => r.finding?.lens === "architecture_ssot").length, 0, "it is no longer a proposal");
+});
+
+test("M9: a transform the gate REFUSED keeps the finding proposed, with the reason appended (never silently dropped)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [structural()], {}, { structureAutoApply: true }, baseDeps(git, {
+    runStructureTransform: async () => ({ ok: false, reason: "§6 council not unanimous (dissent: grok)" })
+  }));
+  assert.equal(out.fixed.length, 0);
+  const entry = out.rejected.find((r) => r.finding?.lens === "architecture_ssot");
+  assert.ok(entry, "still surfaced as a proposal");
+  assert.match(entry.reason, /council not unanimous/, "the operator learns WHY it was not applied");
+});
+
+test("M9: a transform that cannot restore the tree ABORTS the run as stranded (never continues on a dirty tree)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(tmp(), [structural()], {}, { structureAutoApply: true }, baseDeps(git, {
+    runStructureTransform: async () => ({ ok: false, stranded: true, reason: "reset --hard failed" })
+  }));
+  assert.equal(out.ok, false);
+  assert.equal(out.stranded, true, "an unrestorable tree is fatal — a later fix must never stage un-reviewed bytes");
 });

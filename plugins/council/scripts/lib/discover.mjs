@@ -13,16 +13,22 @@ function exists(file) {
   }
 }
 
-function newestMatching(dir, predicate) {
+export function newestMatching(dir, predicate) {
   if (!exists(dir)) return null;
-  const entries = fs
-    .readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isDirectory())
-    .map((e) => path.join(dir, e.name))
-    .filter(predicate)
-    .map((p) => ({ path: p, mtime: fs.statSync(p).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime);
-  return entries[0]?.path ?? null;
+  // A probe must never crash the whole command: readdirSync/statSync can throw (ENOTDIR when the
+  // path is a file, or an ENOENT race after the exists() check). Degrade to "not found" instead.
+  try {
+    const entries = fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => path.join(dir, e.name))
+      .filter(predicate)
+      .map((p) => ({ path: p, mtime: fs.statSync(p).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    return entries[0]?.path ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -37,14 +43,20 @@ function findCodexCompanion() {
   const home = os.homedir();
   const cacheRoot = path.join(home, ".claude", "plugins", "cache", "openai-codex", "codex");
   if (exists(cacheRoot)) {
-    const versions = fs
-      .readdirSync(cacheRoot, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .map((e) => path.join(cacheRoot, e.name, "scripts", "codex-companion.mjs"))
-      .filter(exists)
-      .map((p) => ({ path: p, mtime: fs.statSync(p).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime);
-    if (versions[0]) return versions[0].path;
+    // Guard the readdir/stat so an ENOTDIR/race at probe time degrades to the next candidate
+    // instead of crashing the command.
+    try {
+      const versions = fs
+        .readdirSync(cacheRoot, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => path.join(cacheRoot, e.name, "scripts", "codex-companion.mjs"))
+        .filter(exists)
+        .map((p) => ({ path: p, mtime: fs.statSync(p).mtimeMs }))
+        .sort((a, b) => b.mtime - a.mtime);
+      if (versions[0]) return versions[0].path;
+    } catch {
+      /* probe failed — fall through to the marketplace candidate */
+    }
   }
 
   const marketplace = path.join(

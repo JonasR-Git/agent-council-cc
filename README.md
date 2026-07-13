@@ -19,8 +19,37 @@ Seven slash commands:
 | `/council:setup` | Check backends + scaffold `.council.yml` (`--init`) + `--usage` (limits/tokens) |
 | `/council:doctor` | End-to-end self-test (CLIs, state dir, limits, live agent pings) |
 
+Plus two commands for building **new** features (see [docs/plan-build-usage.md](docs/plan-build-usage.md)):
+
+| Command | Purpose |
+|---------|---------|
+| `council plan <request>` | Multi-model design deliberation → a validated **PlanSpec**. Every active seat proposes independently, every seat peer-critiques the others, one synthesizes. **Read-only** (writes only the plan artifact). |
+| `council build --from <plan.json>` | Autonomously implements the PlanSpec on an **isolated branch**, one step at a time, each step test-gated + council-gated + rolled back on any failure. **Never auto-merged.** |
+
 Power-user analytics (`metrics`, `history`, `ledger`, `overview`, `benchmark`,
 `worktree`) stay available as `node scripts/council-companion.mjs <subcommand>`.
+
+### What `council build` actually guarantees
+
+Every step passes a fail-closed ladder before a single byte is committed:
+**preflight** (clean tree, `HEAD` == the plan's base, a real test command, every §6 seat
+reachable, a green baseline — a miss refuses to start and spends nothing) → **test-first
+RED**: the authored test must fail at *assertion* level before the implementation exists (a
+syntax error or crash is **not** a valid RED, so a tautological test cannot slip through) →
+**implementation** (the model returns file contents as *data*; it gets no fs/shell tools) →
+**drift**: the changed set must equal the step's declared files *exactly* → **GREEN**: the
+same, byte-hashed test now passes → **full suite** → **unanimous §6 council** on the complete
+staged diff → **reviewed-byte binding** (what is committed is byte-for-byte what the council
+saw). Any failure reverts the step and **aborts the run** — later steps depend on earlier ones.
+There are **no escape hatches**: `--allow-untested`, `--skip-council`, `--allow-dirty` and
+`--force` do not exist, and the 8-step blast-radius bound can only be *tightened*, never raised.
+
+**Honest limits.** Autonomous builds are for **pure Node ESM library steps**. Dependency,
+CI/config, migration, secret and auth/crypto paths are protected — a plan declaring one is
+rejected. Under the test sandbox (which is what stops a prompt-injected test from shelling
+out) Node's permission model blocks the V8 inspector, so *changed-line coverage cannot be
+measured*; the gate degrades to a poison-probe dependence check and **says so** rather than
+claiming coverage it did not take. Review the branch yourself — nothing is ever merged for you.
 
 Highlights: verification-first (adversarially refute P0/P1 before surfacing),
 model-agnostic consensus + a findings ledger that recognizes issues across runs,

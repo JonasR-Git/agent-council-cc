@@ -237,7 +237,14 @@ export function collectReviewContext(cwd, target, opts = {}) {
     const stat = runCommand("git", ["diff", "--shortstat", range, ...pathspec], {
       cwd: repoRoot
     }).stdout.trim();
-    const diff = runCommand("git", ["diff", range, ...pathspec], { cwd: repoRoot }).stdout;
+    // Honor git's exit status: a FAILED `git diff` returns empty stdout, which would otherwise be
+    // reported as a clean/empty diff and reviewed as "nothing to flag" — a false all-clear. Fail loudly
+    // instead so the caller never mistakes a git error for an approved empty change set.
+    const diffRes = runCommand("git", ["diff", range, ...pathspec], { cwd: repoRoot });
+    if (diffRes.status !== 0) {
+      throw new Error(`git diff ${range} failed (exit ${diffRes.status}): ${String(diffRes.stderr ?? "").trim().slice(0, 200)} — refusing to review a possibly-empty diff`);
+    }
+    const diff = diffRes.stdout;
     const log = runCommand("git", ["log", "--oneline", `${target.baseRef}..HEAD`], {
       cwd: repoRoot
     }).stdout;

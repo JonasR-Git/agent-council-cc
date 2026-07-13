@@ -50,6 +50,11 @@ test("summarizeProgress parses a live raised= count per agent", () => {
   assert.equal(p.raisedByAgent.claude, undefined, "no suffix -> no live raised");
 });
 
+test("summarizeProgress does not expose an r1Expected field (council nit: dead, no renderer ever read it — both derive R1 totals from agentR1States)", () => {
+  const p = summarizeProgress("Phase: r1: grok done (1/3) raised=9");
+  assert.equal("r1Expected" in p, false);
+});
+
 test("formatDashboardMarkdown renders a table, bars, status emoji, and severity squares", () => {
   const job = { id: "council-abc123", kind: "deliberate", status: "completed", createdAt: "2026-07-10T00:00:00Z", finishedAt: "2026-07-10T00:05:00Z" };
   const { markdown, snapshot } = formatDashboardMarkdown(job, summarizeProgress(LOG), { nowMs: Date.parse("2026-07-10T00:05:00Z"), findings: summarizeFindings(MERGED) });

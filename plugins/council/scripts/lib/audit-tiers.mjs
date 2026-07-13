@@ -43,10 +43,6 @@ const QUALITY_TIER = 3;
 const TIER_OF_LENS = new Map();
 for (const t of TIERS) for (const l of t.lenses) TIER_OF_LENS.set(l, t.id);
 
-// Tier-0 verdicts over a unit. `keep` is the default; only the others gate mechanical
-// work. Removal-class verdicts are proposals, never auto-applied.
-export const VERDICTS = ["keep", "remove", "merge-into", "redesign", "relocate", "quarantine"];
-
 // A P0 in one of these lenses, in reachable code, is ALWAYS processed regardless of a
 // remove?/redesign? verdict — a live hole does not wait for a delete decision (§3).
 // Derived from the registry: exactly the lenses whose ceiling is P0 (security, data

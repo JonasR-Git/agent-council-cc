@@ -46,9 +46,27 @@ export function categoryToLens(category, fallback = "correctness") {
   return CATEGORY_LENS[c] ?? fallback;
 }
 
+/**
+ * True when the refutation verifier REFUTED this finding. `verified` is the verifier's annotation
+ * object {by, refuted, reason, demotable} — it is TRUTHY for BOTH outcomes, so `Boolean(f.verified)`
+ * must never be read as "supported" (council Fable P1: a refuted finding was landing in the STRONGEST
+ * evidence state — adversarial-verified, confidence floor 0.85, lifecycle confirmed, ranked first).
+ */
+export function isRefuted(raw = {}) {
+  return raw?.verified != null && typeof raw.verified === "object" && raw.verified.refuted === true;
+}
+
+/** True when the verifier ran AND SUPPORTED the finding (the only reading that means "verified"). */
+export function isVerifiedSupported(raw = {}) {
+  return Boolean(raw?.verified) && !isRefuted(raw);
+}
+
 /** Evidence state → drives the confidence cap/floor (audit-risk deriveConfidence). */
 export function evidenceState(raw = {}) {
-  if (raw.verified) return raw.reproduced ? "reproduced" : "adversarial-verified";
+  // A REFUTED finding is the WEAKEST evidence state, never the strongest: an independent verifier
+  // could not support it. It stays VISIBLE (annotate-only) but must be deprioritized, not promoted.
+  if (isRefuted(raw)) return "refuted";
+  if (isVerifiedSupported(raw)) return raw.reproduced ? "reproduced" : "adversarial-verified";
   if (raw.consensus) return "independent-agreement";
   const finders = raw.agents?.length ?? (raw.agent ? 1 : 0);
   return finders >= 1 ? "one-finder" : "regex-only";
@@ -60,16 +78,33 @@ const clamp15 = (n, d = 3) => Math.max(1, Math.min(5, Number.isFinite(Number(n))
 export function toCanonicalFinding(raw = {}, { unit, ordinal } = {}) {
   const lens = raw.lens && getLens(raw.lens) ? raw.lens : categoryToLens(raw.category);
   const state = evidenceState(raw);
-  const verified = Boolean(raw.verified);
+  // "verified" here means SUPPORTED by the verifier — a refuted finding must NOT lift the severity cap
+  // nor read as confirmed (council Fable P1).
+  const verified = isVerifiedSupported(raw);
   const severity = cappedSeverity(lens, raw.severity ?? "P2", { verified, regexOnly: state === "regex-only" });
-  const confidence = deriveConfidence(state, Number.isFinite(raw.confidence) ? raw.confidence : 0.6);
+  // A MERGED bucket (findings.mjs finalizeBuckets) carries the finders' averaged self-rating as
+  // `avgConfidence`; a single raw finding carries `confidence`. Reading only the latter scored every
+  // merged finding — i.e. every finding on the audit path — at the 0.6 default and threw the models'
+  // confidence signal away. deriveConfidence still clamps to the evidence-state CAP/FLOOR, so a
+  // self-rating can lower confidence but NEVER exceed what the evidence supports (a refuted finding
+  // stays at the 0.2 cap however loudly the model rated itself).
+  const selfRated = Number.isFinite(raw.avgConfidence) ? raw.avgConfidence : raw.confidence;
+  const confidence = deriveConfidence(state, Number.isFinite(selfRated) ? selfRated : 0.6);
   const L = clamp15(raw.likelihood);
   const B = clamp15(raw.blastRadius);
   const E = clamp15(raw.exploitability);
   const risk = riskScore({ severity, likelihood: L, blastRadius: B, exploitability: E, confidence });
   const scope = raw.scope === "cross-cutting" || isProposeOnly(lens) ? "cross-cutting" : "localized";
   const fixDisposition = scope === "cross-cutting" ? "propose-only" : "localized";
-  const lifecycle = verified || raw.consensus ? "confirmed" : severity === "P0" || severity === "P1" ? "verification_required" : "candidate";
+  // A refuted finding is neither "confirmed" nor pending verification — verification RAN and did not
+  // support it. Surface that honestly so the report/gate deprioritizes it instead of ranking it first.
+  const lifecycle = isRefuted(raw)
+    ? "refuted"
+    : verified || raw.consensus
+      ? "confirmed"
+      : severity === "P0" || severity === "P1"
+        ? "verification_required"
+        : "candidate";
   const path = String(raw.file || unit || "unknown");
   const line = Math.max(1, Math.round(Number(raw.line)) || 1);
 

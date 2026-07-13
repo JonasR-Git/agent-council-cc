@@ -14,7 +14,10 @@ import { nowIso, workspaceRoot } from "./state.mjs";
 /** Enrich inventory records with model facts so mandatorySet can see fan-in/entrypoints. */
 function enrich(inv, model) {
   const factById = new Map((model?.files ?? []).map((f) => [f.id, f]));
-  const entrypoints = new Set(model?.entrypoints ?? []);
+  // Entrypoints live on the graph the codebase-model builds (model.graph.entrypoints),
+  // not at the model root — reading model.entrypoints yielded undefined, so the
+  // mandatory-coverage gate never marked the CLI entrypoint as isEntrypoint.
+  const entrypoints = new Set(model?.graph?.entrypoints ?? []);
   return inv.map((f) => {
     const fact = factById.get(f.id);
     return {

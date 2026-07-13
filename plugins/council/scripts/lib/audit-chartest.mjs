@@ -16,6 +16,12 @@
 //   (c) executes the target's CHANGED LINES (anchored to coverage of the diff, not merely
 //       "the file loaded").
 // Pure control flow; every check is injectable + fail-closed on a harness fault.
+//
+// STATUS: WIRED (opt-in --chartest). chartest-gate.mjs composes this acceptance gate with a firewalled
+// GENERATOR + the Node/node:test harness (chartest-node-harness.mjs), chartest-wiring.mjs builds the
+// live charTestGate, and runAuditFix runs it around a behaviour-preserving refactor: ACCEPT on the clean
+// tree (pin behaviour), then VERIFY the pinned test stays green + covers the changed lines after the
+// refactor. mutationGate stays OPTIONAL (only when a scorer is configured). Default OFF → path unchanged.
 
 /**
  * Decide whether a generated characterization test may gate a refactor.

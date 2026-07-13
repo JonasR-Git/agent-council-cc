@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -11,6 +12,7 @@ import {
   runStructuredWithRetry,
   waitForFile
 } from "./agents.mjs";
+import { activeSeatNames, allSeatNames, isOpenRouterSeat, makeSeatRunners, seatActive } from "./seats.mjs";
 import { runClaudeStructured } from "./claude-agent.mjs";
 import { applyDebateOutcomes, renderDebateSection, runDebateRounds } from "./debate.mjs";
 import {
@@ -32,13 +34,19 @@ import { verifyFindings } from "./verify.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 import { formatExit } from "./util.mjs";
 import { skippedAgents } from "./policy.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
 
-export { READONLY_DISALLOWED_TOOLS, runCodexStructured, runGrokStructured };
+export { READONLY_DISALLOWED_TOOLS };
 
 const EVIDENCE_LINES = 25;
 const EVIDENCE_PER_FINDING_CHARS = 1500;
 const EVIDENCE_TOTAL_CHARS = 16_000;
 const EVIDENCE_FALLBACK_CHARS = 8000;
+
+// The only seats the bounded debate can actually re-run: debate.mjs routes an author/critic to the
+// codex companion or the grok CLI, so any OTHER seat (a spawned Claude, an OpenRouter seat) handed to
+// it would silently be run AS GROK. R1/R2 are seat-generic (dynamic registry); debate stays built-in.
+const DEBATE_SEATS = new Set(["codex", "grok"]);
 
 /**
  * Keep only findings whose severity warrants a peer critique round.
@@ -168,12 +176,15 @@ function buildDebateEntries(merged, options, sessions = {}, criticSessions = {})
   return merged.all
     .filter((item) => item.contested)
     .map((item) => {
-      const author = item.agents.find((agent) => agent !== "claude" && !skipped.has(agent));
+      // Only a DEBATE_SEATS author/critic may be seeded: debate.mjs can re-run codex + grok only.
+      // (For the built-in trio this is the former `!== "claude"` rule verbatim; it additionally keeps
+      // an OpenRouter author out of the grok fall-through.)
+      const author = item.agents.find((agent) => DEBATE_SEATS.has(agent) && !skipped.has(agent));
       if (!author) return null;
       const disagree = (item.peerVotes ?? []).filter((v) => v.vote === "disagree");
       const critic = disagree
         .map((v) => v.from)
-        .find((from) => from !== author && from !== "claude" && !skipped.has(from));
+        .find((from) => from !== author && DEBATE_SEATS.has(from) && !skipped.has(from));
       return {
         id: item.ids[0],
         author,
@@ -197,10 +208,52 @@ function buildDebateEntries(merged, options, sessions = {}, criticSessions = {})
 }
 
 /**
- * Full deliberation: R1 independent (codex+grok [+claude file]) then R2 cross-critique.
+ * The resume-cache context key. The base key (focus/models/effort/base/scope) is UNCHANGED, so a run
+ * with no OpenRouter seats hits exactly the same cache entries as before. A configured seat set folds
+ * its `id@model` signature in, so re-pointing a seat id at a different model never reuses that seat's
+ * stale R1 (resumeContextKey itself only knows the built-in model options).
  */
-export async function runDeliberation(cwd, backends, options = {}) {
-  const onPhase = typeof options.onPhase === "function" ? options.onPhase : () => {};
+function r1ContextKey(backends, options) {
+  const base = resumeContextKey({
+    focusText: options.focusText,
+    policyFocus: options.policyFocus,
+    codexModel: options.codexModel,
+    grokModel: options.grokModel,
+    grokEffort: options.grokEffort,
+    // A different Claude backend/model produces different R1 - don't reuse it.
+    claudeBackend: options.claudeBackend,
+    claudeModel: options.claudeModel,
+    base: options.base,
+    scope: options.scope
+  });
+  const signature = (backends?.openrouter?.seats ?? []).map((s) => `${s.id}@${s.model}`).join(",");
+  if (!signature) return base;
+  return `${base}-${createHash("sha256").update(signature).digest("hex").slice(0, 8)}`;
+}
+
+/**
+ * Full deliberation: R1 independent (every ACTIVE seat) then R2 all-to-all cross-critique.
+ *
+ * SEATS come from the dynamic registry (seats.mjs), never a hardcoded pair: the built-ins
+ * (codex/grok/claude) plus every configured OpenRouter seat. `deps` mirrors makeSeatRunners'
+ * injection contract ({ runCodex, runGrok, runClaude, runOpenRouter }) so unit tests need no CLI
+ * and no network; the same fakes serve both rounds (the round is evident from the prompt).
+ */
+export async function runDeliberation(cwd, backends, options = {}, deps = {}) {
+  const reporter = options.reporter ?? NOOP_REPORTER; // best-effort live telemetry (additive)
+  const userPhase = typeof options.onPhase === "function" ? options.onPhase : () => {};
+  // Every deliberation milestone (context → r1 → r2 → verify → debate) both notifies the caller
+  // and drives the live progress phase — a natural seam, no extra call sites.
+  const onPhase = (msg) => {
+    reporter.phase("deliberate", String(msg)); // reporter is fail-soft internally
+    // The user's phase hook is untrusted telemetry — a throw from it must NEVER abort an otherwise
+    // successful deliberation (fail-soft, exactly like the reporter).
+    try {
+      userPhase(msg);
+    } catch {
+      /* swallow: a broken progress hook must not break the run */
+    }
+  };
   onPhase("collecting-context");
   const target = resolveReviewTarget(cwd, { base: options.base, scope: options.scope });
   const context = collectReviewContext(cwd, target, { skipPaths: options.skipPaths ?? [] });
@@ -214,73 +267,62 @@ export async function runDeliberation(cwd, backends, options = {}) {
   // failed/missing agents (e.g. a timed-out codex) re-run. The cache key folds
   // in focus/models so a different --focus never reuses the wrong R1.
   const resume = Boolean(options.resume);
-  const ctxKey = resumeContextKey({
-    focusText: options.focusText,
-    policyFocus: options.policyFocus,
-    codexModel: options.codexModel,
-    grokModel: options.grokModel,
-    grokEffort: options.grokEffort,
-    // A different Claude backend/model produces different R1 - don't reuse it.
-    claudeBackend: options.claudeBackend,
-    claudeModel: options.claudeModel,
-    base: options.base,
-    scope: options.scope
-  });
-  const cachedCodex = resume ? readCachedR1(cwd, context.snapshotId, "codex", ctxKey) : null;
-  const cachedGrok = resume ? readCachedR1(cwd, context.snapshotId, "grok", ctxKey) : null;
-
-  const r1Jobs = [];
-  if (options.skipCodex) {
-    r1Jobs.push(Promise.resolve({ agent: "codex", skipped: true, reason: "skip", stdout: "" }));
-  } else if (cachedCodex) {
-    r1Jobs.push(Promise.resolve(cachedCodex));
-  } else {
-    r1Jobs.push(
-      runStructuredWithRetry(
-        (p) => runCodexStructured(cwd, backends, { ...options, maxTurns: options.maxTurnsR1 }, p, "r1"),
-        buildR1Prompt("codex", context, r1TemplateOpts),
-        (stdout) => parseAgentFindings(stdout, "codex")
-      )
-    );
-  }
-
-  if (options.skipGrok) {
-    r1Jobs.push(Promise.resolve({ agent: "grok", skipped: true, reason: "skip", stdout: "" }));
-  } else if (cachedGrok) {
-    r1Jobs.push(Promise.resolve(cachedGrok));
-  } else {
-    r1Jobs.push(
-      runStructuredWithRetry(
-        // Capture the session id so debate rebuttals can resume the author's own
-        // R1 context (opt-in via debate_resume).
-        (p) => runGrokStructured(cwd, backends, { ...options, maxTurns: options.maxTurnsR1, captureGrokSession: Boolean(options.debateResume) }, p),
-        buildR1Prompt("grok", context, r1TemplateOpts),
-        (stdout) => parseAgentFindings(stdout, "grok")
-      )
-    );
-  }
+  const ctxKey = r1ContextKey(backends, options);
 
   // Claude backend: 'spawn' runs Claude Code headless as an independent reviewer
   // (pinnable model), so the orchestrating session judges neutrally. 'session'
   // (default) keeps Claude's R1 as the orchestrator's own findings file.
   const claudeSpawned = options.claudeBackend === "spawn" && !options.skipClaude;
-  const cachedClaude = resume && claudeSpawned ? readCachedR1(cwd, context.snapshotId, "claude", ctxKey) : null;
-  if (claudeSpawned) {
-    if (cachedClaude) {
-      r1Jobs.push(Promise.resolve(cachedClaude));
-    } else {
-      // No --max-turns on this CLI: the bound is the wall-clock agentTimeoutMs.
-      r1Jobs.push(
-        runStructuredWithRetry(
-          (p) => runClaudeStructured(cwd, backends, options, p),
-          buildR1Prompt("claude", context, r1TemplateOpts),
-          (stdout) => parseAgentFindings(stdout, "claude")
-        )
-      );
+
+  // R1 runners come from the DYNAMIC seat registry: the per-seat calls below are the SAME ones the
+  // hardcoded triple made (codex keeps the "r1" label — the only label allowed to fall back to
+  // adversarial-review; grok keeps its session capture), and every configured OpenRouter seat gets a
+  // runner for free, so it is a full independent finder rather than being dropped.
+  const r1Options = { ...options, maxTurns: options.maxTurnsR1 };
+  const r1Runners = makeSeatRunners(cwd, backends, r1Options, {
+    runCodex: deps.runCodex ?? ((p) => runCodexStructured(cwd, backends, r1Options, p, "r1")),
+    // Capture the session id so debate rebuttals can resume the author's own R1 context
+    // (opt-in via debate_resume).
+    runGrok:
+      deps.runGrok ??
+      ((p) => runGrokStructured(cwd, backends, { ...r1Options, captureGrokSession: Boolean(options.debateResume) }, p)),
+    // No --max-turns on this CLI: the bound is the wall-clock agentTimeoutMs.
+    runClaude: deps.runClaude ?? ((p) => runClaudeStructured(cwd, backends, options, p)),
+    runOpenRouter: deps.runOpenRouter
+  });
+
+  const skippedSeats = new Set(skippedAgents(options));
+  const r1Jobs = [];
+  const resumedSeats = [];
+  for (const seat of allSeatNames(backends)) {
+    // Claude only SPAWNS an R1 here; in 'session' mode (and when skipped) its findings arrive via
+    // loadClaudeDoc instead, so it must not be dispatched as a CLI seat.
+    if (seat === "claude" && !claudeSpawned) continue;
+    // A policy-skipped built-in still gets an explicit "skipped" row, so a dropped reviewer stays
+    // VISIBLE in the report (fail-closed) instead of vanishing.
+    if (skippedSeats.has(seat)) {
+      r1Jobs.push(Promise.resolve({ agent: seat, skipped: true, reason: "skip", stdout: "" }));
+      continue;
     }
+    // An OpenRouter seat runs only when it is configured, reachable and not skipped — unlike the
+    // built-in CLIs it has no runner that can self-report an unavailable backend as a skip.
+    if (isOpenRouterSeat(seat, backends) && !seatActive(seat, backends, options)) continue;
+    const run = r1Runners[seat];
+    if (!run) continue;
+    const cached = resume ? readCachedR1(cwd, context.snapshotId, seat, ctxKey) : null;
+    if (cached) {
+      resumedSeats.push(seat);
+      r1Jobs.push(Promise.resolve(cached));
+      continue;
+    }
+    r1Jobs.push(
+      runStructuredWithRetry(run, buildR1Prompt(seat, context, r1TemplateOpts), (stdout) =>
+        parseAgentFindings(stdout, seat)
+      ).then((r) => ({ ...r, agent: seat }))
+    );
   }
 
-  onPhase(resume && (cachedCodex || cachedGrok || cachedClaude) ? "r1 (resuming)" : "r1");
+  onPhase(resumedSeats.length ? "r1 (resuming)" : "r1");
   // Emit per-agent completion so a slow/stuck agent (e.g. a codex backend stall)
   // is visible - you can see grok finished while r1 still waits on codex.
   let r1Done = 0;
@@ -347,61 +389,49 @@ export async function runDeliberation(cwd, backends, options = {}) {
   const critiqueStats = [];
   if (options.deliberatePeer !== false) {
     const severities = options.peerCritiqueSeverities ?? null;
-    const codexDoc = r1Docs.find((d) => d.agent === "codex" && d.parseOk);
-    const grokDoc = r1Docs.find((d) => d.agent === "grok" && d.parseOk);
 
+    // Every seat that produced a PARSEABLE R1 is critiqued - the built-ins, the session/file-backed
+    // Claude doc (already in r1Docs) and every configured OpenRouter seat.
     const critiqued = new Map();
-    for (const doc of [codexDoc, grokDoc, claudeDoc?.parseOk ? claudeDoc : null].filter(Boolean)) {
+    for (const doc of r1Docs) {
+      if (!doc.parseOk) continue;
       const filtered = filterDocForCritique(doc, severities);
       critiqued.set(doc.agent, filtered.doc);
       critiqueStats.push({ agent: doc.agent, critiqued: filtered.critiqued, total: filtered.total });
     }
 
+    // ALL-TO-ALL peer critique: every ACTIVE seat critiques every OTHER seat's findings, never its
+    // own. That closes the asymmetry of the old four hardcoded grok/codex pairings, where Claude's
+    // findings were critiqued but Claude never critiqued anyone (and OpenRouter seats did neither).
+    // Claude critiques only as a SPAWNED seat: in 'session' mode Claude IS the orchestrator and casts
+    // its votes in-session (see "Your turn" in the report), so spawning a Claude critic there would
+    // just duplicate the same reviewer. Availability is required - an unreachable seat casts no vote
+    // (fail-closed), it never becomes a silent agreement.
+    const critics = activeSeatNames(backends, options).filter((seat) => seat !== "claude" || claudeSpawned);
+    const r2Opts = r2Options(options);
+    // Same injection contract as R1; the codex label is never "r1", so the adversarial-review
+    // fallback (which cannot carry a structured R2 prompt) stays disabled on this path.
+    const r2Runners = makeSeatRunners(cwd, backends, r2Opts, {
+      runCodex: deps.runCodex ?? ((p) => runCodexStructured(cwd, backends, r2Opts, p, "r2")),
+      runGrok: deps.runGrok ?? ((p) => runGrokStructured(cwd, backends, r2Opts, p)),
+      runClaude: deps.runClaude ?? ((p) => runClaudeStructured(cwd, backends, r2Opts, p)),
+      runOpenRouter: deps.runOpenRouter
+    });
+
     const peerJobs = [];
-    const codexSlim = critiqued.get("codex");
-    const grokSlim = critiqued.get("grok");
-    const claudeSlim = critiqued.get("claude");
-
-    if (codexSlim?.findings.length && !options.skipGrok) {
-      peerJobs.push(
-        runGrokStructured(cwd, backends, r2Options(options), buildR2Prompt("grok", "codex", codexSlim, context)).then(
-          (r) => ({ ...r, aboutAgent: "codex", role: "peer" })
-        )
-      );
-    }
-
-    if (grokSlim?.findings.length && !options.skipCodex) {
-      peerJobs.push(
-        runCodexStructured(
-          cwd,
-          backends,
-          r2Options(options),
-          buildR2Prompt("codex", "grok", grokSlim, context),
-          "r2"
-        ).then((r) => ({ ...r, aboutAgent: "grok", role: "peer" }))
-      );
-    }
-
-    if (claudeSlim?.findings.length) {
-      if (!options.skipGrok) {
+    for (const [aboutAgent, slim] of critiqued) {
+      if (!slim?.findings.length) continue;
+      for (const critic of critics) {
+        if (critic === aboutAgent) continue; // never critique your own findings
+        const run = r2Runners[critic];
+        if (!run) continue;
         peerJobs.push(
-          runGrokStructured(
-            cwd,
-            backends,
-            r2Options(options),
-            buildR2Prompt("grok", "claude", claudeSlim, context)
-          ).then((r) => ({ ...r, aboutAgent: "claude", role: "peer" }))
-        );
-      }
-      if (!options.skipCodex) {
-        peerJobs.push(
-          runCodexStructured(
-            cwd,
-            backends,
-            r2Options(options),
-            buildR2Prompt("codex", "claude", claudeSlim, context),
-            "r2-claude"
-          ).then((r) => ({ ...r, aboutAgent: "claude", role: "peer" }))
+          Promise.resolve(run(buildR2Prompt(critic, aboutAgent, slim, context))).then((r) => ({
+            ...r,
+            agent: critic,
+            aboutAgent,
+            role: "peer"
+          }))
         );
       }
     }

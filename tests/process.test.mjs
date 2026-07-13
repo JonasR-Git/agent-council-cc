@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   needsCmdShell,
   quoteForCmd,
+  runCommand,
   runCommandAsync
 } from "../plugins/council/scripts/lib/process.mjs";
 
@@ -12,9 +13,14 @@ function spawnBlocked(result) {
   return result.error?.code === "EPERM";
 }
 
-test("needsCmdShell only selects Windows bare commands or cmd shims", () => {
+test("needsCmdShell only selects Windows bare commands or cmd shims, exempting git (P1)", () => {
   if (process.platform === "win32") {
-    assert.equal(needsCmdShell("git"), true);
+    // git.exe is a native PE binary (never a .cmd/.bat shim), so it is exempt from the
+    // bare-name -> cmd.exe rule: routing it through cmd.exe would fail-close on '%' in
+    // legitimate git pretty-format args (e.g. `--format=%H`) - see process.mjs P1 fix.
+    assert.equal(needsCmdShell("git"), false);
+    assert.equal(needsCmdShell("git.exe"), false);
+    assert.equal(needsCmdShell("GIT"), false);
     assert.equal(needsCmdShell("tool.cmd"), true);
     assert.equal(needsCmdShell("C:\\Program Files\\nodejs\\node.exe"), false);
     assert.equal(needsCmdShell("C:\\tools\\wrap.bat"), true);
@@ -22,6 +28,37 @@ test("needsCmdShell only selects Windows bare commands or cmd shims", () => {
     assert.equal(needsCmdShell("git"), false);
     assert.equal(needsCmdShell("tool.cmd"), false);
   }
+});
+
+test("runCommand allows git pretty-format '%' args through on win32 instead of fail-closing (P1)", (t) => {
+  if (process.platform !== "win32") {
+    t.skip("this pins the Windows cmd.exe-routing fix only");
+    return;
+  }
+  const result = runCommand("git", ["log", "--format=%H", "-n", "1"], { cwd: process.cwd() });
+  if (result.error?.code === "ENOENT" || result.error?.code === "EPERM") {
+    t.skip("git binary unavailable in this sandbox");
+    return;
+  }
+  assert.doesNotMatch(result.stderr, /Refusing to pass '%'/);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout.trim(), /^[0-9a-f]{40}$/);
+});
+
+test("runCommand honors options.timeoutMs on the sync API, not just options.timeout (P2)", () => {
+  const start = Date.now();
+  // Before the P2 fix, spawnSync only read options.timeout, so a caller passing
+  // timeoutMs (the async API's option name) got an inert cap: the child would run
+  // to completion instead of being killed at ~200ms.
+  const result = runCommand(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], {
+    timeoutMs: 200
+  });
+  const elapsed = Date.now() - start;
+  if (result.error?.code === "EPERM") {
+    return;
+  }
+  assert.ok(elapsed < 4000, `expected the timeoutMs cap to cut the child short, took ${elapsed}ms`);
+  assert.equal(result.error?.code, "ETIMEDOUT");
 });
 
 test("quoteForCmd quotes unsafe tokens and leaves safe tokens alone", () => {

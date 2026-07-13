@@ -7,9 +7,13 @@ import { fingerprintFinding, resolveLedgerEntry } from "./ledger.mjs";
 import { runCommand, runCommandAsync } from "./process.mjs";
 import { snapshotViolation } from "./audit-snapshot.mjs";
 import { evaluatePatchVerdicts } from "./audit-council-gate.mjs";
+import { isStructureClass } from "./structure-gate.mjs";
+import { requiredPatchSeats } from "./seats.mjs";
+import { retryOnRateLimit } from "./audit-retry.mjs";
 import { coverageOfLines, ingestCoverage, parseDiffLines } from "./audit-coverage-ingest.mjs";
 import { ensureStateDir, nowIso, resolveStateDir, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
 
 // Audit V3 - the SAFE auto-fix path. The council's hard-won rule holds:
 //   detect -> propose -> verify -> fix ONLY what is provably safe + tested.
@@ -21,7 +25,7 @@ import { wrapMarkdownFence } from "./markdown-fence.mjs";
 //
 // Safety model (hardened after council review council-361da25f):
 //  - Clean working tree is MANDATORY (no --allow-dirty escape hatch): the rollback
-//    ops (reset --hard + clean -fdx) would otherwise destroy the user's WIP.
+//    ops (reset --hard + clean -fd) would otherwise destroy the user's WIP.
 //  - Paths are normalized to posix before every gate (Windows-separator bypass).
 //  - The write runner gets ONLY nonce-fenced untrusted data (source AND the finding
 //    fields), runs at the repo root, and any nonzero/timeout exit reverts the unit.
@@ -130,7 +134,10 @@ const SENSITIVE_LENSES = new Set(["security_secrets", "concurrency_resources", "
 
 /** True if a finding is in a §6 never-auto-apply class (propose-only regardless of level). */
 export function isSensitiveClass(f) {
-  return SENSITIVE_CATEGORIES.has(String(f?.category ?? "").toLowerCase()) || SENSITIVE_LENSES.has(String(f?.lens ?? ""));
+  // TRIM + lowercase BOTH sides (kept in sync with structure-gate.mjs's isSensitiveStructureClass):
+  // category was case-folded but NOT trimmed and lens was exact, so "security " (trailing space) or
+  // "Security_Secrets" mis-classified as non-sensitive would defeat the §6 consent gate.
+  return SENSITIVE_CATEGORIES.has(String(f?.category ?? "").trim().toLowerCase()) || SENSITIVE_LENSES.has(String(f?.lens ?? "").trim().toLowerCase());
 }
 
 /**
@@ -143,6 +150,9 @@ export function ineligibleReason(f, { maxRank = RANK.P2, protectedRe = PROTECTED
   // Fail CLOSED on scope: only an explicit "localized" is auto-fixable. Missing /
   // unknown scope (e.g. hand-edited --from findings) must never slip through.
   if (f.scope !== "localized") return f.scope === "cross-cutting" ? "cross-cutting → propose-only (never auto-patched)" : "scope not 'localized' (fail-closed)";
+  // An independent seat refuted this finding (annotate-only path) — deprioritize it to
+  // propose-only rather than auto-fix a disputed finding. Still visible in the report.
+  if (f.verified?.refuted) return "refuted by an independent seat → propose-only";
   if (!f.file) return "no target file";
   const file = toPosix(f.file);
   if (/[\r\n]/.test(file) || file.split("/").includes("..") || path.isAbsolute(f.file) || /^[a-zA-Z]:/.test(file)) return "unsafe file path";
@@ -261,7 +271,11 @@ export function buildFixWriteArgs(options = {}) {
     ...WRITE_DISALLOWED,
     "--strict-mcp-config",
     "--permission-mode",
-    "acceptEdits"
+    "acceptEdits",
+    // A2: fixer reasons at xhigh (user pref: always xhigh, never max) for the best minimal
+    // patch. Unknown value warns + falls back, so it can't break the writer.
+    "--effort",
+    options.claudeEffort ?? "xhigh"
   ];
   if (options.claudeModel) args.push("--model", options.claudeModel);
   return args;
@@ -304,9 +318,12 @@ function realGit(root) {
     changedFiles: () => parsePorcelainZ(g(["status", "--porcelain", "-z"]).stdout),
     resetHard: (ref) => {
       const r = g(["reset", "--hard", ref]);
-      // -x also removes ignored files: safe because a clean tree is mandatory, so
-      // anything present is the agent's own output (incl. ignored escape attempts).
-      const c = g(["clean", "-fdx"]);
+      // clean -fd removes the agent's UNTRACKED output (new files it created) but NOT ignored files:
+      // `git status --porcelain` (isClean) does not list ignored files, so a repo with a gitignored
+      // .env + node_modules reports clean — an earlier `-x` here would DELETE the user's local secrets
+      // and dependencies on the first revert, then break every later test gate (council fleet P1
+      // data-loss). Reverting tracked state + removing untracked output is the correct safe revert.
+      const c = g(["clean", "-fd"]);
       // A failed restore is an emergency: a rejected/vetoed patch left in the tree could be
       // staged by a later same-file finding, committing bytes that were never accepted.
       // Fail loud so the caller aborts instead of continuing over a dirty tree.
@@ -319,6 +336,21 @@ function realGit(root) {
       // cannot sweep in artifacts a test run may have produced.
       const add = g(["add", "--", file]);
       if (add.status !== 0) throw new Error(`git add failed: ${add.stderr.trim()}`);
+      const res = g(["commit", "-m", message, "--no-verify"]);
+      if (res.status !== 0) throw new Error(`git commit failed: ${res.stderr.trim()}`);
+      return g(["rev-parse", "HEAD"]).stdout.trim();
+    },
+    // Stage the target and return its STAGED (index) diff vs `ref`. Used by the §6 path to
+    // bind on the exact bytes that will be committed — closing the TOCTOU where an external
+    // writer changes the working tree between a working-tree re-diff and `git add`.
+    stageAndDiffCached: (file, ref) => {
+      const add = g(["add", "--", file]);
+      if (add.status !== 0) throw new Error(`git add failed: ${add.stderr.trim()}`);
+      return g(["diff", "--cached", String(ref), "--", file]).stdout;
+    },
+    // Commit the ALREADY-STAGED index (no re-add) so the committed bytes are exactly the
+    // ones just verified via stageAndDiffCached.
+    commitIndex: (message) => {
       const res = g(["commit", "-m", message, "--no-verify"]);
       if (res.status !== 0) throw new Error(`git commit failed: ${res.stderr.trim()}`);
       return g(["rev-parse", "HEAD"]).stdout.trim();
@@ -460,6 +492,24 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
   // findings still flow in (so they aren't silently dropped) but fail the gate → propose.
   const sensitiveAutoApply = Boolean(options.sensitiveAutoApply) && typeof deps.reviewPatch === "function";
   const reviewPatch = deps.reviewPatch;
+  // §5 characterization-test gate (opt-in --chartest): for a behaviour-PRESERVING refactor, a generated
+  // test pins the target's current behaviour on the CLEAN tree (accept), and after the refactor applies
+  // it must STILL pass AND cover the changed lines (verify) — else the refactor changed behaviour and is
+  // reverted to propose-only. Injected by the CLI; absent → the gate is skipped (default path unchanged).
+  // Fail-closed: an eligible finding whose char-test cannot be ACCEPTED is kept propose-only (a refactor
+  // we cannot characterise is not auto-applied).
+  const charTestGate = deps.charTestGate ?? null;
+  // Rate-limit resilience at the layer where a 429 is actually thrown (the model calls):
+  // wrap applyFix + reviewPatch so a transient limit backs off + retries instead of being
+  // recorded as a failed fix. Opt-in (--retry-on-limit); a non-rate-limit error still
+  // propagates immediately. Sleep injectable for tests.
+  const withLimitRetry = options.retryOnLimit
+    ? (fn) => retryOnRateLimit(fn, {
+        retries: Math.max(1, Math.min(20, options.retryLimit ?? 5)),
+        sleep: deps.sleep,
+        onRetry: ({ attempt, ms }) => log(`  rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt})`)
+      })
+    : (fn) => fn();
   const oracleCmd = deps.oracleCmd ?? options.oracleCmd ?? detectOracleCmd(root);
   const runOracle = deps.runOracle ?? (oracleCmd ? (() => realRunOracle(root, oracleCmd, options)) : null);
   const oracleName = deps.oracleName ?? oracleCmd?.name ?? "lint/typecheck";
@@ -513,7 +563,15 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     }
     return { ok: true, dryRun: true, branch: null, planned: plannedTasks, rejected, capped, fixed: [], failed: [], skipped: [], gated };
   }
-  if (!tasks.length) {
+  // M9: a run whose ONLY work is a STRUCTURAL transform has no single-file `tasks` (a structural finding
+  // is cross-cutting, so classifyFixable rejected it as propose-only) — but it is still real, consented
+  // work. Returning early here would silently skip it, so the early exit only applies when there is
+  // nothing to do at ALL.
+  const structuralPending =
+    typeof deps.runStructureTransform === "function" &&
+    options.structureAutoApply === true &&
+    rejected.some((r) => isStructureClass(r?.finding));
+  if (!tasks.length && !structuralPending) {
     return { ok: true, branch: null, fixed: [], failed: [], rejected, skipped: [], capped, gated, note: "no auto-fixable findings" };
   }
 
@@ -528,12 +586,26 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
   }
 
   const baseRef = git.head();
-  const baseBranch = git.currentBranch();
+  // The loop pins the TRUE base via options.ledgerBaseBranch: on pass 2+ the process is ON the
+  // integration branch, so git.currentBranch() would ledger fixes with the integration branch as
+  // their base — reconcilePendingFixes would then falsely promote them to durable 'fixed' (Opus O7).
+  const baseBranch = options.ledgerBaseBranch ?? git.currentBranch();
   const branch = options.branch ?? `council/audit-fix-${String(baseRef).slice(0, 8)}`;
   const fixed = [];
   const failed = [];
   const skipped = [];
   const log = typeof options.onProgress === "function" ? options.onProgress : () => {};
+  // Best-effort live telemetry (Phase 2). Additive: a reporter call never changes an outcome.
+  const reporter = options.reporter ?? NOOP_REPORTER;
+  // Every post-apply revert flows through here, so the "reverted" counter is bumped in exactly
+  // one place (a gate that failed AFTER the patch was applied). Pre-apply propose-only rejects
+  // (too large / content-protected / char-test not accepted) never call this — they are "proposed".
+  const revert = (snap) => {
+    reporter.counter("reverted");
+    return git.resetHard(snap);
+  };
+  // Findings surfaced but never auto-applied (classification propose-only + file-not-found).
+  if (rejected.length) reporter.counter("proposed", rejected.length);
 
   try {
     try {
@@ -547,6 +619,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     } catch (err) {
       return { ok: false, error: `could not open integration branch: ${String(err?.message ?? err)}` };
     }
+    reporter.phase("fix", `${tasks.length} targets`);
 
     // Oracle state (docs/enterprise-fix-design.md §6): none (no oracle) | disabled
     // (baseline not green / opted out) | active. Only gate when the tree is green to
@@ -558,6 +631,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
       let ok = false;
       for (let i = 0; i < ORACLE_BASELINE_TRIES && !ok; i += 1) ok = Boolean((await runOracle()).ok);
       oracleState = ok ? "active" : "disabled";
+      reporter.gate({ name: "oracle", target: oracleName, state: oracleState === "active" ? "pass" : "veto" });
       if (!ok) log(`oracle (${oracleName}) baseline not green after ${ORACLE_BASELINE_TRIES} tries — oracle gate disabled for this run`);
     }
 
@@ -571,6 +645,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         const source = readFile(task.file);
         if (source.length > MAX_FIX_BYTES) {
           rejected.push({ finding, reason: `file too large for safe auto-fix (${Math.round(source.length / 1024)}KB) — propose-only` });
+          reporter.counter("proposed");
           continue;
         }
         // Content-shape protection: skip BEFORE building the prompt so protected
@@ -578,13 +653,42 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         const cprot = contentProtectionReason(source);
         if (cprot) {
           rejected.push({ finding, reason: `protected by content: ${cprot}` });
+          reporter.counter("proposed");
           log(`  skipped — protected by content (${cprot})`);
           continue;
         }
         const prompt = buildFixPrompt(task.file, source, finding);
         log(`fix: ${finding.severity} ${task.file} — ${finding.title}`);
+        // §5 char-test ACCEPT (on the CLEAN tree, BEFORE the refactor): pin the target's behaviour with a
+        // generated, deterministic, non-vacuous test. Only for behaviour-preserving refactor classes; a
+        // correctness/security fix INTENDS to change behaviour and is not char-test-gated. Fail-closed:
+        // an eligible refactor whose behaviour can't be characterised stays propose-only.
+        let charAccepted = null;
+        if (charTestGate && charTestGate.eligible(finding)) {
+          try {
+            charAccepted = await withLimitRetry(() => charTestGate.accept({ file: task.file, source }));
+          } catch (err) {
+            // A FATAL poison-restore failure means the working tree MAY still hold a poisoned target —
+            // continuing would leak it into every later fix/review. Abort the whole run (fail-closed),
+            // do NOT downgrade to propose-only. An ordinary accept error stays propose-only.
+            if (err?.fatalPoison) {
+              fatalAbort = `§5 char-test poison-restore FATAL on ${task.file}: ${String(err?.message ?? err)}`;
+              failed.push({ finding, file: task.file, reason: fatalAbort });
+              log(`  ABORT — ${fatalAbort}`);
+              break;
+            }
+            charAccepted = { accepted: false, reason: `char-test accept error: ${String(err?.message ?? err)}` };
+          }
+          if (!charAccepted.accepted) {
+            rejected.push({ finding, reason: `§5 char-test: ${charAccepted.reason} → propose-only` });
+            reporter.counter("proposed");
+            log(`  propose-only — §5 char-test not accepted (${charAccepted.reason})`);
+            continue;
+          }
+          log(`  §5 char-test accepted — behaviour pinned; will verify preservation after the refactor`);
+        }
         try {
-          await applyFix(prompt, task, finding);
+          await withLimitRetry(() => applyFix(prompt, task, finding));
           const changed = git.changedFiles();
           if (!changed.length) {
             skipped.push({ finding, file: task.file, reason: "agent made no change" });
@@ -592,7 +696,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           }
           const guard = enforceTouched(changed, task.file);
           if (!guard.ok) {
-            git.resetHard(snapshot);
+            revert(snapshot);
             rejected.push({ finding, reason: `touched files outside target: ${guard.violations.join(", ")}` });
             log(`  reverted — touched ${guard.violations.join(", ")}`);
             continue;
@@ -603,7 +707,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           // couldn't have seen. Revert if it did.
           const cAfter = contentProtectionReason(afterSource);
           if (cAfter) {
-            git.resetHard(snapshot);
+            revert(snapshot);
             rejected.push({ finding, reason: `fix introduced protected content: ${cAfter}` });
             log(`  reverted — fix introduced protected content (${cAfter})`);
             continue;
@@ -615,7 +719,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           if (options.snapshotGate !== false) {
             const viol = snapshotViolation(source, afterSource);
             if (viol) {
-              git.resetHard(snapshot);
+              revert(snapshot);
               rejected.push({ finding, reason: `export surface changed (${viol})` });
               log(`  reverted — export surface changed (${viol})`);
               continue;
@@ -626,9 +730,14 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           // actually exercised. Uses coverage produced once before the run (options.coverage).
           if (options.coverage) {
             const changedLines = typeof git.diffLines === "function" ? git.diffLines(task.file, snapshot) : [];
-            const cov = coverageOfLines(options.coverage, task.file, changedLines);
+            // A pure DELETION has NO new/modified lines (git --unified=0 emits a 0-new-side hunk →
+            // parseDiffLines returns []). coverageOfLines([]) is fail-closed allCovered:false, which would
+            // revert EVERY deletion-only fix to propose-only with a self-contradictory "(0 uncovered)"
+            // reason. The sibling gates deliberately exempt deletions (audit-multifix guards `lines.length`,
+            // chartest only enforces coverage when new lines exist) — mirror them here (council audit P1/P2).
+            const cov = changedLines.length === 0 ? { allCovered: true, uncovered: [] } : coverageOfLines(options.coverage, task.file, changedLines);
             if (!cov.allCovered) {
-              git.resetHard(snapshot);
+              revert(snapshot);
               rejected.push({ finding, reason: `changed lines not executed by any test (${cov.uncovered.length} uncovered) → propose-only` });
               log(`  reverted — changed lines uncovered (coverage gate)`);
               continue;
@@ -644,7 +753,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               if (o.timedOut) {
                 log(`  oracle timed out — gate skipped for this fix`);
               } else {
-                git.resetHard(snapshot);
+                revert(snapshot);
                 rejected.push({ finding, reason: `oracle regression (${oracleName})` });
                 log(`  reverted — oracle regression (${oracleName})`);
                 continue;
@@ -654,22 +763,44 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           if (gated) {
             const t = await runTests();
             if (!t.ok) {
-              git.resetHard(snapshot);
+              revert(snapshot);
               failed.push({ finding, file: task.file, reason: t.timedOut ? "tests timed out after fix" : "tests failed after fix", output: String(t.output ?? "").slice(-800) });
               log("  reverted — tests failed");
               continue;
             }
+          }
+          // §5 char-test VERIFY (after the refactor, tree = post-fix): the pinned test must STILL pass
+          // (behaviour preserved) AND execute the now-known changed lines. A RED test means the refactor
+          // silently changed behaviour the existing suite didn't catch → revert to propose-only.
+          if (charAccepted?.accepted) {
+            const changedLines = typeof git.diffLines === "function" ? git.diffLines(task.file, snapshot) : [];
+            let verdict;
+            try {
+              verdict = await withLimitRetry(() => charTestGate.verify({ ...charAccepted, file: task.file, source: afterSource, changedLines }));
+            } catch (err) {
+              verdict = { pass: false, reason: `char-test verify error: ${String(err?.message ?? err)}` };
+            }
+            if (!verdict.pass) {
+              revert(snapshot);
+              rejected.push({ finding, reason: `§5 char-test: ${verdict.reason} → propose-only` });
+              log(`  reverted — §5 char-test failed (${verdict.reason})`);
+              continue;
+            }
+            log(`  §5 char-test verified — behaviour preserved across the refactor`);
           }
           // §6 council gate (LAST, after every mechanical gate is green): a sensitive-class
           // patch must be UNANIMOUSLY confirmed by the three council seats before it may
           // commit. Runs only under consented sensitiveAutoApply with an injected reviewer.
           // Dissent / a missing seat / a reviewer error all fail closed → revert → propose.
           let councilVerdict = null;
+          let councilCommitStaged = false;
           if (sensitiveAutoApply && isSensitiveClass(finding)) {
+            reporter.gate({ name: "§6-council", state: "running" });
             // The reviewers judge the EXACT patch; without a real diff we fail closed
             // rather than hand them the whole file as if it were the change.
             if (typeof git.diffText !== "function") {
-              git.resetHard(snapshot);
+              reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
+              revert(snapshot);
               rejected.push({ finding, reason: "§6 council: cannot produce a diff to review → propose-only" });
               log(`  reverted — §6 no diff available for council review`);
               continue;
@@ -677,16 +808,20 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             const diff = git.diffText(task.file, snapshot);
             let verdicts;
             try {
-              verdicts = await reviewPatch({ file: task.file, finding, diff, before: source, after: afterSource });
+              verdicts = await withLimitRetry(() => reviewPatch({ file: task.file, finding, diff, before: source, after: afterSource }));
             } catch (err) {
-              git.resetHard(snapshot);
+              reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
+              revert(snapshot);
               rejected.push({ finding, reason: `§6 council review error: ${String(err?.message ?? err)} → propose-only` });
               log(`  reverted — §6 council review error`);
               continue;
             }
-            councilVerdict = evaluatePatchVerdicts(verdicts);
+            // §6 unanimity over the SAME required set the reviewer ran (built-ins + configured
+            // OpenRouter seats) — an OR seat RAISES the bar and a missing vote vetoes (fail-closed).
+            councilVerdict = evaluatePatchVerdicts(verdicts, { required: requiredPatchSeats(backends, options) });
             if (!councilVerdict.approved) {
-              git.resetHard(snapshot);
+              reporter.gate({ name: "§6-council", state: "veto" });
+              revert(snapshot);
               rejected.push({ finding, reason: `§6 council not unanimous (${councilVerdict.summary}) → propose-only`, council: councilVerdict });
               log(`  reverted — §6 council not unanimous (${councilVerdict.summary})`);
               continue;
@@ -696,15 +831,43 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             // the reviewed bytes are stale — revert rather than commit something unseen.
             const postReview = enforceTouched(git.changedFiles(), task.file);
             if (!postReview.ok) {
-              git.resetHard(snapshot);
+              reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
+              revert(snapshot);
               rejected.push({ finding, reason: `§6 changed set drifted during review (${postReview.violations.join(", ")}) → propose-only`, council: councilVerdict });
               log(`  reverted — §6 changed set drifted during review`);
               continue;
             }
+            // Bind the commit to the EXACT bytes that WILL be committed. STAGE the target and
+            // compare its staged (index) diff to the reviewed diff, then commit that index —
+            // so an external writer changing the working tree between the check and the commit
+            // (a hook/concurrent process; same filename evades the touched-set check) cannot
+            // slip unreviewed bytes in. Falls back to a working-tree re-diff if an injected git
+            // lacks staging.
+            if (typeof git.stageAndDiffCached === "function" && typeof git.commitIndex === "function") {
+              if (git.stageAndDiffCached(task.file, snapshot) !== diff) {
+                reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
+                revert(snapshot);
+                rejected.push({ finding, reason: "§6 reviewed bytes changed during review (staged diff drift) → propose-only", council: councilVerdict });
+                log(`  reverted — §6 reviewed bytes drifted during review`);
+                continue;
+              }
+              councilCommitStaged = true;
+            } else if (git.diffText(task.file, snapshot) !== diff) {
+              reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
+              revert(snapshot);
+              rejected.push({ finding, reason: "§6 reviewed bytes changed during review (diff drift) → propose-only", council: councilVerdict });
+              log(`  reverted — §6 reviewed bytes drifted during review`);
+              continue;
+            }
+            reporter.gate({ name: "§6-council", state: "pass" });
             log(`  §6 council unanimous (${councilVerdict.summary}) — auto-apply approved`);
           }
-          const commit = git.commitFile(task.file, `audit-fix: ${finding.title} (${task.file})`);
+          const commit = councilCommitStaged
+            ? git.commitIndex(`audit-fix: ${finding.title} (${task.file})`)
+            : git.commitFile(task.file, `audit-fix: ${finding.title} (${task.file})`);
           fixed.push({ finding, file: task.file, commit, verified: gated, council: councilVerdict });
+          reporter.counter("fixed");
+          reporter.counter("committed");
           log(`  committed ${String(commit).slice(0, 8)}${gated ? " (tests green)" : " (UNVERIFIED)"}${councilVerdict ? " (§6 council ✓)" : ""}`);
         } catch (err) {
           // Any error in apply/enforce/gate/commit reverts this unit and is recorded.
@@ -713,7 +876,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           // could stage un-reviewed bytes. Abort the run and let it be reported stranded.
           let restored = true;
           try {
-            git.resetHard(snapshot);
+            revert(snapshot);
           } catch {
             restored = false;
           }
@@ -725,6 +888,50 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           }
           failed.push({ finding, file: task.file, reason: `fix error: ${String(err?.message ?? err)}` });
           log(`  reverted — ${String(err?.message ?? err)}`);
+        }
+      }
+    }
+
+    // M9 STRUCTURE PASS (opt-in, DOUBLE-consented): architecture_ssot / logical_sense findings are
+    // cross-cutting, so classifyFixable rejected them as propose-only above — the single-file writer
+    // could never apply a multi-file consolidation safely. deps.runStructureTransform (structure-wiring)
+    // now can: it plans the transform, applies it through the build-step machinery (declared file set =
+    // capability boundary, tests must stay green, §6 must be UNANIMOUS on the exact staged multi-file
+    // diff) and judges the result with evaluateStructureGate.
+    //
+    // FAIL-CLOSED + consent: nothing runs unless the transform runner is INJECTED *and* the operator set
+    // structureAutoApply === true (strict; a truthy string never grants it). structure-wiring itself
+    // enforces the SECOND consent (a structural finding that is also §6-sensitive additionally needs
+    // sensitiveAutoApply === true) and reverts on any gate failure. Without all of that, the finding
+    // stays exactly where it was: a visible proposal.
+    if (!fatalAbort && typeof deps.runStructureTransform === "function" && options.structureAutoApply === true) {
+      for (let i = rejected.length - 1; i >= 0; i -= 1) {
+        const entry = rejected[i];
+        if (!isStructureClass(entry?.finding)) continue;
+        const snapshot = git.head();
+        let res;
+        try {
+          res = await withLimitRetry(() => deps.runStructureTransform({ finding: entry.finding, snapshot }, { git, options, now: deps.now }));
+        } catch (err) {
+          res = { ok: false, reason: `structure transform error: ${String(err?.message ?? err)}` };
+        }
+        if (res?.stranded) {
+          fatalAbort = `structure transform left the tree unrestorable: ${res.reason ?? "unknown"}`;
+          log(`  ABORT — ${fatalAbort}`);
+          break;
+        }
+        if (res?.ok && res.commit) {
+          rejected.splice(i, 1); // it is no longer a proposal — it was applied under the full gate ladder
+          fixed.push({ finding: entry.finding, file: entry.finding.file ?? null, commit: res.commit, verified: true, structure: res.gates ?? null });
+          // This structural finding was already counted as "proposed" (the pre-loop rejected batch);
+          // now that it applied, undo that count so it isn't shown as BOTH proposed AND fixed.
+          reporter.counter("proposed", -1);
+          reporter.counter("fixed");
+          reporter.counter("committed");
+          log(`  structure transform applied (${String(res.commit).slice(0, 8)}) — §6 unanimous, tests green`);
+        } else {
+          entry.reason = `${entry.reason} · structure transform not applied: ${res?.reason ?? "gate not satisfied"}`;
+          log(`  structure transform NOT applied — ${res?.reason ?? "gate not satisfied"}`);
         }
       }
     }

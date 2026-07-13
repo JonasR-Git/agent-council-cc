@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { READONLY_DISALLOWED_TOOLS, runDeliberation } from "./lib/deliberate.mjs";
-import { councilPluginRoot, findGrokBinary, probeBackends } from "./lib/discover.mjs";
+import { councilPluginRoot, findClaudeBinary, findGrokBinary, probeBackends } from "./lib/discover.mjs";
 import {
   DEFAULT_POLICY,
   loadPolicy,
@@ -36,31 +36,47 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
-import { colorize, formatDashboard, formatDashboardMarkdown, summarizeCouncilExtras, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
+import { colorize, formatDashboard, formatDashboardMarkdown, pickFreshestWatchSource, readProgressState, renderProgressDashboard, summarizeCouncilExtras, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
+import { makeProgressReporter, mutedFindingsReporter } from "./lib/progress.mjs";
 import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
 import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs";
 import { activeReviewerCount, runAuditReview } from "./lib/audit-review.mjs";
+import { runGroupedReview } from "./lib/audit-grouped-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
 import { runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
+import { buildClaudeReviewArgs, makePatchReviewer, patchReviewerReady } from "./lib/audit-patch-reviewer.mjs";
 import { detectLogical } from "./lib/audit-logical.mjs";
 import { nodesFromGraph } from "./lib/import-graph.mjs";
 import { resolveAutonomy } from "./lib/audit-autonomy.mjs";
 import { reconcilePendingFixes } from "./lib/ledger.mjs";
 import { runEndless } from "./lib/audit-endless.mjs";
+import { runSupervised } from "./lib/supervisor.mjs";
 import { runAudit } from "./lib/audit-run.mjs";
 import { toSarif } from "./lib/audit-sarif.mjs";
-import { buildAgentResult, withTempPrompt } from "./lib/agents.mjs";
+import { buildAgentResult, runCodexStructured, runGrokStructured, runStructuredWithRetry, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { writeFixReportHtml } from "./lib/fix-report-html.mjs";
+import { assembleFixMeta, changedFilesShape } from "./lib/fix-report-meta.mjs";
+import { openRouterBackend, runOpenRouterStructured } from "./lib/openrouter-agent.mjs";
+import { makeCharTestGate } from "./lib/chartest-wiring.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
+import { runPlanDeliberation } from "./lib/plan-deliberate.mjs";
+import { isPlanTestPath, parsePlanSpec, planStepTouched, planSpecDigest, renderPlanMarkdown, validatePlanSpec } from "./lib/plan-spec.mjs";
+import { makeBuildGit, makeStepPorts, renderBuildReport, runBuild } from "./lib/build.mjs";
+import { buildReviewerReady, makeBuildStepReviewer } from "./lib/build-step-reviewer.mjs";
+import { activeSeatNames, makeSeatRunners, seatActive } from "./lib/seats.mjs";
+import { runStructureTransform } from "./lib/structure-wiring.mjs";
+import { snapshotViolation } from "./lib/audit-snapshot.mjs";
+import { buildPoisonedSource, changedLinesCovered } from "./lib/chartest-node-harness.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
 import {
   appendLogLine,
   archiveJobResults,
   createJobLogFile,
+  ensureStateDir,
   generateJobId,
   listAllJobsDirs,
   listJobs,
@@ -83,7 +99,16 @@ function printUsage() {
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
-      "  node scripts/council-companion.mjs audit [review] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
+      "  node scripts/council-companion.mjs plan <feature-request> [--synthesizer <seat>] [--json]   (multi-model design deliberation → a validated PlanSpec; READ-ONLY)",
+      "  node scripts/council-companion.mjs build --from <plan.json> [--dry-run] [--json]   (autonomous test-gated build of a PlanSpec on an isolated branch; never auto-merged)",
+      "  node scripts/council-companion.mjs audit run|review|fix|endless [flags] (see below)",
+      "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
+      "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
+      "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--structure-auto-apply] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
+      "    audit fix --loop [--supervise] [--flat] [--chartest] [--max-passes <n>] [--dry-streak <n>] [--resume] [--allow-untested]   (autonomous fix-until-dry on an isolated branch)",
+      "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume]   (bounded review/propose loop)",
+      "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
+      "  node scripts/council-companion.mjs cancel [job-id]",
       "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
       "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
       "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
@@ -97,7 +122,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs worktree add|remove|list <slug> [--base <ref>] [--force]",
       "",
       "Flags:",
-      "  --wait|--background  --base <ref>  --scope auto|working-tree|branch",
+      "  --background  --base <ref>  --scope auto|working-tree|branch",
       "  --codex-model <id>  --grok-model <id>  --codex-effort <l>  --grok-effort <l>",
       "  --skip-codex  --skip-grok  --claude-findings <path>  --claude-findings-wait <path>",
       "  --wait-timeout <seconds>  --peer-severities P0,P1  --debate-rounds 0|1|2  --debate-resume",
@@ -114,6 +139,61 @@ function printUsage() {
       "Models default from policy or ~/.codex/config.toml + ~/.grok/config.toml"
     ].join("\n")
   );
+}
+
+// The reporter of the run currently in flight (each CLI process runs exactly one command), so a
+// throw that escapes a handler can still be marked terminal — otherwise progress.json stays
+// done:false forever and `council watch` hangs on a dead run. A handler that finishes normally has
+// already called reporter.done(), so the flush below is an idempotent no-op on the success path.
+let __activeRunReporter = null;
+
+/**
+ * If the in-flight run's reporter never reached a terminal state (its handler threw before calling
+ * done()), mark it aborted so watchers stop. Best-effort + idempotent: a run that already finished
+ * (snapshot().done) is left untouched. NEVER throws — telemetry must not perturb the exit path.
+ */
+function flushActiveRunReporter() {
+  const reporter = __activeRunReporter;
+  __activeRunReporter = null;
+  if (!reporter) return;
+  try {
+    if (!reporter.snapshot()?.done) reporter.done({ ok: false, stopReason: "aborted" });
+  } catch {
+    /* fail-soft: a telemetry flush must never change the outcome or exit code */
+  }
+}
+
+/**
+ * Whether an endless review run finished cleanly. It is ok unless it stopped on an error / did-not-run
+ * / failed reason (a review-error stopReason must not report the dashboard green). Mirrors how plan/build
+ * derive `ok` from the outcome rather than hardcoding true. Pure + exported for unit tests.
+ */
+export function endlessRunOk(stopReason) {
+  return !/error|did not run|failed/i.test(String(stopReason ?? ""));
+}
+
+/**
+ * One progress reporter per long-running command, writing the current-run `progress.json` slot in
+ * this workspace's state dir (the universal live-dashboard contract read by `council watch`). In a
+ * non-json run it forwards every line to stderr byte-identically to the old inline `onProgress` AND
+ * persists it; in a --json run the sink is silent but progress.json is STILL written (a JSON/file
+ * consumer can watch it). Best-effort: the reporter is fail-soft, so a plain call never affects the
+ * command's outcome. Non-json runs also print a one-line pointer to the live dashboard.
+ */
+function makeRunReporter(cwd, { kind, title, jobId = null, json = false }) {
+  const stateDir = resolveStateDir(cwd);
+  const reporter = makeProgressReporter({
+    kind,
+    title,
+    jobId,
+    stateDir,
+    logSink: json ? () => {} : (m) => console.error(m)
+  });
+  if (!json) {
+    console.error(`  ▶ live dashboard: council watch${jobId ? ` ${jobId}` : ""}  (add --md for a chat snapshot)`);
+  }
+  __activeRunReporter = reporter; // register so a thrown handler still marks the run terminal (see main())
+  return reporter;
 }
 
 function normalizeArgv(argv) {
@@ -293,7 +373,11 @@ function scaffoldPolicyFile(cwd, options) {
   const claudeModel = sanitizeModelValue(options["claude-model"], "--claude-model");
   const codexModel = sanitizeModelValue(options["codex-model"], "--codex-model");
   const grokModel = sanitizeModelValue(options["grok-model"], "--grok-model");
-  const defaultMode = options["default-mode"] === "review" ? "review" : "deliberate";
+  // default_mode is currently INFORMATIONAL only: no code path reads policy.default_mode to pick a mode
+  // (the slash commands dispatch via explicit --quick/--adversarial/--loop flags). Default to
+  // DEFAULT_POLICY's own value so an un-flagged scaffold doesn't silently diverge from it (council
+  // companion-cli nit).
+  const defaultMode = options["default-mode"] === "deliberate" ? "deliberate" : DEFAULT_POLICY.default_mode;
 
   const contents = [
     "# Council policy. Unknown keys are ignored; re-run /council:setup --init to regenerate.",
@@ -355,7 +439,10 @@ function buildCodexReviewArgs(options, adversarial, focusText) {
   if (options.base) args.push("--base", options.base);
   if (options.scope) args.push("--scope", options.scope);
   if (codexModel) args.push("--model", codexModel);
-  if (adversarial && focusText) args.push(focusText);
+  // Forward the focus text regardless of mode - plain review/--quick must honor it too, not only
+  // adversarial (council companion-cli P2: it was silently dropped for the companion path while the
+  // grok CLI-direct fallback honored it, so identical commands behaved differently by installed backend).
+  if (focusText) args.push(focusText);
   return args;
 }
 
@@ -366,7 +453,7 @@ function buildGrokReviewArgs(options, adversarial, focusText) {
   if (options.scope) args.push("--scope", options.scope);
   if (grokModel) args.push("--model", grokModel);
   if (grokEffort) args.push("--effort", grokEffort);
-  if (adversarial && focusText) args.push(focusText);
+  if (focusText) args.push(focusText);
   return args;
 }
 
@@ -666,6 +753,9 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
 
   if (deliberate) {
     appendLogLine(job.logFile, "Deliberate protocol: R1 independent -> R2 peer critique");
+    // Phase 2: live-dashboard reporter for the deliberation (phase per R1/R2/verify/debate milestone,
+    // threaded ALONGSIDE the existing job phase reporter — see runDeliberation's onPhase wrapper).
+    const reporter = makeRunReporter(cwd, { kind: "deliberate", title: "council deliberate", jobId: job.id, json: Boolean(options.json) });
     const deliberation = await runDeliberation(cwd, backends, {
       ...mergedOpts,
       skipCodex: mergedOpts.skipCodex,
@@ -682,10 +772,12 @@ async function executeCouncilReview(cwd, options, existingJob = null) {
       jobId: job.id,
       nowIso: nowIso(),
       nowMs: Date.now(),
+      reporter,
       onPhase: makePhaseReporter(root, job)
     });
     const r1Failed = deliberation.r1.some((r) => !r.skipped && r.status !== 0);
     const allSkipped = deliberation.r1.every((r) => r.skipped && r.agent !== "claude");
+    reporter.done({ ok: !allSkipped });
     // Agents can exit 0 with unparsable JSON - that must not look like success.
     const r1ParseFailures = deliberation.r1.filter(
       (r) => !r.skipped && r.findings && r.findings.parseOk === false
@@ -826,6 +918,10 @@ async function handleReview(argv, adversarial, deliberate = false, solve = false
       "claude-model",
       "cwd"
     ],
+    // "wait" is accepted (but unused) for backward compatibility with docs/slash-commands that mention
+    // --wait as the (default) opposite of --background - omitting --background already waits
+    // synchronously, so it is intentionally a no-op rather than an unknown-flag error (council
+    // companion-cli nit).
     booleanOptions: ["json", "background", "wait", "skip-codex", "skip-grok", "skip-claude", "debate-resume", "force-budget", "resume", "verify"]
   });
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
@@ -1658,10 +1754,23 @@ async function handleWatch(argv) {
   });
   const cwd = process.cwd();
   const root = workspaceRoot(cwd);
-  const jobId = positionals[0] ?? listJobs(root)[0]?.id;
-  if (!jobId) throw new Error("No council jobs found.");
-  let job = readJobFile(root, jobId);
-  if (!job) throw new Error(`Job not found: ${jobId}`);
+  const requestedId = positionals[0];
+  let job = requestedId ? readJobFile(root, requestedId) : null;
+  if (requestedId && !job) throw new Error(`Job not found: ${requestedId}`);
+
+  // Phase 2: with no explicit job requested, watch the FRESHEST source. Every long-running command
+  // now writes a universal progress.json; a stale legacy job must not shadow a live run.
+  if (!requestedId) {
+    const prog = readProgressState(resolveStateDir(cwd));
+    const latestId = listJobs(root)[0]?.id;
+    job = latestId ? readJobFile(root, latestId) : null;
+    if (pickFreshestWatchSource(prog, job).kind === "progress") {
+      await watchProgress(cwd, prog, options);
+      return;
+    }
+  }
+  if (!job) throw new Error("No council jobs found.");
+  const jobId = job.id;
   const ctx = watchContext(cwd, job); // computed once - stable across redraws
 
   if (options.json) {
@@ -1708,20 +1817,174 @@ async function handleWatch(argv) {
   }
 }
 
+/**
+ * Watch the universal progress.json (Phase 2) — the fallback path for `council watch` when there is
+ * no legacy job. Mirrors handleWatch's json / --md / --once / TTY-loop shape, but renders the
+ * kind-agnostic dashboard (renderProgressDashboard, TOTAL/never-throws) and re-reads the file each
+ * interval, terminating on `prog.done`. `initial` is the state that was present when the fallback
+ * fired; a subsequent read failure falls back to it rather than blanking the screen.
+ */
+async function watchProgress(cwd, initial, options) {
+  const stateDir = resolveStateDir(cwd);
+  const reread = () => readProgressState(stateDir) ?? initial;
+
+  if (options.json) {
+    const prog = reread();
+    outputResult({ kind: prog?.kind ?? null, done: Boolean(prog?.done), dashboard: renderProgressDashboard(prog, { nowMs: Date.now() }) }, true);
+    return;
+  }
+  if (options.md) {
+    console.log(renderProgressDashboard(reread(), { md: true, nowMs: Date.now() }));
+    return;
+  }
+  const paint = (s) => (process.stdout.isTTY ? colorize(s) : s);
+  // Single snapshot for --once or non-TTY stdout (no live redraw).
+  if (options.once || !process.stdout.isTTY) {
+    const prog = reread();
+    console.log(paint(renderProgressDashboard(prog, { nowMs: Date.now() })));
+    if (!prog?.done) console.log("\n(snapshot; re-run or use a TTY for a live view)");
+    return;
+  }
+  const intervalMs = secondsToMs(options.interval, "--interval") ?? 2000;
+  const timeoutMs = secondsToMs(options.timeout, "--timeout") ?? 3_600_000;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const prog = reread();
+    process.stdout.write(`\x1b[2J\x1b[H${paint(renderProgressDashboard(prog, { nowMs: Date.now() }))}\n`);
+    if (prog?.done) return;
+    if (Date.now() >= deadline) {
+      console.log(`\nwatch timed out after ${Math.round(timeoutMs / 1000)}s (progress still running).`);
+      process.exitCode = 1;
+      return;
+    }
+    await delay(intervalMs);
+  }
+}
+
 // Whole-project audit. `audit` (default) is static: it builds the codebase model
 // and emits CANDIDATE findings + hotspots + coverage, reading source only. Writes
 // are opt-in: --write-map writes docs/codebase-map.json and --doc writes the
 // proposal doc (both under the project root). `audit review` additionally runs
 // Codex/Grok over the hotspots — those reviewers are prompted read-only, but they
 // are external CLIs whose sandboxing this command cannot itself enforce. Reviewed
-// code is never auto-edited here. See docs/audit-design.md; the safe --fix agent
-// team is a later phase.
+// code is never auto-edited here. See docs/audit-design.md. NOTE: `audit fix` /
+// `audit fix --loop` (below, M3+) DO write gated fixes on an isolated integration
+// branch; only `audit` (static) and `audit review` are read-only.
+// Conservative CLI cell cap for `audit review --groups` (the library backstop is 4000). A default
+// fine run is ~1080 cells; this caps an accidental fan-out while still covering a normal run — raise
+// it explicitly with --max-cells (a capped run reports PARTIAL coverage, never silently truncates).
+const GROUPED_CLI_DEFAULT_MAX_CELLS = 1500;
+
+// Attach the OpenRouter backend to a probed `backends`. The API key is NEVER taken from the repo policy
+// file: openRouterBackend is called with a null user-key arg, so the key can come ONLY from the user's
+// ENV var (council OpenRouter Claude/Grok P1). A repo-supplied openrouter_api_key is ignored + warned.
+// Any resolution warnings (a base_url refused by the exfil guard, a dropped/duplicate/over-cap model)
+// are surfaced so the operator isn't silently missing a seat.
+function attachOpenRouterSeats(backends, merged, policy, json) {
+  // --skip-openrouter is a TRUE opt-out (council Codex/Claude P1): zero out the backend so the OR seats
+  // participate NOWHERE — not as finders, not as §6 reviewers, not as refuters. Merely reducing the §6
+  // required-vote SUBSET would still POST the patch + reviewed source to every configured OR seat during
+  // patch review (the reviewer is a superset), so a security opt-out MUST remove the seats at the source.
+  if (merged.skipOpenRouter) {
+    backends.openrouter = { available: false, seats: [], baseURL: null, apiKeyEnv: null, apiKeyPresent: false, keySource: null, warnings: [] };
+    return;
+  }
+  // SECURITY (council OpenRouter Claude P1): the policy comes from the AUDITED repo, so a repo-supplied
+  // API key must NEVER activate/redirect egress. Pass NO config key — the key comes only from the user's
+  // ENV var (or a future user-typed CLI flag). Warn loudly if a repo file tried to set one.
+  const repoKey = policy?.openrouter_api_key ?? policy?.openrouter?.apiKey ?? null;
+  if (repoKey && !json) console.error("⚠ openrouter: an API key in the repo policy file is IGNORED for security — set it via the OPENROUTER_API_KEY environment variable instead (a repo-supplied key would ship your source to that key's account).");
+  const backend = openRouterBackend(merged, process.env, null);
+  // A per-seat skip list (--skip-seats or policy skip_seats) also removes those seats from the backend so
+  // they egress nowhere, matching --skip-openrouter's guarantee at seat granularity.
+  const skip = new Set(merged.skipSeats ?? []);
+  if (skip.size) backend.seats = backend.seats.filter((s) => !skip.has(s.id));
+  backends.openrouter = backend;
+  if (!json) for (const w of backend.warnings ?? []) console.error(`⚠ openrouter: ${w}`);
+}
+
+// Build the §5 char-test gate for a fix run, or null when --chartest is off. Fail-LOUD when the flag IS
+// set but no generator seat can write tests (council Grok P1): otherwise makeCharTestGate returns null,
+// runAuditFix silently skips the gate, and behaviour-preserving refactors auto-apply UNGATED while the
+// operator believes --chartest is protecting them. Erroring up front (before any spend) is the honest fix.
+function resolveCharTestGate(cwd, backends, merged, options) {
+  if (!options.chartest) return null;
+  const gate = makeCharTestGate(cwd, backends, merged);
+  if (!gate) throw new Error("--chartest requires a reachable generator seat (Claude/Codex/Grok/OpenRouter) to write characterization tests — none is available; fix a backend or drop --chartest");
+  return gate;
+}
+
+// A12: per-seat TOKEN telemetry. collectAllTokenUsage parses the CLIs' on-disk session logs, so a run's
+// own consumption is the DELTA of a snapshot taken before and after it (fix-metrics.tokenDelta). Two
+// invariants:
+//  - BOTH snapshots must use the SAME `sinceMs` bound. A Date.now()-relative window recomputed for the
+//    second call would shift, drop older sessions from one side only, and corrupt the delta — so the
+//    bound is computed ONCE per run and threaded through.
+//  - FAIL-SOFT + FAIL-CLOSED: an unreadable session log yields null, and a null snapshot makes the report
+//    say "not measured" (cost.tokensMeasured=false) instead of claiming the run cost $0.
+// The window bounds the scan (session logs accumulate forever); anything a fix run touches was written by
+// this run or by a recent session, so 30 days is generously wide.
+const TOKEN_SNAPSHOT_WINDOW_MS = 30 * 86_400_000;
+
+function tokenSnapshot(sinceMs) {
+  try {
+    return collectAllTokenUsage({ homeDir: os.homedir(), sinceMs });
+  } catch {
+    return null; // → tokensMeasured:false, never a false $0
+  }
+}
+
+// Assemble the fix-report telemetry meta (metrics + before→after codebase shape). FAIL-SOFT: any git
+// error just omits the shape — a telemetry report must never break a completed fix run. Only called on
+// --html. The before/after shape is bounded to the CHANGED files (a fix touches a small set).
+async function computeFixReportMeta(cwd, out, ctx = {}) {
+  let shapeBefore;
+  let shapeAfter;
+  let numstat;
+  try {
+    const changed = Array.isArray(out?.changedFiles) ? out.changedFiles : [];
+    const base = out?.baseBranch;
+    const head = out?.branch;
+    if (changed.length && base && head) {
+      const cache = new Map();
+      for (const ref of [base, head]) {
+        for (const f of changed) {
+          const r = await runCommandAsync("git", ["show", `${ref}:${f}`], { cwd, timeoutMs: 15_000 });
+          cache.set(`${ref}:${f}`, r.status === 0 ? r.stdout : "");
+        }
+      }
+      const shapes = changedFilesShape(changed, base, head, (ref, p) => cache.get(`${ref}:${p}`));
+      shapeBefore = shapes.before;
+      shapeAfter = shapes.after;
+      const ns = await runCommandAsync("git", ["diff", "--numstat", `${base}..${head}`], { cwd, timeoutMs: 15_000 });
+      numstat = ns.status === 0 ? ns.stdout : undefined;
+    }
+  } catch {
+    /* fail-soft — omit the shape section */
+  }
+  return assembleFixMeta(out, { ...ctx, shapeBefore, shapeAfter, numstat });
+}
+
 async function handleAudit(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "html"]
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats"],
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest"]
   });
   const cwd = process.cwd();
+  // Validate the grouped-review preset + cap ONCE, up front — before any preflight/coverage/spend, for
+  // EVERY audit subcommand (council R9 Codex P2 fail-fast + one-shot consistency). resolveLensGroups
+  // also throws downstream, but a typo shouldn't first run a long coverage job or a review.
+  if (options.groups != null && !["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
+  if (options["max-cells"] != null) {
+    const nmc = Number(options["max-cells"]);
+    if (!Number.isFinite(nmc) || nmc < 1) throw new Error("--max-cells must be a positive number");
+  }
+  // M8 completeness critic (opt-in): only the GROUPED path (--groups) runs a cell matrix the critic can
+  // judge, so the flag is inert without it — warn rather than silently ignore (council fail-loud habit).
+  const completenessCritic = Boolean(options["completeness-critic"]);
+  if (completenessCritic && !options.groups && !options.json) {
+    console.error("note: --completeness-critic has no effect without --groups (it augments the grouped six-eyes matrix); ignoring for this run");
+  }
   const areas = options.areas ? String(options.areas).split(",").map((s) => s.trim()).filter(Boolean) : undefined;
   let churnDays = 90;
   if (options["churn-days"] != null) {
@@ -1745,7 +2008,9 @@ async function handleAudit(argv) {
   // the project root). Reuses the review engine; does not touch the other subcommands.
   if (positionals[0] === "run") {
     const backends = probeBackends(cwd, ROOT_DIR);
-    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    const _orPolicy = loadPolicy(cwd);
+    const merged = mergeOptionsWithPolicy(options, _orPolicy);
+    attachOpenRouterSeats(backends, merged, _orPolicy, options.json); // OpenRouter seats (if configured) join the six-eyes
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
     const tRun = Date.now();
     const report = await runAudit(cwd, model, backends, {
@@ -1783,16 +2048,55 @@ async function handleAudit(argv) {
 
   if (positionals[0] === "review") {
     const backends = probeBackends(cwd, ROOT_DIR);
-    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    const _orPolicy = loadPolicy(cwd);
+    const merged = mergeOptionsWithPolicy(options, _orPolicy);
+    attachOpenRouterSeats(backends, merged, _orPolicy, options.json); // OpenRouter seats (if configured) join the six-eyes
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
     const t0 = Date.now();
-    const out = await runAuditReview(cwd, model, backends, {
-      ...merged,
-      budget,
-      maxUnits,
-      skipCodex: merged.skipCodex,
-      skipGrok: merged.skipGrok
-    });
+    // --groups <preset> (M7): opt into the six-eyes GROUPED path — every (module × lens-group ×
+    // chunk) CELL is reviewed by all reachable seats, coverage measured cell-granularly. The default
+    // per-file path is unchanged. --max-cells bounds the matrix (overflow is reported, never silent).
+    let out;
+    // Phase 2: the live-dashboard reporter for `audit review` (per-file OR grouped). onProgress is
+    // reporter.line so today's stderr stays byte-identical (non-json) AND is now persisted.
+    const reporter = makeRunReporter(cwd, { kind: "audit-review", title: "audit review", json: options.json });
+    if (options.groups) {
+      // Grouped cost is bounded by CELLS, not the agent-call --budget. A default fine run is already
+      // ~1080 cells (12 files × 30 groups × 3 seats); the library backstop is 4000. Use a lower CLI
+      // default so an accidental run can't fan out thousands of paid spawns, and warn that --budget
+      // has no effect here (council 3/3: Grok/Codex P1, Claude nit).
+      let maxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
+      if (options["max-cells"] != null) {
+        const n = Number(options["max-cells"]);
+        if (!Number.isFinite(n) || n < 1) throw new Error("--max-cells must be a positive number");
+        maxCells = Math.floor(n);
+      }
+      if (options.budget != null && !options.json) {
+        console.error("note: --budget does not bound --groups (grouped cost is bounded by --max-cells); ignoring --budget for this run");
+      }
+      out = await runGroupedReview(cwd, model, backends, {
+        ...merged,
+        maxUnits,
+        lensGroups: String(options.groups),
+        maxCells,
+        completenessCritic, // M8: opt-in thoroughness critic (adds 1 call; surfaces coverage gaps)
+        skipCodex: merged.skipCodex,
+        skipGrok: merged.skipGrok,
+        reporter,
+        onProgress: reporter.line
+      });
+    } else {
+      out = await runAuditReview(cwd, model, backends, {
+        ...merged,
+        budget,
+        maxUnits,
+        skipCodex: merged.skipCodex,
+        skipGrok: merged.skipGrok,
+        reporter,
+        onProgress: reporter.line
+      });
+    }
+    reporter.done({ ok: true });
     recordAuditMetrics(cwd, "review", { wallClockMs: Date.now() - t0, findings: out.findings.length, coverage: out.coverage }, nowIso());
     if (options.doc) {
       const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: "deep review" }, { docPath: options["doc-path"] });
@@ -1811,7 +2115,9 @@ async function handleAudit(argv) {
   // Findings come from --from <json> (a prior review) or a fresh review run.
   if (positionals[0] === "fix") {
     const backends = probeBackends(cwd, ROOT_DIR);
-    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    const _orPolicy = loadPolicy(cwd);
+    const merged = mergeOptionsWithPolicy(options, _orPolicy);
+    attachOpenRouterSeats(backends, merged, _orPolicy, options.json); // OpenRouter seats (if configured) join the six-eyes
     const { budget, maxUnits } = parseAuditBudgetOptions(options);
 
     // Autonomy dial (M4): resolve the level -> commit/propose gate, shared by the loop
@@ -1823,6 +2129,21 @@ async function handleAudit(argv) {
       fixMinSeverity = (SEVRANK[options["min-severity"]] ?? 2) <= (SEVRANK[auto.minSeverity] ?? 2) ? options["min-severity"] : auto.minSeverity;
     }
     if (!auto.apply && !options["dry-run"]) throw new Error("--autonomy propose-only: use `audit run` for a review-only pass (audit fix applies fixes)");
+
+    // M9 structure transform (opt-in --structure-auto-apply, strict === true): the ONE door to the
+    // multi-file structure transform (structure-wiring.mjs). Applies to BOTH the single-shot and the
+    // --loop path. Without the flag, NOTHING is threaded — the default runAuditFix options/deps stay
+    // byte-identical and structural findings remain propose-only proposals, exactly as before.
+    const structureAutoApply = options["structure-auto-apply"] === true;
+    if (structureAutoApply) {
+      console.error(
+        "M9 structure auto-apply ENABLED — cross-cutting architecture_ssot/logical_sense findings may be applied AUTONOMOUSLY as MULTI-FILE consolidations. Every transform must clear the full ladder (plan-declared file boundary, full test suite green, public API provably unchanged, UNANIMOUS §6 council over the exact staged multi-file diff) or it is reverted to a proposal."
+      );
+      console.error(
+        "⚠ SECURITY: the transform planner/author and the §6 reviewers run LLM CLIs inside this repository. --structure-auto-apply does NOT imply --sensitive-auto-apply — a structural finding that is ALSO §6-sensitive still needs BOTH consents. Enable --structure-auto-apply ONLY on repositories you trust."
+      );
+    }
+    const structureTransformRunner = structureAutoApply ? makeStructureTransformRunner(workspaceRoot(cwd), cwd, backends, merged) : null;
 
     // `audit fix --loop` (M3): the autonomous fix-until-dry loop. Reviews -> Tier-0
     // gates -> fixes the localized set on ONE isolated branch -> re-scopes to the blast
@@ -1882,11 +2203,34 @@ async function handleAudit(argv) {
         if (!Number.isFinite(n) || n < 1) throw new Error("--dry-streak must be a positive number");
         dryStreak = Math.floor(n);
       }
-      let loopBudget = 60; // the loop's OWN default (not the single-pass review default)
+      // R9: --groups drives the loop off the GROUPED six-eyes review (cell-granular coverage feeds the
+      // convergence guard). Validate the preset + cap up front so a bad value fails before any spend.
+      let loopLensGroups;
+      let loopMaxCells;
+      if (options.groups) {
+        if (!["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
+        loopLensGroups = String(options.groups);
+        loopMaxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
+        if (options["max-cells"] != null) {
+          const nc = Number(options["max-cells"]);
+          if (!Number.isFinite(nc) || nc < 1) throw new Error("--max-cells must be a positive number");
+          loopMaxCells = Math.floor(nc);
+        }
+      }
+      // The loop budget is in AGENT CALLS. A per-file pass is a handful; a GROUPED pass is up to
+      // maxCells calls, so a grouped loop's budget must be CELL-SCALE — else one pass blows the 60
+      // default and the loop stops after a single pass (council Grok R9). Default a grouped run to ~4
+      // passes' worth of cells, and raise the ceiling accordingly. The per-pass cell dispatch is capped
+      // to the remaining budget (makeFixLoopDeps), so this bounds total spend honestly.
+      const budgetMax = loopLensGroups ? Math.max(2000, loopMaxCells * 20) : 2000;
+      let loopBudget = loopLensGroups ? loopMaxCells * 4 : 60;
       if (options.budget != null) {
         const n = Number(options.budget);
-        if (!Number.isFinite(n) || n < 2 || n > 2000) throw new Error("--budget must be between 2 and 2000");
+        if (!Number.isFinite(n) || n < 2 || n > budgetMax) throw new Error(`--budget must be between 2 and ${budgetMax}`);
         loopBudget = Math.floor(n);
+      }
+      if (loopLensGroups && !options.json) {
+        console.error(`note: --groups prices each review cell as one agent call; the loop budget is ${loopBudget} cells total (each pass reviews up to min(--max-cells ${loopMaxCells}, its per-pass budget)). Raise --budget for deeper coverage / more passes.`);
       }
 
       // Coverage gate (§5): produce coverage ONCE via a project script and ingest it, so
@@ -1909,33 +2253,155 @@ async function handleAudit(argv) {
       } catch {
         /* Tier-0 detection is best-effort */
       }
+      // §6 council-gated auto-apply (consented via --sensitive-auto-apply). Needs all
+      // three seats reachable so the gate can reach unanimity; otherwise warn + keep
+      // sensitive findings propose-only (fail-safe, never a silent never-approve).
+      let sensitiveAutoApply = false;
+      let reviewPatch;
+      if (options["sensitive-auto-apply"]) {
+        const ready = patchReviewerReady(backends, merged);
+        if (ready.ready) {
+          sensitiveAutoApply = true;
+          reviewPatch = makePatchReviewer(cwd, backends, {
+            // CLI flag wins, else the policy-configured model (exposed camelCase by
+            // mergeOptionsWithPolicy) — don't silently drop policy model pins.
+            claudeModel: merged["claude-model"] ?? merged.claudeModel,
+            codexModel: merged["codex-model"] ?? merged.codexModel,
+            grokModel: merged["grok-model"] ?? merged.grokModel,
+            agentTimeoutMs: merged.agentTimeoutMs
+            // NOTE (council OpenRouter Grok P2): deliberately no skip flags here → the reviewer runs the
+            // SUPERSET of configured seats. runAuditFix's gate computes requiredPatchSeats(backends,
+            // options) as a SUBSET (honoring --skip-openrouter). Superset-reviewer ⊇ subset-required
+            // means every required seat is always present in the votes → no false veto, and
+            // evaluatePatchVerdicts ignores votes from non-required seats → no false approve.
+          });
+          console.error("§6 council-gated auto-apply ENABLED — sensitive fixes require UNANIMOUS Claude+Codex+Grok confirmation of the patch.");
+          console.error("⚠ SECURITY: the §6 reviewers run LLM CLIs inside this repository. Project hooks/settings still fire. Enable --sensitive-auto-apply ONLY on repositories you trust.");
+        } else {
+          // Name the ACTUAL unreachable seats, derived from every per-seat flag ready reports (built-ins
+          // AND any configured or-* seat) — not a hardcoded three (council Codex P2). Otherwise an
+          // OpenRouter seat being down prints "seats unreachable ()" and misdiagnoses the veto.
+          const missing = Object.keys(ready).filter((s) => s !== "ready" && !ready[s]);
+          console.error(`⚠ --sensitive-auto-apply requested but seats unreachable (${missing.join(", ")}) — §6 stays propose-only.`);
+        }
+      }
+      // Phase 2: ONE reporter for the whole fix-loop run. It rides into makeFixLoopDeps (so each
+      // pass's runAuditReview feeds the live lens table + unit progress AND runAuditFix feeds the
+      // fix counters/gate) and into loopOpts (so runFixLoop emits pass-level phase/progress) — all
+      // onto the same progress.json slot.
+      const reporter = makeRunReporter(cwd, { kind: "audit-fix-loop", title: "audit fix --loop", json: options.json });
       const deps = makeFixLoopDeps(cwd, model, backends, {
         maxUnits,
         minSeverity: fixMinSeverity,
         allowUntested: options["allow-untested"],
         coverage,
         verdictMap: logical.verdictMap,
+        lensGroups: loopLensGroups,
+        maxCells: loopMaxCells,
+        completenessCritic: completenessCritic && Boolean(loopLensGroups), // M8: only on the grouped loop
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
-        claudeModel: merged["claude-model"]
-      });
+        skipClaude: merged.skipClaude, // B2 (grok-1): honor the Claude opt-out in the fix loop too
+        // Thread the OpenRouter opt-outs so the §6 gate's requiredPatchSeats HONORS --skip-openrouter /
+        // per-seat skips in the LOOP path too (council OpenRouter Claude P2) — else a skipped OR seat
+        // would still be REQUIRED and veto every patch. The reviewer stays a superset; only the required
+        // SET shrinks, and evaluatePatchVerdicts ignores the non-required OR votes.
+        skipOpenRouter: merged.skipOpenRouter,
+        skipSeats: merged.skipSeats ?? options.skipSeats,
+        // §5 char-test gate (opt-in --chartest): behaviour-preserving refactors must keep a generated
+        // characterization test green across the change, else revert to propose-only. null when off;
+        // fail-loud when requested but no generator seat is reachable (never silently ungated).
+        charTestGate: resolveCharTestGate(cwd, backends, merged, options),
+        claudeModel: merged["claude-model"] ?? merged.claudeModel,
+        sensitiveAutoApply,
+        reviewPatch,
+        retryOnLimit: options["retry-on-limit"],
+        // The TRUE base branch, captured before the loop. On pass 2+ the process is ON the
+        // integration branch, so runAuditFix's git.currentBranch() would ledger the fix's baseBranch
+        // as the integration branch — reconcilePendingFixes then trivially finds the commit an
+        // ancestor and falsely promotes it to durable 'fixed' though it was never merged to base
+        // (council Opus O7). Pin the real base for the ledger.
+        ledgerBaseBranch: baseBranch,
+        reporter // Phase 2: threaded into the review + fix closures (see makeFixLoopDeps)
+      }, structureTransformRunner ? {
+        // M9: every loop pass fixes through runAuditFix — thread the structure consent + the
+        // transform runner into EACH pass exactly like the single-shot path does (mirrors how
+        // sensitiveAutoApply/reviewPatch ride the options above; makeFixLoopDeps itself threads
+        // only the §6 keys, so this impl seam is the loop's door). Absent the flag, no impl is
+        // passed at all and the loop's fix calls stay byte-identical.
+        runAuditFix: (fixCwd, fixFindings, fixBackends, fixOptions, fixDeps) =>
+          runAuditFix(fixCwd, fixFindings, fixBackends, { ...fixOptions, structureAutoApply: true }, { ...fixDeps, runStructureTransform: structureTransformRunner })
+      } : {});
       const tLoop = Date.now();
-      const out = await runFixLoop(cwd, { budget: loopBudget, maxPasses, dryStreak, maxUnits, resume: options.resume, perTierConvergence: options["per-tier"], logicalProposals: logical.findings, onProgress: options.json ? undefined : (m) => console.error(m) }, deps);
-      // Return to the base branch after the final pass (fix stayed on the integration
-      // branch); report if the checkout couldn't complete so the user isn't stranded silently.
+      // A12: bracket the loop with a token snapshot so the --html report can diff it into per-seat tokens
+      // + an ≈cost. Only taken when a report will consume it (the scan reads session logs); the same
+      // `sinceMs` bound is reused for the AFTER snapshot below.
+      const loopTokenSince = Date.now() - TOKEN_SNAPSHOT_WINDOW_MS;
+      const loopTokensBefore = options.html ? tokenSnapshot(loopTokenSince) : null;
+      // B5: per-tier convergence (structure → correctness → quality) is ON by default so a
+      // Structure/SSOT consolidation lands before Correctness runs on the consolidated code; --flat
+      // opts out (single flat convergence). --per-tier explicitly affirms the default; passing BOTH is
+      // a contradiction, so reject it loudly instead of silently letting one win (council F2).
+      if (options["per-tier"] && options.flat) throw new Error("--per-tier and --flat are contradictory (per-tier staging vs one flat convergence) — pass at most one");
+      const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, reporter, onProgress: reporter.line };
+      // C3/M10: --supervise wraps the loop in the endless supervisor so a multi-hour autonomous run
+      // survives rate-limit resets — a resumable stop (throttled/backends-down/did-not-run) waits
+      // reset-aware then --resumes from the checkpoint; a terminal convergence returns as normal.
+      const out = options.supervise
+        ? await runSupervised(
+            ({ resume }) => runFixLoop(cwd, { ...loopOpts, resume: resume || options.resume }, deps),
+            { onWait: ({ attempt, waitMs, stopReason }) => options.json || console.error(`⏸ supervisor: rate-limited — reset-aware wait ${Math.round(waitMs / 1000)}s (attempt ${attempt}) [${stopReason}]…`) }
+          )
+        : await runFixLoop(cwd, { ...loopOpts, resume: options.resume }, deps);
+      // A SUPERVISED run that ended on a thrown (non-rate-limit) error returns a synthetic TERMINAL
+      // result carrying `.err` and none of the loop fields (branch/fixed/…). It must NOT report a clean
+      // exit 0 / ok:true — that is the worst outcome for the automated path --supervise exists for (a CI
+      // wrapper reads exit 0 as success). Detect the crash and fail loudly below.
+      const supervisorCrashed = Boolean(out && out.err);
+      // Return to the base branch after the final pass. Attempt the checkout UNCONDITIONALLY: on a
+      // supervisor crash `out.branch` is absent but the process may have been left on the integration
+      // branch (a pass ≥2 runs there), so gating the checkout on out.branch strands the user silently.
       out.baseBranch = baseBranch;
       out.stranded = false;
-      if (out.branch) {
+      {
         const co = await runCommandAsync("git", ["checkout", baseBranch], { cwd, timeoutMs: 30_000 });
         out.stranded = co.status !== 0;
       }
       recordAuditMetrics(cwd, "fixloop", { wallClockMs: Date.now() - tLoop, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, proposed: out.proposed?.length ?? 0, passes: out.passesRun ?? 0, spent: out.spent ?? 0 }, nowIso());
+      reporter.done({ ok: !out.stranded && !supervisorCrashed, stopReason: out.stopReason });
+      // A crash or a failed return-to-base is a HARD failure: non-zero exit so automation never reads it
+      // as success. On a crash, surface it and stop before the report renderers (which assume loop fields).
+      if (supervisorCrashed) {
+        process.exitCode = 1;
+        const msg = `supervised fix loop aborted (terminal): ${out.stopReason ?? String(out.err?.message ?? out.err)}${out.stranded ? ` — AND could not return to ${baseBranch}` : ""}`;
+        if (options.json) outputResult({ ...out, ok: false, error: msg }, true);
+        else console.error(`✖ ${msg}`);
+        return;
+      }
+      if (out.stranded) process.exitCode = 1;
       if (options.json) {
         outputResult(out, true);
         return;
       }
       if (options.html) {
-        const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply: Boolean(out.sensitiveAutoApply), generatedAt: nowIso() });
+        // Use the RESOLVED consent flag (in scope), not out.sensitiveAutoApply which the loop never
+        // returns — else the §6-council-gated report label always fell back to safe-auto (council F3).
+        const meta = await computeFixReportMeta(cwd, out, {
+          startedAt: new Date(tLoop).toISOString(),
+          wallClockMs: Date.now() - tLoop,
+          finishedAt: nowIso(),
+          autonomy: options.autonomy ?? "aggressive",
+          sensitiveAutoApply,
+          // A12: the AFTER snapshot closes the bracket → per-seat tokens + ≈cost actually render (the
+          // machinery was built but never fed). If the BEFORE snapshot failed there is nothing to diff:
+          // pass null on both sides so the report reports "not measured" rather than a fabricated $0.
+          tokensBefore: loopTokensBefore,
+          tokensAfter: loopTokensBefore ? tokenSnapshot(loopTokenSince) : null
+          // Per-seat findings + §6 verdicts are derived from `out` inside buildRunMetrics
+          // (seatContextFromResult) — including any or-* seat. Per-seat CALL counts/durations live inside
+          // the review engine and are not derivable here; they stay 0 until it reports them.
+        });
+        const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply, generatedAt: nowIso(), metrics: meta.metrics, ...(meta.shape ? { shape: meta.shape } : {}) });
         console.log(renderFixLoopReport(out));
         console.log(`\nHTML report: ${file}`);
         return;
@@ -1945,6 +2411,9 @@ async function handleAudit(argv) {
     }
 
     let findings;
+    // Phase 2: ONE reporter for the whole single-shot `audit fix` run — it covers the fresh review
+    // (when no --from) AND the fix itself, so the live dashboard shows unit progress then fix counters.
+    const reporter = makeRunReporter(cwd, { kind: "audit-fix-loop", title: "audit fix", json: options.json });
     if (options.from) {
       // Confine --from to the project root (no absolute/.. escape) the same way
       // --doc-path is confined: it is read and JSON-parsed, so a stray path could
@@ -1957,7 +2426,34 @@ async function handleAudit(argv) {
       findings = Array.isArray(raw) ? raw : raw.findings ?? raw.all ?? [];
     } else {
       if (!options.json) console.error("No --from findings file; running a fresh audit review first…");
-      const rev = await runAuditReview(cwd, model, backends, { ...merged, budget, maxUnits, skipCodex: merged.skipCodex, skipGrok: merged.skipGrok });
+      // Honor --groups/--max-cells for the fresh review here too, mirroring `audit review`'s wiring —
+      // otherwise a grouped request passed validation up front but silently ran the plain per-file
+      // engine instead of the grouped six-eyes matrix (council companion-cli P2).
+      let rev;
+      if (options.groups) {
+        let maxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
+        if (options["max-cells"] != null) {
+          const n = Number(options["max-cells"]);
+          if (!Number.isFinite(n) || n < 1) throw new Error("--max-cells must be a positive number");
+          maxCells = Math.floor(n);
+        }
+        if (options.budget != null && !options.json) {
+          console.error("note: --budget does not bound --groups (grouped cost is bounded by --max-cells); ignoring --budget for this run");
+        }
+        rev = await runGroupedReview(cwd, model, backends, {
+          ...merged,
+          maxUnits,
+          lensGroups: String(options.groups),
+          maxCells,
+          completenessCritic,
+          skipCodex: merged.skipCodex,
+          skipGrok: merged.skipGrok,
+          reporter,
+          onProgress: reporter.line
+        });
+      } else {
+        rev = await runAuditReview(cwd, model, backends, { ...merged, budget, maxUnits, skipCodex: merged.skipCodex, skipGrok: merged.skipGrok, reporter, onProgress: reporter.line });
+      }
       findings = rev.findings;
     }
     let maxFixes;
@@ -1966,24 +2462,68 @@ async function handleAudit(argv) {
       if (!Number.isFinite(n) || n < 1) throw new Error("--max-fixes must be a positive number");
       maxFixes = Math.floor(n);
     }
+    // runAuditFix reads camelCase retryOnLimit/retryLimit; mergeOptionsWithPolicy never converts the
+    // kebab CLI keys, so single-shot `audit fix --retry-on-limit` was silently ignored — only --loop
+    // translated them (council Opus O6). Thread them here too (validated like its numeric siblings).
+    let singleRetryLimit;
+    if (options["retry-limit"] != null) {
+      const n = Number(options["retry-limit"]);
+      if (!Number.isFinite(n) || n < 1) throw new Error("--retry-limit must be a positive number");
+      singleRetryLimit = Math.floor(n);
+    }
+    // §6 council-gated auto-apply is wired ONLY in the --loop path (it injects the patch reviewer);
+    // single-shot `audit fix` has no reviewer, so runAuditFix forces sensitiveAutoApply off. Warn so a
+    // user passing --sensitive-auto-apply single-shot isn't misled into thinking it took effect (F3).
+    if (options["sensitive-auto-apply"] && !options.json) {
+      console.error("note: --sensitive-auto-apply has no effect on single-shot `audit fix` (§6 council review runs only in `audit fix --loop`); sensitive fixes stay propose-only");
+    }
     const tFix = Date.now();
+    // A12: same token bracket as the loop path — snapshot before the run, diff after it, only when --html
+    // will consume it. Same `sinceMs` for both ends (see tokenSnapshot).
+    const fixTokenSince = Date.now() - TOKEN_SNAPSHOT_WINDOW_MS;
+    const fixTokensBefore = options.html ? tokenSnapshot(fixTokenSince) : null;
+    // §5 char-test gate (opt-in --chartest) also on single-shot `audit fix`: a behaviour-preserving
+    // refactor must keep its generated characterization test green across the change. null when off;
+    // fail-loud (via resolveCharTestGate, same as the --loop path) when requested but no generator seat
+    // is reachable — otherwise the raw helper would return null and refactors would auto-apply UNGATED
+    // while the operator believes --chartest is protecting them (council companion-cli P1).
+    const singleCharTestGate = resolveCharTestGate(cwd, backends, merged, options);
     const out = await runAuditFix(cwd, findings, backends, {
       ...merged,
       dryRun: options["dry-run"],
       allowUntested: options["allow-untested"],
       minSeverity: fixMinSeverity,
       maxFixes,
-      onProgress: options.json ? undefined : (m) => console.error(m)
+      retryOnLimit: options["retry-on-limit"],
+      retryLimit: singleRetryLimit,
+      // M9: the structure consent is added ONLY when --structure-auto-apply was passed, so the
+      // default options object stays byte-identical (structure-wiring re-checks === true anyway).
+      ...(structureTransformRunner ? { structureAutoApply: true } : {}),
+      reporter,
+      onProgress: reporter.line
+    }, {
+      ...(singleCharTestGate ? { charTestGate: singleCharTestGate } : {}),
+      ...(structureTransformRunner ? { runStructureTransform: structureTransformRunner } : {})
     });
     if (!options["dry-run"]) {
       recordAuditMetrics(cwd, "fix", { wallClockMs: Date.now() - tFix, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, rejected: out.rejected?.length ?? 0, ledgerResolved: out.ledgerResolved ?? 0, integrationFailed: Boolean(out.integrationFailed) }, nowIso());
     }
+    reporter.done({ ok: out.ok !== false, stopReason: out.aborted ?? null });
     if (options.json) {
       outputResult(out, true);
       return;
     }
     if (options.html) {
-      const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply: Boolean(out.sensitiveAutoApply), generatedAt: nowIso() });
+      const meta = await computeFixReportMeta(cwd, out, {
+        startedAt: new Date(tFix).toISOString(),
+        wallClockMs: Date.now() - tFix,
+        finishedAt: nowIso(),
+        autonomy: options.autonomy ?? "aggressive",
+        sensitiveAutoApply: false,
+        tokensBefore: fixTokensBefore,
+        tokensAfter: fixTokensBefore ? tokenSnapshot(fixTokenSince) : null
+      });
+      const file = writeFixReportHtml(cwd, out, { seats: "Claude · Codex · Grok", sensitiveAutoApply: Boolean(out.sensitiveAutoApply), generatedAt: nowIso(), metrics: meta.metrics, ...(meta.shape ? { shape: meta.shape } : {}) });
       console.log(renderAuditFixReport(out));
       console.log(`\nHTML report: ${file}`);
       return;
@@ -1997,18 +2537,37 @@ async function handleAudit(argv) {
   // progress is checkpointed to the state dir.
   if (positionals[0] === "endless") {
     const backends = probeBackends(cwd, ROOT_DIR);
-    const merged = mergeOptionsWithPolicy(options, loadPolicy(cwd));
+    const _orPolicy = loadPolicy(cwd);
+    const merged = mergeOptionsWithPolicy(options, _orPolicy);
+    attachOpenRouterSeats(backends, merged, _orPolicy, options.json); // OpenRouter seats (if configured) join the six-eyes
     // No callable reviewer => every pass reviews nothing and would falsely report
     // "diminishing returns"; fail loud instead of looping over empty passes.
     if (activeReviewerCount(backends, merged) === 0) {
-      throw new Error("no callable reviewers (Codex/Grok unavailable or skipped) — endless review needs at least one");
+      throw new Error("no callable reviewers (Codex/Grok/Claude all unavailable or skipped) — endless review needs at least one");
     }
     const { maxUnits } = parseAuditBudgetOptions(options);
-    let budget = 60;
+    // R9: --groups drives the endless loop off the grouped six-eyes review. Validate up front (before
+    // any spend) + scale the AGENT-CALL budget to cell-scale (a grouped pass is up to maxCells calls).
+    let endlessLensGroups;
+    let endlessMaxCells;
+    if (options.groups) {
+      if (!["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
+      endlessLensGroups = String(options.groups);
+      endlessMaxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
+      if (options["max-cells"] != null) {
+        const nc = Number(options["max-cells"]);
+        if (!Number.isFinite(nc) || nc < 1) throw new Error("--max-cells must be a positive number");
+        endlessMaxCells = Math.floor(nc);
+      }
+    }
+    let budget = endlessLensGroups ? endlessMaxCells * 4 : 60;
     if (options.budget != null) {
       const n = Number(options.budget);
       if (!Number.isFinite(n) || n < 2) throw new Error("--budget must be a number >= 2");
       budget = Math.floor(n);
+    }
+    if (endlessLensGroups && !options.json) {
+      console.error(`note: --groups prices each review cell as one agent call; the loop budget is ${budget} cells total (each pass reviews up to min(--max-cells ${endlessMaxCells}, its per-pass budget)). Raise --budget for deeper coverage / more passes.`);
     }
     let maxPasses = 10;
     if (options["max-passes"] != null) {
@@ -2022,26 +2581,51 @@ async function handleAudit(argv) {
       if (!Number.isFinite(n) || n < 1) throw new Error("--dry-streak must be a positive number");
       dryStreak = Math.floor(n);
     }
-    // Each pass advances the hotspot window (progressive coverage) and skips the
-    // global reduce after pass 1 (its input is the static map — identical every
-    // pass — so re-running it just re-charges budget).
+    // Each pass advances the hotspot window (progressive coverage) and skips the global reduce after
+    // pass 1 (its input is the static map — identical every pass — so re-running it just re-charges
+    // budget). With --groups the pass is the cell-granular grouped review whose passComplete gates the
+    // dry streak. The window WRAPS (% unit count) so an overrun never returns a 0-unit review that
+    // grouped would report as never-complete (council R9 Claude/Codex). Grouped cells are capped to the
+    // per-pass budget so a pass never dispatches more paid calls than it is allotted (council R9 P1).
+    const nonTestUnits = Math.max(1, (model?.files ?? []).filter((f) => !f.isTest).length);
+    const doEndlessReview = endlessLensGroups ? runGroupedReview : runAuditReview;
+    // Phase 2: live-dashboard reporter for the endless review loop (phase/progress/budget/findings
+    // per pass — see runEndless). onProgress is reporter.line so today's stderr stays byte-identical.
+    const reporter = makeRunReporter(cwd, { kind: "audit-endless", title: "audit endless", json: options.json });
+    // Thread a MUTED-FINDINGS reporter into each pass's review so per-unit/cell phase+progress fire
+    // LIVE inside a pass (today only pass-level phase/progress moved). findings() is a NO-OP on this
+    // wrapper: runEndless already folds each pass's deduped `fresh` findings via reporter.findings(),
+    // so an inner per-unit fold would DOUBLE-COUNT into findingsByLens. onProgress is intentionally
+    // not threaded — the endless loop owns pass-level stderr, so this keeps stderr byte-identical.
+    const passReporter = mutedFindingsReporter(reporter);
     const review = ({ budget: passBudget, pass }) =>
-      runAuditReview(cwd, model, backends, {
+      doEndlessReview(cwd, model, backends, {
         ...merged,
         budget: passBudget,
         maxUnits,
-        unitOffset: (pass - 1) * maxUnits,
+        unitOffset: ((pass - 1) * maxUnits) % nonTestUnits,
         skipReduce: pass > 1,
+        lensGroups: endlessLensGroups,
+        maxCells: endlessLensGroups ? Math.max(1, Math.min(endlessMaxCells, Math.floor(passBudget))) : undefined,
+        completenessCritic: completenessCritic && Boolean(endlessLensGroups), // M8: only on the grouped endless path
         skipCodex: merged.skipCodex,
-        skipGrok: merged.skipGrok
+        skipGrok: merged.skipGrok,
+        reporter: passReporter // live per-unit/cell progress inside a pass; findings folding stays with runEndless
       });
     const tEndless = Date.now();
-    const out = await runEndless(
-      cwd,
-      { budget, maxPasses, dryStreak, resume: options.resume, onProgress: options.json ? undefined : (m) => console.error(m) },
-      { review }
-    );
+    const endlessOpts = { budget, maxPasses, dryStreak, reporter, onProgress: reporter.line };
+    // C3/M10: --supervise survives rate-limit resets across a multi-hour endless review.
+    const out = options.supervise
+      ? await runSupervised(
+          ({ resume }) => runEndless(cwd, { ...endlessOpts, resume: resume || options.resume }, { review }),
+          { onWait: ({ attempt, waitMs, stopReason }) => options.json || console.error(`⏸ supervisor: rate-limited — reset-aware wait ${Math.round(waitMs / 1000)}s (attempt ${attempt}) [${stopReason}]…`) }
+        )
+      : await runEndless(cwd, { ...endlessOpts, resume: options.resume }, { review });
     recordAuditMetrics(cwd, "endless", { wallClockMs: Date.now() - tEndless, passesRun: out.passesRun, spent: out.spent, findings: out.findings.length, stopReason: out.stopReason }, nowIso());
+    // A clean convergence (max passes / budget / diminishing returns) is ok; an endless run that ended
+    // on a review-error / did-not-run / failed stopReason is NOT — mirror how plan/build derive ok from
+    // the outcome rather than hardcoding true (which would flag a dead run green on the dashboard).
+    reporter.done({ ok: endlessRunOk(out.stopReason), stopReason: out.stopReason });
     if (options.doc) {
       const docPath = writeAuditDoc(workspaceRoot(cwd), out.findings, { source: `endless (${out.passesRun} passes)` }, { docPath: options["doc-path"] });
       if (!options.json) console.log(`Wrote proposals to ${docPath}`);
@@ -2079,12 +2663,24 @@ function renderAuditReviewReport(out) {
   L.push("# Council Audit — deep review (v2)");
   L.push("");
   const reviewers = c.reviewers ? Object.entries(c.reviewers).filter(([, on]) => on).map(([k]) => k).join("+") || "none" : "Codex+Grok";
-  const extras = [];
-  if (c.reduceRan === false) extras.push("global SSOT/architecture reduce SKIPPED (budget/reviewers)");
-  if (c.truncatedUnits) extras.push(`${c.truncatedUnits} module(s) truncated — tail unreviewed`);
-  if (c.unitsFailed) extras.push(`${c.unitsFailed} unit(s) failed`);
-  if (c.unparsedReturns) extras.push(`${c.unparsedReturns} unparseable reviewer return(s) after retry`);
-  L.push(`Reviewed ${c.unitsReviewed}/${c.unitsSelected} hotspot modules with ${reviewers} (budget ${c.budgetSpent}/${c.budgetTotal} agent calls). ${c.suppliedChars}/${c.totalCharsOfReviewed} chars of reviewed modules supplied.${extras.length ? ` ⚠ ${extras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);
+  if (c.groupPreset) {
+    // M7 six-eyes GROUPED path — cell-granular coverage instead of per-file. Report cellsScheduled
+    // as the authoritative post-cap count (models × groups × files × CHUNKS, then capped), NOT a
+    // reviewers×groups×units equation which lies for multi-chunk or capped runs (council Grok P2).
+    const gExtras = [];
+    if (c.capped) gExtras.push(`capped — ${c.cellsDropped} cell(s) deferred (raise --max-cells)`);
+    if (c.filesUnsupplied?.length) gExtras.push(`${c.filesUnsupplied.length} file(s) too large or unreadable`);
+    if (c.unitsFailed) gExtras.push(`${c.unitsFailed} unit(s) had no successful cell`);
+    if (c.ran === false) gExtras.push(c.ranReason ?? "nothing dispatched");
+    L.push(`Six-eyes GROUPED review (--groups ${c.groupPreset}): ${reviewers} across ${c.groups} lens-group(s) over ${c.unitsReviewed ?? 0}/${c.unitsSelected} module(s), ${c.cellsScheduled} cell(s) scheduled. Coverage ${c.complete ? "COMPLETE (every scheduled cell reviewed by all seats)" : "PARTIAL"}.${gExtras.length ? ` ⚠ ${gExtras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);
+  } else {
+    const extras = [];
+    if (c.reduceRan === false) extras.push("global SSOT/architecture reduce SKIPPED (budget/reviewers)");
+    if (c.truncatedUnits) extras.push(`${c.truncatedUnits} module(s) truncated — tail unreviewed`);
+    if (c.unitsFailed) extras.push(`${c.unitsFailed} unit(s) failed`);
+    if (c.unparsedReturns) extras.push(`${c.unparsedReturns} unparseable reviewer return(s) after retry`);
+    L.push(`Reviewed ${c.unitsReviewed}/${c.unitsSelected} hotspot modules with ${reviewers} (budget ${c.budgetSpent}/${c.budgetTotal} agent calls). ${c.suppliedChars}/${c.totalCharsOfReviewed} chars of reviewed modules supplied.${extras.length ? ` ⚠ ${extras.join("; ")}.` : ""} Findings are candidates — Claude (you) should synthesize a decision table.`);
+  }
   L.push("");
   const rank = { P0: 0, P1: 1, P2: 2, nit: 3 };
   const sorted = [...out.findings].sort((a, b) => (rank[a.severity] ?? 2) - (rank[b.severity] ?? 2));
@@ -2199,7 +2795,7 @@ function renderFixLoopReport(out) {
   L.push("");
   L.push("## Verified vs. NOT verified (review the gaps)");
   L.push(`- ${out.fixed.length - unverified}/${out.fixed.length} fix(es) test-gated (green per commit + final integration)${unverified ? ` · ${unverified} UNVERIFIED (--allow-untested)` : ""}`);
-  L.push("- NOT measured: change-line coverage, behaviour-equivalence, mutation adequacy — eyeball the diffs + the proposals below");
+  L.push("- change-line coverage is §5-gated per fix WHEN a coverage artifact (--coverage/lcov) was supplied, else NOT measured; behaviour-equivalence + mutation adequacy are NOT measured — eyeball the diffs + the proposals below");
 
   if (out.fixed.length) {
     L.push("");
@@ -2281,7 +2877,7 @@ function renderAuditEndlessReport(out) {
 async function handleUsage(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["days"],
-    booleanOptions: ["json", "all", "tokens", "limits"]
+    booleanOptions: ["json", "tokens", "limits"] // (dropped dead "all" — handleUsage never read it; F2)
   });
   const cwd = process.cwd();
   const root = workspaceRoot(cwd);
@@ -2380,6 +2976,621 @@ function handleCancel(argv) {
   outputResult(options.json ? { job: finished, cancelled: true } : `Cancelled ${job.id}.\n`, options.json);
 }
 
+// ---------------------------------------------------------------------------------------------
+// `council plan` / `council build` — multi-model design deliberation + autonomous test-gated build.
+// See docs/plan-build-design.md. plan is strictly READ-ONLY (its only write is the plan artifact in
+// the state dir); build is the riskiest capability in the tool and is gated at every step
+// (test-first RED->GREEN, the declared-file capability boundary, unanimous §6 on the exact staged
+// diff, reviewed-byte commit binding, abort+rollback on any failure, never auto-merged).
+// ---------------------------------------------------------------------------------------------
+
+/** Resolve a repo-confined --from path (mirrors handleAudit's confinement: no absolute/.. escape). */
+function confinedPlanPath(cwd, from) {
+  const base = workspaceRoot(cwd);
+  const target = path.resolve(base, String(from));
+  const rel = path.relative(base, target);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`--from must stay within the project root (got: ${from})`);
+  }
+  return target;
+}
+
+/** plan-spec REQUIRES a kind-returning existence probe: "file" | "dir" | false (a bare boolean fails closed). */
+function planFileExists(relPosix, root) {
+  try {
+    const st = fs.statSync(path.join(root, relPosix));
+    return st.isFile() ? "file" : st.isDirectory() ? "dir" : false;
+  } catch {
+    return false;
+  }
+}
+
+async function handlePlan(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["synthesizer", "budget", "base", "codex-model", "grok-model", "claude-model"],
+    booleanOptions: ["json", "skip-openrouter"]
+  });
+  const cwd = process.cwd();
+  const request = positionals.join(" ").trim();
+  if (!request) throw new Error("council plan needs a feature request: council plan <what you want built>");
+
+  const backends = probeBackends(cwd, ROOT_DIR, { probeClaude: true });
+  const policy = loadPolicy(cwd);
+  const merged = mergeOptionsWithPolicy(options, policy);
+  attachOpenRouterSeats(backends, merged, policy, options.json); // or-* seats are part of the six-eyes promise
+  if (activeReviewerCount(backends, merged) === 0) {
+    throw new Error("no callable seats (Codex/Grok/Claude all unavailable or skipped) — `council plan` needs at least one to propose");
+  }
+
+  // Phase 2: live-dashboard reporter for the plan deliberation (phase per R1/R2/R3 milestone).
+  const reporter = makeRunReporter(cwd, { kind: "plan", title: "council plan", json: options.json });
+  const out = await runPlanDeliberation(cwd, request, backends, {
+    ...merged,
+    synthesizer: options.synthesizer,
+    budget: options.budget != null ? Number(options.budget) : undefined,
+    reporter,
+    onPhase: options.json ? undefined : (m) => console.error(m)
+  });
+  reporter.done({ ok: Boolean(out?.planSpec) });
+  if (!out?.planSpec) throw new Error("the council could not synthesize a VALID PlanSpec (fail-closed: an invalid plan is never emitted)");
+
+  // Persist BOTH artifacts so `council build --from <path>` works, and print the path.
+  const dir = ensureStateDir(cwd);
+  const slug = `plan-${planSpecDigest(out.planSpec).slice(0, 8)}`;
+  const jsonPath = path.join(dir, `${slug}.json`);
+  const mdPath = path.join(dir, `${slug}.md`);
+  fs.writeFileSync(jsonPath, `${JSON.stringify(out.planSpec, null, 2)}\n`, "utf8");
+  fs.writeFileSync(mdPath, renderPlanMarkdown(out.planSpec), "utf8");
+
+  if (options.json) {
+    outputResult({ planSpec: out.planSpec, seats: out.seats, synthesizer: out.synthesizer, ranking: out.ranking, budget: out.budget, artifacts: { json: jsonPath, markdown: mdPath } }, true);
+    return;
+  }
+  console.log(renderPlanMarkdown(out.planSpec));
+  console.log(`\nSeats: ${out.seats.join(" · ")} (synthesized by ${out.synthesizer})`);
+  console.log(`Plan saved:\n  ${mdPath}\n  ${jsonPath}`);
+  console.log(`\nReview/edit the plan, then build it:\n  council build --from ${path.relative(workspaceRoot(cwd), jsonPath).split(path.sep).join("/")}`);
+}
+
+// --- `council build` REAL adapters (the CLI-owned half of runBuildStep's deps) -----------------
+// runBuild itself supplies the orchestrator-owned ports (git, runFullSuite via detectTestCmd,
+// the repo-contained readFile/fileExists from makeStepPorts, now/backends/options — see
+// build.mjs); THIS wiring supplies the model-facing + sandbox ports the gate ladder additionally
+// requires, all fail-closed: a missing/erroring adapter surfaces as a failed gate + verified
+// rollback inside runBuildStep, never as a soft-skipped gate.
+
+// The EXACT permission sandbox chartest-node-harness uses for MODEL-AUTHORED tests (see the
+// poison-probe notes there): child_process and fs WRITES are denied (the two vectors an injected
+// test would use to tamper or persist), fs reads allowed (the test must import the module under
+// test), and the test runs IN-PROCESS (--experimental-test-isolation=none) because node --test's
+// default per-file child spawn is itself denied under the permission model.
+const STEP_TEST_SANDBOX = Object.freeze(["--experimental-permission", "--allow-fs-read=*", "--experimental-test-isolation=none"]);
+const STEP_TEST_TIMEOUT_MS = 120_000;
+// Same hard default as the §6 seat runners (build-step-reviewer's SEAT_TIMEOUT_MS): an unattended
+// build must never hang forever on a wedged authoring CLI — the seat fails closed instead.
+const STEP_AUTHOR_TIMEOUT_MS = 300_000;
+
+/**
+ * Classify ONE sandboxed `node --test` run of the step's hashed test file(s) into build-step's
+ * runStepTest contract { ok, assertionFailure, stdout }. Exported for direct unit tests.
+ *
+ * assertionFailure is TRUE only for a REAL assertion-level failure — the RED-before oracle
+ * depends on this distinction: a syntax/loader/crash/timeout failure would go "green" the moment
+ * the impl merely parses, so it proves nothing and must be an INVALID red. Fail-closed on
+ * ambiguity: a run showing BOTH an assertion marker and a crash marker is not a valid RED either
+ * (the crash may have masked what the assertions would have said).
+ */
+export function classifyAuthoredTestRun(res) {
+  const stdout = String(res?.stdout ?? "");
+  const stderr = String(res?.stderr ?? "");
+  const combined = stderr ? `${stdout}\n${stderr}` : stdout;
+  if (res?.timedOut === true) return { ok: false, assertionFailure: false, stdout: combined };
+  if (res?.status === 0) return { ok: true, assertionFailure: false, stdout: combined };
+  const assertion = /\bERR_ASSERTION\b|\bAssertionError\b/.test(combined);
+  const crash =
+    /\bSyntaxError\b|\bReferenceError\b|\bERR_MODULE_NOT_FOUND\b|Cannot find (?:module|package)|\bERR_ACCESS_DENIED\b|\bERR_UNKNOWN_FILE_EXTENSION\b|\bERR_INVALID_MODULE_SPECIFIER\b|\bERR_REQUIRE_ESM\b/.test(
+      combined
+    );
+  return { ok: false, assertionFailure: assertion && !crash, stdout: combined };
+}
+
+/**
+ * Parse an author seat's reply into the { files: { path: content } } shape build-step's
+ * normalizeAuthoredFiles consumes, or null (fail-closed — build-step rejects the step). The
+ * contract asks for a RAW JSON object; a fenced or prose-wrapped reply is salvaged by extraction,
+ * but the extracted value must still parse as a plain object whose file values are ALL strings.
+ */
+function parseAuthoredFilesMap(stdout) {
+  const raw = String(stdout ?? "").trim();
+  if (!raw) return null;
+  const candidates = [raw];
+  const fence = raw.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+  if (fence) candidates.push(fence[1].trim());
+  const first = raw.indexOf("{");
+  const last = raw.lastIndexOf("}");
+  if (first !== -1 && last > first) candidates.push(raw.slice(first, last + 1));
+  for (const candidate of candidates) {
+    let parsed;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+    const map = parsed.files && typeof parsed.files === "object" && !Array.isArray(parsed.files) ? parsed.files : parsed;
+    const entries = Object.entries(map ?? {});
+    if (!entries.length) continue;
+    if (entries.every(([, v]) => typeof v === "string")) return { files: Object.fromEntries(entries) };
+  }
+  return null;
+}
+
+/**
+ * Build the CLI-owned stepDeps for runBuildStep (merged over runBuild's orchestrator ports via
+ * deps.stepDeps). `buildGit` is the SAME makeBuildGit instance handed to runBuild, so the test
+ * runner and the drift gates read one consistent view of the tree. Exported so an integration
+ * test can drive the REAL adapters (sandboxed test runner, containment-guarded writes, the
+ * coverage/poison port) with only the model-facing ports faked.
+ */
+export function makeBuildStepDeps(root, cwd, backends, options, buildGit) {
+  // Repo-contained fail-closed fs ports (same construction runBuild uses): a symlink target or a
+  // path resolving outside the repo THROWS — reused here as the writeFiles containment guard.
+  const ports = makeStepPorts(root);
+  const testTimeoutMs = Number(options.stepTestTimeoutMs) || STEP_TEST_TIMEOUT_MS;
+
+  // The ONE authoring seat: the first ACTIVE seat, exactly how chartest-wiring picks its
+  // generator (availability + skip flags honoured; --codex-model/--grok-model/--claude-model pins
+  // and the agent timeout arrive via the merged options). The model's reply is DATA — the seat
+  // runners give it no repo write/exec tools, and the reply is parsed, never executed. The
+  // prompts themselves (built by build-step) nonce-fence every untrusted input.
+  const authorOpts = { ...options, agentTimeoutMs: options.agentTimeoutMs ?? STEP_AUTHOR_TIMEOUT_MS };
+  const runners = makeSeatRunners(cwd, backends, authorOpts);
+  const authorSeat = activeSeatNames(backends, authorOpts).find((s) => typeof runners[s] === "function") ?? null;
+  const author = async (prompt) => {
+    // Unreachable when preflight ran (runBuild refuses to start unless EVERY §6 seat — a superset
+    // of this one — is reachable); kept throwing so a bypassed preflight still fails CLOSED.
+    if (!authorSeat) throw new Error("no authoring seat reachable (codex/grok/claude all unavailable or skipped)");
+    const res = await runStructuredWithRetry(
+      (p) => runners[authorSeat](p),
+      prompt,
+      (stdout) => ({ parseOk: parseAuthoredFilesMap(stdout) != null }),
+      { maxRetries: 1 }
+    );
+    // A skipped/timed-out/truncated/non-zero run casts no files — build-step rejects null closed.
+    if (!res || res.skipped || res.timedOut || res.truncated || res.status !== 0) return null;
+    return parseAuthoredFilesMap(res.stdout);
+  };
+
+  // lstat-truth (NEVER stat): true ONLY for an existing REGULAR file inside the repo, so a
+  // symlink / directory / special edit-target is rejected by the ladder's revalidation gate
+  // (build-step gate 2: "edit exists+regular, no symlink escape").
+  const isRegularFile = (rel) => {
+    const p = String(rel ?? "");
+    if (!p || path.isAbsolute(p) || p.split(/[\\/]+/).includes("..")) return false;
+    try {
+      return fs.lstatSync(path.join(root, p)).isFile();
+    } catch {
+      return false; // ENOENT or any lstat fault: not provably a regular file → fail closed
+    }
+  };
+
+  // The ONLY write path build-step uses. The declared-set bound is enforced mechanically by the
+  // ladder itself (authored keys must EQUAL the declared sets; the drift gates re-check the
+  // tree); here we re-guard CONTAINMENT with the same makeStepPorts guard: fileExists THROWS on a
+  // symlink or an escaping resolution, so a write can never follow a link out of the repo.
+  const writeFiles = (map) => {
+    for (const [rel, content] of Object.entries(map && typeof map === "object" ? map : {})) {
+      ports.fileExists(rel); // throws on symlink/escapes-root — before any byte lands
+      const full = path.join(root, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, String(content ?? ""), "utf8");
+    }
+  };
+
+  // The step's hashed test files, derived from the TREE: at every runStepTest call site the
+  // ladder has already enforced changed-set == declared-set (test-phase drift before the RED
+  // runs, the step drift gate before GREEN/coverage), so the changed test-convention files ARE
+  // exactly the step's declared test set. Fail-closed: no test file present → an invalid run.
+  const stepTestFiles = () => buildGit.changedFiles().filter((p) => isPlanTestPath(p)).sort();
+  const runSandboxedStepTest = async (extraEnv = {}, extraArgs = []) => {
+    const files = stepTestFiles();
+    if (!files.length) {
+      return { status: 1, stdout: "", stderr: "no step test file present in the working tree (fail-closed)", timedOut: false };
+    }
+    return runCommandAsync(process.execPath, [...STEP_TEST_SANDBOX, ...extraArgs, "--test", ...files], {
+      cwd: root,
+      env: { ...process.env, ...extraEnv },
+      timeoutMs: testTimeoutMs
+    });
+  };
+  const runStepTest = async () => classifyAuthoredTestRun(await runSandboxedStepTest());
+
+  // Read + merge the coverage-*.json documents a NODE_V8_COVERAGE run wrote (mirrors
+  // chartest-wiring's private defaultReadCoverage). null = no usable document.
+  const readCoverageDir = (dir) => {
+    let files;
+    try {
+      files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+    } catch {
+      return null;
+    }
+    const result = [];
+    for (const f of files) {
+      try {
+        const doc = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+        if (Array.isArray(doc.result)) result.push(...doc.result);
+      } catch {
+        /* skip an unreadable/partial coverage file */
+      }
+    }
+    return result.length ? { result } : null;
+  };
+
+  // POISON-PROBE one impl file (chartest-node-harness's inspector-free dependence check): swap it
+  // for a same-surface twin whose every export throws, re-run the hashed step test, and require
+  // the run to FAIL. Restore is verified by read-back and THROWS on failure — build-step turns
+  // that into a failed coverage gate + verified git rollback (which restores the bytes anyway).
+  const poisonProbeImplFile = async (rel) => {
+    const original = ports.readFile(rel); // repo-contained; throws on symlink/escape
+    const poisoned = buildPoisonedSource(original);
+    if (poisoned == null) return false; // un-fakeable export surface → fail closed
+    const abs = path.join(root, rel);
+    let run = null;
+    try {
+      fs.writeFileSync(abs, poisoned, "utf8");
+      run = await runSandboxedStepTest();
+    } finally {
+      let restored = false;
+      let lastErr = null;
+      for (let attempt = 0; attempt < 3 && !restored; attempt += 1) {
+        try {
+          fs.writeFileSync(abs, original, "utf8");
+          restored = fs.readFileSync(abs, "utf8") === original;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      if (!restored) {
+        throw new Error(
+          `FATAL(build-poison-restore): could not restore ${rel} after the coverage poison probe (${String(lastErr?.message ?? lastErr ?? "read-back mismatch")}) — failing the step closed; the rollback resets the tree to the step snapshot`
+        );
+      }
+    }
+    if (!run || run.timedOut) return false; // an incomplete probe proves nothing → fail closed
+    return run.status !== 0; // the hashed test FAILS with this impl file poisoned → it depends on it
+  };
+
+  // Changed-line coverage (ladder 7b): re-run the HASHED step test under NODE_V8_COVERAGE and
+  // answer per file via changedLinesCovered (innermost-wins). KNOWN PLATFORM LIMITATION (see the
+  // poison-probe notes in chartest-node-harness.mjs, verified on v22.13.1): under the permission
+  // sandbox the inspector is blocked and the coverage document comes back EMPTY. We never claim
+  // coverage we did not measure — when the document is empty we degrade EXACTLY the way chartest
+  // does (per-impl-file poison probe) and say so on stderr + in the returned result.
+  let coverageDegradeNoted = false;
+  const coverChangedLines = async (changed) => {
+    const entries = Object.entries(changed && typeof changed === "object" ? changed : {});
+    if (!entries.length) return { ok: false, uncovered: [], reason: "no changed lines supplied (fail-closed)" };
+    const covDir = fs.mkdtempSync(path.join(os.tmpdir(), "council-build-cov-"));
+    try {
+      // the coverage run must be allowed to WRITE its NODE_V8_COVERAGE dir under the sandbox
+      const run = await runSandboxedStepTest({ NODE_V8_COVERAGE: covDir }, [`--allow-fs-write=${covDir}`]);
+      if (!run || run.timedOut || run.status !== 0) {
+        return { ok: false, reason: "the hashed step test did not run green under the coverage re-run (fail-closed)" };
+      }
+      const doc = readCoverageDir(covDir);
+      if (doc) {
+        const uncovered = [];
+        for (const [rel, lines] of entries) {
+          if (!changedLinesCovered(doc, path.join(root, rel), ports.readFile(rel), lines)) uncovered.push(rel);
+        }
+        return uncovered.length ? { ok: false, uncovered } : { ok: true, measured: "v8-changed-line-coverage" };
+      }
+    } finally {
+      try {
+        fs.rmSync(covDir, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+    // The run was green but the document is EMPTY → the sandbox blocked the inspector. Degrade
+    // honestly: poison-probe dependence per impl file, line granularity NOT established.
+    if (!coverageDegradeNoted) {
+      coverageDegradeNoted = true;
+      console.error(
+        "council build: changed-line coverage is unavailable under the test sandbox (the permission model blocks the V8 inspector) — degrading to the per-impl-file poison-probe dependence check (chartest's documented fallback); line granularity NOT established"
+      );
+    }
+    const uncovered = [];
+    for (const [rel] of entries) {
+      if ((await poisonProbeImplFile(rel)) !== true) uncovered.push(rel);
+    }
+    return uncovered.length
+      ? { ok: false, uncovered, measured: "poison-probe (degraded — inspector blocked by the sandbox)" }
+      : { ok: true, measured: "poison-probe (degraded — line granularity not established; inspector blocked by the sandbox)" };
+  };
+
+  return {
+    authorSeat, // surfaced for the progress log; runBuildStep ignores non-port keys
+    authorTests: author,
+    authorImpl: author, // the same single active seat — the test/impl firewall is the prompt split + hash binding, enforced in build-step
+    writeFiles,
+    runStepTest,
+    coverChangedLines,
+    isRegularFile,
+    // §6: every required seat (the UNSHRINKABLE build council), independently, on the COMPLETE
+    // staged diff. Note the options are passed through UNTOUCHED — makeBuildStepReviewer itself
+    // refuses under any skip flag and build-step computes the required set with EMPTY options.
+    reviewStep: makeBuildStepReviewer(cwd, backends, options)
+  };
+}
+
+// --- M9 `audit fix --structure-auto-apply` REAL adapters (the CLI-owned deps of runStructureTransform)
+// structure-wiring.mjs owns the whole gate ladder (double consent → plan → author → drift → full
+// suite → public API → §6 unanimity → evaluateStructureGate → reviewed-byte binding → commit);
+// THIS wiring supplies its side-effect ports, all FAIL-CLOSED — a missing/erroring adapter surfaces
+// as a failed gate + verified rollback inside runStructureTransform, never as a soft-skipped gate.
+
+/**
+ * Parse a transform-PLAN reply into a plain object (raw JSON, fenced, or brace-extracted), or null.
+ * The reply is DATA — structure-wiring's validateTransformPlan is the sole judge of the content;
+ * this only rescues the transport shape (same salvage discipline as parseAuthoredFilesMap), and
+ * anything unparseable stays null so the finding remains propose-only (fail-closed).
+ */
+function parseTransformPlanObject(stdout) {
+  const raw = String(stdout ?? "").trim();
+  if (!raw) return null;
+  const candidates = [raw];
+  const fence = raw.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+  if (fence) candidates.push(fence[1].trim());
+  const first = raw.indexOf("{");
+  const last = raw.lastIndexOf("}");
+  if (first !== -1 && last > first) candidates.push(raw.slice(first, last + 1));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+      /* try the next extraction */
+    }
+  }
+  return null;
+}
+
+/**
+ * Build the CLI-owned deps for runStructureTransform (structure-wiring.mjs). Mirrors
+ * makeBuildStepDeps — and deliberately REUSES its pieces (makeStepPorts containment, the
+ * one-active-seat author pattern over makeSeatRunners, parseAuthoredFilesMap, the §6 seat
+ * postures) rather than inventing parallel ones. Exported so an integration test can drive the
+ * REAL adapters with only the model-facing ports faked.
+ */
+export function makeStructureTransformDeps(root, cwd, backends, options, buildGit) {
+  // Repo-contained fail-closed fs ports (the same construction makeBuildStepDeps uses): a symlink
+  // target or a path resolving outside the repo THROWS — structure-wiring turns that throw into a
+  // failed gate + verified rollback, never a read/write through a link out of the repo.
+  const ports = makeStepPorts(root);
+
+  // The ONE planning/authoring seat: the first ACTIVE seat, exactly how makeBuildStepDeps picks
+  // its author (model pins + agent timeout honoured via the merged options; skip flags honoured).
+  // The reply is DATA — the seat runners give the model no repo write/exec tools, and the reply is
+  // parsed, never executed. A skipped/timed-out/truncated/non-zero reply yields null, which
+  // structure-wiring rejects fail-closed (the finding stays propose-only).
+  const authorOpts = { ...options, agentTimeoutMs: options.agentTimeoutMs ?? STEP_AUTHOR_TIMEOUT_MS };
+  const runners = makeSeatRunners(cwd, backends, authorOpts);
+  const authorSeat = activeSeatNames(backends, authorOpts).find((s) => typeof runners[s] === "function") ?? null;
+  const seatData = async (prompt, parse) => {
+    if (!authorSeat) return null; // no reachable seat → null → structure-wiring fails closed
+    const res = await runStructuredWithRetry(
+      (p) => runners[authorSeat](p),
+      prompt,
+      (stdout) => ({ parseOk: parse(stdout) != null }),
+      { maxRetries: 1 }
+    );
+    if (!res || res.skipped || res.timedOut || res.truncated || res.status !== 0) return null;
+    return parse(res.stdout);
+  };
+  const proposePlan = (prompt) => seatData(prompt, parseTransformPlanObject);
+  const authorTransform = (prompt) => seatData(prompt, parseAuthoredFilesMap);
+
+  // The ONLY write path the transform gets — the same containment-guarded writer makeBuildStepDeps
+  // uses. The plan-declared set is enforced mechanically by structure-wiring (authored keys must
+  // EQUAL plannedTouched; its drift gate re-checks the tree); here we re-guard CONTAINMENT with the
+  // makeStepPorts guard: fileExists THROWS on a symlink or an escaping resolution — before any byte
+  // lands, so a write can never follow a link out of the repo.
+  const writeFiles = (map) => {
+    for (const [rel, content] of Object.entries(map && typeof map === "object" ? map : {})) {
+      ports.fileExists(rel);
+      const full = path.join(root, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, String(content ?? ""), "utf8");
+    }
+  };
+
+  // Half of the behaviour oracle: the project's OWN full suite, UNSANDBOXED (it is the user's
+  // trusted suite — same posture as build.mjs's realRunTests), DETECTED, never accepted from
+  // options. No detectable suite → { ok:false } → the transform reverts: a structure transform
+  // without a test gate must never land (fail-closed, no --allow-untested equivalent here).
+  const testCmd = detectTestCmd(root);
+  const runFullSuite = async () => {
+    if (!testCmd) return { ok: false, reason: "no test command detected — a structure transform requires the full-suite gate" };
+    const res = await runCommandAsync(testCmd.cmd, testCmd.args, { cwd: root, timeoutMs: options.testTimeoutMs ?? 600_000 });
+    return { ok: res.status === 0 && !res.timedOut };
+  };
+
+  // The other half: the export-surface check, built on audit-snapshot's snapshotViolation over the
+  // transform's edited files (structure-wiring supplies the exact before/after sources). Definite
+  // semantics, fail-closed: `false` ONLY when every edited file's surface is PROVABLY unchanged;
+  // `true` (changed → blocked) for any removal/rename/default-flip AND for any surface that cannot
+  // be enumerated (star re-export, whole-module CJS — snapshotViolation reports those as
+  // violations by design); `null` (unknown → blocked) when there is nothing to judge.
+  // allowAdditions is audit-snapshot's documented Structure-tier mode: an extract-shared/
+  // consolidate transform legitimately ADDS exports (a new shared module); removals still block.
+  const checkPublicApi = ({ files, before, after }) => {
+    const list = Array.isArray(files) ? files.filter((f) => typeof f === "string" && f) : [];
+    if (!list.length) return null; // cannot tell → structure-wiring blocks (only `false` passes)
+    for (const p of list) {
+      const violation = snapshotViolation(String(before?.[p] ?? ""), String(after?.[p] ?? ""), { allowAdditions: true });
+      if (violation != null) return true;
+    }
+    return false;
+  };
+
+  // §6 vote TRANSPORT for structure-wiring's council gate: (seat, prompt) → runner result. The
+  // REQUIRED set is computed inside structure-wiring via requiredPatchSeats (built-ins + every
+  // configured OpenRouter seat — the runner factory below strips the shrink flags from the options
+  // it forwards, so that set is UNSHRINKABLE). Seat postures mirror makeBuildStepReviewer's:
+  //   - claude: buildClaudeReviewArgs — --safe-mode + Read/Grep/Glob-only (hard-isolated seat);
+  //   - codex/grok: instruction-isolated EMPTY temp cwd (their CLIs auto-load repo instruction
+  //     files, and the diff under review is MODEL-written), grok pinned to its read-only sandbox;
+  //   - or-*: API-only, cwd inert.
+  // Fail-closed: a skipped (seatActive) or unreachable seat returns null → casts NO vote → the
+  // unanimity gate VETOES. A flag can abort a transform; it can never shrink its council.
+  const grokOpts = { ...authorOpts, grokSandbox: options.grokSandbox ?? "read-only" };
+  let isolated = null;
+  const isolatedCwd = () => (isolated ??= fs.mkdtempSync(path.join(os.tmpdir(), "council-structure-review-")));
+  const reviewRunners = {
+    claude: async (prompt) => {
+      const bin = backends?.claude?.bin || findClaudeBinary();
+      return runCommandAsync(bin, buildClaudeReviewArgs(authorOpts), { cwd, input: prompt, timeoutMs: authorOpts.agentTimeoutMs });
+    },
+    codex: (prompt) => runCodexStructured(isolatedCwd(), backends, authorOpts, prompt, "structure-review"),
+    grok: (prompt) => runGrokStructured(isolatedCwd(), backends, grokOpts, prompt)
+  };
+  for (const s of backends?.openrouter?.seats ?? []) {
+    reviewRunners[s.id] = (prompt) => runOpenRouterStructured(cwd, backends, authorOpts, prompt, s.id);
+  }
+  const reviewSeat = (seat, prompt) => {
+    if (!seatActive(seat, backends, options)) return null; // skipped/unreachable seat: NO vote → veto
+    const run = reviewRunners[seat];
+    return run ? run(prompt) : null;
+  };
+
+  return {
+    authorSeat, // surfaced for logs; runStructureTransform ignores non-port keys
+    git: buildGit,
+    proposePlan,
+    authorTransform,
+    writeFiles,
+    runFullSuite,
+    checkPublicApi,
+    reviewSeat,
+    readFile: ports.readFile,
+    fileExists: ports.fileExists,
+    backends,
+    options,
+    now: Date.now
+    // limits: deliberately not set — structure-wiring's own bounded defaults apply
+  };
+}
+
+/**
+ * Compose the CLI deps with runStructureTransform for runAuditFix's M9 structure pass. The pass
+ * invokes the runner as (args, { git, options, now }); three adaptations happen at this seam —
+ * each documented, none weakening a gate:
+ *   - git: audit-fix's realGit is the SINGLE-file adapter (stageAndDiffCached) and lacks the
+ *     multi-file stageSet/diffCachedSet/tree-bound commitIndex surface structure-wiring's gate 0
+ *     requires. The makeBuildGit adapter over the SAME repo root supplies them and WINS on
+ *     overlap, so its reviewed-tree commit binding stays armed by its own diffCachedSet.
+ *   - options: the consent flags (structureAutoApply / sensitiveAutoApply, strict === true) ride
+ *     along from audit-fix, but the §6 SHRINK flags do NOT (skipOpenRouter/skipSeats stripped):
+ *     the structure council is UNSHRINKABLE — requiredPatchSeats stays built-ins + every
+ *     configured OpenRouter seat. A skipped seat still casts NO vote, which VETOES.
+ *   - result: audit-fix's structure pass consumes { ok, commit, stranded, reason };
+ *     structure-wiring reports `applied` — ok maps to true ONLY for an applied+committed
+ *     transform (a rename, not a semantic change; stranded/reason pass through untouched).
+ */
+function makeStructureTransformRunner(root, cwd, backends, options) {
+  const base = makeStructureTransformDeps(root, cwd, backends, options, makeBuildGit(root));
+  return async (args, d = {}) => {
+    const git = { ...(d.git ?? {}), ...base.git };
+    const opts = { ...(d.options ?? base.options ?? {}) };
+    delete opts.skipOpenRouter;
+    delete opts.skipSeats;
+    const res = await runStructureTransform(args, { ...base, ...d, git, options: opts });
+    return res && typeof res === "object" ? { ...res, ok: res.applied === true } : res;
+  };
+}
+
+async function handleBuild(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["from", "base", "codex-model", "grok-model", "claude-model"],
+    booleanOptions: ["json", "dry-run", "skip-openrouter"]
+  });
+  const cwd = process.cwd();
+  const root = workspaceRoot(cwd);
+  if (!options.from) throw new Error("council build needs a PlanSpec: council build --from <plan.json> (produce one with `council plan`)");
+
+  const planPath = confinedPlanPath(cwd, options.from);
+  let raw;
+  try {
+    raw = fs.readFileSync(planPath, "utf8");
+  } catch (err) {
+    throw new Error(`cannot read the PlanSpec at ${options.from}: ${err?.message ?? err}`);
+  }
+  const parsed = parsePlanSpec(raw);
+  if (!parsed.ok) throw new Error(`the PlanSpec is not valid JSON: ${parsed.error}`);
+  // OUT-OF-BAND REQUEST BINDING (council final, Codex P2): when the operator ALSO types the feature
+  // request on argv, thread it through validatePlanSpec as expectedRequest — plan-spec's own documented,
+  // mandatory binding. Without it the requestHash check is only SELF-consistency (a request+hash pair
+  // recomputed together re-points the plan undetected); with it, the plan's request must normalize-equal
+  // what the operator actually asked for. This uses plan-spec's built-in check rather than a parallel
+  // digest compare, so the two layers cannot drift.
+  const askedFor = positionals.join(" ").trim();
+  const check = validatePlanSpec(parsed.spec, { root, fileExists: planFileExists, expectedRequest: askedFor || undefined });
+  if (!check.valid) throw new Error(`the PlanSpec is INVALID (fail-closed — nothing is built):\n  - ${check.errors.join("\n  - ")}`);
+  const planSpec = check.value;
+
+  const backends = probeBackends(cwd, ROOT_DIR, { probeClaude: true });
+  const policy = loadPolicy(cwd);
+  const merged = mergeOptionsWithPolicy(options, policy);
+  attachOpenRouterSeats(backends, merged, policy, options.json);
+
+  if (options["dry-run"]) {
+    // Preflight + validation ONLY. Spends nothing.
+    const ready = buildReviewerReady(backends, merged);
+    const lines = [
+      `PlanSpec ${planSpecDigest(planSpec).slice(0, 8)} — ${planSpec.steps.length} step(s), base ${String(planSpec.baseCommit).slice(0, 8)}`,
+      `Request: ${planSpec.request}`,
+      "",
+      ...planSpec.steps.map((s, i) => `  ${i + 1}. [${s.id}] ${s.title}\n       files: ${planStepTouched(s).join(", ")}`),
+      "",
+      `§6 required seats: ${Object.keys(ready).filter((k) => k !== "ready" && k !== "reasons").join(", ")} — ${ready.ready ? "ALL reachable" : "NOT all reachable (build would refuse to start)"}`,
+      "",
+      "(--dry-run: nothing was built and no model was called)"
+    ];
+    outputResult(options.json ? { planSpec, dryRun: true, reviewerReady: ready } : `${lines.join("\n")}\n`, options.json);
+    return;
+  }
+
+  // The REAL adapters: one shared git instance (runBuild's orchestrator ports and the step-test
+  // runner must read the same tree), plus the CLI-owned model/sandbox ports. runBuild merges its
+  // own orchestrator ports (runFullSuite via detectTestCmd, repo-contained readFile/fileExists,
+  // now/backends/options) underneath deps.stepDeps and refuses at preflight — spending nothing —
+  // when any §6 seat is down, the tree is dirty, HEAD is not the plan's baseCommit, or no test
+  // command exists.
+  const buildGit = makeBuildGit(root);
+  const stepDeps = makeBuildStepDeps(root, cwd, backends, merged, buildGit);
+  if (!options.json && stepDeps.authorSeat) {
+    console.error(`build: authoring seat = ${stepDeps.authorSeat} (first active seat; §6 reviews with EVERY required seat)`);
+  }
+  // Phase 2: live-dashboard reporter for the build (phase + step progress + a gate per committed/
+  // failed step — see runBuild). onProgress is reporter.line so today's stderr stays byte-identical.
+  const reporter = makeRunReporter(cwd, { kind: "build", title: "council build", json: options.json });
+  const out = await runBuild(cwd, planSpec, backends, {
+    ...merged,
+    reporter,
+    onProgress: reporter.line
+  }, { git: buildGit, stepDeps });
+  reporter.done({ ok: out?.ok === true, stopReason: out?.stopReason });
+
+  if (options.json) {
+    outputResult(out, true);
+  } else {
+    console.log(renderBuildReport(out));
+  }
+  // Any failed gate / stranded run is a non-zero exit — a build that did not fully land must not look green.
+  if (!out?.ok || out?.stranded) process.exitCode = 1;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const command = argv[0];
@@ -2422,6 +3633,12 @@ async function main() {
       case "audit":
         await handleAudit(rest);
         break;
+      case "plan":
+        await handlePlan(rest);
+        break;
+      case "build":
+        await handleBuild(rest);
+        break;
       case "usage":
         await handleUsage(rest);
         break;
@@ -2462,7 +3679,27 @@ async function main() {
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
+  } finally {
+    // A handler that threw (or exited early) before calling reporter.done() would otherwise strand
+    // its progress.json at done:false and hang `council watch`. Mark any un-finished run terminal.
+    // Runs on the success path too, where it is a no-op (done already set).
+    flushActiveRunReporter();
   }
 }
 
-await main();
+// Run the CLI only when this file IS the process entry (`node …/council-companion.mjs <cmd>`,
+// which is how every command file, the background-worker respawn, and every subprocess test
+// invoke it). A plain `import` of the module — the unit-test seam for the pure helpers exported
+// above (e.g. classifyAuthoredTestRun) — must not parse argv or print usage.
+function invokedAsCli() {
+  try {
+    if (!process.argv[1]) return false;
+    const self = fs.realpathSync(fileURLToPath(import.meta.url));
+    const entry = fs.realpathSync(path.resolve(process.argv[1]));
+    return process.platform === "win32" ? self.toLowerCase() === entry.toLowerCase() : self === entry;
+  } catch {
+    return true; // fail toward the historical behavior: run the CLI
+  }
+}
+
+if (invokedAsCli()) await main();

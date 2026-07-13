@@ -12,7 +12,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { dedupeNew, endlessStopReason } from "./audit-endless.mjs";
+import { dedupeNew, endlessKey, endlessStopReason } from "./audit-endless.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
+import { retryOnRateLimit } from "./audit-retry.mjs";
 import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
 import { resolveStateDir, writeFileAtomic } from "./state.mjs";
@@ -60,7 +62,8 @@ function defaultCheckpoint(cwd, state) {
  * process+redirect set, tier-ordered (Structure -> Correctness -> Quality) so a bug is
  * fixed once post-consolidation; `surfaced` are serious findings parked behind a
  * remove?/redirect (the report must foreground them). Without a verdict map nothing is
- * pruned — the honest default until Tier 0 is wired in.
+ * pruned — the default for a bare caller that injects no map (the CLI threads in
+ * detectLogical's Tier-0 verdict map, which DOES gate).
  */
 export function gateFindings(findings, verdictMap = {}) {
   const g = applyTierGating(findings, verdictMap);
@@ -86,6 +89,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const totalBudget = clamp(options.budget ?? 60, 2, 100000);
   const perPassBudget = clamp(options.perPassBudget ?? Math.max(4, Math.round(totalBudget / Math.min(maxPasses, 4))), 2, totalBudget);
   const onProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
+  const reporter = options.reporter ?? NOOP_REPORTER; // best-effort live telemetry (additive)
   const review = deps.review;
   const fix = deps.fix;
   if (typeof review !== "function") throw new Error("runFixLoop requires deps.review");
@@ -94,6 +98,16 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const gate = deps.gate ?? ((findings, ctx) => gateFindings(findings, verdictsFor(findings, ctx) ?? {}));
   const expandScope = typeof deps.expandScope === "function" ? deps.expandScope : (x) => x;
   const checkpoint = deps.checkpoint ?? ((state) => defaultCheckpoint(cwd, state));
+  // Rate-limit resilience for unattended runs: on a 429/overload from a review/fix
+  // phase, back off + retry instead of stopping the whole loop. Opt-in (--retry-on-limit);
+  // a non-rate-limit error still propagates immediately. Sleep is injectable for tests.
+  const withLimitRetry = options.retryOnLimit
+    ? (fn) => retryOnRateLimit(fn, {
+        retries: clamp(options.retryLimit ?? 5, 1, 20),
+        sleep: deps.sleep,
+        onRetry: ({ attempt, ms }) => onProgress(`rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt}/${clamp(options.retryLimit ?? 5, 1, 20)})…`)
+      })
+    : (fn) => fn();
 
   const fixedAll = [];
   const failedAll = [];
@@ -102,6 +116,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const seenFixed = new Set();
   const seenProposed = new Set();
   const seenReview = new Set();
+  const reviewedAll = []; // persisted so a resume can rebuild seenReview (mirrors audit-endless)
   let spent = 0;
   let dryStreak = 0;
   let stalledStreak = 0;
@@ -109,13 +124,19 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   let stopReason = null;
   let changedFiles = null; // null = full scope on the first pass
   let branch = null;
-  // Per-tier convergence (§3, opt-in): run each tier (0 logical -> 1 structure -> 2
-  // correctness -> 3 quality) to dry before advancing, so a Structure consolidation lands
-  // before Correctness runs on the consolidated code. OFF by default (structure is
-  // propose-only today, so it would only march through empty tiers); turned on when
-  // structure auto-apply lands.
+  // Per-tier convergence (§3): run each tier (0 logical -> 1 structure -> 2 correctness -> 3
+  // quality) to dry before advancing, so a Structure consolidation lands before Correctness runs
+  // on the consolidated code (a bug is then found once, post-consolidation, not N times across
+  // copies). The pure default is OFF so the function contract is stable; the audit-fix CLI defaults
+  // it ON (B5, --per-tier) at the call site, where real findings carry a lens (see the wiring).
   const perTier = Boolean(options.perTierConvergence);
-  let currentTier = 0;
+  // Start at Tier 1 (Structure), NOT 0 (Logical): tier 0 = logical_sense is propose-only and is
+  // NEVER review-sourced (no category maps to it; categoryToLens falls back to correctness), so its
+  // proposals arrive once via logicalProposals → proposedAll and never enter gate/actionable.
+  // Starting at 0 therefore burned dryStop full review+fix passes of warm-up tax every run once
+  // per-tier became the CLI default (council B5 codex P1). Logical proposals are still surfaced.
+  const FIRST_TIER = 1;
+  let currentTier = FIRST_TIER;
   let tierDryStreak = 0;
 
   if (options.resume) {
@@ -129,15 +150,31 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
         if (!seenProposed.has(k)) { seenProposed.add(k); proposedAll.push(p); }
       }
       if (Array.isArray(prior.passes)) passes.push(...prior.passes);
+      // Rebuild the review dedupe set from the persisted raw findings (mirrors audit-endless's
+      // `for (const f of all) seen.add(endlessKey(f))`) — without this a recurring propose-only
+      // finding re-counts as "fresh" on every resume, resetting the dry streak (council loop-report).
+      if (Array.isArray(prior.reviewed)) {
+        reviewedAll.push(...prior.reviewed);
+        for (const f of prior.reviewed) seenReview.add(endlessKey(f));
+      }
       // Clamp untrusted checkpoint numerics into range so a corrupt/negative value can't
       // bypass the budget or pass ceiling.
       spent = clamp(prior.spent ?? 0, 0, totalBudget);
       passNo = clamp(prior.passNo ?? 0, 0, maxPasses);
       dryStreak = clamp(prior.dryStreak ?? 0, 0, dryStop);
+      // Restore the per-tier staging position so a resume (the M10 supervisor path) continues at the
+      // tier it was fixing, not from tier 0 — which would re-walk structure every restart (council
+      // B5 grok P2/Claude). Clamped so a corrupt checkpoint can't push currentTier out of range.
+      currentTier = clamp(prior.currentTier ?? FIRST_TIER, FIRST_TIER, 4);
+      tierDryStreak = clamp(prior.tierDryStreak ?? 0, 0, dryStop);
+      stalledStreak = clamp(prior.stalledStreak ?? 0, 0, dryStop);
       branch = prior.branch ?? null;
       // Restore the scope so a resumed run doesn't jump straight to a stale full-scope
       // window offset (which would review off-the-end and falsely read "dry").
       if (Array.isArray(prior.changedFiles) && prior.changedFiles.length) changedFiles = prior.changedFiles;
+      // Restore the full-scope window cursor into the deps closure so a resumed FULL pass continues
+      // from where it left off instead of re-reviewing offset 0 and missing later units (Codex C2 P1).
+      if (deps.windowState && Number.isFinite(prior.windowPasses)) deps.windowState.set(prior.windowPasses);
       onProgress(`resumed: ${fixedAll.length} fixed, ${spent}/${totalBudget} spent, ${passNo} passes, dry ${dryStreak}/${dryStop}`);
     }
   }
@@ -162,26 +199,48 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   };
 
   for (;;) {
-    stopReason = endlessStopReason({ passNo, spent, dryStreak }, { maxPasses, totalBudget, dryStop });
-    if (!stopReason && stalledStreak >= dryStop) stopReason = `stalled — actionable findings remain but none are auto-applicable (${stalledStreak} passes)`;
-    if (!stopReason && perTier && currentTier > 3) stopReason = "all tiers converged (structure -> correctness -> quality)";
+    // Under per-tier staging the GLOBAL dry/stalled streaks are TIER-UNAWARE — they see findings
+    // from ALL tiers while `fix` is only offered the CURRENT tier's set, so recurring later-tier
+    // findings would make global dry/stalled trip and stop the loop BEFORE those tiers are ever
+    // fixed (council B5 grok P1). So while per-tier is staging, global dry/stalled must NOT stop the
+    // loop — tier advancement drives progress and the "all tiers converged" reason ends it. Global
+    // dry/stalled apply only in flat (non-per-tier) mode.
+    // Check per-tier CONVERGENCE first (council Codex C2 P2): a run that advances past the last tier
+    // on the SAME iteration it also hits maxPasses/budget should report the meaningful "all tiers
+    // converged", not the generic ceiling — the tiers genuinely finished.
+    stopReason = perTier && currentTier > 3 ? "all tiers converged (structure -> correctness -> quality)" : null;
+    if (!stopReason) stopReason = endlessStopReason({ passNo, spent, dryStreak: perTier ? 0 : dryStreak }, { maxPasses, totalBudget, dryStop });
+    if (!stopReason && !perTier && stalledStreak >= dryStop) stopReason = `stalled — actionable findings remain but none are auto-applicable (${stalledStreak} passes)`;
     if (stopReason) break;
 
     passNo += 1;
+    reporter.phase("fix", `pass ${passNo}`);
+    reporter.progress({ passesDone: passNo, passesTotal: maxPasses });
+    reporter.budget(spent, totalBudget);
     const passBudget = Math.min(perPassBudget, totalBudget - spent);
     onProgress(`pass ${passNo}: review+fix (budget ${passBudget}, ${spent}/${totalBudget}, dry ${dryStreak}/${dryStop})…`);
 
     let rev;
     try {
-      rev = await review({ budget: passBudget, pass: passNo, changedFiles });
+      rev = await withLimitRetry(() => review({ budget: passBudget, pass: passNo, changedFiles }));
     } catch (err) {
       passes.push({ pass: passNo, error: String(err?.message ?? err) });
       stopReason = `review error on pass ${passNo}: ${String(err?.message ?? err)}`;
       break;
     }
+    // A review that DID NOT actually run (no reachable reviewer, or a rate-limit the
+    // retries couldn't outlast) returns ran:false with zero findings. That is NOT a clean
+    // "nothing to fix" — counting it toward the dry streak would let a throttled run declare
+    // false convergence and exit reporting success while nothing was reviewed. Stop honestly.
+    if (rev && rev.ran === false) {
+      passes.push({ pass: passNo, error: "review did not run (no reachable reviewer or rate-limited)" });
+      stopReason = `review did not run on pass ${passNo} (backends unavailable or rate-limited) — stopped without false convergence`;
+      break;
+    }
     const findings = rev?.findings ?? [];
     charge(rev?.coverage?.budgetSpent, Math.max(1, passBudget)); // a review always costs >= 1
     const freshFindings = dedupeNew(findings, seenReview);
+    reviewedAll.push(...freshFindings);
 
     const gated = gate(findings, { changedFiles, pass: passNo });
     for (const p of gated.surfaced ?? []) {
@@ -197,7 +256,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
 
     let fx;
     try {
-      fx = await fix(actionable, { budget: Math.max(1, Math.min(perPassBudget, totalBudget - spent)), pass: passNo, branch, stayOnBranch: true });
+      fx = await withLimitRetry(() => fix(actionable, { budget: Math.max(1, Math.min(perPassBudget, totalBudget - spent)), pass: passNo, branch, stayOnBranch: true }));
     } catch (err) {
       passes.push({ pass: passNo, error: String(err?.message ?? err) });
       stopReason = `fix error on pass ${passNo}: ${String(err?.message ?? err)}`;
@@ -241,25 +300,51 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     const expanded = changed.length ? expandScope(changed) ?? changed : [];
     changedFiles = expanded.length ? expanded : null;
 
-    // Honest convergence: dry when the REVIEW found nothing new; stalled when new
-    // findings exist but none could be auto-applied this pass.
-    dryStreak = freshFindings.length === 0 ? dryStreak + 1 : 0;
-    stalledStreak = freshFindings.length > 0 && freshFixed.length === 0 ? stalledStreak + 1 : 0;
-    // Advance to the next tier once the current one has nothing new to fix for K passes.
+    // Honest, cell-aware convergence (B5): DRY only when the review found nothing new AND its
+    // six-eyes coverage is complete (unreviewed cells → still work → reset; absent coverage info
+    // counts complete for the pre-cell-matrix path). STALLED only when fresh AUTO-FIXABLE findings
+    // remained unapplied — fresh PROPOSE-ONLY findings (architecture/SSOT/etc.) are expected not to
+    // auto-apply and must NOT read as a stall (that would falsely stop with real fixes still open).
+    // Prefer the grouped path's passComplete (scheduled cells reviewed — transient-completable) over
+    // the strict `complete` (which capped/unsupplied force false PERSISTENTLY → the loop could never
+    // converge; council R9 Codex/Claude P1). Per-file path sets neither → undefined → treated complete.
+    // M8: when the completeness critic ran (--completeness-critic), a pass it judges under-examined
+    // (completenessComplete === false: a structural gap OR a critic-found gap) does NOT count toward the
+    // dry streak — the run keeps hunting. undefined (critic off or infra-degraded) is non-blocking, so
+    // the default path is byte-identical to before.
+    const coverageComplete =
+      (rev?.coverage?.passComplete ?? rev?.coverage?.complete) !== false && rev?.coverage?.completenessComplete !== false;
+    // AUTO-FIXABLE = a localized finding the fixer can actually apply. A propose-only / cross-cutting
+    // finding (architecture/SSOT/logical) is offered to fix() only to be surfaced as a proposal — it
+    // NEVER auto-applies, so counting it as live work would (a) falsely read as a stall and (b) pin a
+    // per-tier stage forever: it recurs every pass, keeps `actionable` non-empty, and the tier never
+    // advances while a Tier-2 correctness bug behind it is never reached (council Codex C2 P1).
+    const autoFixable = (f) => f?.scope !== "cross-cutting" && f?.fixDisposition !== "propose-only";
+    const freshActionable = gate(freshFindings, { changedFiles, pass: passNo }).actionable.filter(autoFixable).length;
+    dryStreak = freshFindings.length === 0 && coverageComplete ? dryStreak + 1 : 0;
+    stalledStreak = freshActionable > 0 && freshFixed.length === 0 ? stalledStreak + 1 : 0;
+    // Advance to the next tier once the current one has nothing new AUTO-FIXABLE for K passes AND the
+    // review's six-eyes coverage is complete (an incomplete grouped matrix still has cells to review —
+    // advancing then would declare "all tiers converged" over unreviewed work; council Codex C2 P1).
     if (perTier) {
-      const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier).length;
-      if (actionable.length > 0 || tierFresh > 0) tierDryStreak = 0;
-      else if ((tierDryStreak += 1) >= dryStop) {
+      const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier && autoFixable(f)).length;
+      const tierAuto = actionable.filter(autoFixable).length;
+      if (tierAuto > 0 || tierFresh > 0) tierDryStreak = 0;
+      else if (coverageComplete && (tierDryStreak += 1) >= dryStop) {
         currentTier += 1;
         tierDryStreak = 0;
+        stalledStreak = 0; // a tier advance IS progress — never carry a stall from a done tier into the next (council B5 grok P1-b)
       }
     }
 
     passes.push({ pass: passNo, reviewed: findings.length, fresh: freshFindings.length, actionable: gated.actionable.length, fixed: freshFixed.length, failed: (fx?.failed ?? []).length, spent });
+    // Re-emit the budget AFTER this pass's review+fix charges — the pass-start emit (above) is pre-charge,
+    // so without this the dashboard/progress.json would under-report spend by a whole pass. Best-effort.
+    reporter.budget(spent, totalBudget);
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
-    checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, stopReason: null, done: false });
+    checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason: null, done: false });
   }
 
-  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, dryStreak, stopReason, done: true });
-  return { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak };
+  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason, done: true });
+  return { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak, changedFiles: [...new Set(fixedAll.map((f) => f.file))] };
 }

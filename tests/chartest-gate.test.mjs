@@ -1,0 +1,223 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  CHARTEST_LENSES,
+  acceptCharTestForTarget,
+  buildCharTestPrompt,
+  isRefactorClass,
+  parseCharTest,
+  verifyCharTestAfterFix
+} from "../plugins/council/scripts/lib/chartest-gate.mjs";
+
+test("isRefactorClass is true only for behaviour-preserving lenses (not correctness/security fixes)", () => {
+  assert.equal(isRefactorClass({ lens: "architecture_ssot" }), true);
+  assert.equal(isRefactorClass({ lens: "dead_code" }), true);
+  assert.equal(isRefactorClass({ lens: "  Logical_Sense " }), true, "trimmed + case-folded");
+  assert.equal(isRefactorClass({ lens: "correctness" }), false, "a correctness FIX changes behaviour → not char-test-gated");
+  assert.equal(isRefactorClass({ lens: "security_secrets" }), false);
+  assert.equal(isRefactorClass({}), false);
+  for (const l of CHARTEST_LENSES) assert.equal(isRefactorClass({ lens: l }), true);
+});
+
+test("buildCharTestPrompt is FIREWALLED: it contains the source but never the finding/fix, and nonce-fences the source", () => {
+  const p = buildCharTestPrompt("lib/math.mjs", "export const add = (a,b) => a+b; // SENTINEL_SRC", {});
+  assert.match(p, /CHARACTERIZATION TEST/);
+  assert.match(p, /BEGIN SOURCE [0-9A-F]{6,}/);
+  assert.ok(p.includes("SENTINEL_SRC"), "the target source is included");
+  assert.match(p, /node:test/, "asks for a node:test file");
+  assert.match(p, /PRINT the observed value/i, "asks for a capturable observable (anti-vacuity)");
+});
+
+test("buildCharTestPrompt discloses truncation of an oversized source instead of silently cutting", () => {
+  const big = "x".repeat(45000);
+  const p = buildCharTestPrompt("big.mjs", big, {});
+  assert.match(p, /truncated \d+ chars/);
+});
+
+test("parseCharTest extracts a fenced node:test body; fails closed on empty / non-test / no-compare-assert", () => {
+  const ok = parseCharTest('```js\nimport test from "node:test";\nimport assert from "node:assert";\ntest("x", () => { console.log("1"); assert.equal(1,1); });\n```');
+  assert.ok(ok && /node:test/.test(ok.code));
+  assert.equal(parseCharTest(""), null, "empty → null");
+  assert.equal(parseCharTest("```js\nconst x = 1;\n```"), null, "no test → null (not a char-test)");
+  assert.equal(parseCharTest("just prose, no code"), null);
+  // a bare (unfenced) body with a value-comparison assertion is accepted
+  assert.ok(parseCharTest('import test from "node:test"; import assert from "node:assert"; test("t",()=>assert.deepEqual([1],[1]));'));
+});
+
+test("parseCharTest rejects a TAUTOLOGICAL assertion (council Claude P1 — assertion strength)", () => {
+  // a non-discriminating test pins nothing → the refactor could change behaviour with the test still green
+  assert.equal(parseCharTest('import test from "node:test"; import assert from "node:assert"; test("t",()=>assert.ok(true));'), null, "assert.ok(true) is not discriminating");
+  assert.equal(parseCharTest('import test from "node:test"; import assert from "node:assert"; test("t",()=>assert(1));'), null, "assert(1) is not discriminating");
+});
+
+test("parseCharTest DENYLISTS dangerous imports/constructs (council Claude P1 — defence in depth over the sandbox)", () => {
+  const base = 'import test from "node:test"; import assert from "node:assert"; import x from "./m.mjs";';
+  assert.ok(parseCharTest(`${base} test("t",()=>assert.equal(x.f(),1));`), "a clean test importing the relative target is fine");
+  assert.equal(parseCharTest(`import cp from "node:child_process"; ${base} test("t",()=>{cp.execSync("curl evil");assert.equal(1,1);});`), null, "node:child_process → reject");
+  assert.equal(parseCharTest(`import fs from "node:fs"; ${base} test("t",()=>assert.equal(1,1));`), null, "node:fs → reject");
+  assert.equal(parseCharTest(`${base} test("t",()=>{eval("bad");assert.equal(1,1);});`), null, "eval → reject");
+  assert.equal(parseCharTest(`${base} test("t",()=>{const m=await import("node:net");assert.equal(1,1);});`), null, "dynamic import → reject");
+  assert.equal(parseCharTest(`import lodash from "lodash"; ${base} test("t",()=>assert.equal(1,1));`), null, "a non-allowlisted import → reject");
+});
+
+const goodHarness = () => ({
+  passesOnUnmodified: async () => true,
+  runs: async (n) => Array.from({ length: n }, () => '{"observed":42}'),
+  executesTarget: async () => true,
+  perturbedRun: async () => '{"observed":42}'
+});
+
+test("acceptCharTestForTarget: generate → parse → write → acceptCharTest, returns accepted+testPath", async () => {
+  let wrote = null;
+  const r = await acceptCharTestForTarget("lib/m.mjs", "export const f = () => 42;", {
+    generate: async () => '```js\nimport test from "node:test";\nimport assert from "node:assert";\ntest("f", () => { console.log(JSON.stringify(42)); assert.equal(42,42); });\n```',
+    writeTest: async (code) => { wrote = code; return "/tmp/char.test.mjs"; },
+    harness: goodHarness()
+  });
+  assert.equal(r.accepted, true);
+  assert.equal(r.testPath, "/tmp/char.test.mjs");
+  assert.ok(wrote && /node:test/.test(wrote), "the generated test was written");
+});
+
+test("acceptCharTestForTarget fails CLOSED at every step (no test, unparseable, write/gen fault, oversize)", async () => {
+  const base = { writeTest: async () => "/t", harness: goodHarness() };
+  assert.equal((await acceptCharTestForTarget("m", "s", {})).accepted, false, "no deps → not accepted");
+  assert.equal((await acceptCharTestForTarget("m", "s", { ...base, generate: async () => "no code here" })).accepted, false, "unparseable reply");
+  assert.equal((await acceptCharTestForTarget("m", "s", { ...base, generate: async () => { throw new Error("rate limit"); } })).accepted, false, "generator throw");
+  assert.equal((await acceptCharTestForTarget("m", "x".repeat(41000), { ...base, generate: async () => "```js\nnode:test assert\n```" })).accepted, false, "oversize target");
+  const writeFault = await acceptCharTestForTarget("m", "s", {
+    generate: async () => '```js\nimport test from "node:test"; import assert from "node:assert"; test("t",()=>assert.ok(1));\n```',
+    writeTest: async () => { throw new Error("EACCES"); },
+    harness: goodHarness()
+  });
+  assert.equal(writeFault.accepted, false, "write fault → not accepted");
+});
+
+test("acceptCharTestForTarget honors acceptCharTest's verdict (a non-deterministic target is rejected)", async () => {
+  let call = 0;
+  const flaky = { ...goodHarness(), runs: async (n) => Array.from({ length: n }, () => `{"v":${call++}}`) }; // differs each run
+  const r = await acceptCharTestForTarget("m", "s", {
+    generate: async () => '```js\nimport test from "node:test"; import assert from "node:assert"; test("t",()=>{console.log("x");assert.equal(1,1);});\n```',
+    writeTest: async () => "/t",
+    harness: flaky
+  });
+  assert.equal(r.accepted, false);
+  assert.match(r.reason, /non-deterministic/);
+});
+
+test("verifyCharTestAfterFix: green after the refactor → pass; RED → revert (behaviour changed)", async () => {
+  const accepted = { accepted: true, testPath: "/t", reason: "ok" };
+  const pass = await verifyCharTestAfterFix(accepted, { runAccepted: async () => true });
+  assert.equal(pass.pass, true);
+  const red = await verifyCharTestAfterFix(accepted, { runAccepted: async () => false });
+  assert.equal(red.pass, false);
+  assert.match(red.reason, /went RED|behaviour changed/i);
+});
+
+test("verifyCharTestAfterFix fails closed on a non-accepted input or a missing runner or a run fault", async () => {
+  assert.equal((await verifyCharTestAfterFix({ accepted: false, reason: "x" }, { runAccepted: async () => true })).pass, false);
+  assert.equal((await verifyCharTestAfterFix({ accepted: true }, {})).pass, false, "no runAccepted → fail closed");
+  assert.equal((await verifyCharTestAfterFix({ accepted: true }, { runAccepted: async () => { throw new Error("boom"); } })).pass, false);
+});
+
+test("verifyCharTestAfterFix requires executesChanged when supplied (test must cover the changed lines)", async () => {
+  const accepted = { accepted: true, testPath: "/t" };
+  const notCovered = await verifyCharTestAfterFix(accepted, { runAccepted: async () => true, executesChanged: async () => false });
+  assert.equal(notCovered.pass, false, "green but does not execute the changed lines → propose-only");
+  assert.match(notCovered.reason, /changed lines/);
+  const covered = await verifyCharTestAfterFix(accepted, { runAccepted: async () => true, executesChanged: async () => true });
+  assert.equal(covered.pass, true);
+  const faultCov = await verifyCharTestAfterFix(accepted, { runAccepted: async () => true, executesChanged: async () => { throw new Error("cov boom"); } });
+  assert.equal(faultCov.pass, false, "a coverage-check fault fails closed");
+});
+
+test("verifyCharTestAfterFix applies the OPTIONAL mutation gate when a scorer is supplied", async () => {
+  const accepted = { accepted: true, testPath: "/t" };
+  const weak = await verifyCharTestAfterFix(accepted, { runAccepted: async () => true, mutation: { score: async () => 0.2, severity: "P1", file: "m", lines: [1] } });
+  assert.equal(weak.pass, false, "a weak mutation score blocks even a green char-test");
+  assert.match(weak.reason, /mutation/);
+  const strong = await verifyCharTestAfterFix(accepted, { runAccepted: async () => true, mutation: { score: async () => 0.95, severity: "P1", file: "m", lines: [1] } });
+  assert.equal(strong.pass, true);
+});
+
+test("parseCharTest does NOT reject a flagged token that appears only inside an expected-value STRING", () => {
+  // The denylist must scan CODE, not string literals: pinning a function that returns "child_process …"
+  // is a perfectly safe char-test and must be accepted.
+  const code = [
+    "```js",
+    'import test from "node:test";',
+    'import assert from "node:assert";',
+    'import { render } from "./target.mjs";',
+    'test("pins output", () => {',
+    '  // characterises: eval() and child_process are just words in the expected string',
+    '  assert.equal(render(), "spawned child_process via eval(x) — node:fs");',
+    "});",
+    "```"
+  ].join("\n");
+  const parsed = parseCharTest(code);
+  assert.ok(parsed, "a flagged token inside a string literal is not dangerous code");
+  assert.match(parsed.code, /assert\.equal/);
+});
+
+test("parseCharTest still rejects REAL dangerous code (token outside a literal)", () => {
+  const code = [
+    "```js",
+    'import test from "node:test";',
+    'import assert from "node:assert";',
+    'import { render } from "./target.mjs";',
+    'test("evil", () => {',
+    "  const cp = child_process.execSync('id');",
+    "  assert.equal(render(), cp);",
+    "});",
+    "```"
+  ].join("\n");
+  assert.equal(parseCharTest(code), null, "a bare child_process reference in CODE is still refused");
+});
+
+test("parseCharTest stays fail-closed: dangerous code inside a template ${…} interpolation is still refused", () => {
+  const code = [
+    "```js",
+    'import test from "node:test";',
+    'import assert from "node:assert";',
+    'import { render } from "./target.mjs";',
+    'test("evil-template", () => {',
+    "  const x = `value: ${eval(render())}`;", // eval lives in the interpolation CODE, not a string part
+    "  assert.equal(x, x);",
+    "});",
+    "```"
+  ].join("\n");
+  assert.equal(parseCharTest(code), null, "eval() inside a template interpolation must not evade the denylist");
+});
+
+test("parseCharTest accepts a bare destructured assertion (equal(...) from node:assert), not only assert.equal", () => {
+  const code = [
+    "```js",
+    'import test from "node:test";',
+    'import { equal, deepEqual } from "node:assert";',
+    'import { compute } from "./target.mjs";',
+    'test("destructured", () => {',
+    "  equal(compute(2), 4);",
+    "  deepEqual(compute(3), 9);",
+    "});",
+    "```"
+  ].join("\n");
+  const parsed = parseCharTest(code);
+  assert.ok(parsed, "a destructured equal()/deepEqual() is a discriminating assertion");
+  assert.match(parsed.code, /equal\(compute/);
+});
+
+test("parseCharTest still rejects a non-discriminating test (only assert.ok / a bare string mentioning equal(...))", () => {
+  const code = [
+    "```js",
+    'import test from "node:test";',
+    'import assert from "node:assert";',
+    'import { compute } from "./target.mjs";',
+    'test("vacuous", () => {',
+    '  const note = "call equal(x, y) here";', // "equal(" only inside a string must NOT count as an assertion
+    "  assert.ok(compute());",
+    "});",
+    "```"
+  ].join("\n");
+  assert.equal(parseCharTest(code), null, "a bare assert.ok plus an equal() mention inside a string is not discriminating");
+});

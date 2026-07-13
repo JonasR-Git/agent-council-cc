@@ -5,6 +5,9 @@ import {
   runCodexStructured,
   runGrokStructured
 } from "./agents.mjs";
+import { runClaudeStructured } from "./claude-agent.mjs";
+import { runOpenRouterStructured } from "./openrouter-agent.mjs";
+import { allSeatNames, isOpenRouterSeat, seatActive } from "./seats.mjs";
 import { extractJsonObject } from "./findings.mjs";
 import { skippedAgents } from "./policy.mjs";
 
@@ -27,14 +30,29 @@ export function parseRefutation(stdout) {
 // subprocesses at once and exhaust process/API limits.
 const VERIFY_CONCURRENCY = 4;
 
-export function verifierFor(finding, options) {
-  const skip = new Set(skippedAgents(options));
+/** Which verifier seats are actually reachable (probed), computed inline to avoid a cycle with
+ *  audit-review's reviewerActive. Claude's cli is probed on the audit path (bare probeBackends). */
+export function verifierAvailability(backends, options = {}) {
+  return Object.fromEntries(allSeatNames(backends).map((s) => [s, seatActive(s, backends, options)]));
+}
+
+export function verifierFor(finding, options, available = null, backends = null) {
+  // B2: Claude is now a first-class FINDER, so it must also be an eligible REFUTER — else a
+  // codex-only P0 (grok skipped) ships UNVERIFIED even when Claude is a valid independent seat
+  // (council codex-1). includeClaude:true so skipClaude drops it symmetrically.
+  const skip = new Set(skippedAgents(options, { includeClaude: true }));
   const raisedBy = new Set(finding.agents ?? []);
-  // ONLY an agent that did not raise the finding may verify it. If no such
-  // independent agent is available (peers skipped), do not verify at all - a
-  // finding must never be demoted by its own author.
-  for (const candidate of ["grok", "codex"]) {
-    if (!skip.has(candidate) && !raisedBy.has(candidate)) return candidate;
+  // ONLY an agent that did not raise the finding may verify it (a finding is never demoted by its
+  // own author), and only one that is actually REACHABLE when availability is known — else we pick
+  // a candidate whose spawn just fails, wasting a call and leaving the finding unverified anyway
+  // (council claude-4). When `available` is null, availability is not gated (legacy callers).
+  // An OpenRouter seat can also refute (it did NOT raise a built-in-authored finding) — so a finding
+  // all three built-ins raised can still be independently checked. Built-ins first (cheapest), then OR.
+  const candidates = ["grok", "codex", "claude", ...(backends?.openrouter?.seats ?? []).map((s) => s.id)];
+  for (const candidate of candidates) {
+    if (skip.has(candidate) || raisedBy.has(candidate)) continue;
+    if (available && !available[candidate]) continue;
+    return candidate;
   }
   return null;
 }
@@ -62,8 +80,19 @@ async function mapWithLimit(items, limit, fn) {
   return results;
 }
 
+// Trust a refutation only from a clean, COMPLETE run (not skipped/timed-out/truncated/failed/
+// empty). `truncated` can co-occur with status===0 (a maxBuffer-overflow kill can still report exit
+// 0 if the process had already flushed output as/just-before the kill), so status===0 alone is not
+// enough — mirrors textOf() in audit-patch-reviewer.mjs, which also excludes truncated. Exported as
+// a pure predicate so this fail-closed decision is directly unit-testable without spawning a process.
+export function isTrustworthyVerifierResult(res) {
+  return !res.skipped && !res.timedOut && !res.truncated && res.status === 0 && Boolean(String(res.stdout ?? "").trim());
+}
+
 async function runVerifier(agent, cwd, backends, options, prompt) {
   if (agent === "codex") return runCodexStructured(cwd, backends, options, prompt, "verify");
+  if (agent === "claude") return runClaudeStructured(cwd, backends, options, prompt);
+  if (isOpenRouterSeat(agent, backends)) return runOpenRouterStructured(cwd, backends, options, prompt, agent);
   return runGrokStructured(cwd, backends, options, prompt);
 }
 
@@ -79,10 +108,19 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
     maxTurns: options.maxTurnsR2,
     grokEffort: options.r2Effort ?? options.grokEffort
   };
+  const budget = options.budget ?? null;
+  const available = verifierAvailability(backends, options); // B2: only pick a reachable, non-authoring seat
   const targets = (merged.all ?? []).filter((f) => shouldVerify(f, severities));
   const results = await mapWithLimit(targets, options.verifyConcurrency ?? VERIFY_CONCURRENCY, async (finding) => {
-    const agent = verifierFor(finding, options);
+    const agent = verifierFor(finding, options, available, backends);
     if (!agent) return { finding, verdict: null };
+    // Charge the finite invocation budget so refutation spend is ACCOUNTED (it used to fan
+    // out uncounted). Reserve BEFORE the await; if the budget can't afford it, skip this
+    // refutation and KEEP the finding (a budget-starved verify must never drop a finding).
+    if (budget) {
+      if (!budget.canSpend(1)) return { finding, verdict: null };
+      budget.charge(1);
+    }
     const evidence = buildEvidence(repoRoot, [{ id: finding.ids?.[0], file: finding.file, line: finding.line }], "");
     const hadEvidence = Boolean(evidence) && evidence !== "(no file evidence available)";
     const prompt = interpolate(loadPrompt("r2-verify"), {
@@ -96,8 +134,7 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
       EVIDENCE: evidence
     });
     const res = await runVerifier(agent, cwd, backends, verifyOpts, prompt);
-    // Trust a refutation only from a clean run (not skipped/timed-out/failed/empty).
-    const trustworthy = !res.skipped && !res.timedOut && res.status === 0 && Boolean(String(res.stdout ?? "").trim());
+    const trustworthy = isTrustworthyVerifierResult(res);
     const verdict = trustworthy ? parseRefutation(res.stdout) : null;
     return { finding, agent, verdict, hadEvidence };
   });
@@ -113,7 +150,7 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
       demotable: r.hadEvidence
     });
   }
-  return partitionByRefutation(merged, refutedKeys, targets.length);
+  return partitionByRefutation(merged, refutedKeys, targets.length, { demote: options.demote !== false });
 }
 
 /**
@@ -123,17 +160,21 @@ export async function verifyFindings(cwd, backends, options, merged, buildEviden
  * verifier could not support are moved to the low-confidence bucket. Pure and
  * testable; `refutations` maps finding -> {by, refuted, reason}.
  */
-export function partitionByRefutation(merged, refutations, verifiedCount = 0) {
+export function partitionByRefutation(merged, refutations, verifiedCount = 0, { demote = true } = {}) {
   const kept = [];
   const refuted = [];
   for (const f of merged.all ?? []) {
     const v = refutations.get(f);
     const annotated = v ? { ...f, verified: v } : f;
-    // Demote only a refuted, single-agent finding whose refutation was
-    // evidence-based (demotable !== false). Consensus stays (annotated disputed);
-    // an evidence-less refutation annotates but never hides a finding.
-    if (v?.refuted && v.demotable !== false && !f.consensus) refuted.push(annotated);
-    else kept.push(annotated);
+    // A refuted, single-agent, evidence-based finding (demotable !== false) is a refutation
+    // candidate. Consensus is never a candidate (protected).
+    const isRefuted = Boolean(v?.refuted && v.demotable !== false && !f.consensus);
+    if (isRefuted) refuted.push(annotated);
+    // demote:true HIDES refuted candidates from `.all` (deliberate path, human-reviewed).
+    // demote:false (ANNOTATE-ONLY) keeps them VISIBLE in `.all` with their `verified`
+    // annotation — so on the autonomous audit path a wrongly-refuted REAL finding is never
+    // silently dropped; downstream only DEPRIORITIZES it (propose-only), never erases it.
+    if (!isRefuted || !demote) kept.push(annotated);
   }
   return {
     merged: {

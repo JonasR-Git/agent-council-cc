@@ -149,6 +149,25 @@ test("reverts a transform that carries protected content into a survivor, or reg
   assert.match(oracle.rejected[0].reason, /oracle regression/);
 });
 
+test("a commit-time throw (e.g. commitFiles missing from the git adapter) reverts instead of leaving the tree dirty", async () => {
+  const git = fakeGit();
+  delete git.commitFiles; // reproduces the real adapter's contract mismatch (no commitFiles method)
+  const out = await runMultiFix("/x", [codemod], {}, {}, deps(git));
+  assert.equal(out.applied.length, 0, "an uncommitted transform must never be reported as applied");
+  assert.equal(out.ok, true, "a successful revert must not abort the batch");
+  assert.match(out.rejected[0].reason, /commit failed/);
+  assert.ok(git.calls.some((c) => c[0] === "resetHard"), "the applied-but-uncommitted edits must be rolled back");
+  assert.equal(git.isClean(), true, "the tree must be clean after the revert, not left dirty and unreported");
+});
+
+test("if commitFiles throws AND the rollback also fails, the whole batch aborts (never poisons the next transform)", async () => {
+  const git = fakeGit({ resetLeavesDirty: true });
+  delete git.commitFiles;
+  const out = await runMultiFix("/x", [codemod, codemod], {}, {}, deps(git));
+  assert.equal(out.ok, false);
+  assert.match(out.aborted, /rollback FAILED/);
+});
+
 test("runMultiFix requires its injectable deps", async () => {
   const out = await runMultiFix("/x", [codemod], {}, {}, { git: fakeGit() });
   assert.match(out.error, /requires deps/);

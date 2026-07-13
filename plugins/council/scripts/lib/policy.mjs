@@ -28,7 +28,20 @@ export const DEFAULT_POLICY = {
   verify_findings: false,
   reviewers: ["claude", "codex", "grok"],
   claude_backend: "session", // session | spawn
-  claude_model: null
+  claude_model: null,
+  // OpenRouter multi-model seats (optional). `openrouter_models` is a flat list of "slug" /
+  // "id=slug" / "id=slug@effort" strings (parseSimpleYaml can't nest); a nested `openrouter: {…}`
+  // object is also accepted from .council.json. SECURITY: the API key is read ONLY from the env var
+  // named by openrouter_api_key_env (default OPENROUTER_API_KEY). A literal openrouter_api_key in the
+  // policy file is IGNORED for activation — the file is read from the audited (untrusted) repo, so a
+  // repo-supplied key must never ship your source to that key's account (council OpenRouter Claude/Grok
+  // P1). The field is retained only so a stray value is parsed + warned, not silently honored.
+  // openrouter_base_url may point at a LOOPBACK proxy or the openrouter.ai host only; any other remote
+  // host disables the backend fail-closed.
+  openrouter_models: [],
+  openrouter_api_key: null,
+  openrouter_api_key_env: "OPENROUTER_API_KEY",
+  openrouter_base_url: null
 };
 
 /**
@@ -201,8 +214,10 @@ export function mergeOptionsWithPolicy(options, policy) {
     maxTurnsR1: options.maxTurnsR1 ?? policy.max_turns_r1 ?? 40,
     maxTurnsR2: options.maxTurnsR2 ?? policy.max_turns_r2 ?? 25,
     deliberatePeer: options.deliberatePeer ?? policy.deliberate_peer !== false,
-    requireConsensusFor: options.requireConsensusFor ?? policy.require_consensus_for ?? [],
-    skipPaths: options.skipPaths ?? policy.skip_paths ?? [],
+    // A SCALAR YAML value (`require_consensus_for: security`) instead of a list must not crash the
+    // later `.map` in applyConsensusPolicy / normalizeSkipPaths — coerce a bare scalar to a 1-element list.
+    requireConsensusFor: asArray(options.requireConsensusFor ?? policy.require_consensus_for),
+    skipPaths: asArray(options.skipPaths ?? policy.skip_paths),
     peerCritiqueSeverities: normalizeSeverityList(
       options.peerCritiqueSeverities ?? policy.peer_critique_severities ?? DEFAULT_POLICY.peer_critique_severities
     ),
@@ -214,8 +229,35 @@ export function mergeOptionsWithPolicy(options, policy) {
     forceBudget: options.forceBudget ?? false,
     resume: options.resume ?? false,
     verifyFindings: options.verifyFindings ?? policy.verify_findings === true,
+    // OpenRouter seats — resolved to NON-SECRET options ONLY (council OpenRouter Grok P1): the API key
+    // is DELIBERATELY NOT put here. `merged` is spread widely and could be logged, so the key is passed
+    // TRANSIENTLY to openRouterBackend by the caller (council-companion), which registers it in module
+    // scope. Only the non-secret model list / key-ENV-name / base-url / skip flag live on options.
+    openrouterModels: options.openrouterModels ?? policy.openrouter?.models ?? policy.openrouter_models ?? [],
+    openrouterApiKeyEnv: options.openrouterApiKeyEnv ?? policy.openrouter?.apiKeyEnv ?? policy.openrouter_api_key_env ?? "OPENROUTER_API_KEY",
+    openrouterBaseUrl: options.openrouterBaseUrl ?? policy.openrouter?.baseUrl ?? policy.openrouter_base_url ?? null,
+    // Read BOTH the camelCase (programmatic) and the kebab CLI flag (council Codex/Claude P1): parseArgs
+    // stores --skip-openrouter under its kebab name WITHOUT camelCasing, so reading only options.skipOpenRouter
+    // left the flag inert — the documented kebab-not-converted trap (cf. retry-on-limit). A policy
+    // `skip_openrouter: true` also opts out. skipSeats is a per-seat id list from the same sources.
+    skipOpenRouter: Boolean(options.skipOpenRouter ?? options["skip-openrouter"] ?? policy.skip_openrouter),
+    skipSeats: normalizeStringList(options.skipSeats ?? options["skip-seats"] ?? policy.skip_seats),
     policySource: policy._source
   };
+}
+
+/** Coerce a maybe-scalar list field to an array: an array as-is, null/undefined to [], any other
+ *  scalar (a YAML string/number written where a list was expected) to a 1-element list. */
+function asArray(value) {
+  return Array.isArray(value) ? value : value == null ? [] : [value];
+}
+
+/** Normalize a seat-id skip list to a string[]: an array as-is, a comma string split, else []. Keeps
+ *  seatActive/attachOpenRouterSeats' `.includes(id)` correct (a raw string would match char-wise). */
+function normalizeStringList(value) {
+  if (Array.isArray(value)) return value.map((s) => String(s).trim()).filter(Boolean);
+  if (typeof value === "string") return value.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
 }
 
 function clampPercent(value) {

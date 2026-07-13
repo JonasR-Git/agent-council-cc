@@ -174,6 +174,18 @@ test("buildUnitPrompt bounds oversized source and flags the split", () => {
   assert.match(p.prompt, /truncated to 20 of 50/);
 });
 
+test("B2 (council grok-2): the shared unit prompt carries severity discipline so all 3 finders calibrate alike", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-unit-"));
+  fs.writeFileSync(path.join(dir, "m.mjs"), "export const x = 1;");
+  const model = { files: [{ id: "m.mjs", loc: 1, branches: 0, maxNesting: 0, fanIn: 0, fanOut: 0, churn: 0, smellCount: 0, tested: false, hotspot: 1 }] };
+  const { prompt } = buildUnitPrompt(dir, "m.mjs", model);
+  // Codex/Grok get NO system charter — so the severity rubric MUST live in the shared prompt, else
+  // only the (charter-bearing) Claude finder self-caps and cross-seat calibration skews.
+  assert.match(prompt, /Severity discipline/);
+  assert.match(prompt, /reserve P0\/P1 for a defect with a concrete, demonstrable failure/i);
+  assert.match(prompt, /do not inflate severity/i);
+});
+
 test("reviewerActive/activeReviewerCount reflect policy AND probed availability", () => {
   const both = { codex: { companionAvailable: true }, grok: { cli: { available: true } } };
   assert.equal(activeReviewerCount(both, {}), 2);
@@ -182,6 +194,18 @@ test("reviewerActive/activeReviewerCount reflect policy AND probed availability"
   const noCodex = { codex: { companionAvailable: false }, grok: { cli: { available: true } } };
   assert.equal(activeReviewerCount(noCodex, {}), 1, "unavailable backend is not counted");
   assert.equal(activeReviewerCount({ codex: { companionAvailable: false }, grok: { cli: { available: false } } }, {}), 0);
+});
+
+test("B2: Claude is a first-class FINDER — six-eyes when all three are probed", () => {
+  const three = { codex: { companionAvailable: true }, grok: { cli: { available: true } }, claude: { cli: { available: true } } };
+  assert.equal(reviewerActive("claude", three, {}), true, "a probed Claude cli is an active finder");
+  assert.equal(activeReviewerCount(three, {}), 3, "codex + grok + claude = six eyes");
+  // gated on the ACTUAL probe: an un-probed / unavailable Claude stays silent (four eyes), never counted
+  assert.equal(reviewerActive("claude", { claude: { cli: { available: false } } }, {}), false);
+  assert.equal(reviewerActive("claude", { claude: {} }, {}), false, "no cli probe → not active (avoids silent 4-eyes)");
+  // skipClaude opts out symmetrically with skipCodex/skipGrok
+  assert.equal(reviewerActive("claude", three, { skipClaude: true }), false);
+  assert.equal(activeReviewerCount(three, { skipClaude: true }), 2);
 });
 
 test("writeAuditDoc writes inside root but rejects escaping/absolute docPath", () => {

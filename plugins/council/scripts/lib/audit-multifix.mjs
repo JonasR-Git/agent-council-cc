@@ -145,6 +145,10 @@ async function runOneTransform(transform, deps, options) {
     return revert(`transform write failed: ${String(err?.message ?? err)}`);
   }
 
+  // Every gate below can THROW (an injected dep, the oracle, or the suite runner). Once the transform
+  // is applied, a throw must revert the tree exactly like a gate that returns not-ok — otherwise the
+  // fully-applied edit is left sitting in the working tree while the batch reports "rejected".
+  try {
   // A real codemod must be reproducible (a second run yields an identical result).
   if (typeof deps.isDeterministic === "function" && !(await deps.isDeterministic(transform))) {
     return revert("codemod is not reproducible (a second run differs) — propose-only");
@@ -189,8 +193,20 @@ async function runOneTransform(transform, deps, options) {
   const guard2 = enforcePlannedTouched(deps.git.changedFiles(), planned);
   if (!guard2.ok) return revert(`tree changed during gating (extra: ${guard2.extra.join(", ") || "-"}) — refusing to commit`);
 
-  const commit = deps.git.commitFiles(planned, `audit-multifix: ${transform.title ?? "consolidation"} (${planned.length} files)`);
+  // The commit itself can still fail (adapter contract mismatch, disk/git error) - a throw
+  // here must revert the same as every other gate, never leave the fully-applied,
+  // gate-passed transform sitting uncommitted in a tree reported as "rejected".
+  let commit;
+  try {
+    commit = deps.git.commitFiles(planned, `audit-multifix: ${transform.title ?? "consolidation"} (${planned.length} files)`);
+  } catch (err) {
+    return revert(`commit failed: ${String(err?.message ?? err)}`);
+  }
   return { outcome: "commit", committed: commit, planned };
+  } catch (err) {
+    // A gate/dep threw after the transform was applied — revert so the tree is never left mutated.
+    return revert(`a gate threw after the transform was applied: ${String(err?.message ?? err)}`);
+  }
 }
 
 /**

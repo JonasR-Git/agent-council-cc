@@ -5,13 +5,13 @@ import {
   interpolate,
   loadPrompt,
   makeFenceNonce,
-  runCodexStructured,
-  runGrokStructured,
+  runStructuredWithRetry,
   waitForFile
 } from "./agents.mjs";
 import { runDebateRounds } from "./debate.mjs";
 import { extractJsonObject } from "./findings.mjs";
 import { runCommand } from "./process.mjs";
+import { activeSeatNames, allSeatNames, makeSeatRunners } from "./seats.mjs";
 import { SCHEMAS } from "./schemas.mjs";
 import { validate } from "./validate.mjs";
 import { clampScore } from "./stats.mjs";
@@ -43,7 +43,11 @@ export function parsePlanDoc(stdout, agent) {
     };
   }
   return {
-    agent: String(parsed.agent ?? agent),
+    // The identity is the SEAT that produced this output, never the model-echoed `agent` field:
+    // a plan that claims `"agent":"claude"` while codex wrote it would let codex critique and
+    // score its OWN plan (the self-critique exclusion below matches on plan.agent). Same rule as
+    // parseAgentFindings in findings.mjs.
+    agent,
     parseOk: true,
     summary: String(parsed.summary ?? "").trim(),
     approach: String(parsed.approach ?? "").trim(),
@@ -222,11 +226,21 @@ async function loadClaudePlan(options) {
 }
 
 /**
- * Solve protocol: independent plans (codex + grok [+ claude via file]) ->
- * cross-critique with scores -> ranking [-> bounded debate on blockers].
- * Synthesis and implementation stay with the orchestrator (Claude).
+ * Solve protocol: independent plans (EVERY active seat) -> all-to-all cross-critique with scores ->
+ * ranking [-> bounded debate on blockers]. Synthesis and implementation stay with the orchestrator
+ * (Claude).
+ *
+ * SIX-EYES: the planner AND critic pool is the dynamic seat registry (codex/grok/claude + every
+ * configured OpenRouter seat), never a hardcoded pair. A hardcoded ["codex","grok"] critic list
+ * dropped claude (which only ever handed in a plan FILE) plus every paid OpenRouter seat, AND made
+ * the ranking incomparable: claude's plan collected 2 peer votes while codex/grok collected 1 each,
+ * so rankPlans averaged over DIFFERENT pools. Now every seat proposes and every seat critiques every
+ * OTHER seat's plan (never its own), so each plan is scored by the same pool minus its own author.
+ *
+ * `deps` injects the seat runners (deps.runCodex/runGrok/runClaude/runOpenRouter) so unit tests need
+ * no CLI/network.
  */
-export async function runSolve(cwd, backends, options = {}) {
+export async function runSolve(cwd, backends, options = {}, deps = {}) {
   const onPhase = typeof options.onPhase === "function" ? options.onPhase : () => {};
   onPhase("collecting-context");
   const problem = options.problemFile
@@ -237,25 +251,37 @@ export async function runSolve(cwd, backends, options = {}) {
   }
 
   const hints = collectRepoHints(cwd);
-  const r1Opts = { ...options, maxTurns: options.maxTurnsR1 };
+  // captureGrokSession is read by the grok runner only (every other runner ignores it) - debate
+  // rebuttals resume the author's own R1 session.
+  const r1Opts = { ...options, maxTurns: options.maxTurnsR1, captureGrokSession: Boolean(options.debateResume) };
+  const seats = activeSeatNames(backends, options);
+  const r1Runners = makeSeatRunners(cwd, backends, r1Opts, deps);
+  // Claude may hand its plan in as a FILE (/council:solve has the orchestrating session plan in
+  // parallel with the CLI seats): then it does not re-plan through the CLI, but it still CRITIQUES
+  // like any other seat, so the critique pools stay symmetric. --skip-claude opts out of both
+  // (mirrors deliberate's fileClaudeDoc gating).
+  const claudePlanFromFile =
+    Boolean(options.claudePlanPath || options.claudePlanWaitPath) && !options.skipClaude;
 
   const r1Jobs = [];
-  if (!options.skipCodex) {
-    r1Jobs.push(runCodexStructured(cwd, backends, r1Opts, buildProposalPrompt("codex", problem, hints, options), "solve-r1"));
-  } else {
-    r1Jobs.push(Promise.resolve({ agent: "codex", skipped: true, reason: "skip", stdout: "" }));
-  }
-  if (!options.skipGrok) {
+  for (const seat of allSeatNames(backends)) {
+    if (seat === "claude" && claudePlanFromFile) continue; // its plan arrives via loadClaudePlan below
+    if (!seats.includes(seat)) {
+      // A skipped/unreachable CLI seat stays VISIBLE as an explicit skip (the job status keys off
+      // "every R1 skipped" -> failed, and the report prints it). An inactive claude/OpenRouter seat
+      // simply casts no plan.
+      if (seat === "codex" || seat === "grok") {
+        r1Jobs.push(Promise.resolve({ agent: seat, skipped: true, reason: "skip", stdout: "" }));
+      }
+      continue;
+    }
+    // R1 gets the SAME parse repair every other round has: one malformed JSON must not delete an
+    // entire model's plan - it would take that seat's critiques and its ranking slot with it.
     r1Jobs.push(
-      runGrokStructured(
-        cwd,
-        backends,
-        { ...r1Opts, captureGrokSession: Boolean(options.debateResume) },
-        buildProposalPrompt("grok", problem, hints, options)
-      )
+      runStructuredWithRetry(r1Runners[seat], buildProposalPrompt(seat, problem, hints, options), (stdout) =>
+        parsePlanDoc(stdout, seat)
+      ).then((r) => ({ ...r, agent: seat }))
     );
-  } else {
-    r1Jobs.push(Promise.resolve({ agent: "grok", skipped: true, reason: "skip", stdout: "" }));
   }
 
   onPhase("plans");
@@ -270,7 +296,7 @@ export async function runSolve(cwd, backends, options = {}) {
     )
   );
   onPhase("plans-done");
-  const claudePlan = await loadClaudePlan(options);
+  const claudePlan = claudePlanFromFile ? await loadClaudePlan(options) : null;
 
   const plans = [];
   const r1Results = [];
@@ -297,20 +323,20 @@ export async function runSolve(cwd, backends, options = {}) {
     // Capture grok critic sessions so debate counters can resume them.
     captureGrokSession: Boolean(options.debateRounds >= 2 && options.debateResume)
   };
+  const r2Runners = makeSeatRunners(cwd, backends, r2Opts, deps);
   const critiqueJobs = [];
   for (const plan of parsedPlans) {
-    for (const critic of ["codex", "grok"]) {
-      if (critic === plan.agent) continue;
-      if (critic === "codex" && options.skipCodex) continue;
-      if (critic === "grok" && options.skipGrok) continue;
-      const prompt = buildPlanCritiquePrompt(critic, plan);
-      const job =
-        critic === "codex"
-          ? runCodexStructured(cwd, backends, r2Opts, prompt, `solve-critique-${plan.agent}`)
-          : runGrokStructured(cwd, backends, r2Opts, prompt);
+    // All-to-all: every ACTIVE seat critiques every OTHER seat's plan. The pools are therefore
+    // symmetric (each plan is scored by `seats` minus its own author), so rankPlans' averages are
+    // comparable across plans.
+    for (const critic of seats) {
+      if (critic === plan.agent) continue; // never score your own plan
+      const job = r2Runners[critic](buildPlanCritiquePrompt(critic, plan));
       critiqueJobs.push(
         job.then((res) => ({
           ...res,
+          // The critic identity is the RUNNER seat, never a model-echoed field.
+          agent: critic,
           critique: res.skipped ? null : parsePlanCritique(res.stdout, critic, plan.agent),
           aboutAgent: plan.agent
         }))
@@ -326,9 +352,11 @@ export async function runSolve(cwd, backends, options = {}) {
   let debates = [];
   if ((options.debateRounds ?? 0) > 0) {
     onPhase("debate");
-    const skipped = new Set(
-      [options.skipCodex ? "codex" : null, options.skipGrok ? "grok" : null, "claude"].filter(Boolean)
-    );
+    // debate.mjs can only RUN codex + grok (its runAgentPrompt routes every other name to grok), so
+    // only those seats may author or critique a debate entry - a claude/OpenRouter seat must never be
+    // silently impersonated by grok (fail-closed). Same effective set as the former hardcoded skip
+    // list ({codex,grok} minus the skipped ones), now derived from the active seats.
+    const debatable = new Set(seats.filter((seat) => seat === "codex" || seat === "grok"));
     const grokR1 = r1Raw.find((raw) => raw.agent === "grok" && !raw.skipped);
     // grok critic sessions keyed by the plan author they critiqued.
     const criticSessions = {};
@@ -336,11 +364,11 @@ export async function runSolve(cwd, backends, options = {}) {
       if (r.agent === "grok" && r.sessionId && r.aboutAgent) criticSessions[r.aboutAgent] = r.sessionId;
     }
     const entries = ranking
-      .filter((r) => r.blockers.length && !skipped.has(r.agent))
+      .filter((r) => r.blockers.length && debatable.has(r.agent))
       .map((r) => {
         const plan = parsedPlans.find((p) => p.agent === r.agent);
         if (!plan || plan.confidence < 0.7) return null;
-        const critic = r.blockers.map((b) => b.from).find((from) => from !== r.agent && !skipped.has(from));
+        const critic = r.blockers.map((b) => b.from).find((from) => from !== r.agent && debatable.has(from));
         return {
           id: `plan-${r.agent}`,
           author: r.agent,
@@ -365,7 +393,7 @@ export async function runSolve(cwd, backends, options = {}) {
     header: `Problem: ${problem.trim().split(/\r?\n/)[0]}`,
     ranking: renderRankingSection(ranking),
     debate: debates.length ? renderSolveDebates(debates) : null,
-    synthesis: SYNTHESIS_INSTRUCTIONS
+    synthesis: synthesisInstructions(options.solveWriter ?? "claude")
   };
 
   return {
@@ -382,13 +410,15 @@ export async function runSolve(cwd, backends, options = {}) {
   };
 }
 
-const SYNTHESIS_INSTRUCTIONS = [
-  "## Your turn (Claude) - synthesis",
-  "1. Take the best-ranked plan as the skeleton; graft the strongest improvements from the others.",
-  "2. Resolve or explicitly accept every blocker (debate outcomes above help).",
-  "3. Present the final plan to the user for approval BEFORE implementing.",
-  "4. Implementation: exactly ONE writer (policy solve_writer) on a dedicated branch; then /council:review on the diff. The writer's own verdict does not count towards approval."
-].join("\n");
+function synthesisInstructions(solveWriter) {
+  return [
+    "## Your turn (Claude) - synthesis",
+    "1. Take the best-ranked plan as the skeleton; graft the strongest improvements from the others.",
+    "2. Resolve or explicitly accept every blocker (debate outcomes above help).",
+    "3. Present the final plan to the user for approval BEFORE implementing.",
+    `4. Implementation: exactly ONE writer (${solveWriter}) on a dedicated branch; then /council:review on the diff. The writer's own verdict does not count towards approval.`
+  ].join("\n");
+}
 
 export function renderSolveDebates(debates) {
   const lines = ["## Debate (bounded, blockers only)"];
@@ -524,11 +554,7 @@ function renderSolveReport({ problem, options, r1Results, r2Results, plans, crit
     lines.push("");
   }
 
-  lines.push("## Your turn (Claude) - synthesis");
-  lines.push("1. Take the best-ranked plan as the skeleton; graft the strongest improvements from the others.");
-  lines.push("2. Resolve or explicitly accept every blocker (debate outcomes above help).");
-  lines.push("3. Present the final plan to the user for approval BEFORE implementing.");
-  lines.push("4. Implementation: exactly ONE writer (policy solve_writer) on a dedicated branch; then /council:review on the diff. The writer's own verdict does not count towards approval.");
+  lines.push(synthesisInstructions(options.solveWriter ?? "claude"));
   lines.push("");
 
   return lines.join("\n");

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { fixReportRows, fixReportStats, renderFixReportHtml } from "../plugins/council/scripts/lib/fix-report-html.mjs";
+import { fixReportRows, fixReportStats, renderFixReportHtml, renderShapeSection } from "../plugins/council/scripts/lib/fix-report-html.mjs";
+import { shapeDelta } from "../plugins/council/scripts/lib/codebase-shape.mjs";
 
 const sampleOut = () => ({
   ok: true,
@@ -51,6 +52,46 @@ test("fixReportStats aggregates outcome buckets", () => {
   assert.equal(s.failed, 1);
 });
 
+test("P2: fixReportRows reads the fix-LOOP's flat proposed shape (finding/reason not blank)", () => {
+  // runFixLoop's `proposed` entries are flat ({...finding, rejectedReason}), not the nested
+  // {finding, reason} shape `rejected` uses. Before the fix both finding/reason were undefined here.
+  const loopOut = {
+    fixed: [], rejected: [], failed: [], skipped: [],
+    proposed: [{ file: "big.mjs", title: "consolidate", severity: "P2", category: "design", rejectedReason: "cross-cutting → propose-only" }]
+  };
+  const rows = fixReportRows(loopOut);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].finding.title, "consolidate");
+  assert.equal(rows[0].file, "big.mjs");
+  assert.equal(rows[0].reason, "cross-cutting → propose-only");
+  assert.equal(rows[0].status.key, "proposed");
+});
+
+test("P2: fixReportStats counts an unverified fix separately from a verified 'fixed' — never folded into the green headline", () => {
+  const out = {
+    fixed: [
+      { finding: { severity: "P1", title: "verified one" }, file: "a.mjs", commit: "c1", verified: true },
+      { finding: { severity: "P1", title: "unverified one" }, file: "b.mjs", commit: "c2", verified: false }
+    ],
+    rejected: [], failed: [], skipped: []
+  };
+  const rows = fixReportRows(out);
+  const s = fixReportStats(rows);
+  assert.equal(s.fixed, 1, "only the verified fix counts as 'fixed'");
+  assert.equal(s.unverified, 1, "the unverified fix is bucketed separately, not folded into 'fixed'");
+});
+
+test("P2: renderFixReportHtml never claims 'Tests grün pro Commit' when a fix is unverified (--allow-untested)", () => {
+  const out = {
+    branch: "b", baseBranch: "master",
+    fixed: [{ finding: { severity: "P1", title: "risky one" }, file: "a.mjs", commit: "c1", verified: false }],
+    rejected: [], failed: [], skipped: []
+  };
+  const html = renderFixReportHtml(out);
+  assert.ok(!/Tests grün pro Commit/.test(html), "the blanket 'tests green' claim is not made for an unverified run");
+  assert.match(html, /unverifiziert/);
+});
+
 test("renderFixReportHtml is self-contained, escapes content, shows pills + council verdicts", () => {
   const html = renderFixReportHtml(sampleOut(), { seats: "Claude · Codex · Grok", sensitiveAutoApply: true });
   assert.match(html, /^<!doctype html>/);
@@ -95,4 +136,21 @@ test("renderFixReportHtml renders a RED integration run distinctly", () => {
   const html = renderFixReportHtml(out);
   assert.match(html, /verdict-line red/);
   assert.match(html, /Integrationslauf ROT|rot/);
+});
+
+test("C3: renderShapeSection shows the codebase-shape before→after delta + git churn", () => {
+  const shape = shapeDelta(
+    { files: 20, functions: 120, lines: 4000, complexity: 300 },
+    { files: 18, functions: 110, lines: 3600, complexity: 260 },
+    { added: 40, removed: 480 }
+  );
+  const html = renderShapeSection(shape);
+  assert.match(html, /Code-Form/);
+  assert.match(html, /Dateien · 20 → 18/);
+  assert.match(html, /-2/); // files delta
+  assert.match(html, /Komplexität · 300 → 260/);
+  assert.match(html, /Git-Churn.*\+40.*-480/);
+  // wired into the full report only when meta.shape is present
+  assert.match(renderFixReportHtml(sampleOut(), { shape }), /Code-Form/);
+  assert.ok(!/Code-Form/.test(renderFixReportHtml(sampleOut(), {})));
 });

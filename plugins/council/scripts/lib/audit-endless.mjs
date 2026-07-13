@@ -3,13 +3,14 @@ import path from "node:path";
 
 import { resolveStateDir, writeFileAtomic } from "./state.mjs";
 import { hashLite } from "./util.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
 
 // Audit V4 - the `--endless` mode. It runs BOUNDED review passes over the project
 // and keeps going until the returns diminish (K consecutive passes add nothing
 // new), a finite total agent-call budget is spent, or a max-pass ceiling is hit -
-// whichever comes first. It is deliberately a REVIEW/PROPOSE loop, not an endless
-// auto-fix loop: editing code in an unbounded loop is exactly the runaway the
-// council warned about, so auto-fix stays the explicit, one-shot `audit fix`.
+// whichever comes first. It is deliberately a REVIEW/PROPOSE loop that never edits
+// code: looped AUTO-fix lives in the separately-gated `audit fix --loop` (M3, on an
+// isolated integration branch with per-fix + integration test gates), not here.
 //
 // Progressive coverage: the caller advances the reviewed unit window each pass
 // (offset), so pass N reviews the NEXT band of hotspots rather than re-rolling the
@@ -91,6 +92,7 @@ export async function runEndless(cwd, options = {}, deps = {}) {
   const totalBudget = clamp(options.budget ?? 60, 2, 100000);
   const perPassBudget = clamp(options.perPassBudget ?? Math.max(4, Math.round(totalBudget / Math.min(maxPasses, 4))), 2, totalBudget);
   const onProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
+  const reporter = options.reporter ?? NOOP_REPORTER;
   const review = deps.review;
   if (typeof review !== "function") throw new Error("runEndless requires deps.review");
   const checkpoint = deps.checkpoint ?? ((state) => defaultCheckpoint(cwd, state));
@@ -120,6 +122,8 @@ export async function runEndless(cwd, options = {}, deps = {}) {
     if (stopReason) break;
 
     passNo += 1;
+    reporter.phase("review", `pass ${passNo}`);
+    reporter.progress({ passesDone: passNo, passesTotal: maxPasses });
     const passBudget = Math.min(perPassBudget, totalBudget - spent);
     onProgress(`pass ${passNo}: reviewing (budget ${passBudget}, ${spent}/${totalBudget} spent, dry ${dryStreak}/${dryStop})…`);
     let res;
@@ -137,7 +141,18 @@ export async function runEndless(cwd, options = {}, deps = {}) {
     spent += Math.min(Math.max(1, passSpent), totalBudget - spent);
     const fresh = dedupeNew(passFindings, seen);
     all.push(...fresh);
-    dryStreak = fresh.length === 0 ? dryStreak + 1 : 0;
+    reporter.budget(spent, totalBudget);
+    reporter.findings(fresh); // fold this pass's NEW findings into the live per-lens matrix
+    // B5 (cell-aware convergence): a zero-fresh pass only advances the dry streak when the review's
+    // scheduled cells were all reviewed. Prefer the grouped path's passComplete (transient-completable)
+    // over the strict `complete` — capped/unsupplied force `complete` false PERSISTENTLY, which would
+    // stop the streak from ever advancing (council R9). Absent info (per-file path) counts as complete.
+    // M8 parity with the fix loop (council Grok P2): the completeness critic (--completeness-critic) also
+    // gates the endless dry streak — a pass it judges under-examined (completenessComplete === false) must
+    // not converge. undefined (critic off / infra-degraded) stays non-blocking → default path unchanged.
+    const coverageComplete =
+      (res?.coverage?.passComplete ?? res?.coverage?.complete) !== false && res?.coverage?.completenessComplete !== false;
+    dryStreak = fresh.length === 0 && coverageComplete ? dryStreak + 1 : 0;
     passes.push({ pass: passNo, found: passFindings.length, fresh: fresh.length, spent });
     onProgress(`  pass ${passNo}: +${fresh.length} new (total ${all.length}); dry ${dryStreak}/${dryStop}`);
     checkpoint({ passNo, findings: all, passes, spent, dryStreak, stopReason: null, done: false });

@@ -7,7 +7,9 @@ const SEV_SCORE = { P0: 10, P1: 7, P2: 4, nit: 1 };
 const SEV_RANK = { P0: 0, P1: 1, P2: 2, nit: 3 };
 
 // Evidence state -> confidence CAP (candidate side) or FLOOR (verified side).
-const CONFIDENCE_CAP = { "regex-only": 0.35, "deterministic-unproven": 0.55, "one-finder": 0.65, "independent-agreement": 0.8 };
+// "refuted" = an independent verifier could NOT support this finding → the LOWEST cap (it stays visible
+// as a disputed candidate, but must never outrank an unrefuted one; council Fable P1).
+const CONFIDENCE_CAP = { refuted: 0.2, "regex-only": 0.35, "deterministic-unproven": 0.55, "one-finder": 0.65, "independent-agreement": 0.8 };
 const CONFIDENCE_FLOOR = { "adversarial-verified": 0.85, reproduced: 0.95 };
 
 /** Confidence derived from evidence state, clamping a proposed value to the cap/floor. */

@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildClaudeArgs } from "../plugins/council/scripts/lib/claude-agent.mjs";
+import { buildClaudeArgs, runClaudeStructured } from "../plugins/council/scripts/lib/claude-agent.mjs";
+import { REVIEWER_CHARTER } from "../plugins/council/scripts/lib/reviewer-charter.mjs";
 
 function valuesAfter(args, flag, stopFlags) {
   const i = args.indexOf(flag);
@@ -40,4 +41,22 @@ test("buildClaudeArgs pins the model only when provided", () => {
   const mi = pinned.indexOf("--model");
   assert.notEqual(mi, -1);
   assert.equal(pinned[mi + 1], "claude-opus-4-8");
+});
+
+test("B2: buildClaudeArgs hard-isolates the finder (--safe-mode), pins the charter, reasons at xhigh", () => {
+  const args = buildClaudeArgs({});
+  assert.ok(args.includes("--safe-mode"), "safe-mode disables the audited repo's CLAUDE.md/hooks/plugins/MCP");
+  const ci = args.indexOf("--append-system-prompt");
+  assert.ok(ci >= 0 && args[ci + 1] === REVIEWER_CHARTER, "the stable reviewer charter is appended");
+  assert.equal(args[args.indexOf("--effort") + 1], "xhigh", "reasons at xhigh by default (A2 pref)");
+  assert.equal(buildClaudeArgs({ claudeEffort: "high" })[buildClaudeArgs({ claudeEffort: "high" }).indexOf("--effort") + 1], "high", "explicit effort wins");
+  // the charter is single-line, so it is safe as a cmd.exe-quoted CLI arg (A4)
+  assert.equal(REVIEWER_CHARTER.includes("\n"), false);
+});
+
+test("B2: runClaudeStructured is fail-closed — a probed-unavailable Claude casts NO finding", async () => {
+  const res = await runClaudeStructured("/x", { claude: { cli: { available: false, detail: "not found" } } }, {}, "prompt");
+  assert.equal(res.skipped, true, "an unavailable probe skips instead of running");
+  assert.equal(res.agent, "claude");
+  assert.equal(res.stdout, "", "no output that could be mis-parsed as a clean review");
 });
