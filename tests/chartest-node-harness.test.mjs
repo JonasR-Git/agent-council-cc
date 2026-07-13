@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { captureObservable, changedLinesCovered, makeNodeCharHarness } from "../plugins/council/scripts/lib/chartest-node-harness.mjs";
+import { buildPoisonedSource, captureObservable, changedLinesCovered, makeNodeCharHarness, POISON_SENTINEL } from "../plugins/council/scripts/lib/chartest-node-harness.mjs";
+import { exportSnapshot } from "../plugins/council/scripts/lib/audit-snapshot.mjs";
 import { runCommandAsync } from "../plugins/council/scripts/lib/process.mjs";
 
 const fileUrl = (p) => pathToFileURL(path.resolve(p)).href; // a correct file:// URL for any platform
@@ -93,14 +94,119 @@ test("makeNodeCharHarness.runs captures n deterministic observables; a mid-run f
   assert.equal((await flaky.runs(3)).length, 1, "a failed repeat truncates the list → acceptCharTest rejects (too few runs)");
 });
 
-test("makeNodeCharHarness.executesTarget fails closed without a coverage reader, passes when changed lines covered", async () => {
+test("makeNodeCharHarness.executesTarget fails closed without a coverage reader OR probe fs, passes when changed lines covered", async () => {
   const source = "a\nb\nc\n";
   const abs = path.resolve("/r/m.mjs");
   const doc = { result: [{ url: fileUrl(abs), functions: [{ ranges: [{ startOffset: 0, endOffset: 5, count: 1 }] }] }] };
+  // no readCoverage/coverageDir AND no readFile/writeFile → neither mechanism can run → fail closed
   const noReader = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [1], source, runCommand: okRun("ok 1") });
-  assert.equal(await noReader.executesTarget(), false, "no readCoverage/coverageDir → can't verify → false");
+  assert.equal(await noReader.executesTarget(), false, "no coverage reader and no probe fs → can't verify → false");
   const withCov = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [1, 2], source, coverageDir: "/cov", readCoverage: () => doc, runCommand: okRun("ok 1") });
-  assert.equal(await withCov.executesTarget(), true, "changed lines 1-2 covered");
+  assert.equal(await withCov.executesTarget(), true, "changed lines 1-2 covered (the PREFERRED coverage path still works)");
+  assert.equal(withCov.notes.length, 0, "a real coverage verdict records no degradation note");
+});
+
+// -------------------------------- POISON PROBE (the §5 unblocker) ---------------------------------
+// NODE_V8_COVERAGE is inspector-based and the permission sandbox blocks the inspector UNCONDITIONALLY,
+// so the old coverage-only executesModule was permanently false → EVERY eligible refactor was rejected.
+// The probe needs no inspector: the harness (trusted, unsandboxed parent) swaps the target for a
+// poisoned twin and requires the test's outcome to DIFFER — a strictly stronger dependence signal.
+
+const TARGET_ABS = path.join("/r", "m.mjs"); // = the harness's absTarget for cwd "/r" + targetFile "m.mjs"
+const ORIGINAL_SRC = "export const f = () => 7;\n";
+
+function memFs(initial) {
+  const files = new Map(Object.entries(initial ?? {}));
+  return {
+    files,
+    readFile: (p) => { if (!files.has(p)) throw new Error(`ENOENT: ${p}`); return files.get(p); },
+    writeFile: (p, s) => { files.set(p, s); }
+  };
+}
+
+// A run that DEPENDS on the target: green against the real source, red once the harness poisoned it.
+const poisonAwareRun = (files) => async () => (String(files.get(TARGET_ABS) ?? "").includes(POISON_SENTINEL)
+  ? { status: 1, stdout: `not ok 1 - ${POISON_SENTINEL}`, timedOut: false }
+  : { status: 0, stdout: 'TAP version 13\n{"v":7}\nok 1', timedOut: false });
+
+test("buildPoisonedSource fakes the SAME export surface with a throwing sentinel; un-fakeable surfaces yield null", () => {
+  const src = "export function add(a, b) { return a + b; }\nexport const K = 7;\nexport default add;\n";
+  const poisoned = buildPoisonedSource(src);
+  assert.ok(poisoned.includes(POISON_SENTINEL), "every export throws the poison sentinel");
+  // the poisoned twin exposes the identical surface, so the test's imports still resolve (no load-time
+  // explosion — that would make even an import-unused test fail and be falsely accepted)
+  assert.deepEqual(exportSnapshot(poisoned).names, exportSnapshot(src).names, "same exported names");
+  assert.equal(exportSnapshot(poisoned).hasDefault, true, "default export preserved");
+  assert.equal(buildPoisonedSource('export * from "./x.mjs";\n'), null, "opaque (star re-export) surface → null → probe fails closed");
+});
+
+test("POISON PROBE rejects a test that does NOT depend on the target (identical pass with the target poisoned)", async () => {
+  const { files, readFile, writeFile } = memFs({ [TARGET_ABS]: ORIGINAL_SRC });
+  // this run is BLIND to the target — same green verdict + observable, poisoned or not (the "imports the
+  // target unused + asserts 1===1" shape the old coverage check was meant to catch)
+  const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", runCommand: okRun('TAP version 13\n{"v":1}\nok 1'), readFile, writeFile });
+  assert.equal(await h.executesModule(), false, "unchanged outcome under poison → no dependence → reject");
+  assert.equal(files.get(TARGET_ABS), ORIGINAL_SRC, "the target is restored byte-for-byte");
+  assert.ok(h.notes.some((n) => /does not depend on the target/.test(n) && /poison probe/.test(n)), "the HONEST cause is recorded for the reject reason");
+});
+
+test("POISON PROBE accepts a test that genuinely exercises the target (fails or differs when poisoned)", async () => {
+  // outcome DIFFERS by exit status
+  const a = memFs({ [TARGET_ABS]: ORIGINAL_SRC });
+  const hFail = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", runCommand: poisonAwareRun(a.files), readFile: a.readFile, writeFile: a.writeFile });
+  assert.equal(await hFail.executesModule(), true, "the test FAILS with the target poisoned → it depends on it");
+  assert.equal(a.files.get(TARGET_ABS), ORIGINAL_SRC, "restored byte-for-byte after an accepting probe too");
+  // outcome differs only by OBSERVABLE (a tautological assertion stays green, but the printed value moves)
+  const b = memFs({ [TARGET_ABS]: ORIGINAL_SRC });
+  const obsRun = async () => (String(b.files.get(TARGET_ABS) ?? "").includes(POISON_SENTINEL)
+    ? { status: 0, stdout: '{"v":"poisoned"}', timedOut: false }
+    : { status: 0, stdout: '{"v":7}', timedOut: false });
+  const hObs = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", runCommand: obsRun, readFile: b.readFile, writeFile: b.writeFile });
+  assert.equal(await hObs.executesModule(), true, "a different observable under poison also proves dependence");
+  assert.equal(b.files.get(TARGET_ABS), ORIGINAL_SRC, "restored");
+});
+
+test("POISON PROBE restores the target even when the poisoned run THROWS, and fails closed without probe fs", async () => {
+  const { files, readFile, writeFile } = memFs({ [TARGET_ABS]: ORIGINAL_SRC });
+  let call = 0;
+  const throwing = async () => {
+    call += 1;
+    if (call === 1) return { status: 0, stdout: '{"v":7}', timedOut: false }; // the real baseline run
+    throw new Error("spawn exploded mid-probe");
+  };
+  const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", runCommand: throwing, readFile, writeFile });
+  await assert.rejects(() => h.executesModule(), /spawn exploded/, "the fault propagates (acceptCharTest fails it closed)");
+  assert.equal(files.get(TARGET_ABS), ORIGINAL_SRC, "the finally-restore ran: no poisoned tree even on a thrown run");
+  // and with NO injected fs the probe cannot run at all → fail closed, honest note
+  const noFs = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", runCommand: okRun("ok 1") });
+  assert.equal(await noFs.executesModule(), false, "no readFile/writeFile → probe unavailable → reject");
+  assert.ok(noFs.notes.some((n) => /probe unavailable/.test(n)));
+});
+
+test("POISON PROBE: a failed restore is FATAL and LOUD — never a silently poisoned tree", async () => {
+  const files = new Map([[TARGET_ABS, ORIGINAL_SRC]]);
+  let targetWrites = 0;
+  const readFile = (p) => files.get(p);
+  const writeFile = (p, s) => {
+    if (p === TARGET_ABS) {
+      targetWrites += 1;
+      if (targetWrites > 1) throw new Error("disk full"); // the poison write lands; every restore write fails
+    }
+    files.set(p, s);
+  };
+  const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", runCommand: poisonAwareRun(files), readFile, writeFile });
+  await assert.rejects(() => h.executesModule(), /FATAL\(chartest-poison-restore\).*POISONED/, "the restore failure throws with an unmistakable marker");
+  assert.ok(h.restoreFailure, "restoreFailure is exposed so the wiring can escalate (last-ditch rewrite + rethrow)");
+});
+
+test("executesTarget DEGRADES HONESTLY when the coverage document is empty: poison probe + a granularity note", async () => {
+  const { files, readFile, writeFile } = memFs({ [TARGET_ABS]: ORIGINAL_SRC });
+  // readCoverage yields nothing (the default-sandbox reality: the run is green but the inspector was
+  // blocked, so the coverage dir stays empty) → fall back to the probe instead of rejecting forever
+  const h = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", changedLines: [1], source: ORIGINAL_SRC, coverageDir: "/cov", readCoverage: () => null, runCommand: poisonAwareRun(files), readFile, writeFile });
+  assert.equal(await h.executesTarget(), true, "dependence established by the probe when coverage is unavailable");
+  assert.ok(h.notes.some((n) => /changed-line coverage unavailable/.test(n)), "the degradation is DISCLOSED — never claimed as measured line coverage");
+  assert.equal(files.get(TARGET_ABS), ORIGINAL_SRC, "restored");
 });
 
 test("makeNodeCharHarness SANDBOXES the test run with the Node permission model (council Grok P0 — RCE)", async () => {
@@ -122,16 +228,6 @@ test("makeNodeCharHarness disables per-file process isolation so `node --test` n
   await h.passesOnUnmodified();
   assert.ok(seenArgs.includes("--experimental-test-isolation=none"), "test isolation is disabled so no child_process spawn is needed");
   assert.ok(!seenArgs.some((a) => a.startsWith("--allow-child-process")), "still not granted — the spawn denial is avoided, not permitted");
-});
-
-test("makeNodeCharHarness.executesModule is true only when the target actually ran a function (not import-unused)", async () => {
-  const abs = path.resolve("/r/m.mjs");
-  const ran = { result: [{ url: fileUrl(abs), functions: [{ ranges: [{ startOffset: 0, endOffset: 20, count: 2 }] }] }] };
-  const importedOnly = { result: [{ url: fileUrl(abs), functions: [{ ranges: [{ startOffset: 0, endOffset: 20, count: 0 }] }] }] };
-  const hRan = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", coverageDir: "/c", readCoverage: () => ran, runCommand: async () => ({ status: 0, stdout: "ok 1", timedOut: false }) });
-  assert.equal(await hRan.executesModule(), true, "a count>0 target function → the test exercised the module");
-  const hImp = makeNodeCharHarness({ cwd: "/r", testFile: "t.mjs", targetFile: "m.mjs", coverageDir: "/c", readCoverage: () => importedOnly, runCommand: async () => ({ status: 0, stdout: "ok 1", timedOut: false }) });
-  assert.equal(await hImp.executesModule(), false, "imported but no function executed → not a real characterization");
 });
 
 test("makeNodeCharHarness.perturbedRun returns the observable under a faked clock/locale (null on failure)", async () => {
@@ -224,21 +320,23 @@ test("INTEGRATION: real `node --test` under the real default sandbox passes + yi
   }
 });
 
-test("INTEGRATION: coverage-dependent executesTarget/executesModule stay fail-closed under the real sandbox (documented Node permission-model/inspector limitation, not a regression)", { timeout: 30_000 }, async () => {
+test("INTEGRATION: the POISON PROBE accepts a genuine char-test and rejects an import-unused tautology under the REAL default sandbox (the §5 unblocker)", { timeout: 60_000 }, async () => {
   // NODE_V8_COVERAGE is collected via V8's inspector; Node's permission model unconditionally restricts
-  // opening the inspector with no CLI flag to re-grant it, so a coverage-based check can never observe a
-  // count under the sandbox — confirmed separately (not one of the fixed P1s): the coverage directory
-  // stays empty regardless of --allow-fs-write/--allow-worker/--allow-addons/--allow-child-process. This
-  // pins the CURRENT, SAFE (fail-closed) reality so a future fix to this residual gap has a red test to
-  // turn green, and so nobody mistakes "no coverage json ever appears" for a bug in THIS integration test.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chartest-harness-it-cov-"));
+  // opening the inspector with no CLI flag to re-grant it (confirmed on v22.13.1: the coverage directory
+  // stays empty regardless of --allow-fs-write/--allow-worker/--allow-addons/--allow-child-process), so a
+  // coverage-based check could NEVER accept under the sandbox — the §5 gate rejected every eligible
+  // refactor. This test used to PIN that fail-closed dead end; it now proves the poison probe unblocks it:
+  // executesModule/executesTarget accept a genuinely-depending test with NO inspector, under the FULL
+  // default sandbox, while the import-unused tautology the coverage check was meant to catch stays rejected.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chartest-harness-it-poison-"));
   try {
     const targetFile = path.join(dir, "target.mjs");
     const targetSource = "export function add(a, b) {\n  return a + b;\n}\n";
     fs.writeFileSync(targetFile, targetSource, "utf8");
-    const testFile = path.join(dir, "target.chartest.mjs");
+    const realFs = { readFile: (p) => fs.readFileSync(p, "utf8"), writeFile: (p, s) => fs.writeFileSync(p, s, "utf8") };
+    const genuine = path.join(dir, "target.chartest.mjs");
     fs.writeFileSync(
-      testFile,
+      genuine,
       [
         'import test from "node:test";',
         'import assert from "node:assert/strict";',
@@ -254,9 +352,33 @@ test("INTEGRATION: coverage-dependent executesTarget/executesModule stay fail-cl
     );
     const coverageDir = path.join(dir, "cov");
     fs.mkdirSync(coverageDir, { recursive: true });
-    const h = makeNodeCharHarness({ cwd: dir, testFile, targetFile, changedLines: [2], source: targetSource, runCommand: realRunCommand, readCoverage: readCoverageDir, coverageDir, timeoutMs: 20_000 });
-    assert.equal(await h.executesModule(), false, "coverage cannot be collected under the permission sandbox → fails closed (safe, not a false-accept)");
-    assert.equal(await h.executesTarget(), false, "same limitation → the changed-line coverage bar also stays fail-closed");
+    const h = makeNodeCharHarness({ cwd: dir, testFile: genuine, targetFile, changedLines: [2], source: targetSource, runCommand: realRunCommand, readCoverage: readCoverageDir, coverageDir, timeoutMs: 20_000, ...realFs });
+    assert.equal(await h.executesModule(), true, "the genuine test FAILS with the target poisoned → dependence proven WITHOUT the inspector (was permanently false before)");
+    assert.equal(fs.readFileSync(targetFile, "utf8"), targetSource, "the target is byte-identical after the probe");
+    assert.equal(await h.executesTarget(), true, "coverage stays empty under the sandbox → honest poison-probe fallback accepts");
+    assert.ok(h.notes.some((n) => /changed-line coverage unavailable/.test(n)), "the line-granularity gap is disclosed, not papered over");
+    assert.equal(fs.readFileSync(targetFile, "utf8"), targetSource, "still byte-identical after the fallback probe");
+    // the strictly-stronger property: a test that IMPORTS the target but never uses it passes unchanged
+    // against the poisoned twin → rejected (coverage would also have caught this; the probe must too)
+    const tautology = path.join(dir, "target.tautology.mjs");
+    fs.writeFileSync(
+      tautology,
+      [
+        'import test from "node:test";',
+        'import assert from "node:assert/strict";',
+        'import { add } from "./target.mjs";', // imported, never called
+        "",
+        'test("tautology", () => {',
+        "  console.log(JSON.stringify({ ok: 1 }));",
+        "  assert.equal(1, 1);",
+        "});"
+      ].join("\n"),
+      "utf8"
+    );
+    const hTaut = makeNodeCharHarness({ cwd: dir, testFile: tautology, targetFile, source: targetSource, runCommand: realRunCommand, timeoutMs: 20_000, ...realFs });
+    assert.equal(await hTaut.executesModule(), false, "import-unused + assert 1===1 → identical pass under poison → rejected");
+    assert.ok(hTaut.notes.some((n) => /does not depend on the target/.test(n)), "and the reject cause is the honest one");
+    assert.equal(fs.readFileSync(targetFile, "utf8"), targetSource, "target intact after the rejecting probe too");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

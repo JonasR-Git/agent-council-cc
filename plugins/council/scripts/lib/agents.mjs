@@ -310,15 +310,38 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
 }
 
 /**
- * Run Codex via companion task (read-only-ish prompt for structured output).
- * Falls back to adversarial-review with focus embedding the prompt snippet.
+ * Run the Codex seat DIRECTLY on the standalone `codex` CLI (`codex exec`, the non-interactive mode).
+ * The prompt goes in on STDIN (codex exec reads it from there), so nothing lands in argv.
+ *
+ * This is the fallback when the codex-companion (shipped by the separate OpenAI-Codex CLAUDE PLUGIN) is
+ * absent. Before it existed, runCodexStructured SKIPPED the seat outright whenever that plugin wasn't
+ * installed — even though discover.mjs already probes the standalone CLI. A user with the codex CLI but
+ * without the Claude plugin therefore had a SILENTLY DEAD sixth eye: codex never reviewed, never voted in
+ * §6, never refuted — the exact "a configured model is silently dropped" class this codebase just purged
+ * everywhere else.
+ */
+async function runCodexCli(cwd, backends, options, prompt) {
+  const bin = backends.codex?.cli?.bin || "codex";
+  const args = ["exec", "--skip-git-repo-check"];
+  if (options.codexModel) args.push("--model", options.codexModel);
+  const result = await runCommandAsync(bin, args, { cwd, input: String(prompt ?? ""), timeoutMs: options.agentTimeoutMs });
+  return buildAgentResult("codex", "codex-cli-exec", result, { model: options.codexModel ?? "(default)" });
+}
+
+/**
+ * Run Codex for structured output. Prefers the codex-companion `task` (a clean synchronous subprocess);
+ * falls back to the standalone `codex exec` CLI when the companion isn't installed, and only then to the
+ * companion's adversarial-review shim. Fail-closed: with NEITHER backend reachable the seat is skipped
+ * (it casts no vote and manufactures no review) rather than silently returning an empty "clean" result.
  */
 export async function runCodexStructured(cwd, backends, options, prompt, label) {
   if (!backends.codex?.companionAvailable) {
+    // No companion — but the standalone CLI is a first-class path, not a degraded one.
+    if (backends.codex?.cli?.available) return runCodexCli(cwd, backends, options, prompt);
     return {
       agent: "codex",
       skipped: true,
-      reason: "codex companion not found",
+      reason: "codex unavailable (no codex-companion and no `codex` CLI on PATH)",
       stdout: "",
       stderr: ""
     };

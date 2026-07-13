@@ -1,14 +1,20 @@
 // Node / node:test execute-and-capture HARNESS for the §5 char-test gate (chartest-gate.mjs). Supplies
 // the acceptCharTest deps (passesOnUnmodified / runs / executesTarget / perturbedRun) by shelling out to
-// `node --test` and reading V8 coverage. The harness runs the test against the CURRENT working tree, so
-// the CALLER sequences it: accept BEFORE applying the refactor (tree = original), verify AFTER.
+// `node --test`, plus target-DEPENDENCE probing: V8 coverage where the platform permits it, and a POISON
+// PROBE (buildPoisonedSource) everywhere else — under the default permission sandbox the inspector is
+// blocked, so coverage alone could never accept (council Codex/Claude P1). The harness runs the test
+// against the CURRENT working tree, so the CALLER sequences it: accept BEFORE applying the refactor
+// (tree = original), verify AFTER.
 //
 // The generator is prompted to console.log(JSON.stringify(observable)); captureObservable isolates those
 // JSON lines from the TAP/timing noise so DETERMINISM reflects the OBSERVABLE, not the runner's varying
-// duration_ms. Pure helpers (captureObservable, changedLinesCovered) are exported + unit-tested; the
-// subprocess/fs orchestration is injected (runCommand/readCoverage) so it stays testable and fail-closed.
+// duration_ms. Pure helpers (captureObservable, changedLinesCovered, buildPoisonedSource) are exported +
+// unit-tested; the subprocess/fs orchestration is injected (runCommand/readCoverage/readFile/writeFile)
+// so it stays testable and fail-closed.
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { exportSnapshot } from "./audit-snapshot.mjs";
 
 // Normalize a coverage script URL / a path to a comparable absolute form. Uses fileURLToPath so a
 // percent-encoded file:// URL (e.g. a repo path with a space → %20) DECODES to the real path (council
@@ -102,14 +108,53 @@ export function changedLinesCovered(coverageDoc, absTargetPath, source, changedL
   return changed.every(covered);
 }
 
+// Thrown by every export of a POISONED target. Unique enough that no real module produces it, so any
+// behavioural difference under poison is attributable to the probe, never to the target itself.
+export const POISON_SENTINEL = "__COUNCIL_POISON__";
+
+// A poisoned stand-in must RELIABLY LOAD: a load-time explosion would make even an import-unused test
+// fail under poison and be falsely accepted as "depends on the target". So only plain-identifier export
+// names are faked; anything weirder fails closed (no probe > a probe that can lie).
+const PLAIN_IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/**
+ * Build a POISONED stand-in for a target module: it still parses, loads side-effect-free, and exports the
+ * SAME surface (names + default, via audit-snapshot's export extractor), but every export is one shared
+ * function that throws POISON_SENTINEL when called — and, being a fresh function object, is a sentinel
+ * VALUE equal to nothing the real module could have produced (JSON.stringify drops/nulls it, so a printed
+ * observable differs too). A test that still passes IDENTICALLY against this stand-in cannot depend on
+ * the target. Returns null (→ the probe fails closed) when the surface is OPAQUE (star re-export /
+ * whole-module CommonJS) or an export name is not a plain identifier.
+ */
+export function buildPoisonedSource(source) {
+  const snap = exportSnapshot(String(source ?? ""));
+  if (snap.opaque) return null;
+  const names = snap.names.filter((n) => n !== "default"); // a default export is re-emitted below, not aliased
+  if (!names.every((n) => PLAIN_IDENT.test(n))) return null;
+  const lines = [
+    "// COUNCIL §5 POISON PROBE — transient stand-in written by the (unsandboxed) char-test harness.",
+    "// If this text survives in a working tree, a probe RESTORE FAILED: recover the file from VCS.",
+    `function __councilPoison__() { throw new Error("${POISON_SENTINEL}"); }`
+  ];
+  for (const n of names) lines.push(`export { __councilPoison__ as ${n} };`); // reserved-word aliases are legal ESM
+  if (snap.hasDefault) lines.push("export default __councilPoison__;");
+  return `${lines.join("\n")}\n`;
+}
+
 /**
  * Build the acceptCharTest harness for a Node target. `deps`:
  *   - runCommand(cmd, args, { cwd, env, timeoutMs }) -> { status, stdout, timedOut }   (injected exec)
  *   - readCoverage(dir) -> coverageDoc|null   (merge/read the NODE_V8_COVERAGE json in dir; injected fs)
+ *   - readFile(p) / writeFile(p, s)           (injected fs for the POISON PROBE: the harness — our own
+ *     trusted, UNSANDBOXED parent process — swaps the target for a poisoned twin and restores it; the
+ *     sandboxed test itself may never write)
  *   - source   (the target's CURRENT source text, for offset→line mapping in the coverage check)
- * A run's timeout / non-zero exit / capture fault fails the specific check closed (no throw escapes).
+ * A run's timeout / non-zero exit / capture fault fails the specific check closed (no throw escapes),
+ * with ONE exception: a failed poison-probe RESTORE throws FATAL(chartest-poison-restore) — a silently
+ * poisoned working tree is the one fault that must never be swallowed. The returned `notes` array
+ * collects honest probe caveats (why a probe rejected / degraded) for the wiring to surface in reasons.
  */
-export function makeNodeCharHarness({ cwd, testFile, targetFile, changedLines = [], source = "", runCommand, readCoverage, coverageDir, timeoutMs = 60_000, sandboxArgs } = {}) {
+export function makeNodeCharHarness({ cwd, testFile, targetFile, changedLines = [], source = "", runCommand, readCoverage, coverageDir, timeoutMs = 60_000, sandboxArgs, readFile, writeFile } = {}) {
   // SANDBOX the model-generated test (council Grok P0 — RCE): the test body is written by a seat that saw
   // untrusted target source, then executed by `node --test`. Node's permission model
   // (--experimental-permission) DENIES child_process (no shell/spawn/curl) and fs WRITES by default — the
@@ -130,6 +175,80 @@ export function makeNodeCharHarness({ cwd, testFile, targetFile, changedLines = 
   const runOnce = async (extraEnv = {}, extraArgs = []) => {
     const res = await runCommand("node", [...baseSandbox, ...extraArgs, "--test", testFile], { cwd, env: { ...process.env, ...extraEnv }, timeoutMs });
     return res ?? { status: 1, stdout: "", timedOut: false };
+  };
+  const absTarget = path.isAbsolute(targetFile) ? targetFile : path.join(cwd, String(targetFile ?? ""));
+  const notes = []; // honest probe caveats/causes; chartest-wiring appends them to its reject/pass reasons
+  let restoreFailure = null; // set (then thrown) when the target could not be un-poisoned — fatal + loud
+
+  // Put the ORIGINAL source back after a poison run. Retries, verifies by read-back (byte-for-byte for
+  // the utf8 sources this repo audits), and treats "already original" as restored (covers a failed poison
+  // write). A restore that still fails is FATAL: it THROWS (never returns a verdict) so no caller can
+  // mistake a poisoned working tree for a mere probe rejection.
+  const restoreTarget = (original) => {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        if (readFile(absTarget) === original) return; // already byte-identical
+        writeFile(absTarget, original);
+        if (readFile(absTarget) === original) return;
+        lastErr = new Error("post-restore read-back does not match the original source");
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    restoreFailure = lastErr ?? new Error("unknown restore failure");
+    throw new Error(`FATAL(chartest-poison-restore): could not restore ${absTarget} after the poison probe (${String(restoreFailure?.message ?? restoreFailure)}) — the working tree may still contain a POISONED target; recover the file from VCS before trusting any further result`);
+  };
+
+  // POISON PROBE — the inspector-free target-dependence check that works under the FULL sandbox (council
+  // Codex/Claude P1: NODE_V8_COVERAGE is inspector-based, and the permission model restricts the
+  // inspector UNCONDITIONALLY — no --allow-* flag re-grants it, confirmed on v22.13.1 — so the old
+  // coverage-only checks rejected EVERY refactor). The harness is the trusted, unsandboxed parent, so IT
+  // may rewrite the target: run the test against the REAL target, then against a POISONED twin (same
+  // export surface, every export throws), and require the outcomes to DIFFER. An identical pass = the
+  // test does not depend on the target — this catches strictly MORE than coverage did ("imports the
+  // target unused + asserts 1===1" passes unchanged with the target poisoned, and is rejected here, while
+  // coverage only proved a line had LOADED). Fail-CLOSED at every step: missing fs deps, an unreadable
+  // target, an un-fakeable surface, a failed baseline, or a timed-out poison run all return false with an
+  // honest note; the restore is guarded above (fatal, never silent).
+  const poisonProbe = async () => {
+    if (typeof readFile !== "function" || typeof writeFile !== "function") {
+      notes.push("poison probe unavailable (no injected readFile/writeFile) — fail closed");
+      return false;
+    }
+    let original;
+    try {
+      original = readFile(absTarget);
+    } catch (err) {
+      notes.push(`poison probe could not read the target (${String(err?.message ?? err)}) — fail closed`);
+      return false;
+    }
+    const poisoned = buildPoisonedSource(original);
+    if (poisoned == null) {
+      notes.push("poison probe cannot fake the target's export surface (opaque or non-identifier exports) — fail closed");
+      return false;
+    }
+    const real = await runOnce();
+    if (!real || real.timedOut || real.status !== 0) {
+      notes.push("poison probe could not establish a passing baseline run — fail closed");
+      return false;
+    }
+    const realObs = captureObservable(real.stdout);
+    let poisonRun = null;
+    try {
+      writeFile(absTarget, poisoned);
+      poisonRun = await runOnce(); // the SAME test under the SAME sandbox — only the target differs
+    } finally {
+      restoreTarget(original); // ALWAYS restore; throws FATAL on failure — never a silent poisoned tree
+    }
+    if (!poisonRun || poisonRun.timedOut) {
+      notes.push("poison probe run did not complete — fail closed");
+      return false;
+    }
+    if (poisonRun.status !== 0) return true; // the test FAILS with the target poisoned → it depends on it
+    if (captureObservable(poisonRun.stdout) !== realObs) return true; // its observable differs → depends
+    notes.push("the test does not depend on the target (poison probe: it passed unchanged with the target poisoned)");
+    return false;
   };
   return {
     passesOnUnmodified: async () => {
@@ -155,41 +274,33 @@ export function makeNodeCharHarness({ cwd, testFile, targetFile, changedLines = 
       if (r.timedOut || r.status !== 0) return null; // differs from a captured string → acceptCharTest rejects
       return captureObservable(r.stdout);
     },
-    // KNOWN PLATFORM LIMITATION (separate from the sandbox spawn-denial fixed above, found while verifying
-    // it): NODE_V8_COVERAGE is collected via V8's inspector/Profiler, and Node's permission model
-    // unconditionally restricts opening the inspector with NO CLI flag to re-grant it (confirmed on
-    // v22.13.1: `node --experimental-permission --allow-fs-read=* --test --experimental-test-coverage
-    // file.mjs` prints "Warning: Code coverage could not be enabled. Error: Access to this API has been
-    // restricted" and the coverage dir stays empty even with `--allow-fs-write=*` + `--allow-worker` +
-    // `--allow-addons` + `--allow-child-process` all granted). So under the DEFAULT sandbox this always
-    // fails closed (propose-only) — correctly SAFE, but not yet able to ACCEPT. Dropping
-    // --experimental-permission for just this run would re-execute the same untrusted test unsandboxed,
-    // reopening the RCE vector the sandbox exists to close, so that is not done here; fixing this for real
-    // needs a non-inspector coverage mechanism (tracked separately, out of scope for this fix).
+    // VERIFY-phase check: does the pinned test exercise the refactor's CHANGED lines? The PREFERRED
+    // mechanism is real V8 changed-line coverage — it works when the caller supplies sandboxArgs: []
+    // (a trusted/unsandboxed context) or on a future node whose permission model re-grants the inspector.
+    // Under the DEFAULT sandbox the coverage document always comes back EMPTY (inspector blocked, see
+    // poisonProbe), so this DEGRADES HONESTLY: fall back to the poison probe (the test must depend on the
+    // target) and record that changed-LINE granularity could not be established — never claim the changed
+    // lines were covered when they were not measured. The load-bearing behaviour check remains the
+    // harness-captured observable comparison in chartest-gate.mjs's verifyCharTestAfterFix; this
+    // complements it.
     executesTarget: async () => {
-      if (typeof readCoverage !== "function" || !coverageDir) return false; // can't verify → fail closed
-      // the coverage run must be allowed to WRITE its NODE_V8_COVERAGE dir under the sandbox
-      const r = await runOnce({ NODE_V8_COVERAGE: coverageDir }, [`--allow-fs-write=${coverageDir}`]);
-      if (!r || r.timedOut || r.status !== 0) return false;
-      const doc = readCoverage(coverageDir);
-      if (!doc) return false;
-      return changedLinesCovered(doc, path.isAbsolute(targetFile) ? targetFile : path.join(cwd, targetFile), source, changedLines);
+      if (typeof readCoverage === "function" && coverageDir) {
+        // the coverage run must be allowed to WRITE its NODE_V8_COVERAGE dir under the sandbox
+        const r = await runOnce({ NODE_V8_COVERAGE: coverageDir }, [`--allow-fs-write=${coverageDir}`]);
+        if (!r || r.timedOut || r.status !== 0) return false; // the RUN itself failed (not a coverage gap) → fail closed
+        const doc = readCoverage(coverageDir);
+        if (doc) return changedLinesCovered(doc, absTarget, source, changedLines);
+        // fall through: the run was green but the document is EMPTY → the sandbox blocked the inspector
+      }
+      notes.push("changed-line coverage unavailable under the sandbox (measured by the poison probe instead — line granularity not established)");
+      return poisonProbe();
     },
-    // ACCEPT-phase coverage check (council Grok P1): the test must actually EXECUTE the target module —
-    // ≥1 of the target's functions ran (count>0) — not merely import it unused with a tautology. Weaker
-    // than the changed-line bar (the diff is unknown pre-apply) but it forecloses "imports target, asserts
-    // 1===1". Fail-closed: no coverage reader / target absent / no executed function → false.
-    executesModule: async () => {
-      if (typeof readCoverage !== "function" || !coverageDir) return false;
-      const r = await runOnce({ NODE_V8_COVERAGE: coverageDir }, [`--allow-fs-write=${coverageDir}`]);
-      if (!r || r.timedOut || r.status !== 0) return false;
-      const doc = readCoverage(coverageDir);
-      const abs = path.isAbsolute(targetFile) ? targetFile : path.join(cwd, targetFile);
-      const script = (doc?.result ?? []).find((s) => normPath(String(s.url ?? "")) === normPath(abs));
-      if (!script) return false;
-      // ≥1 target function actually ran (a count>0 range that is NOT the whole-script outer wrapper) —
-      // "imported unused" leaves only the outer count and count:0 function bodies.
-      return (script.functions ?? []).some((fn) => (fn.ranges ?? []).some((rg) => (rg.count ?? 0) > 0));
-    }
+    // ACCEPT-phase check (council Grok P1): the test must actually DEPEND on the target — not merely
+    // import it unused with a tautology. The poison probe replaces the old executesModule coverage check
+    // (permanently false under the sandbox) with a strictly STRONGER signal: coverage proved a line had
+    // loaded; the probe proves the test's verdict/observable CHANGES when the target's behaviour does.
+    executesModule: () => poisonProbe(),
+    notes,
+    get restoreFailure() { return restoreFailure; }
   };
 }

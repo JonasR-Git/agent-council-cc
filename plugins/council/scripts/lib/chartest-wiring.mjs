@@ -1,8 +1,9 @@
 // Wiring for the §5 char-test gate: composes the firewalled GENERATOR (a model seat) + the Node/node:test
-// HARNESS (real `node --test` + V8 coverage) + the acceptance/verify state machine (chartest-gate.mjs)
-// into the `charTestGate` object runAuditFix consumes. Opt-in (--chartest); absent → the fix path is
-// byte-identical. Every side effect (generate seat / exec / fs) is injected so this is unit-testable
-// without a CLI or a real test run, and fail-CLOSED (any fault → not accepted / not verified → propose-only).
+// HARNESS (real `node --test` + poison-probe/coverage dependence checks) + the acceptance/verify state
+// machine (chartest-gate.mjs) into the `charTestGate` object runAuditFix consumes. Opt-in (--chartest);
+// absent → the fix path is byte-identical. Every side effect (generate seat / exec / fs) is injected so
+// this is unit-testable without a CLI or a real test run, and fail-CLOSED (any fault → not accepted /
+// not verified → propose-only; a failed poison-probe restore is FATAL and thrown, never swallowed).
 import fs from "node:fs";
 import path from "node:path";
 
@@ -42,6 +43,7 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
   const root = cwd;
   const runCommand = deps.runCommand ?? runCommandAsync;
   const writeFile = deps.writeFile ?? ((p, s) => fs.writeFileSync(p, s, "utf8"));
+  const readFile = deps.readFile ?? ((p) => fs.readFileSync(p, "utf8"));
   const removeFile = deps.removeFile ?? ((p) => { try { fs.rmSync(p, { force: true }); } catch { /* best effort */ } });
   const readCoverage = deps.readCoverage ?? defaultReadCoverage;
   const mkCoverageDir = deps.mkCoverageDir ?? ((testFile) => path.join(path.dirname(testFile), `.council-chartest-cov-${path.basename(testFile)}`));
@@ -69,19 +71,40 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
 
   const importPathFor = (file) => `./${path.basename(file)}`;
 
+  // A poison-probe RESTORE failure must never be silent (§5 fail-closed, hardest case): the harness has
+  // already retried and thrown; here we try one last rewrite from the in-memory source snapshot, then
+  // throw LOUDLY either way — a result computed over a possibly-poisoned tree must never be returned as
+  // if it were a mere probe verdict.
+  const guardPoisonRestore = (harness, absTarget, sourceSnapshot) => {
+    if (!harness?.restoreFailure) return;
+    let recovered = false;
+    try {
+      writeFile(absTarget, sourceSnapshot);
+      recovered = readFile(absTarget) === sourceSnapshot;
+    } catch { /* recovery failed — reported below */ }
+    throw new Error(`FATAL §5 char-test: poison-probe restore failed for ${absTarget} (${String(harness.restoreFailure?.message ?? harness.restoreFailure)})${recovered ? " — the target was recovered from the in-memory snapshot; verify the tree before trusting later results" : " — the target MAY STILL BE POISONED on disk; restore it from VCS before continuing"}`);
+  };
+  // Surface the harness's probe notes — the HONEST cause ("the test does not depend on the target" vs
+  // "changed-line coverage unavailable under the sandbox") — in the reason the caller logs/records, so a
+  // platform limitation is never misreported as a defect of the generated test (council Codex/Claude P1).
+  const withNotes = (reason, harness) => {
+    const ns = Array.isArray(harness?.notes) ? harness.notes : [];
+    return ns.length ? `${reason ?? ""} [${ns.join("; ")}]`.trim() : reason;
+  };
+
   return {
     eligible: (finding) => isRefactorClass(finding),
 
     // ACCEPT (clean tree): generate + pin behaviour (deterministic, non-vacuous) AND require the test to
-    // actually EXECUTE the target module (council Grok P1 — no "import unused + assert 1===1"). The exact
-    // changed-line coverage is DEFERRED to verify (the diff is unknown pre-apply), so acceptCharTest's
-    // executesTarget maps to executesModule here. The transient test + coverage dir are deleted before
-    // returning so the tree is clean for applyFix.
+    // actually DEPEND on the target (council Grok P1 — no "import unused + assert 1===1"): acceptCharTest's
+    // executesTarget maps to the harness's poison-probe executesModule here (the exact changed-line bar is
+    // DEFERRED to verify — the diff is unknown pre-apply). The transient test + coverage dir are deleted
+    // before returning so the tree is clean for applyFix.
     accept: async ({ file, source }) => {
       const testFile = transientTestPath(root, file, exists);
       if (!testFile) return { accepted: false, reason: "could not allocate a transient char-test path (collisions) → propose-only" };
       const coverageDir = freshDir(mkCoverageDir(testFile));
-      const h = makeNodeCharHarness({ cwd: root, testFile, targetFile: file, source, runCommand, readCoverage, coverageDir, timeoutMs });
+      const h = makeNodeCharHarness({ cwd: root, testFile, targetFile: file, source, runCommand, readCoverage, coverageDir, timeoutMs, readFile, writeFile });
       const acceptHarness = { ...h, executesTarget: h.executesModule };
       let res;
       try {
@@ -95,26 +118,30 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
       } finally {
         removeFile(testFile);
         rmDir(coverageDir);
+        guardPoisonRestore(h, path.join(root, file), source); // fatal + loud — never a silent poisoned tree
       }
       // carry the generated code + the baseline observable forward so verify can re-materialise the SAME
       // test post-apply and compare the observable (the load-bearing behaviour-preservation check)
-      return { accepted: res.accepted, reason: res.reason, code: res.code, baseline: res.baseline, testFile };
+      return { accepted: res.accepted, reason: withNotes(res.reason, h), code: res.code, baseline: res.baseline, testFile };
     },
 
     // VERIFY (post-apply tree): re-materialise the accepted test, require it STILL passes AND — for an
-    // addition/modification — covers the changed lines, then delete it. A pure DELETION has no new lines
-    // to cover (council Grok P2: dead_code deletions), so the changed-line bar is skipped there; the
-    // still-green check alone attests behaviour preservation. Mutation gate stays OPTIONAL.
+    // addition/modification — exercises the changed region (real changed-line coverage where the platform
+    // permits it; the poison probe, honestly disclosed via notes, under the default sandbox), then delete
+    // it. A pure DELETION has no new lines to cover (council Grok P2: dead_code deletions), so the
+    // changed-line bar is skipped there; the still-green check alone attests behaviour preservation.
+    // Mutation gate stays OPTIONAL.
     verify: async ({ file, source, code, baseline, changedLines }) => {
       if (!code) return { pass: false, reason: "no accepted char-test to verify" };
       const testFile = transientTestPath(root, file, exists);
       if (!testFile) return { pass: false, reason: "could not allocate a transient char-test path (collisions) → propose-only" };
       writeFile(testFile, code);
       const coverageDir = freshDir(mkCoverageDir(testFile));
-      const harness = makeNodeCharHarness({ cwd: root, testFile, targetFile: file, changedLines, source, runCommand, readCoverage, coverageDir, timeoutMs });
+      const harness = makeNodeCharHarness({ cwd: root, testFile, targetFile: file, changedLines, source, runCommand, readCoverage, coverageDir, timeoutMs, readFile, writeFile });
       const hasNewLines = Array.isArray(changedLines) && changedLines.length > 0;
+      let out;
       try {
-        return await verifyCharTestAfterFix({ accepted: true, testPath: testFile, baseline }, {
+        out = await verifyCharTestAfterFix({ accepted: true, testPath: testFile, baseline }, {
           runAccepted: harness.passesOnUnmodified, // "passes on the CURRENT (post-refactor) tree" = behaviour preserved
           // the LOAD-BEARING check: the observable must match the accepted baseline (harness = oracle)
           observe: async () => { const o = await harness.runs(1); return Array.isArray(o) && o.length ? o[0] : null; },
@@ -124,7 +151,9 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
       } finally {
         removeFile(testFile);
         rmDir(coverageDir);
+        guardPoisonRestore(harness, path.join(root, file), source); // fatal + loud — never a silent poisoned tree
       }
+      return { ...out, reason: withNotes(out.reason, harness) };
     }
   };
 }
