@@ -113,6 +113,98 @@ comes from the orchestrating session) or `spawn` (an independent
 per-CLI: `codex login`, `grok login`, and (for the spawn backend) run `claude`
 once.
 
+## Commands & flags
+
+Every command is a slash command (`/council:<cmd>`) that shells out to the same
+`council-companion.mjs`. Add `--json` to any command for machine-readable output.
+Per-seat model/effort flags apply everywhere agents run: `--codex-model` /
+`--grok-model` / `--claude-model`, `--codex-effort` / `--grok-effort`, and
+`--skip-codex` / `--skip-grok` / `--skip-claude`.
+
+### `/council:review` — multi-seat diff review
+
+Default is a 3-way deliberation (Claude + Codex + Grok: independent, then peer critique).
+
+| Flag | Effect |
+|------|--------|
+| `--mode quick\|deliberate\|adversarial` | canonical protocol selector. `quick` = dual Codex+Grok, no peer round (you synthesize); `deliberate` = 3-way + peer critique + consensus; `adversarial` = challenge design/direction. `deliberate` / `adversarial` also exist as legacy **alias verbs**. |
+| `--base <ref>` | review the diff vs a git ref instead of the working tree |
+| `--reviewers claude,codex,grok` | choose who participates |
+| `--claude-backend session\|spawn` | run Claude in-session, or as a decoupled spawned CLI |
+| `--verify` | add a refutation pass (deliberate only) |
+| `--background` / `--wait` | run detached (monitor via `/council:status`) or block synchronously |
+
+### `/council:audit` — whole-project audit + autonomous fix
+
+Subcommands: `run` (self-driving report + risk register + gate), `review` (deep
+six-eyes review of hotspot modules), `fix` (safe **test-gated** auto-fix on an
+isolated branch — nothing auto-merged), `endless` (bounded review/propose loop).
+
+| Flag | Effect | Applies to |
+|------|--------|-----------|
+| `--deep` | deeper analysis scope | all |
+| `--groups fine\|tier\|lens` | cell-granular grouped six-eyes review | review / endless |
+| `--loop` | autonomous **fix-until-dry** loop on one isolated branch | fix |
+| `--supervise` | survive rate-limit resets across a multi-hour run | fix --loop / endless |
+| `--usage-ceiling [c/x/g]` | **WEEKLY** hard stop at a per-model quota % (bare = 40/50/40; opt-in, off by default) | fix --loop / endless |
+| `--pause-at-5h off\|<pct>\|auto[:<pct>]` | **5h** soft pause (default **ON at 85%**); `auto` waits in-process to the reset then resumes; `off` disables; `<pct>` retunes | fix --loop / endless |
+| `--autonomy <lvl>` | commit/propose dial | fix |
+| `--from <json>` | reuse findings from a prior `review --json` (skip a fresh review) | fix |
+| `--min-severity P0\|P1\|P2` / `--max-fixes <n>` | severity gate (default P2) + fix cap (default 50) | fix |
+| `--max-passes <n>` / `--dry-streak <n>` / `--budget <n>` | loop bounds | loop / endless |
+| `--areas a,b` / `--max-units <n>` / `--max-cells <n>` / `--churn-days <n>` | scope the scan | all |
+| `--sarif` / `--html` / `--doc` | write a SARIF 2.1.0 log / self-contained HTML report / `docs/AUDIT.md` proposals | run / review |
+| `--base <ref>` | scope to a diff | run |
+| `--dry-run` | preview the fix plan without editing | fix |
+
+### `/council:plan` — converge a build spec across seats
+
+| Flag | Effect |
+|------|--------|
+| `--synthesizer <seat>` | who synthesizes the converged PlanSpec |
+| `--skip-openrouter` | drop OpenRouter seats | 
+| `--background` / `--json` | run detached / machine output |
+| `<feature request>` | positional: what you want built |
+
+### `/council:build` — execute a PlanSpec (test-gated, isolated branch)
+
+| Flag | Effect |
+|------|--------|
+| `--from <plan.json>` | the PlanSpec to build (**required**) |
+| `--dry-run` | preview the build plan without writing |
+| `--base <ref>` / `--json` | base ref / machine output |
+
+Build runs a safety machine: preflight baseline suite → isolated branch → per-step
+test gate → rollback on failure → never auto-merged. See the guarantees above.
+
+### `/council:solve` — collaborative problem solving
+
+| Flag | Effect |
+|------|--------|
+| `--debate-rounds 0\|1\|2` | peer-debate depth |
+| `--debate-resume` | resume a checkpointed debate |
+| `--background` / `--wait` | run detached / block |
+| `<problem text>` | positional: the problem to solve |
+
+### `/council:setup` · `/council:doctor` — environment
+
+| Command / flag | Effect |
+|------|--------|
+| `/council:setup` | report backends + suggested next step |
+| `/council:setup --init [--reviewers … --claude-backend … --force]` | write a `.council.yml` |
+| `/council:setup --usage [--days <n>]` | per-seat quota usage (weekly + 5h) |
+| `/council:doctor [--no-ping]` | check node + CLIs + state dir (+ live reachability ping) |
+
+### `/council:status` — monitor background jobs
+
+| Flag | Effect |
+|------|--------|
+| `[job-id]` | default: the most recent job |
+| `--watch` | live auto-refreshing dashboard |
+| `--result [--summary\|--html]` | final report (trimmed / self-contained HTML) |
+| `--wait [--follow]` | block until the job finishes |
+| `--cancel` | cancel a running job |
+
 ## Deliberate protocol
 
 Round 1 is independent: Claude writes its own JSON findings first, while Codex
