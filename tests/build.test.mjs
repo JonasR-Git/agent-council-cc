@@ -127,7 +127,14 @@ test("planShapeReason enforces earlier-only dependsOn (acyclic by construction) 
   assert.match(planShapeReason(plan({ steps: [planStep("a", { dependsOn: ["a"] })] })), /EARLIER/, "self-dependency rejected");
   const big = plan({ steps: Array.from({ length: 9 }, (_, i) => planStep(`s-${i}`)) });
   assert.match(planShapeReason(big), /exceeds the 8-step/);
-  assert.equal(planShapeReason(big, { maxSteps: 9 }), null, "bound is configurable");
+  // The 8-step blast-radius bound is a CEILING, not a default: maxSteps may only TIGHTEN it. A caller
+  // that could RAISE it would be an escape hatch on the riskiest capability in the tool (a bigger
+  // request must be split into multiple plans instead).
+  assert.match(planShapeReason(big, { maxSteps: 9 }), /exceeds the 8-step/, "the ceiling CANNOT be raised by a caller");
+  assert.match(planShapeReason(big, { maxSteps: 99 }), /exceeds the 8-step/, "...not by any value");
+  const five = plan({ steps: Array.from({ length: 5 }, (_, i) => planStep(`s-${i}`)) });
+  assert.equal(planShapeReason(five), null, "a plan within the ceiling is fine");
+  assert.match(planShapeReason(five, { maxSteps: 3 }), /exceeds the 3-step/, "...but a caller MAY tighten the bound");
 });
 
 // --- preflight: refuse-to-start, spending NOTHING --------------------------------

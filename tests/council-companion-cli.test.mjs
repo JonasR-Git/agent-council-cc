@@ -135,3 +135,50 @@ test("plain `review` (non-adversarial) forwards focus text to the codex companio
     );
   });
 });
+
+// --- `council plan` / `council build` CLI contracts ------------------------------------------
+// The build command is the riskiest capability in the tool (autonomous greenfield code generation).
+// These pin the SAFETY surface at the CLI boundary, where a regression would be invisible to the
+// module unit tests: the path confinement, the absence of every escape hatch, and fail-loud inputs.
+
+const cli = (args, cwd = process.cwd()) =>
+  spawnSync(process.execPath, [COMPANION, ...args], { cwd, encoding: "utf8", timeout: 30_000 });
+
+test("council plan/build are dispatched (they exist and fail LOUDLY without their required input)", () => {
+  const plan = cli(["plan"]);
+  assert.notEqual(plan.status, 0, "a plan with no feature request must fail, not silently no-op");
+  assert.match(`${plan.stdout}${plan.stderr}`, /needs a feature request/i);
+
+  const build = cli(["build"]);
+  assert.notEqual(build.status, 0);
+  assert.match(`${build.stdout}${build.stderr}`, /needs a PlanSpec/i, "build must refuse to run without a plan");
+});
+
+test("council build --from is CONFINED to the project root (no ../ escape)", () => {
+  const res = cli(["build", "--from", "../../etc/passwd"]);
+  assert.notEqual(res.status, 0);
+  assert.match(`${res.stdout}${res.stderr}`, /must stay within the project root/i, "an escaping --from is refused, never read");
+});
+
+test("council build has NO escape hatches (they must not even parse)", () => {
+  // The gate ladder + §6 unanimity are the whole safety argument. A flag that could weaken them must
+  // not exist — assert the parser REJECTS each as unknown rather than silently accepting it.
+  for (const hatch of ["--allow-untested", "--skip-council", "--allow-dirty", "--force", "--no-verify"]) {
+    const res = cli(["build", "--from", "plan.json", hatch]);
+    assert.notEqual(res.status, 0, `${hatch} must not be accepted`);
+    assert.match(`${res.stdout}${res.stderr}`, /Unknown flag/i, `${hatch} must be an UNKNOWN flag, not a silently honored one`);
+  }
+});
+
+test("council build refuses an INVALID PlanSpec (fail-closed — nothing is built)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-plan-"));
+  const bad = path.join(dir, "bad.json");
+  fs.writeFileSync(bad, JSON.stringify({ schemaVersion: 1, steps: [] }), "utf8");
+  try {
+    const res = spawnSync(process.execPath, [COMPANION, "build", "--from", path.relative(dir, bad)], { cwd: dir, encoding: "utf8", timeout: 30_000 });
+    assert.notEqual(res.status, 0);
+    assert.match(`${res.stdout}${res.stderr}`, /INVALID|not valid|must stay|not a git/i, "an invalid plan never reaches the build engine");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

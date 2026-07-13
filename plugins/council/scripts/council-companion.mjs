@@ -62,11 +62,16 @@ import { assembleFixMeta, changedFilesShape } from "./lib/fix-report-meta.mjs";
 import { openRouterBackend } from "./lib/openrouter-agent.mjs";
 import { makeCharTestGate } from "./lib/chartest-wiring.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
+import { runPlanDeliberation } from "./lib/plan-deliberate.mjs";
+import { parsePlanSpec, planStepTouched, planSpecDigest, renderPlanMarkdown, requestDigest, validatePlanSpec } from "./lib/plan-spec.mjs";
+import { makeBuildGit, renderBuildReport, runBuild } from "./lib/build.mjs";
+import { buildReviewerReady } from "./lib/build-step-reviewer.mjs";
 import { collectVerdicts, evaluateApproval, selectActionable } from "./lib/verdicts.mjs";
 import {
   appendLogLine,
   archiveJobResults,
   createJobLogFile,
+  ensureStateDir,
   generateJobId,
   listAllJobsDirs,
   listJobs,
@@ -89,6 +94,8 @@ function printUsage() {
       "  node scripts/council-companion.mjs solve [flags] [problem text]",
       "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
       "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
+      "  node scripts/council-companion.mjs plan <feature-request> [--synthesizer <seat>] [--json]   (multi-model design deliberation → a validated PlanSpec; READ-ONLY)",
+      "  node scripts/council-companion.mjs build --from <plan.json> [--dry-run] [--json]   (autonomous test-gated build of a PlanSpec on an isolated branch; never auto-merged)",
       "  node scripts/council-companion.mjs audit run|review|fix|endless [flags] (see below)",
       "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
       "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
@@ -2768,6 +2775,143 @@ function handleCancel(argv) {
   outputResult(options.json ? { job: finished, cancelled: true } : `Cancelled ${job.id}.\n`, options.json);
 }
 
+// ---------------------------------------------------------------------------------------------
+// `council plan` / `council build` — multi-model design deliberation + autonomous test-gated build.
+// See docs/plan-build-design.md. plan is strictly READ-ONLY (its only write is the plan artifact in
+// the state dir); build is the riskiest capability in the tool and is gated at every step
+// (test-first RED->GREEN, the declared-file capability boundary, unanimous §6 on the exact staged
+// diff, reviewed-byte commit binding, abort+rollback on any failure, never auto-merged).
+// ---------------------------------------------------------------------------------------------
+
+/** Resolve a repo-confined --from path (mirrors handleAudit's confinement: no absolute/.. escape). */
+function confinedPlanPath(cwd, from) {
+  const base = workspaceRoot(cwd);
+  const target = path.resolve(base, String(from));
+  const rel = path.relative(base, target);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`--from must stay within the project root (got: ${from})`);
+  }
+  return target;
+}
+
+/** plan-spec REQUIRES a kind-returning existence probe: "file" | "dir" | false (a bare boolean fails closed). */
+function planFileExists(relPosix, root) {
+  try {
+    const st = fs.statSync(path.join(root, relPosix));
+    return st.isFile() ? "file" : st.isDirectory() ? "dir" : false;
+  } catch {
+    return false;
+  }
+}
+
+async function handlePlan(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["synthesizer", "budget", "base", "codex-model", "grok-model", "claude-model"],
+    booleanOptions: ["json", "skip-openrouter"]
+  });
+  const cwd = process.cwd();
+  const request = positionals.join(" ").trim();
+  if (!request) throw new Error("council plan needs a feature request: council plan <what you want built>");
+
+  const backends = probeBackends(cwd, ROOT_DIR, { probeClaude: true });
+  const policy = loadPolicy(cwd);
+  const merged = mergeOptionsWithPolicy(options, policy);
+  attachOpenRouterSeats(backends, merged, policy, options.json); // or-* seats are part of the six-eyes promise
+  if (activeReviewerCount(backends, merged) === 0) {
+    throw new Error("no callable seats (Codex/Grok/Claude all unavailable or skipped) — `council plan` needs at least one to propose");
+  }
+
+  const out = await runPlanDeliberation(cwd, request, backends, {
+    ...merged,
+    synthesizer: options.synthesizer,
+    budget: options.budget != null ? Number(options.budget) : undefined,
+    onPhase: options.json ? undefined : (m) => console.error(m)
+  });
+  if (!out?.planSpec) throw new Error("the council could not synthesize a VALID PlanSpec (fail-closed: an invalid plan is never emitted)");
+
+  // Persist BOTH artifacts so `council build --from <path>` works, and print the path.
+  const dir = ensureStateDir(cwd);
+  const slug = `plan-${planSpecDigest(out.planSpec).slice(0, 8)}`;
+  const jsonPath = path.join(dir, `${slug}.json`);
+  const mdPath = path.join(dir, `${slug}.md`);
+  fs.writeFileSync(jsonPath, `${JSON.stringify(out.planSpec, null, 2)}\n`, "utf8");
+  fs.writeFileSync(mdPath, renderPlanMarkdown(out.planSpec), "utf8");
+
+  if (options.json) {
+    outputResult({ planSpec: out.planSpec, seats: out.seats, synthesizer: out.synthesizer, ranking: out.ranking, budget: out.budget, artifacts: { json: jsonPath, markdown: mdPath } }, true);
+    return;
+  }
+  console.log(renderPlanMarkdown(out.planSpec));
+  console.log(`\nSeats: ${out.seats.join(" · ")} (synthesized by ${out.synthesizer})`);
+  console.log(`Plan saved:\n  ${mdPath}\n  ${jsonPath}`);
+  console.log(`\nReview/edit the plan, then build it:\n  council build --from ${path.relative(workspaceRoot(cwd), jsonPath).split(path.sep).join("/")}`);
+}
+
+async function handleBuild(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["from", "base", "codex-model", "grok-model", "claude-model"],
+    booleanOptions: ["json", "dry-run", "skip-openrouter"]
+  });
+  const cwd = process.cwd();
+  const root = workspaceRoot(cwd);
+  if (!options.from) throw new Error("council build needs a PlanSpec: council build --from <plan.json> (produce one with `council plan`)");
+
+  const planPath = confinedPlanPath(cwd, options.from);
+  let raw;
+  try {
+    raw = fs.readFileSync(planPath, "utf8");
+  } catch (err) {
+    throw new Error(`cannot read the PlanSpec at ${options.from}: ${err?.message ?? err}`);
+  }
+  const parsed = parsePlanSpec(raw);
+  if (!parsed.ok) throw new Error(`the PlanSpec is not valid JSON: ${parsed.error}`);
+  const check = validatePlanSpec(parsed.spec, { root, fileExists: planFileExists });
+  if (!check.valid) throw new Error(`the PlanSpec is INVALID (fail-closed — nothing is built):\n  - ${check.errors.join("\n  - ")}`);
+  const planSpec = check.value;
+
+  // A positional request, when given, must be the SAME request the plan was made for — otherwise the
+  // operator believes they are building X while the plan builds Y.
+  const askedFor = positionals.join(" ").trim();
+  if (askedFor && requestDigest(askedFor) !== planSpec.requestHash) {
+    throw new Error("the feature request you passed does not match the one this PlanSpec was made for — refusing to build a plan for a different request");
+  }
+
+  const backends = probeBackends(cwd, ROOT_DIR, { probeClaude: true });
+  const policy = loadPolicy(cwd);
+  const merged = mergeOptionsWithPolicy(options, policy);
+  attachOpenRouterSeats(backends, merged, policy, options.json);
+
+  if (options["dry-run"]) {
+    // Preflight + validation ONLY. Spends nothing.
+    const ready = buildReviewerReady(backends, merged);
+    const lines = [
+      `PlanSpec ${planSpecDigest(planSpec).slice(0, 8)} — ${planSpec.steps.length} step(s), base ${String(planSpec.baseCommit).slice(0, 8)}`,
+      `Request: ${planSpec.request}`,
+      "",
+      ...planSpec.steps.map((s, i) => `  ${i + 1}. [${s.id}] ${s.title}\n       files: ${planStepTouched(s).join(", ")}`),
+      "",
+      `§6 required seats: ${Object.keys(ready).filter((k) => k !== "ready").join(", ")} — ${ready.ready ? "ALL reachable" : "NOT all reachable (build would refuse to start)"}`,
+      "",
+      "(--dry-run: nothing was built and no model was called)"
+    ];
+    outputResult(options.json ? { planSpec, dryRun: true, reviewerReady: ready } : `${lines.join("\n")}\n`, options.json);
+    return;
+  }
+
+  const out = await runBuild(cwd, planSpec, backends, {
+    ...merged,
+    onProgress: options.json ? undefined : (m) => console.error(m)
+  }, { git: makeBuildGit(root) });
+
+  if (options.json) {
+    outputResult(out, true);
+  } else {
+    console.log(renderBuildReport(out));
+  }
+  // Any failed gate / stranded run is a non-zero exit — a build that did not fully land must not look green.
+  if (!out?.ok || out?.stranded) process.exitCode = 1;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const command = argv[0];
@@ -2809,6 +2953,12 @@ async function main() {
         break;
       case "audit":
         await handleAudit(rest);
+        break;
+      case "plan":
+        await handlePlan(rest);
+        break;
+      case "build":
+        await handleBuild(rest);
         break;
       case "usage":
         await handleUsage(rest);
