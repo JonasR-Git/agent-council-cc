@@ -45,9 +45,9 @@ import { activeReviewerCount, runAuditReview } from "./lib/audit-review.mjs";
 import { runGroupedReview } from "./lib/audit-grouped-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
-import { runFixLoop } from "./lib/audit-fixloop.mjs";
+import { evaluateResumeGuard, loadFixLoopCheckpoint, runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
-import { parseUsageCeiling } from "./lib/usage-guard.mjs";
+import { parsePause5hOption, parseUsageCeiling } from "./lib/usage-guard.mjs";
 import { buildClaudeReviewArgs, makePatchReviewer, patchReviewerReady } from "./lib/audit-patch-reviewer.mjs";
 import { detectLogical } from "./lib/audit-logical.mjs";
 import { nodesFromGraph } from "./lib/import-graph.mjs";
@@ -106,8 +106,9 @@ function printUsage() {
       "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
       "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
       "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--structure-auto-apply] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
-      "    audit fix --loop [--deep] [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume]   (autonomous fix-until-dry on an isolated branch)",
+      "    audit fix --loop [--deep] [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]   (autonomous fix-until-dry on an isolated branch)",
       "      --deep : ONE flag for max analysis depth — grouped six-eyes over the full lens partition (incl. SSOT/architecture), completeness critic, char-test gate, budget auto-sized to a full sweep. Auto-apply stays explicit (--structure-auto-apply/--sensitive-auto-apply).",
+      "      --usage-ceiling : WEEKLY hard stop on a confirmed per-model quota breach (default 40/50/40). --pause-at-5h : SOFT pause on the 5h window, ON BY DEFAULT at 85% (a plain run pauses safely with a manual-resume contract; `off` disables, `<pct>` retunes, `auto` waits in-process to the reset then resumes itself).",
       "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume]   (bounded review/propose loop)",
       "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/council-companion.mjs cancel [job-id]",
@@ -1977,6 +1978,33 @@ async function computeFixReportMeta(cwd, out, ctx = {}) {
   return assembleFixMeta(out, { ...ctx, shapeBefore, shapeAfter, numstat });
 }
 
+/**
+ * Build the versioned `council.pause.v1` contract from a finished fix-loop result carrying a `pause`
+ * (a --pause-at-5h stop). PURE (no I/O; `observedAt` is injectable) so the exit-75 payload is
+ * unit-testable. `argv` is the normalized audit-subcommand token list (what handleAudit received); the
+ * emitted resume argv re-invokes the companion with `--resume` appended (idempotent). `state`
+ * distinguishes a schedulable pause ("pause_requested") from a manual stop ("manual_stop"); both exit 75.
+ */
+export function buildPausePayload(out, { baseBranch = null, cwd = null, argv = [], observedAt } = {}) {
+  const pz = (out && out.pause) || {};
+  const resumeArgv = ["audit", ...(Array.isArray(argv) ? argv : [])];
+  if (!resumeArgv.includes("--resume")) resumeArgv.push("--resume");
+  return {
+    schemaVersion: 1,
+    event: "council.pause.v1",
+    state: pz.schedulable ? "pause_requested" : "manual_stop",
+    reason: "quota_5h",
+    runId: out?.branch ?? baseBranch ?? null,
+    pauseId: pz.pauseId ?? null,
+    pass: out?.passesRun ?? 0,
+    checkpoint: { branch: out?.branch ?? null, base: baseBranch },
+    blockers: (pz.blockers ?? []).map((b) => ({ model: b.model, usedPercent: b.percent, threshold: b.threshold, resetsAt: b.resetsAt ?? null })),
+    observedAt: observedAt ?? nowIso(),
+    resumeAt: pz.resumeAt ?? null,
+    resume: { cwd, argv: resumeArgv }
+  };
+}
+
 async function handleAudit(argv) {
   // Capture the run-start clock BEFORE any work so --usage-ceiling's token scan (tokens spent SINCE
   // the run began) and the loop's usage snapshots share one honest baseline. Date.now() is allowed
@@ -1984,13 +2012,14 @@ async function handleAudit(argv) {
   const usageSince = Date.now();
   // --usage-ceiling accepts an OPTIONAL value: `--usage-ceiling` alone means "use the default
   // 40/50/40", `--usage-ceiling 40/50/40` (or `=45` / `=claude=40,codex=50`) overrides it, and an
-  // absent flag means no ceiling. The arg parser errors on a value-option given no value, so rewrite
-  // a BARE occurrence to an empty inline value up front — parseUsageCeiling("") returns the default.
+  // absent flag means no ceiling. --pause-at-5h likewise takes an OPTIONAL value (bare = the default-on
+  // 85%). The arg parser errors on a value-option given no value, so rewrite a BARE occurrence of
+  // either to an empty inline value up front — the parsers treat "" as the default.
   const preArgv = normalizeArgv(argv).map((tok, i, a) =>
-    tok === "--usage-ceiling" && (a[i + 1] == null || String(a[i + 1]).startsWith("-")) ? "--usage-ceiling=" : tok
+    (tok === "--usage-ceiling" || tok === "--pause-at-5h") && (a[i + 1] == null || String(a[i + 1]).startsWith("-")) ? `${tok}=` : tok
   );
   const { options, positionals } = parseCommandInput(preArgv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats", "usage-ceiling"],
+    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats", "usage-ceiling", "pause-at-5h"],
     booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep"]
   });
   // --deep: ONE flag for maximum ANALYSIS depth, so a thorough run needs no long flag list. It turns on
@@ -2192,7 +2221,6 @@ async function handleAudit(argv) {
     // radius -> repeats until dry/budget/max-passes. Nothing auto-merged.
     if (options.loop) {
       if (options["dry-run"]) throw new Error("--dry-run is not supported with --loop (the loop commits on an isolated branch). Preview a single pass with `audit fix --dry-run`, then run `audit fix --loop`.");
-      if (activeReviewerCount(backends, merged) === 0) throw new Error("no callable reviewers (Codex/Grok unavailable or skipped) — audit fix --loop needs at least one");
 
       // Preflight BEFORE paying for a review (the loop must never review-then-hard-stop):
       // require a branch (not detached HEAD), a clean tree, and a test gate.
@@ -2201,7 +2229,30 @@ async function handleAudit(argv) {
       if (!baseBranch) throw new Error("audit fix --loop requires being on a branch (detached HEAD detected) — check out a branch first");
       if (/^council\/audit-fix-/.test(baseBranch) && !options.resume) throw new Error(`you are on an integration branch (${baseBranch}) — check out your base branch first, or pass --resume to continue it`);
       const st = await runCommandAsync("git", ["status", "--porcelain"], { cwd, timeoutMs: 10_000 });
-      if (st.status === 0 && st.stdout.trim() !== "") throw new Error("working tree not clean — commit or stash first (the loop's rollback would destroy uncommitted work)");
+      const treeDirty = st.status === 0 && st.stdout.trim() !== "";
+      // Resume guard (LOAD-BEARING — never overwrite the user's work): on --resume, FAIL CLOSED if the
+      // tree is dirty (the user edited during the pause) or the checkpoint's integration branch no
+      // longer exists (fingerprint mismatch). We NEVER stash/reset/clean — we print `resume_blocked:`
+      // and exit non-zero, leaving the tree exactly as-is. Runs FIRST — before probing reviewers or the
+      // generic clean-tree throw — so a dirty/mismatched resume fails closed as early and cheaply as
+      // possible with the explicit resume_blocked contract.
+      if (options.resume) {
+        const priorCheckpoint = loadFixLoopCheckpoint(cwd);
+        let branchExists = true;
+        if (priorCheckpoint?.branch) {
+          const rp = await runCommandAsync("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${priorCheckpoint.branch}`], { cwd, timeoutMs: 10_000 });
+          branchExists = rp.status === 0;
+        }
+        const guard = evaluateResumeGuard({ checkpoint: priorCheckpoint, dirty: treeDirty, branchExists });
+        if (!guard.ok) {
+          process.exitCode = 1;
+          if (options.json) outputResult({ ok: false, resumeBlocked: true, reason: guard.reason, error: `resume_blocked: ${guard.reason}` }, true);
+          else console.error(`resume_blocked: ${guard.reason}`);
+          return;
+        }
+      }
+      if (treeDirty) throw new Error("working tree not clean — commit or stash first (the loop's rollback would destroy uncommitted work)");
+      if (activeReviewerCount(backends, merged) === 0) throw new Error("no callable reviewers (Codex/Grok unavailable or skipped) — audit fix --loop needs at least one");
       if (!detectTestCmd(workspaceRoot(cwd)) && !options["allow-untested"]) throw new Error("no test command detected — audit fix --loop needs a test gate; pass --allow-untested to run without verification (not recommended)");
 
       // Reconcile prior provisional fixes -> durable 'fixed' when their commit landed on
@@ -2251,6 +2302,21 @@ async function handleAudit(argv) {
       const usageCeiling = options["usage-ceiling"] != null ? parseUsageCeiling(options["usage-ceiling"]) : undefined;
       if (usageCeiling && !options.json) {
         console.error(`note: --usage-ceiling active — the loop STOPS between passes on a confirmed quota breach (claude ${usageCeiling.claude}% / codex ${usageCeiling.codex}% / grok ${usageCeiling.grok}%). Unknown/unavailable usage never stops it.`);
+      }
+      // --pause-at-5h: the SOFT 5h-window pause, a SEPARATE policy from --usage-ceiling (weekly hard
+      // stop). ON BY DEFAULT at 85% for the --loop path — an ABSENT flag yields { enabled:true,
+      // threshold:85, autonomous:false } so a plain `audit fix --loop` already pauses safely with a
+      // manual-resume contract. `--pause-at-5h off` disables; `--pause-at-5h 90` retunes; `--pause-at-5h
+      // auto` (or auto:N) makes it AUTONOMOUS (waits in-process to the reset, then resumes itself).
+      // parsePause5hOption validates + throws fail-fast here. (Only the loop pauses between passes; the
+      // single-shot `audit fix` path never reaches this and is unaffected.)
+      const pause5h = parsePause5hOption(options["pause-at-5h"]);
+      if (!options.json) {
+        if (pause5h.enabled) {
+          console.error(`note: --pause-at-5h active — the loop PAUSES between passes when an available model's 5h window is ≥ ${pause5h.threshold}% (${pause5h.autonomous ? "AUTONOMOUS: waits in-process to the reset then resumes itself" : "safe stop with a manual-resume contract, exit 75"}). Disable with --pause-at-5h off. Unknown/unavailable usage never pauses.`);
+        } else {
+          console.error("note: --pause-at-5h off — the 5h soft-pause safety is DISABLED for this run (the run will not pause when the 5h window fills).");
+        }
       }
       // R9: --groups drives the loop off the GROUPED six-eyes review (cell-granular coverage feeds the
       // convergence guard). Validate the preset + cap up front so a bad value fails before any spend.
@@ -2392,7 +2458,7 @@ async function handleAudit(argv) {
       // opts out (single flat convergence). --per-tier explicitly affirms the default; passing BOTH is
       // a contradiction, so reject it loudly instead of silently letting one win (council F2).
       if (options["per-tier"] && options.flat) throw new Error("--per-tier and --flat are contradictory (per-tier staging vs one flat convergence) — pass at most one");
-      const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, usageCeiling, usageSince, reporter, onProgress: reporter.line };
+      const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, usageCeiling, usageSince, pause5h, reporter, onProgress: reporter.line };
       // C3/M10: --supervise wraps the loop in the endless supervisor so a multi-hour autonomous run
       // survives rate-limit resets — a resumable stop (throttled/backends-down/did-not-run) waits
       // reset-aware then --resumes from the checkpoint; a terminal convergence returns as normal.
@@ -2425,6 +2491,24 @@ async function handleAudit(argv) {
         const msg = `supervised fix loop aborted (terminal): ${out.stopReason ?? String(out.err?.message ?? out.err)}${out.stranded ? ` — AND could not return to ${baseBranch}` : ""}`;
         if (options.json) outputResult({ ...out, ok: false, error: msg }, true);
         else console.error(`✖ ${msg}`);
+        return;
+      }
+      // --pause-at-5h clean stop (a NON-autonomous pause, or an autonomous one whose reset was not
+      // schedulable): NOT a crash and NOT a completion. Emit the resume contract + EXIT 75 (EX_TEMPFAIL)
+      // so the orchestrator schedules the durable resume and automation never reads PAUSED as done or
+      // crashed. Do NOT print the normal fix-loop report (that would imply completion). The plugin only
+      // EMITS the contract — the orchestrator (not the plugin) creates any durable resume cron.
+      if (out.pause) {
+        process.exitCode = 75;
+        const pz = out.pause;
+        if (options.json) {
+          outputResult(buildPausePayload(out, { baseBranch, cwd, argv: normalizeArgv(argv) }), true);
+          return;
+        }
+        const blockersDesc = (pz.blockers ?? []).map((b) => `${b.model} 5h ${b.percent}%≥${b.threshold}%`).join(", ");
+        const resumeCmd = `node ${process.argv[1] ?? "council-companion.mjs"} audit fix --loop --resume`;
+        const tail = pz.schedulable ? `resume ${pz.resumeAt}; resume with: ${resumeCmd}` : "resume manually — reset time not schedulable";
+        console.error(`⏸ Paused safely after pass ${out.passesRun ?? 0}: ${blockersDesc}; ${tail}${out.stranded ? ` (note: could not return to ${baseBranch} — a resume will continue on ${out.branch})` : ""}`);
         return;
       }
       if (out.stranded) process.exitCode = 1;

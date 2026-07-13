@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { fixKey, gateFindings, runFixLoop } from "../plugins/council/scripts/lib/audit-fixloop.mjs";
+import { evaluateResumeGuard, fixKey, gateFindings, runFixLoop } from "../plugins/council/scripts/lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "../plugins/council/scripts/lib/audit-fixloop-deps.mjs";
 
 const finding = (o) => ({ lens: "correctness", severity: "P1", ...o });
@@ -427,4 +427,25 @@ test("P2: runFixLoop returns changedFiles (union of fixed files) so `audit fix -
   });
   const out = await runFixLoop("/x", { budget: 40, dryStreak: 2 }, { review, fix, checkpoint: noCheckpoint });
   assert.deepEqual([...out.changedFiles].sort(), ["a.mjs", "b.mjs"]);
+});
+
+// --- evaluateResumeGuard: the LOAD-BEARING "never overwrite the user's work" resume gate -----------
+
+test("evaluateResumeGuard: a clean tree with the checkpoint branch present → ok (resume proceeds)", () => {
+  const g = evaluateResumeGuard({ checkpoint: { branch: "council/audit-fix-1" }, dirty: false, branchExists: true });
+  assert.deepEqual(g, { ok: true, reason: null });
+  // no checkpoint at all is also fine (a resume with nothing to resume just starts fresh)
+  assert.deepEqual(evaluateResumeGuard({ checkpoint: null, dirty: false, branchExists: true }), { ok: true, reason: null });
+});
+
+test("evaluateResumeGuard: a DIRTY tree FAILS CLOSED (the user edited during the pause — never overwrite)", () => {
+  const g = evaluateResumeGuard({ checkpoint: { branch: "council/audit-fix-1" }, dirty: true, branchExists: true });
+  assert.equal(g.ok, false);
+  assert.match(g.reason, /dirty|overwrit/i);
+});
+
+test("evaluateResumeGuard: a checkpoint branch that no longer exists FAILS CLOSED (fingerprint mismatch)", () => {
+  const g = evaluateResumeGuard({ checkpoint: { branch: "council/audit-fix-1" }, dirty: false, branchExists: false });
+  assert.equal(g.ok, false);
+  assert.match(g.reason, /no longer exists|cannot resume/i);
 });

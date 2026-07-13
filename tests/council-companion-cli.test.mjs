@@ -497,6 +497,81 @@ test("--structure-auto-apply does NOT imply --sensitive-auto-apply (double conse
   }
 });
 
+// --- --pause-at-5h: the exit-75 pause CONTRACT + the resume-safety guard at the CLI boundary --------
+
+test("buildPausePayload emits the versioned council.pause.v1 contract (schedulable → pause_requested)", async () => {
+  // main() is entry-guarded, so a direct import runs no CLI — the payload builder is a pure export.
+  const { buildPausePayload } = await import(pathToFileURL(COMPANION).href);
+  const out = {
+    branch: "council/audit-fix-42",
+    passesRun: 3,
+    pause: {
+      schedulable: true,
+      resumeAt: "2026-07-13T02:02:00Z",
+      threshold: 85,
+      autonomous: false,
+      pauseId: "abc123",
+      blockers: [{ model: "claude", percent: 92, threshold: 85, resetsAt: "2026-07-13T02:00:00Z" }]
+    }
+  };
+  const p = buildPausePayload(out, { baseBranch: "master", cwd: "/repo", argv: ["fix", "--loop", "--pause-at-5h", "85"], observedAt: "2026-07-13T00:00:00Z" });
+  assert.equal(p.schemaVersion, 1);
+  assert.equal(p.event, "council.pause.v1");
+  assert.equal(p.state, "pause_requested", "a schedulable pause is a pause_requested");
+  assert.equal(p.reason, "quota_5h");
+  assert.equal(p.runId, "council/audit-fix-42");
+  assert.equal(p.pauseId, "abc123");
+  assert.equal(p.pass, 3);
+  assert.deepEqual(p.checkpoint, { branch: "council/audit-fix-42", base: "master" });
+  assert.deepEqual(p.blockers, [{ model: "claude", usedPercent: 92, threshold: 85, resetsAt: "2026-07-13T02:00:00Z" }], "percent is surfaced as usedPercent");
+  assert.equal(p.resumeAt, "2026-07-13T02:02:00Z");
+  assert.equal(p.observedAt, "2026-07-13T00:00:00Z");
+  assert.equal(p.resume.cwd, "/repo");
+  assert.deepEqual(p.resume.argv, ["audit", "fix", "--loop", "--pause-at-5h", "85", "--resume"], "the resume argv re-invokes with --resume appended");
+});
+
+test("buildPausePayload marks an UNSCHEDULABLE pause as manual_stop and never duplicates an existing --resume", async () => {
+  const { buildPausePayload } = await import(pathToFileURL(COMPANION).href);
+  const out = { branch: "council/audit-fix-7", passesRun: 1, pause: { schedulable: false, resumeAt: null, threshold: 85, autonomous: true, pauseId: "z", blockers: [{ model: "codex", percent: 99, threshold: 85, resetsAt: null }] } };
+  const p = buildPausePayload(out, { baseBranch: "main", cwd: "/w", argv: ["fix", "--loop", "--resume"] });
+  assert.equal(p.state, "manual_stop", "an unschedulable pause is a manual stop (still exit 75; state distinguishes it)");
+  assert.equal(p.resumeAt, null);
+  assert.equal(p.blockers[0].usedPercent, 99);
+  assert.deepEqual(p.resume.argv, ["audit", "fix", "--loop", "--resume"], "an already-present --resume is not doubled (idempotent)");
+});
+
+test("audit fix --loop --resume FAILS CLOSED on a dirty tree (resume_blocked, tree left untouched)", (t) => {
+  // The LOAD-BEARING resume-safety guard: a user who edited during a pause must never have their work
+  // stashed/reset/overwritten. A dirty tree on --resume prints resume_blocked and exits non-zero, and
+  // the uncommitted file is left EXACTLY as-is.
+  const repo = makeStructureFixRepo([]); // committed index.mjs + every seat unreachable
+  if (!repo) {
+    t.skip("git is unavailable in this environment");
+    return;
+  }
+  const indexPath = path.join(repo.workDir, "index.mjs");
+  const dirty = "export const value = 999; // uncommitted work the user is mid-edit on\n";
+  fs.writeFileSync(indexPath, dirty, "utf8"); // dirty the tree AFTER the commit
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-resume-state-"));
+  try {
+    const res = spawnSync(
+      process.execPath,
+      [COMPANION, "audit", "fix", "--loop", "--resume", "--json"],
+      { cwd: repo.workDir, env: { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot, CLAUDE_BIN: repo.fakeClaudeBin }, encoding: "utf8", timeout: 120_000 }
+    );
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.notEqual(res.status, 0, "a dirty resume must exit non-zero (fail closed), never silently proceed");
+    assert.match(`${res.stdout}${res.stderr}`, /resume_blocked/, "it prints the explicit resume_blocked contract");
+    assert.equal(fs.readFileSync(indexPath, "utf8"), dirty, "the user's uncommitted work is left EXACTLY as-is — no stash/reset/checkout");
+  } finally {
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+    fs.rmSync(repo.workDir, { recursive: true, force: true });
+  }
+});
+
 test("council build binds the plan to the operator's request when one is given (council final Codex P2)", () => {
   // With a positional request, validatePlanSpec's expectedRequest binding must reject a plan whose
   // request differs — otherwise the operator builds a plan for a DIFFERENT request than they typed.

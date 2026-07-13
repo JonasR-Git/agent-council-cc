@@ -15,11 +15,19 @@ import path from "node:path";
 
 import { dedupeNew, endlessKey, endlessStopReason } from "./audit-endless.mjs";
 import { NOOP_REPORTER } from "./progress.mjs";
-import { evaluateCeiling, readUsageSnapshot } from "./usage-guard.mjs";
+import { evaluateCeiling, evaluatePause5h, readUsageSnapshot } from "./usage-guard.mjs";
 import { retryOnRateLimit } from "./audit-retry.mjs";
 import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
 import { resolveStateDir, writeFileAtomic } from "./state.mjs";
+import { hashLite } from "./util.mjs";
+
+// The autonomous 5h pause waits IN-PROCESS to a KNOWN future reset. Cap the wait so a wrong/rolled
+// resetsAt can never turn into an indefinite/absurd sleep: max = maxAheadMs (5h15m) + the pause buffer
+// (2m). evaluatePause5h already refuses to mark anything past this bound schedulable; this is the
+// belt-and-suspenders bound at the sleep site. NOTE: an in-process multi-hour wait is FRAGILE — the
+// machine/terminal must stay up — but the checkpoint written FIRST makes a mid-wait death --resume-able.
+const MAX_AUTONOMOUS_WAIT_MS = 5 * 3600e3 + 17 * 60e3;
 
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, Math.floor(Number.isFinite(n) ? n : lo)));
 
@@ -49,6 +57,24 @@ export function loadFixLoopCheckpoint(cwd) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Resume-safety guard (LOAD-BEARING — a resume must NEVER overwrite the user's work). PURE: given
+ * whether the tree is `dirty` and whether the checkpoint's recorded integration `branch` still exists
+ * (`branchExists`), decide if `audit fix --loop --resume` may proceed. Returns `{ ok, reason }`.
+ * FAIL CLOSED: a dirty tree (the user edited during the pause) or a vanished/renamed integration
+ * branch (the checkpoint fingerprint no longer matches) → `{ ok:false, reason }` so the caller aborts
+ * WITHOUT stashing/resetting/cleaning anything. This function itself touches nothing — it only judges.
+ */
+export function evaluateResumeGuard({ checkpoint, dirty, branchExists } = {}) {
+  if (dirty) {
+    return { ok: false, reason: "working tree is dirty — resume aborted so your uncommitted changes are never overwritten (commit or stash them, then resume)" };
+  }
+  if (checkpoint && checkpoint.branch && branchExists === false) {
+    return { ok: false, reason: `checkpoint integration branch "${checkpoint.branch}" no longer exists — cannot resume without risking overwrite; re-run without --resume to start a fresh loop` };
+  }
+  return { ok: true, reason: null };
 }
 
 function defaultCheckpoint(cwd, state) {
@@ -101,6 +127,16 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const readUsage = typeof deps.readUsage === "function"
     ? deps.readUsage
     : () => readUsageSnapshot({ homeDir: os.homedir(), sinceMs: options.usageSince });
+  // --pause-at-5h: a SEPARATE, SOFTER policy than --usage-ceiling (which is a weekly HARD stop). The 5h
+  // window resets in hours, so a breach PAUSES between passes with a resume contract instead of stopping
+  // terminally. `options.pause5h = { enabled, threshold, autonomous }` (the companion applies the
+  // default-on 85%). Non-autonomous: checkpoint + break clean (exit 75 + a durable-resume contract the
+  // orchestrator schedules). Autonomous: wait IN-PROCESS to the known reset, then continue. FAIL-SOFT:
+  // a usage-read failure never pauses. `now`/`sleep` are injectable for tests (sleep is shared with the
+  // retry backoff — both default to real setTimeout).
+  const pause5h = options.pause5h && typeof options.pause5h === "object" && options.pause5h.enabled ? options.pause5h : null;
+  const nowFn = typeof deps.now === "function" ? deps.now : () => Date.now();
+  const sleepFn = typeof deps.sleep === "function" ? deps.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
   const review = deps.review;
   const fix = deps.fix;
   if (typeof review !== "function") throw new Error("runFixLoop requires deps.review");
@@ -135,6 +171,13 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   let stopReason = null;
   let changedFiles = null; // null = full scope on the first pass
   let branch = null;
+  // --pause-at-5h machine-readable result (companion emits the resume contract + exit 75 from it) and
+  // the anti-thrash guard. `pauseGuard` remembers the last pause's window signature + durable-fix count
+  // so a resume that IMMEDIATELY re-pauses on the SAME 5h window with NO progress is caught (persisted
+  // in the checkpoint so it survives the non-autonomous exit/resume boundary).
+  let pauseInfo = null;
+  let pauseGuard = null;
+  const pauseWindowSig = (blockers) => blockers.map((b) => `${b.model}@${b.resetsAt ?? "?"}`).sort().join(",");
   // Per-tier convergence (§3): run each tier (0 logical -> 1 structure -> 2 correctness -> 3
   // quality) to dry before advancing, so a Structure consolidation lands before Correctness runs
   // on the consolidated code (a bug is then found once, post-consolidation, not N times across
@@ -180,6 +223,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       tierDryStreak = clamp(prior.tierDryStreak ?? 0, 0, dryStop);
       stalledStreak = clamp(prior.stalledStreak ?? 0, 0, dryStop);
       branch = prior.branch ?? null;
+      // Restore the pause anti-thrash guard so a resume that immediately re-pauses on the SAME 5h
+      // window with no progress is caught across the exit/resume boundary (not just within one process).
+      if (prior.pauseGuard && typeof prior.pauseGuard === "object") pauseGuard = prior.pauseGuard;
       // Restore the scope so a resumed run doesn't jump straight to a stale full-scope
       // window offset (which would review off-the-end and falsely read "dry").
       if (Array.isArray(prior.changedFiles) && prior.changedFiles.length) changedFiles = prior.changedFiles;
@@ -353,7 +399,8 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // so without this the dashboard/progress.json would under-report spend by a whole pass. Best-effort.
     reporter.budget(spent, totalBudget);
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
-    checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason: null, done: false });
+    const cpState = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, stopReason: null, done: false };
+    checkpoint(cpState);
 
     // Between passes: honor --usage-ceiling on a CONFIRMED provider-quota breach. FAIL-SOFT —
     // a usage-read failure is treated as "not breached" (the loop continues); only an available
@@ -374,8 +421,77 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
         /* fail-soft: a usage-read failure never stops (or crashes) the loop */
       }
     }
+
+    // Between passes: the SOFT --pause-at-5h policy (separate from the weekly ceiling above). On a
+    // CONFIRMED 5h breach the loop PAUSES rather than stops terminally — the 5h window resets in hours.
+    // FAIL-SOFT: a usage-read failure never pauses. Only an AVAILABLE model with a finite 5h% ≥ the
+    // threshold pauses; unknown/unavailable/null-5h never does (evaluatePause5h enforces this).
+    if (pause5h) {
+      try {
+        const snap = await readUsage();
+        reporter.usage?.(snap); // bare: refresh the live 5h numbers without clobbering any active ceiling
+        const nowMs = nowFn();
+        const p = evaluatePause5h(snap, pause5h.threshold, { nowMs });
+        if (p.paused) {
+          const blockersDesc = p.blockers.map((b) => `${b.model} 5h ${b.percent}%≥${b.threshold}%`).join(", ");
+          const windowSig = pauseWindowSig(p.blockers);
+          // ANTI-THRASH: a resume that immediately re-pauses on the SAME 5h window with NO durable-fix
+          // progress since that pause is a spin (a wrong reset time, or the window never actually
+          // cleared). Hard-stop for manual attention instead of waiting/exiting into the same loop.
+          if (pauseGuard && pauseGuard.windowSig === windowSig && fixedAll.length <= (pauseGuard.fixedCount ?? 0)) {
+            stopReason = `quota-pause-manual: ${blockersDesc} — resumed but the same 5h window is still over threshold with no progress; stopping for manual attention`;
+            pauseInfo = { schedulable: false, resumeAt: null, blockers: p.blockers, threshold: pause5h.threshold, autonomous: Boolean(pause5h.autonomous), thrash: true, pauseId: hashLite(`${options.runId ?? ""}|${branch ?? ""}|${passNo}|thrash|${windowSig}`) };
+            reporter.line(`⏸ ${stopReason}`);
+            onProgress(stopReason);
+            checkpoint({ ...cpState, pauseGuard, stopReason, done: false });
+            break;
+          }
+          // Remember this pause so the NEXT iteration / resume can detect a no-progress re-pause.
+          pauseGuard = { windowSig, fixedCount: fixedAll.length, passNo };
+
+          // AUTONOMOUS + schedulable: wait IN-PROCESS to the KNOWN future reset, then continue the loop
+          // (the next pass re-reads usage). Checkpoint FIRST so a mid-wait process death stays
+          // --resume-able. Only a valid, bounded future wait — never an indefinite/absurd sleep.
+          if (pause5h.autonomous && p.schedulable) {
+            const resumeMs = Date.parse(p.resumeAt);
+            const waitMs = Number.isFinite(resumeMs) ? Math.max(0, resumeMs - nowMs) : NaN;
+            if (Number.isFinite(waitMs) && waitMs <= MAX_AUTONOMOUS_WAIT_MS) {
+              pauseGuard.autonomous = true;
+              checkpoint({ ...cpState, pauseGuard, stopReason: null, done: false });
+              reporter.line(`⏸ autonomous: waiting until ${p.resumeAt} for ${blockersDesc} reset`);
+              onProgress(`⏸ autonomous: waiting until ${p.resumeAt} for ${blockersDesc} reset`);
+              await sleepFn(waitMs);
+              continue; // resume the loop in-process; do NOT exit
+            }
+            // Not a valid bounded wait → fall through to the manual/exit path (never a blind sleep).
+          }
+
+          // NON-autonomous (or autonomous-but-unschedulable): clean stop between passes carrying a
+          // resume contract. The companion emits the contract + exit 75 from pauseInfo; the loop is
+          // already back-on-base + --resume-able.
+          stopReason = p.schedulable
+            ? `quota-pause: ${blockersDesc} — resume ${p.resumeAt}`
+            : `quota-pause-manual: ${blockersDesc} — reset time not schedulable, resume manually`;
+          pauseInfo = { schedulable: p.schedulable, resumeAt: p.resumeAt, blockers: p.blockers, threshold: pause5h.threshold, autonomous: Boolean(pause5h.autonomous), pauseId: hashLite(`${options.runId ?? ""}|${branch ?? ""}|${passNo}|${p.resumeAt ?? "manual"}`) };
+          reporter.line(`⏸ ${stopReason}`);
+          onProgress(stopReason);
+          checkpoint({ ...cpState, pauseGuard, stopReason, done: false });
+          break;
+        }
+        // Not paused → progressed past any prior pause on this window; clear the guard so a LATER,
+        // legitimate pause on the same window (after real work) isn't misread as a thrash.
+        pauseGuard = null;
+      } catch {
+        /* fail-soft: a usage-read failure never pauses (or crashes) the loop */
+      }
+    }
   }
 
-  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, stopReason, done: true });
-  return { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak, changedFiles: [...new Set(fixedAll.map((f) => f.file))] };
+  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, stopReason, done: true });
+  const result = { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak, changedFiles: [...new Set(fixedAll.map((f) => f.file))] };
+  // `pause` is present ONLY when a NON-autonomous (or autonomous-but-unschedulable) pause actually
+  // STOPPED the run — the companion turns it into the resume contract + exit 75. An autonomous wait
+  // that resumed in-process and later converged leaves pauseInfo null (a normal terminal result).
+  if (pauseInfo) result.pause = pauseInfo;
+  return result;
 }

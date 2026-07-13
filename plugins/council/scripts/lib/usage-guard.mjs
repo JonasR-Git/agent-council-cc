@@ -102,10 +102,11 @@ function codexFiveHourWindow(cd) {
 /**
  * Read a normalized per-model usage snapshot. `readers` is injectable (defaults
  * wrap token-usage.mjs). Returns:
- *   { claude:{available,weekPercent,fiveHourPercent,weekResetsAt,tokens:{out,in,total}},
- *     codex: {available,weekPercent,fiveHourPercent,weekResetsAt,tokens:{out,in,total}},
+ *   { claude:{available,weekPercent,fiveHourPercent,weekResetsAt,fiveHourResetsAt,tokens:{out,in,total}},
+ *     codex: {available,weekPercent,fiveHourPercent,weekResetsAt,fiveHourResetsAt,tokens:{out,in,total}},
  *     grok:  {available,weekPercent,weekResetsAt,tokens:{total}} }
- * (Grok has no 5h window; Codex's fiveHourPercent is null when the latest snapshot has none active.)
+ * (Grok has no 5h window → no fiveHour* fields; Codex's fiveHourPercent/fiveHourResetsAt are null when
+ * the latest snapshot has no active 5h window. fiveHourResetsAt is the resume clock for `--pause-at-5h`.)
  * FAIL-SOFT per model: a quota reader that throws or returns {error}/null leaves
  * that model `available:false` with null percents — it NEVER throws the whole
  * snapshot. Token reading is independent (its own try/catch, degrading to zeros)
@@ -135,6 +136,7 @@ export async function readUsageSnapshot({ homeDir, sinceMs, readers } = {}) {
     weekPercent: null,
     fiveHourPercent: null,
     weekResetsAt: null,
+    fiveHourResetsAt: null,
     tokens: { out: numOr0(cTok.outputTokens), in: numOr0(cTok.inputTokens), total: numOr0(cTok.inputTokens) + numOr0(cTok.outputTokens) }
   };
   try {
@@ -145,6 +147,7 @@ export async function readUsageSnapshot({ homeDir, sinceMs, readers } = {}) {
         claude.weekPercent = finitePct(c.sevenDay?.usedPercent);
         claude.fiveHourPercent = finitePct(c.fiveHour?.usedPercent);
         claude.weekResetsAt = c.sevenDay?.resetsAt ?? null;
+        claude.fiveHourResetsAt = c.fiveHour?.resetsAt ?? null;
       }
     }
   } catch {
@@ -156,6 +159,7 @@ export async function readUsageSnapshot({ homeDir, sinceMs, readers } = {}) {
     weekPercent: null,
     fiveHourPercent: null,
     weekResetsAt: null,
+    fiveHourResetsAt: null,
     tokens: { out: numOr0(xTok.outputTokens), in: numOr0(xTok.inputTokens), total: numOr0(xTok.totalTokens) }
   };
   try {
@@ -168,6 +172,7 @@ export async function readUsageSnapshot({ homeDir, sinceMs, readers } = {}) {
         codex.weekPercent = finitePct(weekly?.usedPercent);
         codex.fiveHourPercent = finitePct(fiveH?.usedPercent);
         codex.weekResetsAt = weekly?.resetsAt ?? null;
+        codex.fiveHourResetsAt = fiveH?.resetsAt ?? null;
       }
     }
   } catch {
@@ -198,12 +203,12 @@ export async function readUsageSnapshot({ homeDir, sinceMs, readers } = {}) {
 
 /**
  * Evaluate a snapshot against a ceiling. Returns `{ breached, breaches, unavailable }`.
- * A breach is recorded ONLY for a model that is `available` AND has a numeric
- * weekPercent at/over its ceiling — `{ model, window:"weekly", percent, ceiling }`.
- * A model that reports a 5h window (Claude always; Codex when active) additionally breaches on it
- * (an earlier signal against the SAME ceiling): `{ model, window:"5h", ... }`. A model with
- * `available:false` (or no numeric percent) is NEVER a breach — the guard can never
- * stop on unknown usage — but its name is collected in `unavailable`. PURE.
+ * `--usage-ceiling` is the WEEKLY HARD STOP and NOTHING else: a breach is recorded ONLY for a model
+ * that is `available` AND has a numeric WEEKLY `weekPercent` at/over its ceiling —
+ * `{ model, window:"weekly", percent, ceiling }`. The 5h window is DELIBERATELY not evaluated here:
+ * it is a soft PAUSE (evaluatePause5h below), a separate policy that resets in hours, never a terminal
+ * ceiling stop. A model with `available:false` (or no numeric weekPercent) is NEVER a breach — the
+ * guard can never stop on unknown usage — but its name is collected in `unavailable`. PURE.
  */
 export function evaluateCeiling(snapshot, ceiling) {
   const snap = snapshot && typeof snapshot === "object" ? snapshot : {};
@@ -220,10 +225,101 @@ export function evaluateCeiling(snapshot, ceiling) {
     if (limit == null) continue; // no ceiling configured for this model → can't breach
     const week = finitePct(m.weekPercent);
     if (week != null && week >= limit) breaches.push({ model, window: "weekly", percent: week, ceiling: limit });
-    // The 5h window is an EARLIER signal against the same ceiling — for any model that reports one
-    // (Claude always; Codex when its 5h window is active). Grok has no 5h window → fiveHourPercent null.
-    const fiveH = finitePct(m.fiveHourPercent);
-    if (fiveH != null && fiveH >= limit) breaches.push({ model, window: "5h", percent: fiveH, ceiling: limit });
   }
   return { breached: breaches.length > 0, breaches, unavailable };
+}
+
+/**
+ * Parse a `--pause-at-5h` value into `{ enabled, threshold(1..100), autonomous }`. The 5h SOFT PAUSE
+ * is ON BY DEFAULT at 85% (the user's explicit safety rule): a plain `audit fix --loop` already pauses
+ * between passes when an available model's 5h window is ≥ 85%, with a manual-resume contract. Forms:
+ *  - null/undefined/"" (ABSENT flag)  → { enabled:true,  threshold:85, autonomous:false }  (DEFAULT ON)
+ *  - "off" | "none" | "0" | "false"   → { enabled:false, threshold:85, autonomous:false }  (turn OFF)
+ *  - "<N>" (1..100)                   → { enabled:true,  threshold:N,  autonomous:false }  (retune)
+ *  - "auto" | "auto:<N>" | "<N>:auto" → { enabled:true,  threshold:N||85, autonomous:true } (AUTONOMOUS:
+ *                                        the loop waits in-process to the reset then resumes itself)
+ * Throws on an out-of-range/unparseable threshold. PURE.
+ */
+export function parsePause5hOption(input) {
+  const DEFAULT = 85;
+  if (input == null) return { enabled: true, threshold: DEFAULT, autonomous: false };
+  const raw = String(input).trim().toLowerCase();
+  if (raw === "") return { enabled: true, threshold: DEFAULT, autonomous: false };
+  if (raw === "off" || raw === "none" || raw === "false" || raw === "0") {
+    return { enabled: false, threshold: DEFAULT, autonomous: false };
+  }
+
+  const validate = (s) => {
+    const v = Number(s);
+    if (!Number.isFinite(v)) throw new Error(`--pause-at-5h: threshold must be a number 1..100 (got "${s}")`);
+    if (v < 1 || v > 100) throw new Error(`--pause-at-5h: threshold must be between 1 and 100 (got ${v})`);
+    return v;
+  };
+
+  // AUTONOMOUS forms carry the word "auto" (alone, or paired with a threshold in either order).
+  if (raw.includes("auto")) {
+    const parts = raw.split(":").map((s) => s.trim()).filter((s) => s !== "");
+    const nums = parts.filter((s) => s !== "auto");
+    // The only non-numeric token allowed alongside "auto" is nothing — reject e.g. "autox" / "auto:hi".
+    if (nums.some((s) => !Number.isFinite(Number(s)))) {
+      throw new Error(`--pause-at-5h: unrecognized value "${raw}" (expected off | <N> | auto | auto:<N>)`);
+    }
+    return { enabled: true, threshold: nums.length ? validate(nums[0]) : DEFAULT, autonomous: true };
+  }
+
+  return { enabled: true, threshold: validate(raw), autonomous: false };
+}
+
+/**
+ * Evaluate a snapshot's 5h windows against a soft-pause `threshold`. This is the `--pause-at-5h`
+ * policy — a SEPARATE, softer thing than `--usage-ceiling` (weekly hard stop): the 5h window resets in
+ * hours, so pausing + resuming across it is useful, never terminal. PURE, TOTAL, fail-soft. Returns:
+ *   { paused, blockers:[{model,percent,threshold,resetsAt}], schedulable, resumeAt:ISO|null, reason }
+ * Rules:
+ *  - A blocker is ONLY an AVAILABLE model with a FINITE fiveHourPercent ≥ threshold (unavailable /
+ *    null-5h → never a blocker; Grok has no 5h window). No blocker → paused:false, reason:"none".
+ *  - resumeAt = max(blocker.resetsAt) + bufferMs, schedulable:true — but ONLY when that latest reset is
+ *    a VALID timestamp that is either in the future within maxAheadMs, OR just-reset in the immediate
+ *    past (within justResetGraceMs → resumable-now, resumeAt = now + bufferMs). A missing/invalid,
+ *    genuinely stale (old past), or absurdly-far (> now + maxAheadMs) reset → schedulable:false,
+ *    resumeAt:null, reason:"unschedulable-timestamp" (the caller MANUAL-stops — it must never
+ *    auto-schedule a dead/indefinite/absurd wait, even in autonomous mode).
+ */
+export function evaluatePause5h(
+  snapshot,
+  threshold,
+  { nowMs = Date.now(), bufferMs = 120000, maxAheadMs = 5 * 3600e3 + 15 * 60e3, justResetGraceMs = 15 * 60e3 } = {}
+) {
+  const snap = snapshot && typeof snapshot === "object" ? snapshot : {};
+  const t = finitePct(threshold);
+  const blockers = [];
+  if (t != null) {
+    for (const model of MODELS) {
+      const m = snap[model];
+      if (!m || typeof m !== "object" || m.available !== true) continue;
+      const fiveH = finitePct(m.fiveHourPercent);
+      if (fiveH != null && fiveH >= t) blockers.push({ model, percent: fiveH, threshold: t, resetsAt: m.fiveHourResetsAt ?? null });
+    }
+  }
+  if (blockers.length === 0) return { paused: false, blockers: [], schedulable: false, resumeAt: null, reason: "none" };
+
+  // Resume clock = the LATEST breaching reset (a resume before the last window clears would just
+  // re-pause). Only schedule against a timestamp we can trust.
+  let maxResetMs = null;
+  for (const b of blockers) {
+    const ms = b.resetsAt == null ? NaN : Date.parse(b.resetsAt);
+    if (Number.isFinite(ms) && (maxResetMs == null || ms > maxResetMs)) maxResetMs = ms;
+  }
+  const unschedulable = { paused: true, blockers, schedulable: false, resumeAt: null, reason: "unschedulable-timestamp" };
+  if (maxResetMs == null) return unschedulable; // every breaching reset was missing/invalid
+  if (maxResetMs > nowMs + maxAheadMs) return unschedulable; // absurdly far (wrong/rolled clock)
+  if (maxResetMs <= nowMs) {
+    // Past reset: a JUST-reset window is resumable-now (short buffer); an old/stale timestamp is not
+    // trustworthy → manual stop, never a blind resume on ancient data.
+    if (nowMs - maxResetMs <= justResetGraceMs) {
+      return { paused: true, blockers, schedulable: true, resumeAt: new Date(nowMs + bufferMs).toISOString(), reason: "ok" };
+    }
+    return unschedulable;
+  }
+  return { paused: true, blockers, schedulable: true, resumeAt: new Date(maxResetMs + bufferMs).toISOString(), reason: "ok" };
 }

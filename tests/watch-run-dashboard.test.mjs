@@ -76,12 +76,14 @@ test("renderRunDashboard: a breach shows the ⛔ ceiling line with model/percent
   assert.ok(!/\*\*Ceiling\*\* 40\/50\/40 ✓/.test(md), "a breach never also prints the OK line");
 });
 
-test("renderRunDashboard: claude 5h breach is surfaced on the ceiling line", () => {
+test("renderRunDashboard: a high 5h with low weekly does NOT breach the ceiling (ceiling is WEEKLY-only)", () => {
+  // The ceiling is now the WEEKLY hard-stop policy only; the 5h window is handled by --pause-at-5h.
+  // A claude 5h at 55% (over the 40 ceiling) while weekly is 2% must NOT show a ceiling breach.
   const usage = fullUsage();
   usage.claude = { available: true, weekPercent: 2, fiveHourPercent: 55, weekResetsAt: null, tokens: { total: 10 } };
   const md = renderRunDashboard(fullState(), { usage, ceiling: CEILING });
-  assert.match(md, /⛔ \*\*Ceiling\*\*/);
-  assert.match(md, /claude 55%≥40% \(5h\)/);
+  assert.doesNotMatch(md, /⛔ \*\*Ceiling\*\*/, "a 5h value never triggers a ceiling breach");
+  assert.match(md, /\*\*Ceiling\*\* 40\/50\/40 ✓/, "ceiling stays OK on weekly (5h is out of scope here)");
 });
 
 test("renderRunDashboard: null usage degrades to the plain box (no quota columns)", () => {

@@ -85,6 +85,107 @@ test("no --usage-ceiling → readUsage is never called (zero overhead when the g
   assert.equal(usageCalls, 0, "with no ceiling the loop never reads usage");
 });
 
+// --- --pause-at-5h: the SOFT 5h pause hook (separate from the weekly --usage-ceiling above) --------
+
+const NOWMS = Date.parse("2026-07-13T00:00:00Z");
+const RESET = Date.parse("2026-07-13T02:00:00Z");
+const isoOf = (ms) => new Date(ms).toISOString();
+const under5h = () => ({ claude: { available: true, fiveHourPercent: 10, fiveHourResetsAt: isoOf(RESET) }, codex: { available: false }, grok: { available: false } });
+const over5h = () => ({ claude: { available: true, fiveHourPercent: 92, fiveHourResetsAt: isoOf(RESET) }, codex: { available: false }, grok: { available: false } });
+const PAUSE_ON = { enabled: true, threshold: 85, autonomous: false };
+const PAUSE_AUTO = { enabled: true, threshold: 85, autonomous: true };
+
+test("--pause-at-5h (non-autonomous): a 5h breach on pass 2 PAUSES with a schedulable resume contract", async () => {
+  let p = 0;
+  const review = async () => ({ findings: [finding({ file: "a.mjs", title: `bug ${p++}` })], coverage: { budgetSpent: 1 } });
+  const fix = async (actionable) => ({ fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], branch: "council/x", changedFiles: ["a.mjs"], spent: 1 });
+  let calls = 0;
+  const readUsage = async () => (++calls >= 2 ? over5h() : under5h());
+  const out = await runFixLoop(
+    "/x",
+    { budget: 40, maxPasses: 10, dryStreak: 5, pause5h: PAUSE_ON },
+    { review, fix, readUsage, now: () => NOWMS, checkpoint: noCheckpoint }
+  );
+  assert.ok(out.pause, "the loop returns a machine-readable pause object the companion emits as the contract");
+  assert.equal(out.pause.schedulable, true);
+  assert.equal(out.pause.autonomous, false);
+  assert.equal(out.pause.threshold, 85);
+  assert.equal(out.pause.resumeAt, isoOf(RESET + 120000), "resumeAt = breaching reset + the 2m buffer");
+  assert.ok(out.pause.blockers.some((b) => b.model === "claude" && b.percent === 92));
+  assert.ok(out.pause.pauseId, "a deterministic pauseId is derived for scheduler idempotency");
+  assert.equal(out.passesRun, 2, "ran pass 1 (under) then paused after pass 2 (over)");
+  assert.match(out.stopReason, /quota-pause/);
+});
+
+test("--pause-at-5h auto: the loop WAITS in-process to the reset then RESUMES (no exit); converges once usage clears", async () => {
+  let rc = 0;
+  const review = async () => (rc++ === 0 ? { findings: [finding({ file: "a.mjs", title: "bug" })], coverage: { budgetSpent: 1 } } : { findings: [], coverage: { budgetSpent: 1 } });
+  const fix = async (actionable) => ({ fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], branch: "council/x", changedFiles: ["a.mjs"], spent: 1 });
+  let calls = 0;
+  const readUsage = async () => (++calls === 1 ? over5h() : under5h()); // over on pass 1's check, clears after
+  const sleeps = [];
+  const out = await runFixLoop(
+    "/x",
+    { budget: 40, maxPasses: 10, dryStreak: 2, pause5h: PAUSE_AUTO },
+    { review, fix, readUsage, now: () => NOWMS, sleep: async (ms) => sleeps.push(ms), checkpoint: noCheckpoint }
+  );
+  assert.equal(sleeps.length, 1, "it waited exactly once, in-process (did not exit)");
+  assert.equal(sleeps[0], RESET + 120000 - NOWMS, "the wait runs until resumeAt (reset + buffer)");
+  assert.equal(out.pause, undefined, "an autonomous wait that resumed then converged returns NO pause / never exits on the pause");
+  assert.match(out.stopReason, /diminishing returns|all tiers converged|budget|max passes/);
+});
+
+test("--pause-at-5h auto with an UNSCHEDULABLE reset → manual stop/exit, NEVER a blind in-process wait", async () => {
+  let rc = 0;
+  const review = async () => (rc++ === 0 ? { findings: [finding({ file: "a.mjs", title: "bug" })], coverage: { budgetSpent: 1 } } : { findings: [], coverage: { budgetSpent: 1 } });
+  const fix = async (actionable) => ({ fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], branch: "council/x", changedFiles: ["a.mjs"], spent: 1 });
+  const overStale = () => ({ claude: { available: true, fiveHourPercent: 92, fiveHourResetsAt: "2020-01-01T00:00:00Z" }, codex: { available: false }, grok: { available: false } });
+  const sleeps = [];
+  const out = await runFixLoop(
+    "/x",
+    { budget: 40, maxPasses: 10, dryStreak: 5, pause5h: PAUSE_AUTO },
+    { review, fix, readUsage: async () => overStale(), now: () => NOWMS, sleep: async (ms) => sleeps.push(ms), checkpoint: noCheckpoint }
+  );
+  assert.equal(sleeps.length, 0, "an unschedulable reset must never trigger a blind multi-hour wait, even in auto");
+  assert.ok(out.pause, "it falls through to the manual/exit path carrying a pause object");
+  assert.equal(out.pause.schedulable, false);
+  assert.equal(out.pause.resumeAt, null);
+  assert.match(out.stopReason, /quota-pause-manual/);
+  assert.equal(out.passesRun, 1);
+});
+
+test("--pause-at-5h: a THROWING readUsage never pauses or crashes the loop (fail-soft, like the ceiling)", async () => {
+  let rc = 0;
+  const review = async () => (rc++ === 0 ? { findings: [finding({ file: "a.mjs", title: "bug" })], coverage: { budgetSpent: 1 } } : { findings: [], coverage: { budgetSpent: 1 } });
+  const fix = async (actionable) => ({ fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], branch: "council/x", changedFiles: ["a.mjs"], spent: 1 });
+  const out = await runFixLoop(
+    "/x",
+    { budget: 40, dryStreak: 2, pause5h: PAUSE_ON },
+    { review, fix, readUsage: async () => { throw new Error("provider network down"); }, now: () => NOWMS, checkpoint: noCheckpoint }
+  );
+  assert.equal(out.pause, undefined, "a usage-read failure is treated as not-paused");
+  assert.match(out.stopReason, /diminishing returns|budget|max passes/);
+});
+
+test("--pause-at-5h anti-thrash: a resume that re-pauses the SAME 5h window with no progress → hard manual stop", async () => {
+  // Prior run paused on this exact window after 1 fix. On resume the window is STILL over and this pass
+  // fixes nothing new → a resume→re-pause spin. It must hard-stop for manual attention, not pause+exit
+  // into the same loop again.
+  const sig = `claude@${isoOf(RESET)}`;
+  const prior = { fixed: [{ file: "a.mjs", finding: { fingerprint: "fp1" } }], passNo: 1, spent: 1, branch: "council/x", pauseGuard: { windowSig: sig, fixedCount: 1, passNo: 1 } };
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 1 } }); // nothing new → no progress
+  const fix = async () => ({ fixed: [], failed: [], branch: "council/x", changedFiles: [], spent: 0 });
+  const out = await runFixLoop(
+    "/x",
+    { budget: 40, maxPasses: 10, dryStreak: 5, resume: true, pause5h: PAUSE_ON },
+    { review, fix, readUsage: async () => over5h(), now: () => NOWMS, loadCheckpoint: () => prior, checkpoint: noCheckpoint }
+  );
+  assert.ok(out.pause, "the thrash stop still surfaces a (manual) pause object");
+  assert.equal(out.pause.thrash, true);
+  assert.equal(out.pause.schedulable, false);
+  assert.match(out.stopReason, /no progress/);
+});
+
 // --- reporter.usage round-trip (progress.mjs writer side) ---------------------
 test("reporter.usage round-trips a compact snapshot + ceiling; a bare call keeps the earlier ceiling", () => {
   const reporter = makeProgressReporter({ kind: "audit-fix-loop", stateDir: null });
