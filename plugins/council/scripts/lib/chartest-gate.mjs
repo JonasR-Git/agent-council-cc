@@ -80,7 +80,61 @@ const ALLOWED_IMPORT = /^(node:test|node:assert(?:\/strict)?|\.\.?\/)/;
 const DANGEROUS_CODE = /\b(child_process|node:(fs|net|http|https|dgram|dns|tls|worker_threads|vm|module|cluster|inspector|repl|process)\b|process\.binding|require\s*\(\s*['"]node:(?!test|assert))|\beval\s*\(|new\s+Function\s*\(|\bimport\s*\(/;
 // A DISCRIMINATING assertion: a value comparison, not a tautology. `assert.ok(true)` / `assert(1)` do NOT
 // tie the pinned observable to a check, so they are rejected (council Claude P1 — assertion strength).
-const COMPARE_ASSERT = /\bassert\s*\.\s*(equal|strictEqual|deepEqual|deepStrictEqual|notEqual|notStrictEqual|notDeepEqual|match)\b/;
+// Accept BOTH the namespaced `assert.equal(...)` form AND a bare destructured `equal(...)` call from
+// `import { equal } from "node:assert"` — a common, valid style the prefix-only regex wrongly rejected.
+// `match` stays namespaced-only: bare `match(` collides with String.prototype.match and is not an assertion.
+const ASSERT_METHODS = "equal|strictEqual|deepEqual|deepStrictEqual|notEqual|notStrictEqual|notDeepEqual";
+const COMPARE_ASSERT = new RegExp(`\\bassert\\s*\\.\\s*(?:${ASSERT_METHODS}|match)\\s*\\(|\\b(?:${ASSERT_METHODS})\\s*\\(`);
+
+// Blank out single/double-quoted string literals and comments (replacing chars with spaces to preserve
+// offsets) so the denylist scans CODE only. Without this, a flagged token that appears solely inside an
+// expected-value STRING literal (e.g. a char-test pinning a function that returns "child_process") was
+// false-rejected. Import/require specifiers are checked separately against ALLOWED_IMPORT on the raw
+// source, so blanking their strings here does not weaken the import allowlist.
+// Template literals are NOT blanked — they are still SCANNED. Blanking them would drop the CODE inside
+// `${ … }` interpolations, opening a fail-OPEN hole (a hostile `${eval(x)}` would evade the denylist).
+// The `template` state exists only so a `'` or `"` inside a backtick is not mistaken for a string start;
+// a flagged token in a template's string part therefore still (safely, fail-closed) over-rejects.
+function stripLiterals(code) {
+  const src = String(code ?? "");
+  let out = "";
+  let state = "code"; // code | line | block | single | double | template
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    const next = src[i + 1];
+    if (state === "code") {
+      if (ch === "/" && next === "/") { state = "line"; out += "  "; i += 1; continue; }
+      if (ch === "/" && next === "*") { state = "block"; out += "  "; i += 1; continue; }
+      if (ch === "'") { state = "single"; out += " "; continue; }
+      if (ch === '"') { state = "double"; out += " "; continue; }
+      if (ch === "`") { state = "template"; out += ch; continue; }
+      out += ch;
+      continue;
+    }
+    if (state === "line") {
+      if (ch === "\n") { state = "code"; out += ch; } else out += " ";
+      continue;
+    }
+    if (state === "block") {
+      if (ch === "*" && next === "/") { state = "code"; out += "  "; i += 1; } else out += ch === "\n" ? "\n" : " ";
+      continue;
+    }
+    if (state === "template") {
+      // scan template contents verbatim (string parts AND ${…} code); honour \` so it doesn't end early
+      if (ch === "\\") { out += src.slice(i, i + 2); i += 1; continue; }
+      if (ch === "`") state = "code";
+      out += ch;
+      continue;
+    }
+    // inside single/double string: blank the char, honour backslash escapes
+    if (ch === "\\") { out += "  "; i += 1; continue; }
+    if ((state === "single" && ch === "'") || (state === "double" && ch === '"')) {
+      state = "code";
+    }
+    out += ch === "\n" ? "\n" : " ";
+  }
+  return out;
+}
 
 /**
  * Extract the generated test body from a fenced reply. Fail-CLOSED — returns null (the gate then refuses
@@ -97,14 +151,18 @@ export function parseCharTest(stdout) {
   if (!code) return null;
   const hasTest = /node:test|require\(['"]node:test['"]\)|\btest\s*\(/.test(code);
   if (!hasTest) return null;
-  if (DANGEROUS_CODE.test(code)) return null; // child_process/fs/net/eval/dynamic-import → reject
-  // every static import/require specifier must be on the allowlist
+  // Scan CODE only (literals/comments blanked) so a flagged token inside an expected-value STRING
+  // does not false-reject, and a "assert.equal" appearing inside a string does not false-accept.
+  const codeOnly = stripLiterals(code);
+  if (DANGEROUS_CODE.test(codeOnly)) return null; // child_process/fs/net/eval/dynamic-import → reject
+  // every static import/require specifier must be on the allowlist (checked on the RAW source: the
+  // specifier strings are exactly what the allowlist inspects, so they must remain intact here)
   const specRe = /(?:\bfrom\s*|\brequire\s*\(\s*)['"]([^'"]+)['"]/g;
   let m;
   while ((m = specRe.exec(code))) {
     if (!ALLOWED_IMPORT.test(m[1])) return null; // an import outside {node:test, node:assert, ./target}
   }
-  if (!COMPARE_ASSERT.test(code)) return null; // no value-comparison assertion → not discriminating
+  if (!COMPARE_ASSERT.test(codeOnly)) return null; // no value-comparison assertion → not discriminating
   return { code };
 }
 

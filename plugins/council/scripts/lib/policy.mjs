@@ -214,8 +214,10 @@ export function mergeOptionsWithPolicy(options, policy) {
     maxTurnsR1: options.maxTurnsR1 ?? policy.max_turns_r1 ?? 40,
     maxTurnsR2: options.maxTurnsR2 ?? policy.max_turns_r2 ?? 25,
     deliberatePeer: options.deliberatePeer ?? policy.deliberate_peer !== false,
-    requireConsensusFor: options.requireConsensusFor ?? policy.require_consensus_for ?? [],
-    skipPaths: options.skipPaths ?? policy.skip_paths ?? [],
+    // A SCALAR YAML value (`require_consensus_for: security`) instead of a list must not crash the
+    // later `.map` in applyConsensusPolicy / normalizeSkipPaths — coerce a bare scalar to a 1-element list.
+    requireConsensusFor: asArray(options.requireConsensusFor ?? policy.require_consensus_for),
+    skipPaths: asArray(options.skipPaths ?? policy.skip_paths),
     peerCritiqueSeverities: normalizeSeverityList(
       options.peerCritiqueSeverities ?? policy.peer_critique_severities ?? DEFAULT_POLICY.peer_critique_severities
     ),
@@ -242,6 +244,12 @@ export function mergeOptionsWithPolicy(options, policy) {
     skipSeats: normalizeStringList(options.skipSeats ?? options["skip-seats"] ?? policy.skip_seats),
     policySource: policy._source
   };
+}
+
+/** Coerce a maybe-scalar list field to an array: an array as-is, null/undefined to [], any other
+ *  scalar (a YAML string/number written where a list was expected) to a 1-element list. */
+function asArray(value) {
+  return Array.isArray(value) ? value : value == null ? [] : [value];
 }
 
 /** Normalize a seat-id skip list to a string[]: an array as-is, a comma string split, else []. Keeps

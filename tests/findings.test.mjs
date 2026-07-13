@@ -122,6 +122,37 @@ test("applyPeerVotes agree vote promotes unique finding to consensus", () => {
   assert.deepEqual(voted.consensus[0].voteAgents, ["grok"]);
 });
 
+test("applyPeerVotes: a targetId vote does NOT fabricate consensus on a same-title finding with a different id", () => {
+  // Two DISTINCT findings that share a normalized title but live in different files (so they never
+  // merge) and carry different ids. A vote naming ONLY the first must not bleed onto the second via
+  // the title fallback.
+  const merged = mergeFindings([
+    { agent: "codex", findings: [{ id: "codex-1", severity: "P2", category: "correctness", title: "Null deref", detail: "a", file: "src/a.js", line: 3, confidence: 0.8 }] },
+    { agent: "grok", findings: [{ id: "grok-9", severity: "P2", category: "correctness", title: "Null deref", detail: "b", file: "src/b.js", line: 3, confidence: 0.8 }] }
+  ]);
+  const voted = applyPeerVotes(merged, [
+    // The vote carries BOTH the precise targetId AND a title (as a real critique does). Only codex-1 is meant.
+    { agent: "claude", aboutAgent: "codex", stdout: JSON.stringify({ votes: [{ targetId: "codex-1", title: "Null deref", vote: "agree" }] }) }
+  ]);
+  const targeted = voted.all.find((i) => i.ids.includes("codex-1"));
+  const other = voted.all.find((i) => i.ids.includes("grok-9"));
+  assert.equal(targeted.consensus, true, "the finding the vote actually names gains consensus");
+  assert.deepEqual(targeted.voteAgents, ["claude"]);
+  assert.equal(other.consensus, false, "the same-title but differently-identified finding must stay unique");
+  assert.deepEqual(other.voteAgents, [], "no vote leaks onto the untargeted finding");
+});
+
+test("applyPeerVotes: a title-only vote (no targetId) still matches by title", () => {
+  const merged = mergeFindings([
+    { agent: "codex", findings: [{ id: "codex-1", severity: "P2", category: "correctness", title: "Race condition", detail: "a", file: "src/a.js", line: 3, confidence: 0.8 }] }
+  ]);
+  const voted = applyPeerVotes(merged, [
+    { agent: "grok", aboutAgent: "codex", stdout: JSON.stringify({ votes: [{ title: "Race condition", vote: "agree" }] }) }
+  ]);
+  assert.equal(voted.consensus.length, 1, "a vote with no targetId still falls back to the title match");
+  assert.deepEqual(voted.consensus[0].voteAgents, ["grok"]);
+});
+
 // --- A6 #1: a null/unknown line must stay NULL (never line 0) ----------------
 
 test("a whole-file finding keeps line null - Number(null)===0 must not invent line 0", () => {

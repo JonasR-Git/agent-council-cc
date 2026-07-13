@@ -147,3 +147,23 @@ test("parseClaudeLimits maps the OAuth usage payload", () => {
   assert.equal(parseClaudeLimits({ nothing: true }), null);
   assert.equal(parseClaudeLimits(null), null);
 });
+
+test("collectGrokLimits collects a billing entry that sits on line 0 of a small (below-tail) log", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-grok-"));
+  try {
+    fs.mkdirSync(path.join(dir, "logs"), { recursive: true });
+    const entry = {
+      ctx: { config: { creditUsagePercent: 42, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-08-01T00:00:00Z" } } },
+      ts: "2026-07-13T00:00:00Z"
+    };
+    // The ONLY billing line is line 0 (log read whole, from byte 0). The old `i > 0` loop skipped it.
+    fs.writeFileSync(path.join(dir, "logs", "unified.jsonl"), JSON.stringify(entry), "utf8");
+    const limits = collectGrokLimits(dir);
+    assert.ok(limits, "a first-line-only billing entry in a small log is collected, not dropped");
+    assert.equal(limits.window, "weekly");
+    assert.equal(limits.usedPercent, 42);
+    assert.equal(limits.resetsAt, "2026-08-01T00:00:00Z");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

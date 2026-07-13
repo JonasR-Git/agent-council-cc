@@ -140,3 +140,84 @@ test("verifyCharTestAfterFix applies the OPTIONAL mutation gate when a scorer is
   const strong = await verifyCharTestAfterFix(accepted, { runAccepted: async () => true, mutation: { score: async () => 0.95, severity: "P1", file: "m", lines: [1] } });
   assert.equal(strong.pass, true);
 });
+
+test("parseCharTest does NOT reject a flagged token that appears only inside an expected-value STRING", () => {
+  // The denylist must scan CODE, not string literals: pinning a function that returns "child_process …"
+  // is a perfectly safe char-test and must be accepted.
+  const code = [
+    "```js",
+    'import test from "node:test";',
+    'import assert from "node:assert";',
+    'import { render } from "./target.mjs";',
+    'test("pins output", () => {',
+    '  // characterises: eval() and child_process are just words in the expected string',
+    '  assert.equal(render(), "spawned child_process via eval(x) — node:fs");',
+    "});",
+    "```"
+  ].join("\n");
+  const parsed = parseCharTest(code);
+  assert.ok(parsed, "a flagged token inside a string literal is not dangerous code");
+  assert.match(parsed.code, /assert\.equal/);
+});
+
+test("parseCharTest still rejects REAL dangerous code (token outside a literal)", () => {
+  const code = [
+    "```js",
+    'import test from "node:test";',
+    'import assert from "node:assert";',
+    'import { render } from "./target.mjs";',
+    'test("evil", () => {',
+    "  const cp = child_process.execSync('id');",
+    "  assert.equal(render(), cp);",
+    "});",
+    "```"
+  ].join("\n");
+  assert.equal(parseCharTest(code), null, "a bare child_process reference in CODE is still refused");
+});
+
+test("parseCharTest stays fail-closed: dangerous code inside a template ${…} interpolation is still refused", () => {
+  const code = [
+    "```js",
+    'import test from "node:test";',
+    'import assert from "node:assert";',
+    'import { render } from "./target.mjs";',
+    'test("evil-template", () => {',
+    "  const x = `value: ${eval(render())}`;", // eval lives in the interpolation CODE, not a string part
+    "  assert.equal(x, x);",
+    "});",
+    "```"
+  ].join("\n");
+  assert.equal(parseCharTest(code), null, "eval() inside a template interpolation must not evade the denylist");
+});
+
+test("parseCharTest accepts a bare destructured assertion (equal(...) from node:assert), not only assert.equal", () => {
+  const code = [
+    "```js",
+    'import test from "node:test";',
+    'import { equal, deepEqual } from "node:assert";',
+    'import { compute } from "./target.mjs";',
+    'test("destructured", () => {',
+    "  equal(compute(2), 4);",
+    "  deepEqual(compute(3), 9);",
+    "});",
+    "```"
+  ].join("\n");
+  const parsed = parseCharTest(code);
+  assert.ok(parsed, "a destructured equal()/deepEqual() is a discriminating assertion");
+  assert.match(parsed.code, /equal\(compute/);
+});
+
+test("parseCharTest still rejects a non-discriminating test (only assert.ok / a bare string mentioning equal(...))", () => {
+  const code = [
+    "```js",
+    'import test from "node:test";',
+    'import assert from "node:assert";',
+    'import { compute } from "./target.mjs";',
+    'test("vacuous", () => {',
+    '  const note = "call equal(x, y) here";', // "equal(" only inside a string must NOT count as an assertion
+    "  assert.ok(compute());",
+    "});",
+    "```"
+  ].join("\n");
+  assert.equal(parseCharTest(code), null, "a bare assert.ok plus an equal() mention inside a string is not discriminating");
+});

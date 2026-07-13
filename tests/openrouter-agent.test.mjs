@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
+import https from "node:https";
+import { EventEmitter } from "node:events";
+import { StringDecoder } from "node:string_decoder";
 
-import { normalizeOpenRouterModels, openRouterBackend, registerOpenRouterKey, runOpenRouterStructured, OPENROUTER_MAX_SEATS } from "../plugins/council/scripts/lib/openrouter-agent.mjs";
+import { normalizeOpenRouterModels, openRouterBackend, postJson, registerOpenRouterKey, runOpenRouterStructured, OPENROUTER_MAX_SEATS } from "../plugins/council/scripts/lib/openrouter-agent.mjs";
 import { isRateLimitError } from "../plugins/council/scripts/lib/audit-retry.mjs";
 
 test("normalizeOpenRouterModels parses the 3 string forms + object form, sanitizes ids", () => {
@@ -284,4 +287,43 @@ test("runOpenRouterStructured: a transport timeout → status 124 timedOut; a mi
   assert.equal(r.timedOut, true);
   const miss = await runOpenRouterStructured("/x", seatBackends(), {}, "p", "or-unknown", { transport: async () => ({ status: 200, body: "{}" }) });
   assert.equal(miss.skipped, true, "an unconfigured seat id is skipped, not run");
+});
+
+test("postJson reassembles a multibyte UTF-8 body split across chunk boundaries (setEncoding, not per-Buffer decode)", async (t) => {
+  const body = '{"msg":"a😀b"}'; // 😀 (U+1F600) is 4 UTF-8 bytes starting at byte 9
+  const buf = Buffer.from(body, "utf8");
+  const split = 11; // slice THROUGH the emoji (2 of its 4 bytes on each side)
+  const chunks = [buf.subarray(0, split), buf.subarray(split)];
+
+  t.mock.method(https, "request", (_url, _opts, cb) => {
+    const res = new EventEmitter();
+    res.statusCode = 200;
+    let encoding = null;
+    res.setEncoding = (enc) => { encoding = enc; };
+    res.destroy = () => {};
+    const req = new EventEmitter();
+    req.destroy = () => {};
+    req.end = () => {
+      // Emit after the postJson callback has attached its listeners. Honour the real stream contract:
+      // when setEncoding("utf8") was called a StringDecoder stitches split codepoints; otherwise raw
+      // Buffers surface and per-chunk decoding corrupts the emoji — so this pins the setEncoding fix.
+      setImmediate(() => {
+        if (encoding) {
+          const dec = new StringDecoder(encoding);
+          for (const c of chunks) { const s = dec.write(c); if (s) res.emit("data", s); }
+          const tail = dec.end();
+          if (tail) res.emit("data", tail);
+        } else {
+          for (const c of chunks) res.emit("data", c);
+        }
+        res.emit("end");
+      });
+    };
+    cb(res);
+    return req;
+  });
+
+  const r = await postJson("https://openrouter.ai/api/v1/chat", { a: 1 }, {}, 5000);
+  assert.equal(r.status, 200);
+  assert.equal(r.body, body, "the split emoji is reassembled intact, not mojibake");
 });

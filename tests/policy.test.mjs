@@ -82,3 +82,21 @@ quoted: "value # keep"
   assert.equal(parsed.plain, "value");
   assert.equal(parsed.quoted, "value # keep");
 });
+
+test("mergeOptionsWithPolicy coerces a SCALAR require_consensus_for / skip_paths into a 1-element list (no .map crash)", () => {
+  const merged = mergeOptionsWithPolicy({}, { require_consensus_for: "security", skip_paths: "dist/" });
+  assert.deepEqual(merged.requireConsensusFor, ["security"]);
+  assert.deepEqual(merged.skipPaths, ["dist/"]);
+  // These are the exact shapes applyConsensusPolicy / normalizeSkipPaths .map over — a bare string would throw.
+  assert.doesNotThrow(() => merged.requireConsensusFor.map((c) => String(c).toLowerCase()));
+  assert.doesNotThrow(() => merged.skipPaths.map((p) => String(p)));
+});
+
+test("mergeOptionsWithPolicy leaves a list value intact and an absent value as []", () => {
+  const asList = mergeOptionsWithPolicy({}, { require_consensus_for: ["security", "correctness"], skip_paths: ["a", "b"] });
+  assert.deepEqual(asList.requireConsensusFor, ["security", "correctness"]);
+  assert.deepEqual(asList.skipPaths, ["a", "b"]);
+  const absent = mergeOptionsWithPolicy({}, {});
+  assert.deepEqual(absent.requireConsensusFor, []);
+  assert.deepEqual(absent.skipPaths, []);
+});

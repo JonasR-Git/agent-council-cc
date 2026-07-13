@@ -526,7 +526,12 @@ export function applyPeerVotes(merged, critiques) {
 
   const enriched = merged.all.map((item) => {
     const related = votes.filter((v) => {
-      if (v.targetId && item.ids.includes(v.targetId)) return true;
+      // A vote that carries a targetId is a precise reference: it matches ONLY the
+      // finding whose id it names. Falling through to the title match would let an
+      // agree vote for finding X fabricate consensus on a DIFFERENT finding Y that
+      // merely shares X's normalized title (e.g. the same issue in another file).
+      // The title fallback exists solely for votes with no targetId at all.
+      if (v.targetId) return item.ids.includes(v.targetId);
       if (v.title && item.title && normalizedTitle(v.title) === normalizedTitle(item.title)) return true;
       return false;
     });

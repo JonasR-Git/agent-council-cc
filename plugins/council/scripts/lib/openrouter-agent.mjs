@@ -164,7 +164,7 @@ export function openRouterBackend(options = {}, env = process.env, userKeyArg = 
 }
 
 /** Minimal node:https/http JSON POST → { status, body } (or throws on transport error). Injectable. */
-function postJson(url, payload, headers, timeoutMs) {
+export function postJson(url, payload, headers, timeoutMs) {
   return new Promise((resolve, reject) => {
     let u;
     try {
@@ -202,6 +202,10 @@ function postJson(url, payload, headers, timeoutMs) {
       u,
       { method: "POST", headers: { "content-type": "application/json", "content-length": data.length, ...headers }, timeout: timeoutMs },
       (res) => {
+        // Decode via the stream's StringDecoder so a multibyte UTF-8 sequence split across chunk
+        // boundaries is reassembled correctly. Concatenating raw Buffers as strings (`body += chunk`)
+        // would decode each chunk independently and corrupt any codepoint straddling the split.
+        res.setEncoding("utf8");
         let body = "";
         let capped = false;
         res.on("data", (c) => {

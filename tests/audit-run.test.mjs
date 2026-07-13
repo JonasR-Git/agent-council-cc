@@ -60,3 +60,17 @@ test("runAudit tolerates a review that returns nothing", async () => {
   assert.ok(validate(SCHEMAS.auditReport, rep).valid);
   assert.equal(rep.register.length, 0);
 });
+
+test("runAudit marks a graph.entrypoint unit as mandatory (entrypoints live on model.graph, not model root)", async () => {
+  // src/cli.mjs is not security/manifest/high-fan-in, so its ONLY route into the mandatory set is the
+  // entrypoint signal — which must be read from model.graph.entrypoints, the shape codebase-model emits.
+  const modelWithEntry = { files: [{ id: "src/cli.mjs", fanIn: 1 }], graph: { entrypoints: ["src/cli.mjs"] } };
+  const customDeps = {
+    inventory: [{ id: "src/cli.mjs", fileClass: "js" }],
+    nowIso: () => "2026-07-11T00:00:00Z",
+    governance: { baselined: new Set(), waivers: new Map() },
+    review: async () => ({ findings: [], reviewed: [] })
+  };
+  const rep = await runAudit("/x", modelWithEntry, {}, {}, customDeps);
+  assert.equal(rep.mandatorySurface.reasons["src/cli.mjs"], "entrypoint", "the CLI entrypoint is mandatory-covered via graph.entrypoints");
+});
