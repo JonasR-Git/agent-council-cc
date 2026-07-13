@@ -322,7 +322,13 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
  */
 async function runCodexCli(cwd, backends, options, prompt) {
   const bin = backends.codex?.cli?.bin || "codex";
-  const args = ["exec", "--skip-git-repo-check"];
+  // --sandbox read-only ENFORCES containment at OUR call, not codex's own config (council final, Codex
+  // P2): the grok seat is read-only via its tool deny-list + --disable-web-search and the claude seat via
+  // --safe-mode + a Read/Grep/Glob allow-list, but this standalone codex path previously relied entirely
+  // on the user's ~/.codex/config.toml sandbox policy — so `council plan` (documented READ-ONLY) could
+  // have let codex run model-generated shell commands with write access. read-only makes the three seats
+  // symmetric: a review/plan seat may inspect the repo but never mutate it.
+  const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only"];
   if (options.codexModel) args.push("--model", options.codexModel);
   const result = await runCommandAsync(bin, args, { cwd, input: String(prompt ?? ""), timeoutMs: options.agentTimeoutMs });
   return buildAgentResult("codex", "codex-cli-exec", result, { model: options.codexModel ?? "(default)" });

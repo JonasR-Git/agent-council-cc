@@ -33,3 +33,16 @@ test("codex seat: with NEITHER the companion NOR the CLI, it is SKIPPED fail-clo
   assert.match(res.reason, /codex unavailable/i);
   assert.equal(res.stdout, "", "a skipped seat never returns content that could read as a clean review");
 });
+
+test("codex CLI seat ENFORCES --sandbox read-only (council final Codex P2 — plan/review must be read-only)", async () => {
+  // runCommandAsync is not injectable in this module, so guard the security flag at the source level: the
+  // standalone codex path must pass --sandbox read-only, not rely on the user's ~/.codex config. This
+  // keeps the three seats symmetric (grok deny-list, claude --safe-mode, codex read-only) and makes the
+  // README's "council plan is read-only" claim true for every seat.
+  const fs = await import("node:fs");
+  const url = await import("node:url");
+  const path = await import("node:path");
+  const src = fs.readFileSync(path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "../plugins/council/scripts/lib/agents.mjs"), "utf8");
+  const cliFn = src.slice(src.indexOf("async function runCodexCli"), src.indexOf("async function runCodexCli") + 1200);
+  assert.match(cliFn, /"--sandbox",\s*"read-only"/, "the standalone codex exec invocation pins read-only sandboxing");
+});
