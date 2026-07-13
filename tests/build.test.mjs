@@ -807,3 +807,31 @@ test("renderBuildReport covers refusal, per-step outcomes, and the never-merge g
   assert.match(abortedReport, /FAILED: council veto/);
   assert.match(abortedReport, /\+1 step\(s\) not reached/);
 });
+
+test("makeBuildGit provides commitFiles — the adapter audit-multifix declares but nothing supplied (latent trap closed)", () => {
+  // audit-multifix.mjs (M6) commits via deps.git.commitFiles(planned, msg). No adapter had it, so wiring
+  // it would have thrown "commitFiles is not a function" AT THE COMMIT — after the transform was applied
+  // and every gate had passed. The whole-plugin audit flagged this as a latent trap for whoever wires M6.
+  const dir = tmp();
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+  spawnSync("git", ["config", "user.email", "t@t"], { cwd: dir });
+  spawnSync("git", ["config", "user.name", "t"], { cwd: dir });
+  fs.writeFileSync(path.join(dir, "a.mjs"), "export const a = 1;\n");
+  fs.writeFileSync(path.join(dir, "b.mjs"), "export const b = 2;\n");
+  spawnSync("git", ["add", "-A"], { cwd: dir });
+  spawnSync("git", ["commit", "-q", "-m", "base"], { cwd: dir });
+
+  const git = makeBuildGit(dir);
+  assert.equal(typeof git.commitFiles, "function", "the adapter exists");
+
+  fs.writeFileSync(path.join(dir, "a.mjs"), "export const a = 11;\n");
+  fs.writeFileSync(path.join(dir, "b.mjs"), "export const b = 22;\n");
+  fs.writeFileSync(path.join(dir, "unplanned.mjs"), "export const c = 3;\n"); // must NOT be committed
+  const sha = git.commitFiles(["a.mjs", "b.mjs"], "multifix: consolidate");
+  assert.match(sha, /^[0-9a-f]{7,40}$/, "returns the new commit sha");
+
+  const show = spawnSync("git", ["show", "--stat", "--name-only", "--format=", sha], { cwd: dir, encoding: "utf8" });
+  const files = show.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  assert.deepEqual(files.sort(), ["a.mjs", "b.mjs"], "stages ONLY the planned pathspec — never add -A");
+  assert.throws(() => git.commitFiles([], "x"), /empty path set/, "an empty set is fail-closed");
+});

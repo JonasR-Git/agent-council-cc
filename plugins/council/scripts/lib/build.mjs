@@ -178,6 +178,25 @@ export function makeBuildGit(root) {
       const res = g(["add", "--", ...posixSet(paths)]);
       if (res.status !== 0) throw new Error(`git add failed: ${res.stderr.trim()}`);
     },
+    // Stage + commit EXACTLY the given path set in one call, with no reviewed-byte binding. This is the
+    // adapter audit-multifix.mjs (M6, the deterministic-codemod path) declares in its deps contract but
+    // which NO adapter provided — wiring it with any existing git adapter would have thrown
+    // "commitFiles is not a function" at the commit, AFTER the transform had been applied and every gate
+    // had passed (a latent trap the whole-plugin audit flagged). It stages ONLY the planned pathspec
+    // (never `add -A`), as that contract requires. NOTE: this deliberately does NOT do the §6
+    // reviewed-byte binding — M6 gates a DETERMINISTIC codemod with its own re-run + surface checks; the
+    // LLM path (build-step / structure-wiring) must use stageSet + diffCachedSet + commitIndex instead.
+    commitFiles: (paths, message) => {
+      const set = posixSet(paths);
+      if (!set.length) throw new Error("commitFiles refused: empty path set (fail-closed)");
+      const add = g(["add", "--", ...set]);
+      if (add.status !== 0) throw new Error(`git add failed: ${add.stderr.trim()}`);
+      const res = g(["commit", "--no-verify", "-m", String(message), "--", ...set]);
+      if (res.status !== 0) throw new Error(`git commit failed: ${res.stderr.trim()}`);
+      const sha = g(["rev-parse", "HEAD"]);
+      if (sha.status !== 0) throw new Error(`git rev-parse HEAD failed after commit: ${sha.stderr.trim()}`);
+      return sha.stdout.trim();
+    },
     // The STAGED (index) diff of the set vs `ref` — the exact bytes a §6 review judges and
     // the exact bytes commitIndex will land (closes the TOCTOU between review and commit).
     // The index tree is captured (git write-tree) so commitIndex can PROVE it commits this
