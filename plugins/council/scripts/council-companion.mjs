@@ -1983,6 +1983,13 @@ async function watchProgress(cwd, initial, options) {
 // fine run is ~1080 cells; this caps an accidental fan-out while still covering a normal run — raise
 // it explicitly with --max-cells (a capped run reports PARTIAL coverage, never silently truncates).
 const GROUPED_CLI_DEFAULT_MAX_CELLS = 1500;
+// A — the LOOP grouped path uses a SMALL per-pass cell cap by default (not the one-shot 1500) so a
+// `audit fix --loop --deep` cycles review→fix roughly every ~20 min instead of burning one ~1500-cell
+// (~15h) pass before the first fix / quota check / persisted finding. Coverage stays complete via the
+// progressive unitOffset window + blast-radius re-scope across passes; the GATE + SSOT reduce run over
+// the ACCUMULATED findings ledger (audit-findings.jsonl), so small passes bound WORK, not evidence. 40
+// cells ≈ a handful of files × the active seats — one focused review→fix cycle. --max-cells overrides.
+const LOOP_DEFAULT_MAX_CELLS = 40;
 
 // Attach the OpenRouter backend to a probed `backends`. The API key is NEVER taken from the repo policy
 // file: openRouterBackend is called with a null user-key arg, so the key can come ONLY from the user's
@@ -2485,11 +2492,16 @@ async function handleAudit(argv) {
       if (options.groups) {
         if (!["fine", "tier", "lens"].includes(String(options.groups))) throw new Error(`--groups must be one of fine|tier|lens (got: ${options.groups})`);
         loopLensGroups = String(options.groups);
-        loopMaxCells = GROUPED_CLI_DEFAULT_MAX_CELLS;
+        // A: the LOOP defaults to a SMALL per-pass cell cap (not the one-shot 1500) so review→fix cycles
+        // frequently and a quota breach is caught within a pass, not after ~15h. --max-cells overrides.
+        loopMaxCells = LOOP_DEFAULT_MAX_CELLS;
         if (options["max-cells"] != null) {
           const nc = Number(options["max-cells"]);
           if (!Number.isFinite(nc) || nc < 1) throw new Error("--max-cells must be a positive number");
           loopMaxCells = Math.floor(nc);
+        }
+        if (!options.json) {
+          console.error(`note: the loop reviews up to ${loopMaxCells} cell(s)/pass by default (small passes → frequent review→fix cycles + fast quota response); the GATE + SSOT reduce run over the ACCUMULATED findings ledger across passes, so bounding per-pass work does not fragment cross-file/SSOT issues. Raise --max-cells for bigger passes.`);
         }
       }
       // The loop budget is in AGENT CALLS. A per-file pass is a handful; a GROUPED pass is up to
@@ -2615,7 +2627,24 @@ async function handleAudit(argv) {
       // B5: per-tier convergence (structure → correctness → quality) is ON by default so a
       // Structure/SSOT consolidation lands before Correctness runs on the consolidated code; --flat
       // opts out (single flat convergence).
-      const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, usageCeiling, usageSince, pause5h, reporter, onProgress: reporter.line };
+      const loopOpts = {
+        budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat,
+        retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined,
+        logicalProposals: logical.findings, usageCeiling, usageSince, pause5h, reporter, onProgress: reporter.line,
+        // B: the mid-pass checkpoint-and-resume quota guard — on the grouped path a quota breach quiesces
+        // the pass (finish the in-flight cell, flush partial findings + cursor) and emits the SAME
+        // hard-stop / pause the between-pass backstop does. Inert on the per-file path (no cells).
+        midPassGuard: true,
+        // C: durable findings SSOT (audit-findings.jsonl) — the grouped review appends each finding as
+        // discovered; the gate reads the accumulated ledger; the dashboard tails it. Autonomous FIXING
+        // fails CLOSED if the store can't be opened (no untracked fix ever lands).
+        durableFindings: true,
+        failClosedFindings: true,
+        // D: deterministic correlation — one writer per same-file cluster; multi-file / cross-cutting /
+        // SSOT clusters escalate to proposal instead of a symptom fix. Uses the model's import graph.
+        correlate: true,
+        correlateImporters: model.graph?.importers ?? {}
+      };
       // C3/M10: --supervise wraps the loop in the endless supervisor so a multi-hour autonomous run
       // survives rate-limit resets — a resumable stop (throttled/backends-down/did-not-run) waits
       // reset-aware then --resumes from the checkpoint; a terminal convergence returns as normal.

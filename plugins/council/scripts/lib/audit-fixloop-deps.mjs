@@ -148,7 +148,7 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     agentTimeoutMs: options.agentTimeoutMs
   };
 
-  const review = async ({ budget, changedFiles }) => {
+  const review = async ({ budget, changedFiles, pass, guard, findingsAppender } = {}) => {
     // Fold the PRIOR pass's flagged gap files (if any) into this pass's scope: they ride ALONGSIDE
     // an existing localized changedFiles scope, or — absent one — BECOME it, so the loop actually
     // re-targets the gap next pass instead of only resetting the dry streak.
@@ -156,15 +156,22 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     const scopedFiles = gapScope && gapScope.length ? files.filter((f) => gapScope.includes(f.id)) : null;
     let reviewFiles;
     let offset = 0;
+    let fullScopePass = false;
     if (scopedFiles && scopedFiles.length) {
       reviewFiles = scopedFiles; // localized pass: review the changed (+ folded gap) band from the top
     } else {
-      // Full scope (first pass, hub-forced full, or empty-scoped fallback): advance the
-      // window by full-scope passes and WRAP so an overrun never returns an empty review.
+      // Full scope (first pass, hub-forced full, or empty-scoped fallback): advance the window by
+      // full-scope passes and WRAP so an overrun never returns an empty review. The advance is DEFERRED
+      // until AFTER a successful (non-quiesced) review, so a mid-pass quiesce leaves the offset unchanged
+      // and the --resume re-reviews the SAME band (its durable cursor skips the cells already done).
       reviewFiles = files;
       offset = (fullPasses * maxUnits) % nonTestCount;
-      fullPasses += 1;
+      fullScopePass = true;
     }
+    // skipReduce keys on the full-scope-pass COUNT INCLUDING this pass (the SSOT reduce runs once, on the
+    // first full pass). Since the fullPasses INCREMENT is now deferred until after a non-quiesced review,
+    // fold this pass in here so the value is byte-identical to the pre-deferral `fullPasses > 1`.
+    const effectiveFullPasses = fullScopePass ? fullPasses + 1 : fullPasses;
     const scopedModel = reviewFiles === files ? model : { ...model, files: reviewFiles };
     const rev = await doReview(cwd, scopedModel, backends, {
       // A5: model/effort/timeout pins first — every explicit key below still wins.
@@ -172,10 +179,15 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       // Phase 2: the loop's ONE reporter (audit-fix-loop) also gets each pass's review so the live
       // per-lens matrix + unit progress land on the same progress.json the fix counters do (additive).
       reporter: options.reporter,
+      // B/C: the mid-pass checkpoint-and-resume quota guard + the durable findings appender, threaded
+      // into the grouped review (runAuditReview ignores them). `pass` stamps each durable finding record.
+      reviewGuard: guard,
+      findingsAppender,
+      pass,
       budget,
       maxUnits,
       unitOffset: offset,
-      skipReduce: fullPasses > 1, // the SSOT reduce is over static input — run it once
+      skipReduce: effectiveFullPasses > 1, // the SSOT reduce is over static input — run it once
       skipCodex: options.skipCodex,
       skipGrok: options.skipGrok,
       // B2 (council grok-1): thread skipClaude too, else the fix loop spawns the Claude finder
@@ -233,6 +245,9 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       agents: rawFindings[i]?.agents ?? nf.agents
     }));
     const cov = rev?.coverage ?? {};
+    // Advance the full-scope window cursor ONLY after a full-scope pass that did NOT quiesce — a mid-pass
+    // quiesce must leave the offset put so the --resume re-reviews the SAME band from its durable cursor.
+    if (fullScopePass && !cov.quiesced) fullPasses += 1;
     // Capture THIS pass's flagged gaps for the NEXT call (replaces, not accumulates — a gap that
     // got resolved this pass naturally drops off coverage.completenessGaps and stops being scoped).
     pendingGapFiles = gapFileIds(cov.completenessGaps, knownFileIds);

@@ -130,6 +130,44 @@ test("council Codex C2: a recurring PROPOSE-ONLY finding does not pin its tier (
   assert.match(out.stopReason, /all tiers converged/);
 });
 
+// Claude-P1 REGRESSION PIN: a propose-only finding read back from the DURABLE STORE (a raw record with
+// lens/category/file/line but NO scope/fixDisposition — exactly what toRecord persists) must be
+// RE-NORMALIZED before gating, so it reads back as cross-cutting / propose-only and does NOT pin its
+// per-tier stage. Pre-fix it read back autoFixable → tier 2 was pinned forever → the loop never converged.
+test("Claude-P1: a propose-only finding round-tripped through the durable store does NOT pin its tier", async () => {
+  // A config_cicd_security (tier 2, propose-only lens) store record — no scope/fixDisposition, like toRecord.
+  const storeRecord = { fingerprint: "ci.yml::0::deploy-secret", lens: "config_cicd_security", category: "config", severity: "P1", title: "hardcoded deploy secret", file: "ci.yml", line: 3 };
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 1 } });
+  const fix = async (actionable) => ({
+    fixed: actionable.filter((f) => f.scope !== "cross-cutting" && f.fixDisposition !== "propose-only").map((f) => ({ file: f.file, finding: f, commit: "x" })),
+    rejected: [], failed: [], changedFiles: [], spent: 0
+  });
+  const out = await runFixLoop(
+    "/x",
+    { budget: 80, maxPasses: 40, dryStreak: 2, perTierConvergence: true },
+    { review, fix, accumulatedFindings: () => [storeRecord], checkpoint: noCheckpoint }
+  );
+  assert.match(out.stopReason, /all tiers converged/, "the re-normalized propose-only store record no longer pins tier 2 — staging converges");
+  assert.equal(out.fixed.length, 0, "a propose-only finding is never auto-applied");
+});
+
+test("Claude-P1: a LOCALIZED finding round-tripped through the store is STILL auto-fixable (fix applies it)", async () => {
+  // The dual invariant: re-normalization must not over-correct — a genuinely localized (correctness)
+  // record still normalizes to fixDisposition:localized and is auto-applied.
+  const storeRecord = { fingerprint: "a.mjs::0::offbyone", lens: "correctness", category: "bug", severity: "P1", title: "off by one in loop", file: "a.mjs", line: 12 };
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 1 } });
+  const fix = async (actionable) => ({
+    fixed: actionable.filter((f) => f.scope !== "cross-cutting" && f.fixDisposition !== "propose-only").map((f) => ({ file: f.file, finding: f, commit: "x" })),
+    rejected: [], failed: [], changedFiles: ["a.mjs"], spent: 1
+  });
+  const out = await runFixLoop(
+    "/x",
+    { budget: 40, maxPasses: 20, dryStreak: 2, perTierConvergence: true },
+    { review, fix, accumulatedFindings: () => [storeRecord], checkpoint: noCheckpoint }
+  );
+  assert.ok(out.fixed.some((f) => f.file === "a.mjs"), "the localized correctness record normalizes to auto-fixable and is applied");
+});
+
 test("R9: a --groups fix loop does NOT converge while grouped coverage is INCOMPLETE", async () => {
   const gModel = { files: [{ id: "a.mjs", fanIn: 1 }] };
   let pass = 0;

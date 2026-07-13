@@ -12,7 +12,7 @@ import path from "node:path";
 
 import { resolveLensGroups } from "./audit-lens-groups.mjs";
 import { chunkSource } from "./audit-group-prompt.mjs";
-import { DEFAULT_MAX_CELLS, capCells, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
+import { DEFAULT_MAX_CELLS, capCells, cellKey, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
 import { makeBudget, reviewerActive, selectUnits } from "./audit-review.mjs";
 import { activeSeatNames, allSeatNames, makeSeatRunners } from "./seats.mjs";
 import { runCompletenessAssessment } from "./completeness-critic.mjs";
@@ -122,6 +122,11 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
 
   const reviewCell = deps.reviewCell ?? makeCellReviewer(cwd, backends, options);
   const runMatrix = deps.runMatrix ?? runCellMatrix;
+  // B/C: the optional mid-pass guard (checkpoint-and-resume quota guard + durable reviewed-cell cursor)
+  // and the durable findings appender (the SSOT the gate reads + the dashboard tails). Both are injected
+  // by the loop; when absent (a plain one-shot review, or a unit test) the path is byte-identical.
+  const guard = options.reviewGuard ?? deps.reviewGuard ?? null;
+  const appender = options.findingsAppender ?? deps.findingsAppender ?? null;
   // Cell-granular live progress (the FINEST resolution): after each cell completes, fold its findings
   // into the per-lens matrix and advance unitsDone. The grouped path is the one place a completed unit
   // is a single (file, group, model) cell, so the dashboard's Findings-by-lens table fills fastest here.
@@ -132,12 +137,31 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
     maxInflight: options.maxInflight,
     retryOnLimit: options.retryOnLimit,
     sleep: deps.sleep,
+    guard,
     onRetry: progress ? ({ attempt, ms }) => progress(`  cell rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt})…`) : undefined,
     onCell: (r) => {
       cellsDone += 1;
       reporter.progress({ unitsDone: cellsDone, unitsTotal: cells.length });
       if (r && r.ok === true && Array.isArray(r.findings) && r.findings.length) {
         reporter.findings(r.findings, r.cell?.model ? { seat: r.cell.model } : undefined);
+      }
+      // C then B (ORDER MATTERS): flush this cell's findings to the durable store FIRST (fsync), THEN
+      // mark the cell done in the resume cursor. A crash between the two re-reviews the cell (findings
+      // re-appended, deduped) instead of skipping an unrecorded one — no lost finding, no double count.
+      // A resume-SKIPPED cell (r.skipped) already recorded its findings + cursor key in the prior pass.
+      if (r && r.ok === true && r.skipped !== true) {
+        // A failed durable flush must NOT mark the cell done — else --resume skips it and its findings
+        // are lost forever (the unsafe direction the design forbids). Only mark done when there was
+        // nothing to flush OR the flush actually succeeded; a throw => re-review the cell on resume.
+        let flushed = true;
+        if (appender && Array.isArray(r.findings) && r.findings.length) {
+          try {
+            appender.append(r.findings, { pass: options.pass });
+          } catch {
+            flushed = false; // REVIEW is best-effort, but the cursor must reflect the durable truth
+          }
+        }
+        if (flushed && guard && r.cell) guard.markDone(cellKey(r.cell));
       }
     }
   });
@@ -327,6 +351,12 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
       groups: groups.length,
       cellsScheduled: cells.length,
       cellsDropped: dropped,
+      // B: cells the durable cursor RESUME-SKIPPED (0 paid calls — reviewed in a prior interrupted pass)
+      // and cells the mid-pass guard QUIESCED before dispatch (0 paid calls). `quiesced` is the breach
+      // marker the loop turns into the SAME between-pass hard-stop / pause (SSOT); null on a normal pass.
+      cellsSkipped: matrixOut.skipped ?? 0,
+      cellsQuiesced: cells.length - (matrixOut.dispatched ?? cells.length) - (matrixOut.skipped ?? 0),
+      quiesced: matrixOut.quiesced ?? null,
       capped,
       // How many single-agent P0/P1 findings an independent seat could NOT support (annotate-only: they
       // stay in `findings`, deprioritized, and are also listed under `refuted`).
@@ -341,7 +371,10 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
       // + EXTRA calls: a parse repair and a rate-limit retry each re-invoke a seat runner, i.e. each is
       // another PAID agent call. Omitting them let a throttled/garbled pass spawn far more calls than it
       // reported (council Grok P1/P2) — the loop then paced itself off a spend figure that was too low.
-      budgetSpent: cells.length + (completeness?.criticRan ? 1 : 0) + verifySpent + (Number(matrixOut.extraCalls) || 0),
+      // Charge only the cells actually DISPATCHED (a resume-skipped or quiesced cell spent 0 paid calls),
+      // plus the critic + refutation + repair/retry extras. matrixOut.dispatched is absent for an injected
+      // test runMatrix → fall back to the full cell count (byte-identical to before B).
+      budgetSpent: (matrixOut.dispatched ?? cells.length) + (completeness?.criticRan ? 1 : 0) + verifySpent + (Number(matrixOut.extraCalls) || 0),
       // surfaced so the operator can see WHY a pass cost more than its cell count
       extraCalls: Number(matrixOut.extraCalls) || 0,
       repairCalls: Number(matrixOut.repairCalls) || 0,

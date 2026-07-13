@@ -20,13 +20,23 @@ import { MAX_AUTONOMOUS_WAIT_MS, evaluateBetweenPassGuards } from "./audit-loop-
 import { retryOnRateLimit } from "./audit-retry.mjs";
 import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
-import { resolveStateDir, writeFileAtomic } from "./state.mjs";
+import { nowIso, resolveStateDir, writeFileAtomic } from "./state.mjs";
+import { findingsStorePath, makeFindingsAppender, readFindingsStore, requireDurableStore, resetFindingsStore } from "./audit-findings-store.mjs";
+import { makeMidPassGuard, makeReviewCursor, reviewCursorPath } from "./audit-midpass-guard.mjs";
+import { normalizeFindings } from "./audit-normalize.mjs";
+import { correlateFindings } from "./audit-correlate.mjs";
 
 // NOTE: an in-process multi-hour autonomous pause wait is FRAGILE — the machine/terminal must stay up —
 // but the checkpoint written FIRST makes a mid-wait death --resume-able. The MAX_AUTONOMOUS_WAIT_MS
 // bound + the between-pass guard DECISION now live in audit-loop-guards.mjs (SSOT with audit-endless).
 
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, Math.floor(Number.isFinite(n) ? n : lo)));
+
+/** SSOT for the --usage-ceiling terminal stop message — shared by the between-pass backstop AND the
+ *  mid-pass quiesce so the two paths report the ceiling breach identically. PURE. */
+function ceilingStopReason(breaches) {
+  return `usage-ceiling: ${(breaches ?? []).map((b) => `${b.model} ${b.percent}%≥${b.ceiling}% (${b.window ?? "weekly"})`).join(", ")}`;
+}
 
 /** Cross-pass dedupe key for a committed fix. Prefers the AST-anchored fingerprint the
  *  rest of the pipeline already uses (ledger/tier gating); else the ledger's own key
@@ -134,6 +144,49 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const pause5h = options.pause5h && typeof options.pause5h === "object" && options.pause5h.enabled ? options.pause5h : null;
   const nowFn = typeof deps.now === "function" ? deps.now : () => Date.now();
   const sleepFn = typeof deps.sleep === "function" ? deps.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // C — the DURABLE findings SSOT + the reviewed-cell CURSOR (B). Both are OPT-IN so the pure unit
+  // tests (injected review/fix, no fs) stay byte-identical:
+  //   - options.durableFindings: append each discovered finding to audit-findings.jsonl (the gate/
+  //     dashboard SSOT). deps.findingsAppender overrides (tests inject a fake / a failing appender).
+  //   - options.failClosedFindings: autonomous FIXING FAILS CLOSED — probe the store is writable up
+  //     front (requireDurableStore) and, if it isn't, stop the loop WITHOUT applying any untracked fix.
+  //   - options.midPassGuard: thread the mid-pass checkpoint-and-resume quota guard + the durable cursor
+  //     into each grouped pass so a quota breach quiesces mid-pass instead of after ~1500 cells.
+  const stateSession = options.runId ?? options.jobId ?? null;
+  // P2a: a FRESH (non-resume) run starts with an EMPTY durable findings store — mirror the reviewed-cell
+  // cursor reset below. Without this a new run inherits every prior run's findings into readAccumulated
+  // (re-actioning already-fixed items, wasting budget) and the jsonl grows unbounded across runs. Reset
+  // BEFORE the appender is constructed so it seeds its dedupe/seq from an empty store; a --resume KEEPS
+  // it. Only touch the real store when this run actually uses it (no injected appender/accumulator).
+  if (!options.resume && !deps.findingsAppender && !deps.accumulatedFindings && (options.durableFindings || options.failClosedFindings)) {
+    (deps.resetFindingsStore ?? resetFindingsStore)(findingsStorePath(cwd));
+  }
+  let findingsAppender = deps.findingsAppender ?? null;
+  let failClosedStop = null;
+  if (!findingsAppender && (options.durableFindings || options.failClosedFindings)) {
+    try {
+      const mk = options.failClosedFindings
+        ? (deps.requireDurableStore ?? requireDurableStore)
+        : (deps.makeFindingsAppender ?? makeFindingsAppender);
+      findingsAppender = mk(findingsStorePath(cwd), { session: stateSession, nowIso: () => (options.nowIso ?? nowIso()) });
+    } catch (err) {
+      // FAIL CLOSED: a fix without durable provenance must never land. Record the stop and skip the loop.
+      if (options.failClosedFindings) failClosedStop = `cannot durably record findings (${String(err?.message ?? err)}) — autonomous fixing fails closed; no fix applied`;
+    }
+  }
+  const midPassEnabled = Boolean(options.midPassGuard) && (Boolean(usageCeiling) || pause5h != null);
+  const reviewCursor = midPassEnabled ? (deps.reviewCursor ?? makeReviewCursor(reviewCursorPath(resolveStateDir(cwd)))) : null;
+  // Accumulated evidence (A): the gate/reduce operate over the WHOLE-RUN findings ledger, not just this
+  // small pass — so a cross-file/SSOT issue seen in pass 1 still influences pass 2's gating. Defaults to
+  // the durable store; injectable for tests. Off (→ []) when durable findings aren't enabled, so the
+  // per-pass behaviour is unchanged for a bare caller.
+  const readAccumulated = typeof deps.accumulatedFindings === "function"
+    ? deps.accumulatedFindings
+    : findingsAppender && (options.durableFindings || options.failClosedFindings)
+      ? () => readFindingsStore(findingsStorePath(cwd))
+      : () => [];
+
   const review = deps.review;
   const fix = deps.fix;
   if (typeof review !== "function") throw new Error("runFixLoop requires deps.review");
@@ -174,6 +227,13 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // in the checkpoint so it survives the non-autonomous exit/resume boundary).
   let pauseInfo = null;
   let pauseGuard = null;
+  // P2b: the hard-ceiling stale-TTL clock is a RUN-level property, not per-pass. The mid-pass guard is
+  // rebuilt each pass (its startedAtMs resets), so a ~<2min default pass could never accrue enough
+  // staleness to quiesce the ceiling and prior-pass staleness was forgotten. Track the last time usage
+  // was USABLE across the whole run here (seeded to the run start on the first guarded pass, restored
+  // from the checkpoint on --resume), seed each pass's guard from it, and re-checkpoint it after each
+  // pass so persistent unreadability quiesces the hard ceiling RUN-wide even under small passes.
+  let staleSinceMs = null;
   // Per-tier convergence (§3): run each tier (0 logical -> 1 structure -> 2 correctness -> 3
   // quality) to dry before advancing, so a Structure consolidation lands before Correctness runs
   // on the consolidated code (a bug is then found once, post-consolidation, not N times across
@@ -222,6 +282,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       // Restore the pause anti-thrash guard so a resume that immediately re-pauses on the SAME 5h
       // window with no progress is caught across the exit/resume boundary (not just within one process).
       if (prior.pauseGuard && typeof prior.pauseGuard === "object") pauseGuard = prior.pauseGuard;
+      // P2b: restore the run-level stale-TTL clock so the hard-ceiling staleness keeps accruing across the
+      // resume boundary — a resume that stays unreadable must still eventually quiesce the hard ceiling.
+      if (Number.isFinite(prior.staleSinceMs)) staleSinceMs = prior.staleSinceMs;
       // Restore the scope so a resumed run doesn't jump straight to a stale full-scope
       // window offset (which would review off-the-end and falsely read "dry").
       if (Array.isArray(prior.changedFiles) && prior.changedFiles.length) changedFiles = prior.changedFiles;
@@ -256,12 +319,65 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // next loop head AND right after a pass completes (C / codex-4), so the between-pass ceiling/pause
   // guards are skipped on an already-terminal final pass. Reads the live counters via closure.
   const computeTerminalStop = () => {
+    // FAIL-CLOSED (C): if the durable store could not be opened, autonomous fixing must not run at all —
+    // this is terminal BEFORE the first pass, so no untracked fix is ever applied.
+    if (failClosedStop) return failClosedStop;
     if (perTier && currentTier > 3) return "all tiers converged (structure -> correctness -> quality)";
     const bounded = endlessStopReason({ passNo, spent, dryStreak: perTier ? 0 : dryStreak }, { maxPasses, totalBudget, dryStop });
     if (bounded) return bounded;
     if (!perTier && stalledStreak >= dryStop) return `stalled — actionable findings remain but none are auto-applicable (${stalledStreak} passes)`;
     return null;
   };
+
+  // A FRESH (non-resume) run starts with an empty reviewed-cell cursor — a resume keeps the on-disk
+  // cursor so its interrupted pass skips the cells it already reviewed.
+  if (reviewCursor && !options.resume) reviewCursor.reset();
+
+  // SSOT pause-emission (B): mid-pass quiesce AND the between-pass backstop share ONE decision + ONE
+  // emit path. `applyPause` takes a `pause` decision object (from evaluateBetweenPassGuards, the shared
+  // pure decision) + the checkpoint state, applies the anti-thrash / autonomous-wait / manual-exit
+  // policy IDENTICALLY for both call sites, mutating stopReason/pauseInfo/pauseGuard via closure and
+  // performing the autonomous in-process wait. Returns "continue" (autonomous wait resumed) or "break".
+  async function applyPause(pause, cpState) {
+    const blockersDesc = pause.blockers.map((b) => `${b.model} 5h ${b.percent}%≥${b.threshold}%`).join(", ");
+    // ANTI-THRASH: a resume that immediately re-pauses on the SAME 5h window with NO durable-fix progress
+    // is a spin (wrong reset, or the window never cleared) — hard-stop for manual attention, don't re-wait.
+    if (pause.thrash) {
+      stopReason = `quota-pause-manual: ${blockersDesc} — resumed but the same 5h window is still over threshold with no progress; stopping for manual attention`;
+      pauseInfo = { schedulable: false, resumeAt: null, blockers: pause.blockers, threshold: pause5h.threshold, autonomous: Boolean(pause5h.autonomous), thrash: true, pauseId: pause.pauseId };
+      reporter.line(`⏸ ${stopReason}`);
+      onProgress(stopReason);
+      checkpoint({ ...cpState, pauseGuard, stopReason, done: false });
+      return "break";
+    }
+    // Remember this pause so the NEXT iteration / resume can detect a no-progress re-pause.
+    pauseGuard = { windowSig: pause.windowSig, fixedCount: fixedAll.length, passNo };
+    // AUTONOMOUS + schedulable: wait IN-PROCESS to the KNOWN future reset, then continue (the next pass
+    // re-reads usage). Checkpoint FIRST so a mid-wait process death stays --resume-able. Only a valid,
+    // bounded future wait — never an indefinite/absurd sleep.
+    if (pause5h.autonomous && pause.schedulable) {
+      const resumeMs = Date.parse(pause.resumeAt);
+      const waitMs = Number.isFinite(resumeMs) ? Math.max(0, resumeMs - nowFn()) : NaN;
+      if (Number.isFinite(waitMs) && waitMs <= MAX_AUTONOMOUS_WAIT_MS) {
+        pauseGuard.autonomous = true;
+        checkpoint({ ...cpState, pauseGuard, stopReason: null, done: false });
+        reporter.line(`⏸ autonomous: waiting until ${pause.resumeAt} for ${blockersDesc} reset`);
+        onProgress(`⏸ autonomous: waiting until ${pause.resumeAt} for ${blockersDesc} reset`);
+        await sleepFn(waitMs);
+        return "continue";
+      }
+      // Not a valid bounded wait → fall through to the manual/exit path (never a blind sleep).
+    }
+    // NON-autonomous (or autonomous-but-unschedulable): clean stop carrying a resume contract (exit 75).
+    stopReason = pause.schedulable
+      ? `quota-pause: ${blockersDesc} — resume ${pause.resumeAt}`
+      : `quota-pause-manual: ${blockersDesc} — reset time not schedulable, resume manually`;
+    pauseInfo = { schedulable: pause.schedulable, resumeAt: pause.resumeAt, blockers: pause.blockers, threshold: pause5h.threshold, autonomous: Boolean(pause5h.autonomous), pauseId: pause.pauseId };
+    reporter.line(`⏸ ${stopReason}`);
+    onProgress(stopReason);
+    checkpoint({ ...cpState, pauseGuard, stopReason, done: false });
+    return "break";
+  }
 
   for (;;) {
     // Under per-tier staging the GLOBAL dry/stalled streaks are TIER-UNAWARE — they see findings
@@ -283,12 +399,68 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     const passBudget = Math.min(perPassBudget, totalBudget - spent);
     onProgress(`pass ${passNo}: review+fix (budget ${passBudget}, ${spent}/${totalBudget}, dry ${dryStreak}/${dryStop})…`);
 
+    // B: the mid-pass checkpoint-and-resume quota guard for THIS pass (opt-in). It reads usage BEFORE
+    // each cell (cheap, cached to GUARD_EVERY_MS) and, on a breach, finishes the in-flight cell then
+    // QUIESCES. It carries the per-pass anti-thrash context so a mid-pass PAUSE builds the SAME pause
+    // object the between-pass backstop would; the durable cursor bridges the pass's quiesce→resume.
+    // P2b: seed the guard's stale-TTL clock from the run-level baseline so the hard-ceiling stale quiesce
+    // measures staleness RUN-wide, not per-pass. Initialize the baseline to the run start on the first
+    // guarded pass of a fresh run (a --resume restored it above).
+    if (midPassEnabled && !Number.isFinite(staleSinceMs)) staleSinceMs = nowFn();
+    const guard = midPassEnabled
+      ? (deps.makeGuard ?? makeMidPassGuard)({
+          cursor: reviewCursor,
+          readUsage,
+          usageCeiling,
+          pause5h,
+          now: nowFn,
+          staleSinceMs,
+          prevWindowSig: pauseGuard?.windowSig ?? null,
+          madeProgress: () => fixedAll.length > (pauseGuard?.fixedCount ?? 0),
+          pauseIdSeed: `${options.runId ?? ""}|${branch ?? ""}|${passNo}`
+        })
+      : null;
+
     let rev;
     try {
-      rev = await withLimitRetry(() => review({ budget: passBudget, pass: passNo, changedFiles }));
+      rev = await withLimitRetry(() => review({ budget: passBudget, pass: passNo, changedFiles, guard, findingsAppender }));
     } catch (err) {
       passes.push({ pass: passNo, error: String(err?.message ?? err) });
       stopReason = `review error on pass ${passNo}: ${String(err?.message ?? err)}`;
+      break;
+    }
+    // P2b: carry the guard's last-usable-usage timestamp back to the run level so the hard-ceiling
+    // stale-TTL clock accrues ACROSS passes (the guard is rebuilt per pass). A pass that saw a usable
+    // reading bumps the baseline forward (resetting staleness); a pass that never did leaves it put so
+    // staleness keeps growing. Persisted into every checkpoint below.
+    if (guard && Number.isFinite(guard.lastUsableAtMs)) staleSinceMs = guard.lastUsableAtMs;
+    // B (checkpoint-and-resume): the grouped review QUIESCED mid-pass — a quota breach stopped it from
+    // scheduling new cells after finishing the in-flight ones. The partial findings are ALREADY durably
+    // recorded (the store) + the reviewed cells are in the durable cursor, so a --resume continues the
+    // SAME band from the cursor with no re-charge. This pass's review band is INCOMPLETE, so we do NOT
+    // gate/fix it — we checkpoint (WITHOUT advancing the window/scope; the review closure held the offset
+    // back on a quiesce) and emit the SAME between-pass hard-stop / pause (SSOT). This runs BEFORE the
+    // ran:false check so a first-cell quiesce reports the real quota reason, not a false "did not run".
+    const quiesce = rev?.coverage?.quiesced ?? null;
+    if (quiesce) {
+      charge(rev?.coverage?.budgetSpent, 1); // charge the cells this pass actually dispatched before quiescing
+      const freshQ = dedupeNew(rev?.findings ?? [], seenReview);
+      reviewedAll.push(...freshQ);
+      const cpQuiesce = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, quiesced: true, stopReason: null, done: false };
+      passes.push({ pass: passNo, reviewed: (rev?.findings ?? []).length, fresh: freshQ.length, quiesced: quiesce.kind });
+      if (quiesce.kind === "pause" && quiesce.pause) {
+        onProgress(`⏸ mid-pass quiesce (pause) after finishing the in-flight cell — partial findings preserved, cursor checkpointed`);
+        const action = await applyPause(quiesce.pause, cpQuiesce);
+        if (action === "continue") continue; // autonomous wait resumed → the SAME band re-runs, cursor skips done cells
+        break;
+      }
+      // ceiling / stale-ceiling → terminal hard stop (a --resume continues from the reviewed-cell cursor).
+      stopReason = quiesce.kind === "stale-ceiling"
+        ? `usage-ceiling: usage unreadable/stale beyond ${Math.round((quiesce.ttlMs ?? 0) / 1000)}s — quiesced mid-pass (hard ceiling cannot fail-soft indefinitely); resume when usage is readable`
+        : ceilingStopReason(quiesce.breaches);
+      reporter.line(`⛔ ${stopReason} — mid-pass quiesce; resume continues from the reviewed-cell cursor`);
+      onProgress(stopReason);
+      checkpoint({ ...cpQuiesce, stopReason, done: false });
       break;
     }
     // A review that DID NOT actually run (no reachable reviewer, or a rate-limit the
@@ -305,7 +477,45 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     const freshFindings = dedupeNew(findings, seenReview);
     reviewedAll.push(...freshFindings);
 
-    const gated = gate(findings, { changedFiles, pass: passNo });
+    // A (accumulated-evidence gating): small passes bound WORK, not the EVIDENCE horizon. The gate +
+    // SSOT reduce must see the WHOLE-RUN findings ledger, not just this pass's small band — else a
+    // cross-file/SSOT issue first seen in pass 1 fragments into a symptom-fix in pass 2. Union this
+    // pass's findings with the durable accumulated store (deduped by fingerprint), then gate the union.
+    // readAccumulated() is [] for a bare caller → union == findings → byte-identical to before.
+    const gateInput = (() => {
+      const acc = readAccumulated() ?? [];
+      if (!acc.length) return findings;
+      const seenFp = new Set(findings.map((f) => fingerprintFinding(f)));
+      // Don't re-surface a finding this run already FIXED (the store is an append-only discovery log, not
+      // a resolution tracker) — else it re-enters the gate every pass and the fixer no-op-retries it.
+      const fixedFps = new Set(fixedAll.map((x) => (x?.finding?.fingerprint ? String(x.finding.fingerprint) : fingerprintFinding({ file: x?.finding?.file ?? x?.file, title: x?.finding?.title, category: x?.finding?.category, line: x?.finding?.line }))));
+      const extra = acc.filter((f) => {
+        const fp = f.fingerprint ?? fingerprintFinding(f);
+        if (seenFp.has(fp) || fixedFps.has(fp)) return false;
+        seenFp.add(fp);
+        return true;
+      });
+      if (!extra.length) return findings;
+      // P1 (convergence): the accumulated store records are PRE-normalization — the durable append
+      // (toRecord) persists severity/lens/category/file/line but NOT scope/fixDisposition, and the append
+      // happens in the grouped review, BEFORE the review adapter (audit-fixloop-deps) normalizes. Fed raw
+      // into the gate, a propose-only tier-2 finding (config_cicd_security / compliance_governance) reads
+      // back with scope/fixDisposition undefined → autoFixable()===true → it keeps `actionable` non-empty
+      // every pass → the per-tier stage NEVER advances past it (the loop can't converge). Re-normalize the
+      // accumulated records with the SAME normalizer this pass's findings get (normalizeFindings, exactly
+      // as the review adapter does), re-attaching file/line onto the canonical shape and PRESERVING the
+      // stored fingerprint (dedup already ran above — do NOT weaken the fingerprint filtering) so
+      // scope/fixDisposition/lens are correct before gate().
+      const normExtra = normalizeFindings(extra, {}).map((nf, i) => ({
+        ...nf,
+        file: nf.location?.path ?? extra[i]?.file,
+        line: nf.location?.startLine ?? extra[i]?.line,
+        fingerprint: extra[i]?.fingerprint ?? nf.fingerprint
+      }));
+      return [...findings, ...normExtra];
+    })();
+
+    const gated = gate(gateInput, { changedFiles, pass: passNo });
     for (const p of gated.surfaced ?? []) {
       const k = proposedKey(p);
       if (!seenProposed.has(k)) {
@@ -315,7 +525,29 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     }
 
     // Per-tier convergence restricts a pass to the CURRENT tier's actionable set.
-    const actionable = perTier ? gated.actionable.filter((f) => (typeof f.tier === "number" ? f.tier : tierOfLens(f.lens)) === currentTier) : gated.actionable;
+    let actionable = perTier ? gated.actionable.filter((f) => (typeof f.tier === "number" ? f.tier : tierOfLens(f.lens)) === currentTier) : gated.actionable;
+    // D (deterministic correlation, opt-in): give ONE writer each SAME-FILE anchor cluster (audit-fix
+    // already serializes one writer per file + reverts a multi-file touch; enforceTouched) and ESCALATE
+    // multi-file / cross-cutting / SSOT clusters to PROPOSAL instead of auto-fixing a symptom. No LLM.
+    // The escalated findings move from `actionable` to proposals; same-file clusters stay actionable.
+    if (options.correlate) {
+      const { escalated } = correlateFindings(actionable, { importers: options.correlateImporters ?? {} });
+      if (escalated.length) {
+        const escIds = new Set(escalated.flatMap((c) => c.findingIds.map(String)));
+        const isEsc = (f, i) => escIds.has(String(f?.id ?? f?.fingerprint ?? `f${i}`));
+        for (let i = 0; i < actionable.length; i += 1) {
+          const f = actionable[i];
+          if (!isEsc(f, i)) continue;
+          const p = { ...f, rejectedReason: "correlation: multi-file / cross-cutting cluster — escalated to proposal (not auto-fixed)" };
+          const k = proposedKey(p);
+          if (!seenProposed.has(k)) {
+            seenProposed.add(k);
+            proposedAll.push(p);
+          }
+        }
+        actionable = actionable.filter((f, i) => !isEsc(f, i));
+      }
+    }
 
     let fx;
     try {
@@ -405,8 +637,12 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // so without this the dashboard/progress.json would under-report spend by a whole pass. Best-effort.
     reporter.budget(spent, totalBudget);
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
-    const cpState = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, stopReason: null, done: false };
+    const cpState = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, stopReason: null, done: false };
     checkpoint(cpState);
+    // A pass that COMPLETED (not quiesced) clears the reviewed-cell cursor: the next pass reviews a
+    // different scope/window, and even an overlapping file must be re-reviewed after a fix — the cursor
+    // only bridges a quiesce→resume of the SAME interrupted pass.
+    if (reviewCursor) reviewCursor.reset();
 
     // C (codex-4): if THIS pass already tripped a terminal stop, break now WITHOUT running the
     // between-pass ceiling/pause guards — the run is ending regardless, so an exit-75 pause or a
@@ -428,7 +664,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
         reporter.usage?.(snap, usageCeiling);
         const { ceiling } = evaluateBetweenPassGuards({ usageCeiling, snapshot: snap });
         if (ceiling?.breached) {
-          stopReason = `usage-ceiling: ${ceiling.breaches.map((b) => `${b.model} ${b.percent}%≥${b.ceiling}% (${b.window})`).join(", ")}`;
+          stopReason = ceilingStopReason(ceiling.breaches); // SSOT message — same as the mid-pass quiesce
           onProgress(stopReason);
           reporter.line(`⛔ ${stopReason}`);
           break;
@@ -458,48 +694,10 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
           pauseIdSeed: `${options.runId ?? ""}|${branch ?? ""}|${passNo}`
         });
         if (pause) {
-          const blockersDesc = pause.blockers.map((b) => `${b.model} 5h ${b.percent}%≥${b.threshold}%`).join(", ");
-          // ANTI-THRASH: a resume that immediately re-pauses on the SAME 5h window with NO durable-fix
-          // progress since that pause is a spin (a wrong reset time, or the window never actually
-          // cleared). Hard-stop for manual attention instead of waiting/exiting into the same loop.
-          if (pause.thrash) {
-            stopReason = `quota-pause-manual: ${blockersDesc} — resumed but the same 5h window is still over threshold with no progress; stopping for manual attention`;
-            pauseInfo = { schedulable: false, resumeAt: null, blockers: pause.blockers, threshold: pause5h.threshold, autonomous: Boolean(pause5h.autonomous), thrash: true, pauseId: pause.pauseId };
-            reporter.line(`⏸ ${stopReason}`);
-            onProgress(stopReason);
-            checkpoint({ ...cpState, pauseGuard, stopReason, done: false });
-            break;
-          }
-          // Remember this pause so the NEXT iteration / resume can detect a no-progress re-pause.
-          pauseGuard = { windowSig: pause.windowSig, fixedCount: fixedAll.length, passNo };
-
-          // AUTONOMOUS + schedulable: wait IN-PROCESS to the KNOWN future reset, then continue the loop
-          // (the next pass re-reads usage). Checkpoint FIRST so a mid-wait process death stays
-          // --resume-able. Only a valid, bounded future wait — never an indefinite/absurd sleep.
-          if (pause5h.autonomous && pause.schedulable) {
-            const resumeMs = Date.parse(pause.resumeAt);
-            const waitMs = Number.isFinite(resumeMs) ? Math.max(0, resumeMs - nowMs) : NaN;
-            if (Number.isFinite(waitMs) && waitMs <= MAX_AUTONOMOUS_WAIT_MS) {
-              pauseGuard.autonomous = true;
-              checkpoint({ ...cpState, pauseGuard, stopReason: null, done: false });
-              reporter.line(`⏸ autonomous: waiting until ${pause.resumeAt} for ${blockersDesc} reset`);
-              onProgress(`⏸ autonomous: waiting until ${pause.resumeAt} for ${blockersDesc} reset`);
-              await sleepFn(waitMs);
-              continue; // resume the loop in-process; do NOT exit
-            }
-            // Not a valid bounded wait → fall through to the manual/exit path (never a blind sleep).
-          }
-
-          // NON-autonomous (or autonomous-but-unschedulable): clean stop between passes carrying a
-          // resume contract. The companion emits the contract + exit 75 from pauseInfo; the loop is
-          // already back-on-base + --resume-able.
-          stopReason = pause.schedulable
-            ? `quota-pause: ${blockersDesc} — resume ${pause.resumeAt}`
-            : `quota-pause-manual: ${blockersDesc} — reset time not schedulable, resume manually`;
-          pauseInfo = { schedulable: pause.schedulable, resumeAt: pause.resumeAt, blockers: pause.blockers, threshold: pause5h.threshold, autonomous: Boolean(pause5h.autonomous), pauseId: pause.pauseId };
-          reporter.line(`⏸ ${stopReason}`);
-          onProgress(stopReason);
-          checkpoint({ ...cpState, pauseGuard, stopReason, done: false });
+          // SSOT: the SAME pause-emission path the mid-pass quiesce uses (anti-thrash / autonomous-wait /
+          // manual-exit), factored into applyPause — no copy-paste between the two call sites.
+          const action = await applyPause(pause, cpState);
+          if (action === "continue") continue; // autonomous wait resumed in-process; do NOT exit
           break;
         }
         // Not paused → progressed past any prior pause on this window; clear the guard so a LATER,
@@ -511,7 +709,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     }
   }
 
-  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, stopReason, done: true });
+  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, stopReason, done: true });
   const result = { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak, changedFiles: [...new Set(fixedAll.map((f) => f.file))] };
   // `pause` is present ONLY when a NON-autonomous (or autonomous-but-unschedulable) pause actually
   // STOPPED the run — the companion turns it into the resume contract + exit 75. An autonomous wait

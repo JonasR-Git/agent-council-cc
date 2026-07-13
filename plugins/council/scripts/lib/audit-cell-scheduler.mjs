@@ -313,7 +313,7 @@ export function makeCellReviewer(cwd, backends, options = {}, deps = {}) {
  * (council B4 grok-3). An unreviewed/failed cell keeps its triple incomplete → B5's convergence
  * knows there is still work.
  */
-export async function runCellMatrix(cells, reviewCell, { models, maxInflight, retryOnLimit = true, retries, sleep, onRetry, onCell } = {}) {
+export async function runCellMatrix(cells, reviewCell, { models, maxInflight, retryOnLimit = true, retries, sleep, onRetry, onCell, guard = null } = {}) {
   const matrix = makeCoverageMatrix(models ?? [...new Set(cells.map((c) => c.model))]);
   // A rate-limit RETRY re-invokes the seat runner — i.e. it is another PAID agent call (council Grok P2:
   // these were invisible to the budget, so a throttled pass could spawn several times its allowance while
@@ -327,6 +327,22 @@ export async function runCellMatrix(cells, reviewCell, { models, maxInflight, re
   const results = await scheduleCells(
     cells,
     async (cell, idx) => {
+      // B (checkpoint-and-resume): the optional mid-pass guard gates each cell BEFORE it is dispatched.
+      //  - RESUME-SKIP: a cell already reviewed in a prior (interrupted) pass is in the durable cursor →
+      //    mark its triple DONE (its findings live in the accumulated store) and DO NOT re-charge it.
+      //  - QUIESCE: a pre-dispatch quota breach → do NOT start this cell (nor any later one — the guard's
+      //    quiesce is sticky, so in-flight cells finish and every subsequent beforeCell short-circuits →
+      //    overshoot is bounded to the cells already running). A quiesced cell is neither done nor failed
+      //    → its triple stays incomplete → passComplete stays false → the loop knows work remains.
+      if (guard) {
+        if (guard.isDone && guard.isDone(cellKey(cell))) {
+          matrix.markDone(cell);
+          return { ok: true, cell, findings: [], skipped: true };
+        }
+        if (guard.beforeCell && (await guard.beforeCell(cell))) {
+          return { ok: false, cell, quiesced: true };
+        }
+      }
       // A cell that THROWS (retries exhausted, or a non-rate-limit error) must still be recorded
       // FAILED in the matrix — else scheduleCells' catch records {ok:false} but the triple is left
       // neither done nor failed, so the matrix summary loses the failed cell (council Grok G2 / Codex
@@ -347,8 +363,26 @@ export async function runCellMatrix(cells, reviewCell, { models, maxInflight, re
   const findings = results.filter((r) => r && r.ok === true && Array.isArray(r.findings)).flatMap((r) => r.findings);
   const repairCalls = results.reduce((n, r) => n + (Number.isFinite(r?.repairCalls) ? r.repairCalls : 0), 0);
   const triples = triplesOf(cells);
+  // B: a cell RESUME-SKIPPED from the durable cursor was NOT dispatched (0 paid calls), and a QUIESCED
+  // cell was refused before dispatch (0 paid calls) — surface both so the caller charges only the cells
+  // it actually ran and knows the pass stopped early. `quiesced` carries the guard's breach reason so the
+  // loop turns it into the SAME between-pass hard-stop / pause (SSOT).
+  const skipped = results.filter((r) => r && r.skipped === true).length;
+  const dispatched = results.filter((r) => r && r.skipped !== true && r.quiesced !== true).length;
   // extraCalls = every PAID agent call beyond the one-per-scheduled-cell baseline (parse repairs +
   // rate-limit retries). The caller charges these into coverage.budgetSpent so the loop's accounting sees
   // the true spend (council Grok P1/P2).
-  return { results, matrix, findings, complete: matrix.sixEyesComplete(triples), triples, repairCalls, retryCalls, extraCalls: repairCalls + retryCalls };
+  return {
+    results,
+    matrix,
+    findings,
+    complete: matrix.sixEyesComplete(triples),
+    triples,
+    repairCalls,
+    retryCalls,
+    extraCalls: repairCalls + retryCalls,
+    skipped,
+    dispatched,
+    quiesced: guard?.quiesce ?? null
+  };
 }
