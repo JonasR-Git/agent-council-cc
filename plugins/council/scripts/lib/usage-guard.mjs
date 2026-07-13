@@ -88,12 +88,24 @@ function codexWeeklyWindow(cd) {
   return cd.primary && typeof cd.primary === "object" ? cd.primary : null;
 }
 
+// Codex ALSO reports a 5h window (window_minutes 300) alongside the weekly one — it just sits in
+// primary OR secondary depending on which is the constraining window at that moment. Pick it by label
+// (null when the latest snapshot has no active 5h window, e.g. just after a 5h reset).
+function codexFiveHourWindow(cd) {
+  if (!cd || typeof cd !== "object") return null;
+  for (const w of [cd.primary, cd.secondary]) {
+    if (w && typeof w === "object" && w.window === "5h") return w;
+  }
+  return null;
+}
+
 /**
  * Read a normalized per-model usage snapshot. `readers` is injectable (defaults
  * wrap token-usage.mjs). Returns:
  *   { claude:{available,weekPercent,fiveHourPercent,weekResetsAt,tokens:{out,in,total}},
- *     codex: {available,weekPercent,weekResetsAt,tokens:{out,in,total}},
+ *     codex: {available,weekPercent,fiveHourPercent,weekResetsAt,tokens:{out,in,total}},
  *     grok:  {available,weekPercent,weekResetsAt,tokens:{total}} }
+ * (Grok has no 5h window; Codex's fiveHourPercent is null when the latest snapshot has none active.)
  * FAIL-SOFT per model: a quota reader that throws or returns {error}/null leaves
  * that model `available:false` with null percents — it NEVER throws the whole
  * snapshot. Token reading is independent (its own try/catch, degrading to zeros)
@@ -142,6 +154,7 @@ export async function readUsageSnapshot({ homeDir, sinceMs, readers } = {}) {
   const codex = {
     available: false,
     weekPercent: null,
+    fiveHourPercent: null,
     weekResetsAt: null,
     tokens: { out: numOr0(xTok.outputTokens), in: numOr0(xTok.inputTokens), total: numOr0(xTok.totalTokens) }
   };
@@ -150,8 +163,10 @@ export async function readUsageSnapshot({ homeDir, sinceMs, readers } = {}) {
       const x = await R.collectCodexRateLimits(path.join(home, ".codex"));
       if (x && typeof x === "object" && !x.error) {
         const weekly = codexWeeklyWindow(x);
+        const fiveH = codexFiveHourWindow(x);
         codex.available = true;
         codex.weekPercent = finitePct(weekly?.usedPercent);
+        codex.fiveHourPercent = finitePct(fiveH?.usedPercent);
         codex.weekResetsAt = weekly?.resetsAt ?? null;
       }
     }
@@ -185,8 +200,8 @@ export async function readUsageSnapshot({ homeDir, sinceMs, readers } = {}) {
  * Evaluate a snapshot against a ceiling. Returns `{ breached, breaches, unavailable }`.
  * A breach is recorded ONLY for a model that is `available` AND has a numeric
  * weekPercent at/over its ceiling — `{ model, window:"weekly", percent, ceiling }`.
- * Claude additionally breaches on its 5h window (an earlier signal against the SAME
- * claude ceiling): `{ model:"claude", window:"5h", ... }`. A model with
+ * A model that reports a 5h window (Claude always; Codex when active) additionally breaches on it
+ * (an earlier signal against the SAME ceiling): `{ model, window:"5h", ... }`. A model with
  * `available:false` (or no numeric percent) is NEVER a breach — the guard can never
  * stop on unknown usage — but its name is collected in `unavailable`. PURE.
  */
@@ -205,10 +220,10 @@ export function evaluateCeiling(snapshot, ceiling) {
     if (limit == null) continue; // no ceiling configured for this model → can't breach
     const week = finitePct(m.weekPercent);
     if (week != null && week >= limit) breaches.push({ model, window: "weekly", percent: week, ceiling: limit });
-    if (model === "claude") {
-      const fiveH = finitePct(m.fiveHourPercent);
-      if (fiveH != null && fiveH >= limit) breaches.push({ model: "claude", window: "5h", percent: fiveH, ceiling: limit });
-    }
+    // The 5h window is an EARLIER signal against the same ceiling — for any model that reports one
+    // (Claude always; Codex when its 5h window is active). Grok has no 5h window → fiveHourPercent null.
+    const fiveH = finitePct(m.fiveHourPercent);
+    if (fiveH != null && fiveH >= limit) breaches.push({ model, window: "5h", percent: fiveH, ceiling: limit });
   }
   return { breached: breaches.length > 0, breaches, unavailable };
 }

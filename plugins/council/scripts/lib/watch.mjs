@@ -873,7 +873,8 @@ function renderRunDashboardMarkdown(progressState, { usage, ceiling, prior, nowM
     const avail = model != null && model.available === true; // quota columns only trust an AVAILABLE model
     const raised = seat.raised != null ? seat.raised : "–";
     const wk = avail && model.weekPercent != null ? `\`${fmtPct(model.weekPercent)}\`` : "–";
-    const fiveH = key === "claude" && avail && model.fiveHourPercent != null ? `\`${fmtPct(model.fiveHourPercent)}\`` : "–";
+    // 5h window: any model that reports one (Claude always; Codex when active). Grok has none.
+    const fiveH = avail && model.fiveHourPercent != null ? `\`${fmtPct(model.fiveHourPercent)}\`` : "–";
     const tok = model && model.tokens ? compactTokens(model.tokens.total) : "–";
     let ceil = "–";
     if (ceiling && avail) {
