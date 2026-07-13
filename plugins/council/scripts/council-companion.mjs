@@ -2849,6 +2849,278 @@ async function handlePlan(argv) {
   console.log(`\nReview/edit the plan, then build it:\n  council build --from ${path.relative(workspaceRoot(cwd), jsonPath).split(path.sep).join("/")}`);
 }
 
+// --- `council build` REAL adapters (the CLI-owned half of runBuildStep's deps) -----------------
+// runBuild itself supplies the orchestrator-owned ports (git, runFullSuite via detectTestCmd,
+// the repo-contained readFile/fileExists from makeStepPorts, now/backends/options — see
+// build.mjs); THIS wiring supplies the model-facing + sandbox ports the gate ladder additionally
+// requires, all fail-closed: a missing/erroring adapter surfaces as a failed gate + verified
+// rollback inside runBuildStep, never as a soft-skipped gate.
+
+// The EXACT permission sandbox chartest-node-harness uses for MODEL-AUTHORED tests (see the
+// poison-probe notes there): child_process and fs WRITES are denied (the two vectors an injected
+// test would use to tamper or persist), fs reads allowed (the test must import the module under
+// test), and the test runs IN-PROCESS (--experimental-test-isolation=none) because node --test's
+// default per-file child spawn is itself denied under the permission model.
+const STEP_TEST_SANDBOX = Object.freeze(["--experimental-permission", "--allow-fs-read=*", "--experimental-test-isolation=none"]);
+const STEP_TEST_TIMEOUT_MS = 120_000;
+// Same hard default as the §6 seat runners (build-step-reviewer's SEAT_TIMEOUT_MS): an unattended
+// build must never hang forever on a wedged authoring CLI — the seat fails closed instead.
+const STEP_AUTHOR_TIMEOUT_MS = 300_000;
+
+/**
+ * Classify ONE sandboxed `node --test` run of the step's hashed test file(s) into build-step's
+ * runStepTest contract { ok, assertionFailure, stdout }. Exported for direct unit tests.
+ *
+ * assertionFailure is TRUE only for a REAL assertion-level failure — the RED-before oracle
+ * depends on this distinction: a syntax/loader/crash/timeout failure would go "green" the moment
+ * the impl merely parses, so it proves nothing and must be an INVALID red. Fail-closed on
+ * ambiguity: a run showing BOTH an assertion marker and a crash marker is not a valid RED either
+ * (the crash may have masked what the assertions would have said).
+ */
+export function classifyAuthoredTestRun(res) {
+  const stdout = String(res?.stdout ?? "");
+  const stderr = String(res?.stderr ?? "");
+  const combined = stderr ? `${stdout}\n${stderr}` : stdout;
+  if (res?.timedOut === true) return { ok: false, assertionFailure: false, stdout: combined };
+  if (res?.status === 0) return { ok: true, assertionFailure: false, stdout: combined };
+  const assertion = /\bERR_ASSERTION\b|\bAssertionError\b/.test(combined);
+  const crash =
+    /\bSyntaxError\b|\bReferenceError\b|\bERR_MODULE_NOT_FOUND\b|Cannot find (?:module|package)|\bERR_ACCESS_DENIED\b|\bERR_UNKNOWN_FILE_EXTENSION\b|\bERR_INVALID_MODULE_SPECIFIER\b|\bERR_REQUIRE_ESM\b/.test(
+      combined
+    );
+  return { ok: false, assertionFailure: assertion && !crash, stdout: combined };
+}
+
+/**
+ * Parse an author seat's reply into the { files: { path: content } } shape build-step's
+ * normalizeAuthoredFiles consumes, or null (fail-closed — build-step rejects the step). The
+ * contract asks for a RAW JSON object; a fenced or prose-wrapped reply is salvaged by extraction,
+ * but the extracted value must still parse as a plain object whose file values are ALL strings.
+ */
+function parseAuthoredFilesMap(stdout) {
+  const raw = String(stdout ?? "").trim();
+  if (!raw) return null;
+  const candidates = [raw];
+  const fence = raw.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+  if (fence) candidates.push(fence[1].trim());
+  const first = raw.indexOf("{");
+  const last = raw.lastIndexOf("}");
+  if (first !== -1 && last > first) candidates.push(raw.slice(first, last + 1));
+  for (const candidate of candidates) {
+    let parsed;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+    const map = parsed.files && typeof parsed.files === "object" && !Array.isArray(parsed.files) ? parsed.files : parsed;
+    const entries = Object.entries(map ?? {});
+    if (!entries.length) continue;
+    if (entries.every(([, v]) => typeof v === "string")) return { files: Object.fromEntries(entries) };
+  }
+  return null;
+}
+
+/**
+ * Build the CLI-owned stepDeps for runBuildStep (merged over runBuild's orchestrator ports via
+ * deps.stepDeps). `buildGit` is the SAME makeBuildGit instance handed to runBuild, so the test
+ * runner and the drift gates read one consistent view of the tree. Exported so an integration
+ * test can drive the REAL adapters (sandboxed test runner, containment-guarded writes, the
+ * coverage/poison port) with only the model-facing ports faked.
+ */
+export function makeBuildStepDeps(root, cwd, backends, options, buildGit) {
+  // Repo-contained fail-closed fs ports (same construction runBuild uses): a symlink target or a
+  // path resolving outside the repo THROWS — reused here as the writeFiles containment guard.
+  const ports = makeStepPorts(root);
+  const testTimeoutMs = Number(options.stepTestTimeoutMs) || STEP_TEST_TIMEOUT_MS;
+
+  // The ONE authoring seat: the first ACTIVE seat, exactly how chartest-wiring picks its
+  // generator (availability + skip flags honoured; --codex-model/--grok-model/--claude-model pins
+  // and the agent timeout arrive via the merged options). The model's reply is DATA — the seat
+  // runners give it no repo write/exec tools, and the reply is parsed, never executed. The
+  // prompts themselves (built by build-step) nonce-fence every untrusted input.
+  const authorOpts = { ...options, agentTimeoutMs: options.agentTimeoutMs ?? STEP_AUTHOR_TIMEOUT_MS };
+  const runners = makeSeatRunners(cwd, backends, authorOpts);
+  const authorSeat = activeSeatNames(backends, authorOpts).find((s) => typeof runners[s] === "function") ?? null;
+  const author = async (prompt) => {
+    // Unreachable when preflight ran (runBuild refuses to start unless EVERY §6 seat — a superset
+    // of this one — is reachable); kept throwing so a bypassed preflight still fails CLOSED.
+    if (!authorSeat) throw new Error("no authoring seat reachable (codex/grok/claude all unavailable or skipped)");
+    const res = await runStructuredWithRetry(
+      (p) => runners[authorSeat](p),
+      prompt,
+      (stdout) => ({ parseOk: parseAuthoredFilesMap(stdout) != null }),
+      { maxRetries: 1 }
+    );
+    // A skipped/timed-out/truncated/non-zero run casts no files — build-step rejects null closed.
+    if (!res || res.skipped || res.timedOut || res.truncated || res.status !== 0) return null;
+    return parseAuthoredFilesMap(res.stdout);
+  };
+
+  // lstat-truth (NEVER stat): true ONLY for an existing REGULAR file inside the repo, so a
+  // symlink / directory / special edit-target is rejected by the ladder's revalidation gate
+  // (build-step gate 2: "edit exists+regular, no symlink escape").
+  const isRegularFile = (rel) => {
+    const p = String(rel ?? "");
+    if (!p || path.isAbsolute(p) || p.split(/[\\/]+/).includes("..")) return false;
+    try {
+      return fs.lstatSync(path.join(root, p)).isFile();
+    } catch {
+      return false; // ENOENT or any lstat fault: not provably a regular file → fail closed
+    }
+  };
+
+  // The ONLY write path build-step uses. The declared-set bound is enforced mechanically by the
+  // ladder itself (authored keys must EQUAL the declared sets; the drift gates re-check the
+  // tree); here we re-guard CONTAINMENT with the same makeStepPorts guard: fileExists THROWS on a
+  // symlink or an escaping resolution, so a write can never follow a link out of the repo.
+  const writeFiles = (map) => {
+    for (const [rel, content] of Object.entries(map && typeof map === "object" ? map : {})) {
+      ports.fileExists(rel); // throws on symlink/escapes-root — before any byte lands
+      const full = path.join(root, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, String(content ?? ""), "utf8");
+    }
+  };
+
+  // The step's hashed test files, derived from the TREE: at every runStepTest call site the
+  // ladder has already enforced changed-set == declared-set (test-phase drift before the RED
+  // runs, the step drift gate before GREEN/coverage), so the changed test-convention files ARE
+  // exactly the step's declared test set. Fail-closed: no test file present → an invalid run.
+  const stepTestFiles = () => buildGit.changedFiles().filter((p) => isPlanTestPath(p)).sort();
+  const runSandboxedStepTest = async (extraEnv = {}, extraArgs = []) => {
+    const files = stepTestFiles();
+    if (!files.length) {
+      return { status: 1, stdout: "", stderr: "no step test file present in the working tree (fail-closed)", timedOut: false };
+    }
+    return runCommandAsync(process.execPath, [...STEP_TEST_SANDBOX, ...extraArgs, "--test", ...files], {
+      cwd: root,
+      env: { ...process.env, ...extraEnv },
+      timeoutMs: testTimeoutMs
+    });
+  };
+  const runStepTest = async () => classifyAuthoredTestRun(await runSandboxedStepTest());
+
+  // Read + merge the coverage-*.json documents a NODE_V8_COVERAGE run wrote (mirrors
+  // chartest-wiring's private defaultReadCoverage). null = no usable document.
+  const readCoverageDir = (dir) => {
+    let files;
+    try {
+      files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+    } catch {
+      return null;
+    }
+    const result = [];
+    for (const f of files) {
+      try {
+        const doc = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+        if (Array.isArray(doc.result)) result.push(...doc.result);
+      } catch {
+        /* skip an unreadable/partial coverage file */
+      }
+    }
+    return result.length ? { result } : null;
+  };
+
+  // POISON-PROBE one impl file (chartest-node-harness's inspector-free dependence check): swap it
+  // for a same-surface twin whose every export throws, re-run the hashed step test, and require
+  // the run to FAIL. Restore is verified by read-back and THROWS on failure — build-step turns
+  // that into a failed coverage gate + verified git rollback (which restores the bytes anyway).
+  const poisonProbeImplFile = async (rel) => {
+    const original = ports.readFile(rel); // repo-contained; throws on symlink/escape
+    const poisoned = buildPoisonedSource(original);
+    if (poisoned == null) return false; // un-fakeable export surface → fail closed
+    const abs = path.join(root, rel);
+    let run = null;
+    try {
+      fs.writeFileSync(abs, poisoned, "utf8");
+      run = await runSandboxedStepTest();
+    } finally {
+      let restored = false;
+      let lastErr = null;
+      for (let attempt = 0; attempt < 3 && !restored; attempt += 1) {
+        try {
+          fs.writeFileSync(abs, original, "utf8");
+          restored = fs.readFileSync(abs, "utf8") === original;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      if (!restored) {
+        throw new Error(
+          `FATAL(build-poison-restore): could not restore ${rel} after the coverage poison probe (${String(lastErr?.message ?? lastErr ?? "read-back mismatch")}) — failing the step closed; the rollback resets the tree to the step snapshot`
+        );
+      }
+    }
+    if (!run || run.timedOut) return false; // an incomplete probe proves nothing → fail closed
+    return run.status !== 0; // the hashed test FAILS with this impl file poisoned → it depends on it
+  };
+
+  // Changed-line coverage (ladder 7b): re-run the HASHED step test under NODE_V8_COVERAGE and
+  // answer per file via changedLinesCovered (innermost-wins). KNOWN PLATFORM LIMITATION (see the
+  // poison-probe notes in chartest-node-harness.mjs, verified on v22.13.1): under the permission
+  // sandbox the inspector is blocked and the coverage document comes back EMPTY. We never claim
+  // coverage we did not measure — when the document is empty we degrade EXACTLY the way chartest
+  // does (per-impl-file poison probe) and say so on stderr + in the returned result.
+  let coverageDegradeNoted = false;
+  const coverChangedLines = async (changed) => {
+    const entries = Object.entries(changed && typeof changed === "object" ? changed : {});
+    if (!entries.length) return { ok: false, uncovered: [], reason: "no changed lines supplied (fail-closed)" };
+    const covDir = fs.mkdtempSync(path.join(os.tmpdir(), "council-build-cov-"));
+    try {
+      // the coverage run must be allowed to WRITE its NODE_V8_COVERAGE dir under the sandbox
+      const run = await runSandboxedStepTest({ NODE_V8_COVERAGE: covDir }, [`--allow-fs-write=${covDir}`]);
+      if (!run || run.timedOut || run.status !== 0) {
+        return { ok: false, reason: "the hashed step test did not run green under the coverage re-run (fail-closed)" };
+      }
+      const doc = readCoverageDir(covDir);
+      if (doc) {
+        const uncovered = [];
+        for (const [rel, lines] of entries) {
+          if (!changedLinesCovered(doc, path.join(root, rel), ports.readFile(rel), lines)) uncovered.push(rel);
+        }
+        return uncovered.length ? { ok: false, uncovered } : { ok: true, measured: "v8-changed-line-coverage" };
+      }
+    } finally {
+      try {
+        fs.rmSync(covDir, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+    // The run was green but the document is EMPTY → the sandbox blocked the inspector. Degrade
+    // honestly: poison-probe dependence per impl file, line granularity NOT established.
+    if (!coverageDegradeNoted) {
+      coverageDegradeNoted = true;
+      console.error(
+        "council build: changed-line coverage is unavailable under the test sandbox (the permission model blocks the V8 inspector) — degrading to the per-impl-file poison-probe dependence check (chartest's documented fallback); line granularity NOT established"
+      );
+    }
+    const uncovered = [];
+    for (const [rel] of entries) {
+      if ((await poisonProbeImplFile(rel)) !== true) uncovered.push(rel);
+    }
+    return uncovered.length
+      ? { ok: false, uncovered, measured: "poison-probe (degraded — inspector blocked by the sandbox)" }
+      : { ok: true, measured: "poison-probe (degraded — line granularity not established; inspector blocked by the sandbox)" };
+  };
+
+  return {
+    authorSeat, // surfaced for the progress log; runBuildStep ignores non-port keys
+    authorTests: author,
+    authorImpl: author, // the same single active seat — the test/impl firewall is the prompt split + hash binding, enforced in build-step
+    writeFiles,
+    runStepTest,
+    coverChangedLines,
+    isRegularFile,
+    // §6: every required seat (the UNSHRINKABLE build council), independently, on the COMPLETE
+    // staged diff. Note the options are passed through UNTOUCHED — makeBuildStepReviewer itself
+    // refuses under any skip flag and build-step computes the required set with EMPTY options.
+    reviewStep: makeBuildStepReviewer(cwd, backends, options)
+  };
+}
+
 async function handleBuild(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["from", "base", "codex-model", "grok-model", "claude-model"],
@@ -2892,7 +3164,7 @@ async function handleBuild(argv) {
       "",
       ...planSpec.steps.map((s, i) => `  ${i + 1}. [${s.id}] ${s.title}\n       files: ${planStepTouched(s).join(", ")}`),
       "",
-      `§6 required seats: ${Object.keys(ready).filter((k) => k !== "ready").join(", ")} — ${ready.ready ? "ALL reachable" : "NOT all reachable (build would refuse to start)"}`,
+      `§6 required seats: ${Object.keys(ready).filter((k) => k !== "ready" && k !== "reasons").join(", ")} — ${ready.ready ? "ALL reachable" : "NOT all reachable (build would refuse to start)"}`,
       "",
       "(--dry-run: nothing was built and no model was called)"
     ];
@@ -2900,10 +3172,21 @@ async function handleBuild(argv) {
     return;
   }
 
+  // The REAL adapters: one shared git instance (runBuild's orchestrator ports and the step-test
+  // runner must read the same tree), plus the CLI-owned model/sandbox ports. runBuild merges its
+  // own orchestrator ports (runFullSuite via detectTestCmd, repo-contained readFile/fileExists,
+  // now/backends/options) underneath deps.stepDeps and refuses at preflight — spending nothing —
+  // when any §6 seat is down, the tree is dirty, HEAD is not the plan's baseCommit, or no test
+  // command exists.
+  const buildGit = makeBuildGit(root);
+  const stepDeps = makeBuildStepDeps(root, cwd, backends, merged, buildGit);
+  if (!options.json && stepDeps.authorSeat) {
+    console.error(`build: authoring seat = ${stepDeps.authorSeat} (first active seat; §6 reviews with EVERY required seat)`);
+  }
   const out = await runBuild(cwd, planSpec, backends, {
     ...merged,
     onProgress: options.json ? undefined : (m) => console.error(m)
-  }, { git: makeBuildGit(root) });
+  }, { git: buildGit, stepDeps });
 
   if (options.json) {
     outputResult(out, true);
@@ -3005,4 +3288,19 @@ async function main() {
   }
 }
 
-await main();
+// Run the CLI only when this file IS the process entry (`node …/council-companion.mjs <cmd>`,
+// which is how every command file, the background-worker respawn, and every subprocess test
+// invoke it). A plain `import` of the module — the unit-test seam for the pure helpers exported
+// above (e.g. classifyAuthoredTestRun) — must not parse argv or print usage.
+function invokedAsCli() {
+  try {
+    if (!process.argv[1]) return false;
+    const self = fs.realpathSync(fileURLToPath(import.meta.url));
+    const entry = fs.realpathSync(path.resolve(process.argv[1]));
+    return process.platform === "win32" ? self.toLowerCase() === entry.toLowerCase() : self === entry;
+  } catch {
+    return true; // fail toward the historical behavior: run the CLI
+  }
+}
+
+if (invokedAsCli()) await main();

@@ -1,14 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-// council-companion.mjs is a bare CLI entry point (no exports), so these findings can only be pinned
-// by spawning it as a subprocess - matching the pattern used by tests/release-fixes.test.mjs,
-// tests/phase-d.test.mjs and tests/setup-init.test.mjs (which this file does not modify).
+// council-companion.mjs is a CLI entry point, so most findings can only be pinned by spawning it as
+// a subprocess - matching the pattern used by tests/release-fixes.test.mjs, tests/phase-d.test.mjs
+// and tests/setup-init.test.mjs (which this file does not modify). It additionally exports a few
+// PURE helpers (e.g. classifyAuthoredTestRun) and guards its main() behind an entry-script check,
+// so those helpers are unit-tested by direct import (the import runs no CLI).
 
 const COMPANION = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -180,5 +183,132 @@ test("council build refuses an INVALID PlanSpec (fail-closed — nothing is buil
     assert.match(`${res.stdout}${res.stderr}`, /INVALID|not valid|must stay|not a git/i, "an invalid plan never reaches the build engine");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- the REAL build wiring (adapters) ---------------------------------------------------------
+
+/** A minimal PlanSpec that passes validatePlanSpec against an empty work dir (both files absent). */
+function validPlanSpec(baseCommit, request = "add a tiny helper module") {
+  const requestHash = createHash("sha256").update(request.replace(/\s+/g, " ").trim(), "utf8").digest("hex");
+  return {
+    schemaVersion: 1,
+    request,
+    requestHash,
+    baseCommit,
+    steps: [
+      {
+        id: "step-one",
+        title: "Add the helper",
+        intent: "Create a helper module exposing one pure function.",
+        files: [
+          { path: "src/helper.mjs", action: "create", role: "source", intent: "the helper implementation" },
+          { path: "tests/helper.test.mjs", action: "create", role: "test", intent: "pins the helper behaviour" }
+        ],
+        test: { files: ["tests/helper.test.mjs"], intent: "the helper returns the expected value" }
+      }
+    ],
+    risks: [],
+    testStrategy: { perStep: "full", final: "full" }
+  };
+}
+
+test("council build --dry-run spends nothing and reports the §6 seat readiness", (t) => {
+  withCli((workDir, baseEnv) => {
+    const fakeClaudeBin = makeAllSeatsUnreachable(workDir);
+    const env = { ...baseEnv, CLAUDE_BIN: fakeClaudeBin };
+    fs.writeFileSync(path.join(workDir, "plan.json"), JSON.stringify(validPlanSpec("a".repeat(40))), "utf8");
+    const res = spawnSync(process.execPath, [COMPANION, "build", "--from", "plan.json", "--dry-run"], {
+      cwd: workDir,
+      env,
+      encoding: "utf8",
+      timeout: 60_000
+    });
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.equal(res.status, 0, res.stderr);
+    // The unshrinkable build council is listed by seat (never the internal `reasons` key), and with
+    // every seat forced unreachable the dry run must say the real build would refuse to start.
+    assert.match(res.stdout, /§6 required seats: codex, grok, claude — NOT all reachable \(build would refuse to start\)/);
+    assert.match(res.stdout, /nothing was built and no model was called/);
+  });
+});
+
+test("council build refuses when HEAD does not match the plan's baseCommit (before any model spend)", (t) => {
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "council-build-repo-"));
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-build-state-"));
+  try {
+    const git = (...args) => spawnSync("git", args, { cwd: workDir, encoding: "utf8", timeout: 30_000 });
+    const init = git("init");
+    if (init.error || init.status !== 0) {
+      t.skip("git is unavailable in this environment");
+      return;
+    }
+    // Everything (plan, policy, fake claude bin) is written BEFORE the commit so the tree is clean
+    // and the refusal under test is specifically the baseCommit binding, not the dirty-tree gate.
+    fs.writeFileSync(path.join(workDir, "index.mjs"), "export const value = 1;\n", "utf8");
+    const fakeClaudeBin = makeAllSeatsUnreachable(workDir);
+    fs.writeFileSync(path.join(workDir, "plan.json"), JSON.stringify(validPlanSpec("a".repeat(40))), "utf8");
+    git("add", "-A");
+    const commit = git("-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-m", "init", "--no-verify");
+    if (commit.error || commit.status !== 0) {
+      t.skip(`git commit is unavailable in this environment (${commit.stderr})`);
+      return;
+    }
+    const res = spawnSync(process.execPath, [COMPANION, "build", "--from", "plan.json"], {
+      cwd: workDir,
+      env: { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot, CLAUDE_BIN: fakeClaudeBin },
+      encoding: "utf8",
+      timeout: 60_000
+    });
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.notEqual(res.status, 0, "a baseCommit-drifted plan must not exit 0");
+    assert.match(
+      `${res.stdout}${res.stderr}`,
+      /REFUSED at preflight[\s\S]*does not match the plan's baseCommit/,
+      "the plan was made against a different tree — build must refuse at preflight, spending nothing"
+    );
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("the authored-test runner rejects a NON-assertion failure as an invalid RED", async () => {
+  // main() is entry-guarded, so a direct import runs no CLI — the classification is a pure export.
+  const { classifyAuthoredTestRun } = await import(pathToFileURL(COMPANION).href);
+
+  // A passing run is GREEN, never an assertion failure.
+  const green = classifyAuthoredTestRun({ status: 0, timedOut: false, stdout: "ok 1 - x", stderr: "" });
+  assert.equal(green.ok, true);
+  assert.equal(green.assertionFailure, false);
+
+  // A genuine assertion-level failure IS a valid RED.
+  const red = classifyAuthoredTestRun({
+    status: 1,
+    timedOut: false,
+    stdout: "not ok 1 - helper\n  ---\n  failureType: 'testCodeFailure'\n  code: 'ERR_ASSERTION'\n  ...",
+    stderr: ""
+  });
+  assert.equal(red.ok, false);
+  assert.equal(red.assertionFailure, true, "an ERR_ASSERTION failure is the one valid RED");
+
+  // Syntax / loader / crash / timeout failures prove nothing — they must NOT count as RED.
+  for (const invalid of [
+    { status: 1, timedOut: false, stdout: "", stderr: "SyntaxError: Unexpected token ')'" },
+    { status: 1, timedOut: false, stdout: "", stderr: "Error [ERR_MODULE_NOT_FOUND]: Cannot find module './missing.mjs'" },
+    { status: 1, timedOut: false, stdout: "", stderr: "ReferenceError: foo is not defined" },
+    { status: 124, timedOut: true, stdout: "", stderr: "[timed out after 1000ms]" },
+    // Ambiguity fails closed: an assertion marker alongside a crash marker is still not a valid RED.
+    { status: 1, timedOut: false, stdout: "AssertionError: nope", stderr: "SyntaxError: also broken" }
+  ]) {
+    const r = classifyAuthoredTestRun(invalid);
+    assert.equal(r.ok, false);
+    assert.equal(r.assertionFailure, false, `must reject as invalid RED: ${JSON.stringify(invalid).slice(0, 80)}`);
   }
 });

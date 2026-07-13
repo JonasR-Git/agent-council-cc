@@ -141,7 +141,24 @@ export function makeBuildGit(root) {
       if (res.status !== 0) throw new Error(`git checkout -b failed: ${res.stderr.trim()}`);
     },
     checkout: (ref) => g(["checkout", ref]).status === 0,
-    changedFiles: () => parsePorcelainZ(g(["status", "--porcelain", "-z"]).stdout),
+    // The drift gate compares this against the step's DECLARED file set, so it must see every divergence
+    // it can afford to look for.
+    //
+    // --untracked-files=all is MANDATORY: without it a file created inside a NEW directory collapses to a
+    // single "dir/" entry in porcelain, so the drift gate compares a DIRECTORY against a declared FILE
+    // path and rejects every plan that introduces a new directory (it fails closed, but wrongly — this
+    // broke any step creating e.g. lib/newthing/x.mjs).
+    //
+    // --ignored is DELIBERATELY NOT passed, against build-step's stated wish (council teammate). Measured:
+    // in a real target repo `--ignored --untracked-files=all` enumerates every file under node_modules and
+    // any other ignored tree — tens of thousands of paths — which would make the drift gate compare that
+    // whole set against the step's declared files and blow up (or time out) on every step. The residual
+    // gap is narrow and documented: a step could leave an artifact in an ignored path unnoticed. It is
+    // bounded because writeFiles only ever writes the step's DECLARED paths, and a declared path can never
+    // be an ignored/protected tree (PLAN_PROTECTED_RE blocks dist/build/vendor/coverage/node_modules/...).
+    // A scoped ignored-check (pathspec-limited to the step's own directories) is the right fix if this
+    // ever needs closing — a repo-wide one is not.
+    changedFiles: () => parsePorcelainZ(g(["status", "--porcelain", "-z", "--untracked-files=all"]).stdout),
     resetHard: (ref) => {
       reviewedTree = null; // any reset invalidates a pending review binding
       const r = g(["reset", "--hard", String(ref)]);
