@@ -506,7 +506,9 @@ export async function runStructureTransform({ finding = null, snapshot = null } 
         try {
           // A fresh nonce per seat (buildStructureReviewPrompt makes its own), so no seat can see
           // or replay another seat's framing.
-          const text = textOf(await deps.reviewSeat(seat, buildStructureReviewPrompt(plan, reviewedDiff, seat)));
+          // diffMax = the SAME limit the oversized-diff veto above used, so a diff that reached this
+          // point (<= maxDiffBytes) is never disclose-truncated: every seat sees the COMPLETE diff.
+          const text = textOf(await deps.reviewSeat(seat, buildStructureReviewPrompt(plan, reviewedDiff, seat, { diffMax: limits.maxDiffBytes })));
           return text ? parsePatchVerdict(text, seat) : null;
         } catch {
           return null; // fail-closed: an erroring/unreachable seat is a non-vote, never a confirm

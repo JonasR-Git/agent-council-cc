@@ -473,3 +473,27 @@ test("--structure-auto-apply does NOT imply --sensitive-auto-apply (double conse
     fs.rmSync(repo.workDir, { recursive: true, force: true });
   }
 });
+
+test("council build binds the plan to the operator's request when one is given (council final Codex P2)", () => {
+  // With a positional request, validatePlanSpec's expectedRequest binding must reject a plan whose
+  // request differs — otherwise the operator builds a plan for a DIFFERENT request than they typed.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "council-plan-"));
+  const spec = {
+    schemaVersion: 1,
+    request: "add a widget",
+    requestHash: "0".repeat(64), // wrong on purpose — the binding must catch the mismatch
+    baseCommit: "a".repeat(40),
+    steps: [{ id: "s", title: "t", intent: "i", files: [{ path: "lib/w.mjs", action: "create", role: "source", intent: "x" }, { path: "tests/w.test.mjs", action: "create", role: "test", intent: "y" }], test: { files: ["tests/w.test.mjs"], intent: "z" }, dependsOn: [] }],
+    risks: [], testStrategy: { perStep: "full", final: "full" }
+  };
+  const p = path.join(dir, "plan.json");
+  fs.writeFileSync(p, JSON.stringify(spec), "utf8");
+  try {
+    // operator asks for something ELSE than the plan's request → refused before anything is built
+    const res = spawnSync(process.execPath, [COMPANION, "build", "--from", path.relative(dir, p), "build me a rocket"], { cwd: dir, encoding: "utf8", timeout: 30_000 });
+    assert.notEqual(res.status, 0);
+    assert.match(`${res.stdout}${res.stderr}`, /INVALID|request|not a git/i, "a request mismatch (or the invalid hash) is caught before the build engine");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

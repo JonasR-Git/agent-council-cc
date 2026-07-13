@@ -63,7 +63,7 @@ import { openRouterBackend, runOpenRouterStructured } from "./lib/openrouter-age
 import { makeCharTestGate } from "./lib/chartest-wiring.mjs";
 import { addWorktree, listWorktrees, removeWorktree } from "./lib/worktree.mjs";
 import { runPlanDeliberation } from "./lib/plan-deliberate.mjs";
-import { isPlanTestPath, parsePlanSpec, planStepTouched, planSpecDigest, renderPlanMarkdown, requestDigest, validatePlanSpec } from "./lib/plan-spec.mjs";
+import { isPlanTestPath, parsePlanSpec, planStepTouched, planSpecDigest, renderPlanMarkdown, validatePlanSpec } from "./lib/plan-spec.mjs";
 import { makeBuildGit, makeStepPorts, renderBuildReport, runBuild } from "./lib/build.mjs";
 import { buildReviewerReady, makeBuildStepReviewer } from "./lib/build-step-reviewer.mjs";
 import { activeSeatNames, makeSeatRunners, seatActive } from "./lib/seats.mjs";
@@ -3356,16 +3356,16 @@ async function handleBuild(argv) {
   }
   const parsed = parsePlanSpec(raw);
   if (!parsed.ok) throw new Error(`the PlanSpec is not valid JSON: ${parsed.error}`);
-  const check = validatePlanSpec(parsed.spec, { root, fileExists: planFileExists });
+  // OUT-OF-BAND REQUEST BINDING (council final, Codex P2): when the operator ALSO types the feature
+  // request on argv, thread it through validatePlanSpec as expectedRequest — plan-spec's own documented,
+  // mandatory binding. Without it the requestHash check is only SELF-consistency (a request+hash pair
+  // recomputed together re-points the plan undetected); with it, the plan's request must normalize-equal
+  // what the operator actually asked for. This uses plan-spec's built-in check rather than a parallel
+  // digest compare, so the two layers cannot drift.
+  const askedFor = positionals.join(" ").trim();
+  const check = validatePlanSpec(parsed.spec, { root, fileExists: planFileExists, expectedRequest: askedFor || undefined });
   if (!check.valid) throw new Error(`the PlanSpec is INVALID (fail-closed — nothing is built):\n  - ${check.errors.join("\n  - ")}`);
   const planSpec = check.value;
-
-  // A positional request, when given, must be the SAME request the plan was made for — otherwise the
-  // operator believes they are building X while the plan builds Y.
-  const askedFor = positionals.join(" ").trim();
-  if (askedFor && requestDigest(askedFor) !== planSpec.requestHash) {
-    throw new Error("the feature request you passed does not match the one this PlanSpec was made for — refusing to build a plan for a different request");
-  }
 
   const backends = probeBackends(cwd, ROOT_DIR, { probeClaude: true });
   const policy = loadPolicy(cwd);

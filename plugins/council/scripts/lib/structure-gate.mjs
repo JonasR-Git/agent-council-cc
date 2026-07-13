@@ -299,7 +299,14 @@ function clampDisclosed(s, max) {
   return str.length > max ? `${str.slice(0, max)}\n…[truncated ${str.length - max} chars — the tail is NOT shown; do not confirm what you cannot see]` : str;
 }
 
-export function buildStructureReviewPrompt(plan, diff, seat = "reviewer") {
+// `diffMax` COUPLES the disclosed-content clamp to the CALLER's oversized-diff VETO grail (council final,
+// user question "is 60k high enough that the council always sees everything?"). The autonomous apply path
+// (structure-wiring) VETOES any diff whose byte length exceeds its maxDiffBytes BEFORE building this
+// prompt, then passes that same maxDiffBytes as diffMax. Since a UTF-8 byte length is always >= the UTF-16
+// string length, a diff that cleared the byte-length veto (<= maxDiffBytes) has string length <= diffMax,
+// so clampDisclosed never truncates it: the seats ALWAYS see the complete diff or the step is vetoed —
+// never a truncated tail. Standalone callers (a human-reviewed proposal) keep the DIFF_MAX_CHARS default.
+export function buildStructureReviewPrompt(plan, diff, seat = "reviewer", { diffMax = DIFF_MAX_CHARS } = {}) {
   const nonce = makeFenceNonce();
   const planCheck = validateTransformPlan(plan);
   return [
@@ -324,7 +331,7 @@ export function buildStructureReviewPrompt(plan, diff, seat = "reviewer") {
     `--- END PLAN ${nonce} ---`,
     ``,
     `--- BEGIN MULTI-FILE DIFF ${nonce} ---`,
-    wrapMarkdownFence(clampDisclosed(diff, DIFF_MAX_CHARS)),
+    wrapMarkdownFence(clampDisclosed(diff, diffMax)),
     `--- END MULTI-FILE DIFF ${nonce} ---`,
     ``,
     `Answer with EXACTLY two lines, nothing else:`,
