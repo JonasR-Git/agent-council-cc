@@ -23,6 +23,7 @@ import { recordAndAnnotate } from "./ledger.mjs";
 import { buildEvidence } from "./deliberate.mjs";
 import { shouldVerify, verifyFindings } from "./verify.mjs";
 import { nowIso, workspaceRoot } from "./state.mjs";
+import { NOOP_REPORTER } from "./progress.mjs";
 
 const READ_MAX_BYTES = 2_000_000; // don't slurp a giant file into a chunker
 // Ceiling on the refutation fan-out per pass. Each refutation is one PAID agent call ON TOP of the
@@ -59,6 +60,7 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   const groups = resolveLensGroups(options.lensGroups ?? "fine");
   const files = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
   const progress = typeof options.onProgress === "function" ? options.onProgress : null;
+  const reporter = options.reporter ?? NOOP_REPORTER;
 
   if (models.length === 0 || files.length === 0 || groups.length === 0) {
     // Distinguish WHY nothing ran so the report doesn't misdiagnose an empty scope as "no reviewer"
@@ -120,12 +122,24 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
 
   const reviewCell = deps.reviewCell ?? makeCellReviewer(cwd, backends, options);
   const runMatrix = deps.runMatrix ?? runCellMatrix;
+  // Cell-granular live progress (the FINEST resolution): after each cell completes, fold its findings
+  // into the per-lens matrix and advance unitsDone. The grouped path is the one place a completed unit
+  // is a single (file, group, model) cell, so the dashboard's Findings-by-lens table fills fastest here.
+  reporter.progress({ unitsDone: 0, unitsTotal: cells.length });
+  let cellsDone = 0;
   const matrixOut = await runMatrix(cells, reviewCell, {
     models,
     maxInflight: options.maxInflight,
     retryOnLimit: options.retryOnLimit,
     sleep: deps.sleep,
-    onRetry: progress ? ({ attempt, ms }) => progress(`  cell rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt})…`) : undefined
+    onRetry: progress ? ({ attempt, ms }) => progress(`  cell rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt})…`) : undefined,
+    onCell: (r) => {
+      cellsDone += 1;
+      reporter.progress({ unitsDone: cellsDone, unitsTotal: cells.length });
+      if (r && r.ok === true && Array.isArray(r.findings) && r.findings.length) {
+        reporter.findings(r.findings, r.cell?.model ? { seat: r.cell.model } : undefined);
+      }
+    }
   });
 
   // Merge + scope + ledger — the SAME post-processing the per-file path (runAuditReview) runs, so

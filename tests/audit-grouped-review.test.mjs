@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { activeModels, runGroupedReview } from "../plugins/council/scripts/lib/audit-grouped-review.mjs";
+import { makeProgressReporter } from "../plugins/council/scripts/lib/progress.mjs";
 import { normalizeFindings } from "../plugins/council/scripts/lib/audit-normalize.mjs";
 import { partitionByRefutation, shouldVerify } from "../plugins/council/scripts/lib/verify.mjs";
 import { tierOfLens } from "../plugins/council/scripts/lib/audit-tiers.mjs";
@@ -68,6 +69,24 @@ test("runGroupedReview: the cell-matrix path returns findings + six-eyes coverag
   assert.equal(seenCells, 39);
   assert.equal(out.coverage.cellsScheduled, 39);
   assert.deepEqual(out.coverage.reviewers, { codex: true, grok: true, claude: true });
+});
+
+test("runGroupedReview: cell-granular reporter — each completed cell folds findings + advances progress", async () => {
+  const reporter = makeProgressReporter({ kind: "audit-review", now: () => "2026-07-13T00:00:00Z", writeFile: () => {} });
+  const runMatrix = async (_cells, _reviewCell, opts) => {
+    // Simulate three cells completing: two with findings from different model seats, one failed.
+    opts.onCell({ ok: true, cell: { model: "codex" }, findings: [{ id: "c1", lens: "security_secrets", severity: "P1" }] }, 0);
+    opts.onCell({ ok: true, cell: { model: "grok" }, findings: [{ id: "g1", lens: "concurrency", severity: "P2" }] }, 1);
+    opts.onCell({ ok: false, cell: { model: "claude" }, error: "boom" }, 2); // failed → no findings, still advances
+    return { findings: [], matrix: { summary: () => ({ models: 3, done: 2, failed: 1 }) }, complete: false };
+  };
+  await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, ...NO_VERIFY, reporter }, { runMatrix, ...FS });
+  const snap = reporter.snapshot();
+  assert.equal(snap.findingsByLens.security_secrets.P1, 1, "cell findings folded into the lens matrix by lens+severity");
+  assert.equal(snap.findingsByLens.concurrency.P2, 1);
+  assert.equal(snap.progress.unitsDone, 3, "progress advanced once per completed cell (incl. the failed one)");
+  assert.equal(snap.seats.find((s) => s.name === "codex")?.raised, 1, "raised attributed to the raising model seat");
+  assert.equal(snap.seats.find((s) => s.name === "grok")?.raised, 1);
 });
 
 test("runGroupedReview: a CAPPED run is not COMPLETE (report) but IS passComplete (loop) — council R9", async () => {

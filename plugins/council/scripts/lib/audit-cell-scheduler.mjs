@@ -129,7 +129,7 @@ export function makeCoverageMatrix(models = []) {
  * 1..16, default 6) in flight at once. Preserves input order in `results`. A cell whose runCell
  * throws resolves to `{ ok:false, error }` — one bad cell never rejects the whole batch.
  */
-export async function scheduleCells(cells, runCell, { maxInflight = DEFAULT_MAX_INFLIGHT } = {}) {
+export async function scheduleCells(cells, runCell, { maxInflight = DEFAULT_MAX_INFLIGHT, onCell = null } = {}) {
   const limit = Math.max(1, Math.min(MAX_INFLIGHT_CEILING, Number.isFinite(maxInflight) ? Math.floor(maxInflight) : DEFAULT_MAX_INFLIGHT));
   const results = new Array(cells.length);
   let next = 0;
@@ -141,6 +141,15 @@ export async function scheduleCells(cells, runCell, { maxInflight = DEFAULT_MAX_
         results[idx] = await runCell(cells[idx], idx);
       } catch (error) {
         results[idx] = { ok: false, error };
+      }
+      // Per-cell completion hook (live cell-granular progress). Fail-soft: a throwing
+      // hook must never break the scheduler — the review is the work, telemetry is not.
+      if (typeof onCell === "function") {
+        try {
+          onCell(results[idx], idx);
+        } catch {
+          /* swallow — telemetry never breaks the batch */
+        }
       }
     }
   }
@@ -304,7 +313,7 @@ export function makeCellReviewer(cwd, backends, options = {}, deps = {}) {
  * (council B4 grok-3). An unreviewed/failed cell keeps its triple incomplete → B5's convergence
  * knows there is still work.
  */
-export async function runCellMatrix(cells, reviewCell, { models, maxInflight, retryOnLimit = true, retries, sleep, onRetry } = {}) {
+export async function runCellMatrix(cells, reviewCell, { models, maxInflight, retryOnLimit = true, retries, sleep, onRetry, onCell } = {}) {
   const matrix = makeCoverageMatrix(models ?? [...new Set(cells.map((c) => c.model))]);
   // A rate-limit RETRY re-invokes the seat runner — i.e. it is another PAID agent call (council Grok P2:
   // these were invisible to the budget, so a throttled pass could spawn several times its allowance while
@@ -333,7 +342,7 @@ export async function runCellMatrix(cells, reviewCell, { models, maxInflight, re
       else matrix.markFailed(cell);
       return r;
     },
-    { maxInflight }
+    { maxInflight, onCell }
   );
   const findings = results.filter((r) => r && r.ok === true && Array.isArray(r.findings)).flatMap((r) => r.findings);
   const repairCalls = results.reduce((n, r) => n + (Number.isFinite(r?.repairCalls) ? r.repairCalls : 0), 0);
