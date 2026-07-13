@@ -668,6 +668,15 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           try {
             charAccepted = await withLimitRetry(() => charTestGate.accept({ file: task.file, source }));
           } catch (err) {
+            // A FATAL poison-restore failure means the working tree MAY still hold a poisoned target —
+            // continuing would leak it into every later fix/review. Abort the whole run (fail-closed),
+            // do NOT downgrade to propose-only. An ordinary accept error stays propose-only.
+            if (err?.fatalPoison) {
+              fatalAbort = `§5 char-test poison-restore FATAL on ${task.file}: ${String(err?.message ?? err)}`;
+              failed.push({ finding, file: task.file, reason: fatalAbort });
+              log(`  ABORT — ${fatalAbort}`);
+              break;
+            }
             charAccepted = { accepted: false, reason: `char-test accept error: ${String(err?.message ?? err)}` };
           }
           if (!charAccepted.accepted) {

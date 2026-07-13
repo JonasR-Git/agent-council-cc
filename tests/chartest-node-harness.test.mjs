@@ -277,6 +277,15 @@ test("buildExportPoisonedSource poisons ONLY the named export — every other ex
   assert.ok(anon.includes("const __councilRealDefault__ = { v: 1 };"), "the expression stays evaluated, un-exported");
   assert.ok(anon.includes("export default __councilPoison__;"), "and the default binding is the poison");
   assert.deepEqual(exportSnapshot(anon).names, ["K"], "the sibling named export is untouched");
+  // an ANONYMOUS default CLASS (`class extends Base` / `class implements Foo`) has no name after `class`,
+  // so it MUST take the const-expression branch — the named-declaration branch would emit `class extends
+  // Base {…}`, an unnamed class DECLARATION which is a hard SyntaxError, and a twin that fails to LOAD is
+  // read by the poison probe as a spurious outcome difference (false-positive dependence).
+  const anonClass = buildExportPoisonedSource("export default class extends Base { greet() { return 1; } }\nexport const K = 2;\n", "default");
+  assert.ok(anonClass, "an anonymous default class still produces a twin (not null)");
+  assert.ok(anonClass.includes("const __councilRealDefault__ = class extends Base {"), "kept as a VALID class EXPRESSION, not an unnamed declaration");
+  assert.ok(!/\bexport\s+default\s+class\s+extends\b/.test(anonClass) && !/^\s*class\s+extends\b/m.test(anonClass), "no invalid unnamed `class extends` declaration is emitted");
+  assert.ok(anonClass.includes("export default __councilPoison__;"), "the default binding is the poison");
 });
 
 test("buildExportPoisonedSource fails CLOSED (null) on unknown names, opaque surfaces and surface-drifting transforms", () => {

@@ -82,7 +82,14 @@ export function makeCharTestGate(cwd, backends, options = {}, deps = {}) {
       writeFile(absTarget, sourceSnapshot);
       recovered = readFile(absTarget) === sourceSnapshot;
     } catch { /* recovery failed — reported below */ }
-    throw new Error(`FATAL §5 char-test: poison-probe restore failed for ${absTarget} (${String(harness.restoreFailure?.message ?? harness.restoreFailure)})${recovered ? " — the target was recovered from the in-memory snapshot; verify the tree before trusting later results" : " — the target MAY STILL BE POISONED on disk; restore it from VCS before continuing"}`);
+    // Tag the error so the fix loop can tell a corrupted-tree FATAL apart from an ordinary accept
+    // failure (which is merely propose-only). A poisoned target left on disk MUST abort the run, not
+    // silently continue leaking the poison into every subsequent fix/review. `recovered` records
+    // whether the in-memory snapshot restored the file (still abort — the tree needs verification).
+    const err = new Error(`FATAL §5 char-test: poison-probe restore failed for ${absTarget} (${String(harness.restoreFailure?.message ?? harness.restoreFailure)})${recovered ? " — the target was recovered from the in-memory snapshot; verify the tree before trusting later results" : " — the target MAY STILL BE POISONED on disk; restore it from VCS before continuing"}`);
+    err.fatalPoison = true;
+    err.poisonRecovered = recovered;
+    throw err;
   };
   // Surface the harness's probe notes — the HONEST cause ("the test does not depend on the target" vs
   // "changed-line coverage unavailable under the sandbox") — in the reason the caller logs/records, so a

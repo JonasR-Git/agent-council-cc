@@ -2321,16 +2321,32 @@ async function handleAudit(argv) {
             { onWait: ({ attempt, waitMs, stopReason }) => options.json || console.error(`⏸ supervisor: rate-limited — reset-aware wait ${Math.round(waitMs / 1000)}s (attempt ${attempt}) [${stopReason}]…`) }
           )
         : await runFixLoop(cwd, { ...loopOpts, resume: options.resume }, deps);
-      // Return to the base branch after the final pass (fix stayed on the integration
-      // branch); report if the checkout couldn't complete so the user isn't stranded silently.
+      // A SUPERVISED run that ended on a thrown (non-rate-limit) error returns a synthetic TERMINAL
+      // result carrying `.err` and none of the loop fields (branch/fixed/…). It must NOT report a clean
+      // exit 0 / ok:true — that is the worst outcome for the automated path --supervise exists for (a CI
+      // wrapper reads exit 0 as success). Detect the crash and fail loudly below.
+      const supervisorCrashed = Boolean(out && out.err);
+      // Return to the base branch after the final pass. Attempt the checkout UNCONDITIONALLY: on a
+      // supervisor crash `out.branch` is absent but the process may have been left on the integration
+      // branch (a pass ≥2 runs there), so gating the checkout on out.branch strands the user silently.
       out.baseBranch = baseBranch;
       out.stranded = false;
-      if (out.branch) {
+      {
         const co = await runCommandAsync("git", ["checkout", baseBranch], { cwd, timeoutMs: 30_000 });
         out.stranded = co.status !== 0;
       }
       recordAuditMetrics(cwd, "fixloop", { wallClockMs: Date.now() - tLoop, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, proposed: out.proposed?.length ?? 0, passes: out.passesRun ?? 0, spent: out.spent ?? 0 }, nowIso());
-      reporter.done({ ok: !out.stranded, stopReason: out.stopReason });
+      reporter.done({ ok: !out.stranded && !supervisorCrashed, stopReason: out.stopReason });
+      // A crash or a failed return-to-base is a HARD failure: non-zero exit so automation never reads it
+      // as success. On a crash, surface it and stop before the report renderers (which assume loop fields).
+      if (supervisorCrashed) {
+        process.exitCode = 1;
+        const msg = `supervised fix loop aborted (terminal): ${out.stopReason ?? String(out.err?.message ?? out.err)}${out.stranded ? ` — AND could not return to ${baseBranch}` : ""}`;
+        if (options.json) outputResult({ ...out, ok: false, error: msg }, true);
+        else console.error(`✖ ${msg}`);
+        return;
+      }
+      if (out.stranded) process.exitCode = 1;
       if (options.json) {
         outputResult(out, true);
         return;

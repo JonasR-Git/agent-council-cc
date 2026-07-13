@@ -157,7 +157,13 @@ const EXPORT_NAMED_LINE = /^\s*export\s+(?:(?:async\s+)?function\s*\*?\s*|class\
 // export default <NAMED fn/class declaration>: stripping just the `export default ` prefix keeps the
 // declaration AND its module-scope name binding (internal references stay real — replacing it with a
 // const expression would ReferenceError other exports at load and false-accept the probe).
-const DEFAULT_NAMED_DECL = /^(\s*)export\s+default\s+(?=(?:async\s+)?function(?:\s*\*)?\s+[A-Za-z_$]|class\s+[A-Za-z_$])/;
+// The `class` alternative excludes the keyword head `extends`/`implements`: an ANONYMOUS default class
+// (`export default class extends Base {`) has `extends` right after `class `, whose leading `e` would
+// otherwise satisfy `[A-Za-z_$]` and mis-classify it as a NAMED declaration — stripping only the prefix
+// then yields `class extends Base {`, an unnamed class DECLARATION which is a hard SyntaxError. The
+// negative lookahead makes such anonymous classes fall to the valid `const __councilRealDefault__ = class …`
+// else-branch (fail-closed: a mis-scan must degrade, never manufacture an invalid poison twin).
+const DEFAULT_NAMED_DECL = /^(\s*)export\s+default\s+(?=(?:async\s+)?function(?:\s*\*)?\s+[A-Za-z_$]|class\s+(?!extends\b|implements\b)[A-Za-z_$])/;
 
 /**
  * Scan a module into EXPORT REGIONS: each top-level export declaration line opens a region that runs to
