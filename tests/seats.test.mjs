@@ -25,6 +25,15 @@ test("seatActive: built-in branches match the former reviewerActive; OR seats ga
   assert.equal(seatActive("or-unknown", withOR(), {}), false, "an unconfigured id is never active");
 });
 
+test("seatActive: --skip-seats is the canonical skip and drops BUILT-IN seats too (not just OpenRouter)", () => {
+  // skipSeats naming a built-in deactivates it even WITHOUT the per-seat --skip-codex boolean…
+  assert.equal(seatActive("codex", builtinBackends, { skipSeats: ["codex"] }), false, "--skip-seats codex drops the built-in codex");
+  assert.equal(seatActive("grok", builtinBackends, { skipSeats: ["grok"] }), false, "--skip-seats grok drops the built-in grok");
+  assert.equal(seatActive("claude", builtinBackends, { skipSeats: ["claude"] }), false, "--skip-seats claude drops the built-in claude");
+  // …and it only skips the NAMED seat: a codex not in the list stays active.
+  assert.equal(seatActive("codex", builtinBackends, { skipSeats: ["grok"] }), true, "skipSeats:[grok] leaves codex active");
+});
+
 test("activeSeatNames: default is the 3 built-ins; OR seats add when reachable", () => {
   assert.deepEqual(activeSeatNames(builtinBackends, {}), ["codex", "grok", "claude"]);
   assert.deepEqual(activeSeatNames(withOR(), {}), ["codex", "grok", "claude", "or-x", "or-y"]);

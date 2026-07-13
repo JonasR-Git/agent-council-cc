@@ -204,8 +204,8 @@ Two things are currently **JS/npm-tuned** — know this before you rely on them:
   get duplication, churn, complexity, smells and the file map, but no import graph.
   The agent `review` works regardless.
 - **`/council:audit fix`** — the test gate is **`npm test`** only right now. No
-  `package.json` test script → it refuses (rather than commit unverified edits)
-  unless you pass `--allow-untested` (not recommended). So the safe fix path is
+  `package.json` test script → it refuses (rather than commit unverified edits);
+  the test gate is mandatory with no CLI bypass. So the safe fix path is
   npm-projects-only for now.
 
 Recommended first run, read-only → writing:

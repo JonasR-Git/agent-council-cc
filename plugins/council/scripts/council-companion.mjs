@@ -104,6 +104,7 @@ function printUsage() {
       "  node scripts/council-companion.mjs build --from <plan.json> [--dry-run] [--json]   (autonomous test-gated build of a PlanSpec on an isolated branch; never auto-merged)",
       "  node scripts/council-companion.mjs audit run|review|fix|endless [flags] (see below)",
       "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
+      "      --budget : ADVANCED/LEGACY agent-call cap — most runs never need it; steer cost with --deep (analysis scope) + --usage-ceiling / --pause-at-5h (quota) instead.",
       "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
       "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--structure-auto-apply] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
       "    audit fix --loop [--deep] [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]   (autonomous fix-until-dry on an isolated branch)",
@@ -2020,7 +2021,7 @@ async function handleAudit(argv) {
   );
   const { options, positionals } = parseCommandInput(preArgv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats", "usage-ceiling", "pause-at-5h"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "allow-untested", "resume", "sarif", "loop", "per-tier", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep"]
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep"]
   });
   // --deep: ONE flag for maximum ANALYSIS depth, so a thorough run needs no long flag list. It turns on
   // the grouped six-eyes review over a FULL lens partition (every lens — incl. SSOT/architecture — gets
@@ -2253,7 +2254,7 @@ async function handleAudit(argv) {
       }
       if (treeDirty) throw new Error("working tree not clean — commit or stash first (the loop's rollback would destroy uncommitted work)");
       if (activeReviewerCount(backends, merged) === 0) throw new Error("no callable reviewers (Codex/Grok unavailable or skipped) — audit fix --loop needs at least one");
-      if (!detectTestCmd(workspaceRoot(cwd)) && !options["allow-untested"]) throw new Error("no test command detected — audit fix --loop needs a test gate; pass --allow-untested to run without verification (not recommended)");
+      if (!detectTestCmd(workspaceRoot(cwd))) throw new Error("no test command detected — audit fix --loop requires a test gate (audit only auto-fixes tested code)");
 
       // Reconcile prior provisional fixes -> durable 'fixed' when their commit landed on
       // the fix's own base branch. Skip when checked out ON an integration branch
@@ -2408,7 +2409,6 @@ async function handleAudit(argv) {
       const deps = makeFixLoopDeps(cwd, model, backends, {
         maxUnits,
         minSeverity: fixMinSeverity,
-        allowUntested: options["allow-untested"],
         coverage,
         verdictMap: logical.verdictMap,
         lensGroups: loopLensGroups,
@@ -2455,9 +2455,7 @@ async function handleAudit(argv) {
       const loopTokensBefore = options.html ? tokenSnapshot(loopTokenSince) : null;
       // B5: per-tier convergence (structure → correctness → quality) is ON by default so a
       // Structure/SSOT consolidation lands before Correctness runs on the consolidated code; --flat
-      // opts out (single flat convergence). --per-tier explicitly affirms the default; passing BOTH is
-      // a contradiction, so reject it loudly instead of silently letting one win (council F2).
-      if (options["per-tier"] && options.flat) throw new Error("--per-tier and --flat are contradictory (per-tier staging vs one flat convergence) — pass at most one");
+      // opts out (single flat convergence).
       const loopOpts = { budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat, retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined, logicalProposals: logical.findings, usageCeiling, usageSince, pause5h, reporter, onProgress: reporter.line };
       // C3/M10: --supervise wraps the loop in the endless supervisor so a multi-hour autonomous run
       // survives rate-limit resets — a resumable stop (throttled/backends-down/did-not-run) waits
@@ -2624,7 +2622,6 @@ async function handleAudit(argv) {
     const out = await runAuditFix(cwd, findings, backends, {
       ...merged,
       dryRun: options["dry-run"],
-      allowUntested: options["allow-untested"],
       minSeverity: fixMinSeverity,
       maxFixes,
       retryOnLimit: options["retry-on-limit"],
@@ -2927,7 +2924,7 @@ function renderFixLoopReport(out) {
   const unverified = out.fixed.filter((f) => f.verified === false).length;
   L.push("");
   L.push("## Verified vs. NOT verified (review the gaps)");
-  L.push(`- ${out.fixed.length - unverified}/${out.fixed.length} fix(es) test-gated (green per commit + final integration)${unverified ? ` · ${unverified} UNVERIFIED (--allow-untested)` : ""}`);
+  L.push(`- ${out.fixed.length - unverified}/${out.fixed.length} fix(es) test-gated (green per commit + final integration)${unverified ? ` · ${unverified} UNVERIFIED (ungated)` : ""}`);
   L.push("- change-line coverage is §5-gated per fix WHEN a coverage artifact (--coverage/lcov) was supplied, else NOT measured; behaviour-equivalence + mutation adequacy are NOT measured — eyeball the diffs + the proposals below");
 
   if (out.fixed.length) {

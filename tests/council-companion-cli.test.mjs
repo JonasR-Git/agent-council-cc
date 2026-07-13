@@ -342,9 +342,11 @@ test("finding 7: endlessRunOk maps a clean convergence to ok and an error/did-no
 // default path must stay transform-free; WITH it the transform runner must actually be reached
 // (and fail CLOSED when no seat can plan); and the flag must never imply the §6 sensitive consent.
 
-/** A git-repo workDir with one committed source file, EVERY seat forced unreachable, and a
- *  --from findings file — the cheapest real substrate runAuditFix's M9 structure pass runs on.
- *  Returns null (→ caller skips) when git is unavailable in this environment. */
+/** A git-repo workDir with one committed source file, a DETECTABLE test command (so `audit fix`'s
+ *  mandatory test gate is satisfied — the CLI has no --allow-untested escape hatch), EVERY seat forced
+ *  unreachable, and a --from findings file — the cheapest real substrate runAuditFix's M9 structure
+ *  pass runs on. The test script is never actually executed (no reachable seat → no patch → no gate
+ *  run). Returns null (→ caller skips) when git is unavailable in this environment. */
 function makeStructureFixRepo(findings) {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "council-structure-cli-"));
   const git = (...args) => spawnSync("git", args, { cwd: workDir, encoding: "utf8", timeout: 30_000 });
@@ -354,6 +356,7 @@ function makeStructureFixRepo(findings) {
     return null;
   }
   fs.writeFileSync(path.join(workDir, "index.mjs"), "export const value = 1;\n", "utf8");
+  fs.writeFileSync(path.join(workDir, "package.json"), JSON.stringify({ scripts: { test: "exit 0" } }), "utf8");
   const fakeClaudeBin = makeAllSeatsUnreachable(workDir);
   fs.writeFileSync(path.join(workDir, "findings.json"), JSON.stringify(findings), "utf8");
   git("add", "-A");
@@ -379,13 +382,14 @@ function structuralFinding(overrides = {}) {
   };
 }
 
-/** Spawn single-shot `audit fix --from findings.json --allow-untested --json [...extraArgs]`. */
+/** Spawn single-shot `audit fix --from findings.json --json [...extraArgs]` (the repo carries a
+ *  detectable test command, so no --allow-untested escape hatch is needed to reach the fix engine). */
 function runStructureFixCli(repo, extraArgs) {
   const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-structure-state-"));
   try {
     return spawnSync(
       process.execPath,
-      [COMPANION, "audit", "fix", "--from", "findings.json", "--allow-untested", "--json", ...extraArgs],
+      [COMPANION, "audit", "fix", "--from", "findings.json", "--json", ...extraArgs],
       {
         cwd: repo.workDir,
         env: { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot, CLAUDE_BIN: repo.fakeClaudeBin },

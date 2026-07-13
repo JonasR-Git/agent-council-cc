@@ -483,7 +483,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
   const testCmd = deps.testCmd ?? options.testCmd ?? detectTestCmd(root);
   const gated = Boolean(testCmd) && !options.allowUntested;
   if (!testCmd && !options.allowUntested) {
-    return { ok: false, error: "no test command detected — --fix requires a test gate; pass --allow-untested to fix without verification (not recommended)" };
+    return { ok: false, error: "no test command detected — audit fix requires a test gate (it only auto-fixes TESTED code); add a test command/script. There is no CLI bypass." };
   }
   const runTests = deps.runTests ?? (() => realRunTests(root, testCmd, options));
   const applyFix = deps.applyFix ?? ((prompt) => realApplyFix(root, backends, options, prompt));

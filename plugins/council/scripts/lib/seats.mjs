@@ -28,9 +28,14 @@ export function allSeatNames(backends) {
  * and it was not skipped (--skip-openrouter, or a per-seat skipSeats list).
  */
 export function seatActive(name, backends, options = {}) {
-  if (name === "codex") return !options.skipCodex && Boolean(backends?.codex?.companionAvailable);
-  if (name === "grok") return !options.skipGrok && Boolean(backends?.grok?.cli?.available);
-  if (name === "claude") return !options.skipClaude && Boolean(backends?.claude?.cli?.available);
+  // --skip-seats is the CANONICAL skip: it drops the named seat whether it is a built-in (codex/grok/
+  // claude) OR an OpenRouter id. The per-seat --skip-codex/--skip-grok/--skip-claude booleans stay as
+  // sugar on top. (requiredPatchSeats keeps built-ins REQUIRED, so skipping one still vetoes §6 —
+  // fail-closed, exactly like the per-seat booleans do.)
+  const skipSeats = options.skipSeats ?? [];
+  if (name === "codex") return !options.skipCodex && !skipSeats.includes(name) && Boolean(backends?.codex?.companionAvailable);
+  if (name === "grok") return !options.skipGrok && !skipSeats.includes(name) && Boolean(backends?.grok?.cli?.available);
+  if (name === "claude") return !options.skipClaude && !skipSeats.includes(name) && Boolean(backends?.claude?.cli?.available);
   const orSeats = backends?.openrouter?.seats ?? [];
   if (orSeats.some((s) => s.id === name)) {
     return !options.skipOpenRouter && Boolean(backends?.openrouter?.available) && !(options.skipSeats ?? []).includes(name);

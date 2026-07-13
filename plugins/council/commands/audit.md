@@ -35,8 +35,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" audit $ARGUMENTS
   come from `--from <json>` (a prior `review --json`, confined to the project root)
   or a fresh review. `--dry-run` previews the plan without editing; `--min-severity
   <P0|P1|P2>` sets the gate (default P2); `--max-fixes <n>` caps the number of fixes
-  (default 50); `--allow-untested` fixes without a test gate (**not recommended** —
-  commits are then flagged unverified). `--autonomy <lvl>` sets the commit/propose
+  (default 50). The test gate is mandatory — `audit fix` only auto-fixes tested code
+  and there is no CLI bypass. `--autonomy <lvl>` sets the commit/propose
   dial; `--sensitive-auto-apply` enables §6 council-gated auto-apply of sensitive
   fixes (**only in `--loop`**, gated by unanimous 3-seat patch review); `--html`
   writes a self-contained report; `--retry-on-limit` rides out rate limits.

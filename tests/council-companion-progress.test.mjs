@@ -148,8 +148,9 @@ test("finding 9: a run that throws after makeRunReporter still marks progress.js
     fs.writeFileSync(path.join(workDir, "index.mjs"), "export const value = 1;\n", "utf8");
     fs.writeFileSync(path.join(workDir, ".council.yml"), "version: 1\nreviewers: [claude]\n", "utf8");
     const env = { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot };
-    // A committed, CLEAN git tree so the fix-loop preflight guards pass and the handler reaches
-    // makeRunReporter; --per-tier + --flat is then a contradiction it throws on AFTER the reporter exists.
+    // A committed, CLEAN git tree so state resolution keys on this workspace and the handler reaches
+    // makeRunReporter (single-shot `audit fix` announces the run); an escaping --from is then a throw
+    // it raises AFTER the reporter exists, so main()'s finally must still mark progress.json terminal.
     const git = (args) => spawnSync("git", args, { cwd: workDir, env, encoding: "utf8", timeout: 30_000 });
     const init = git(["init", "-q"]);
     if (isSandboxBlocked(init) || init.status !== 0) {
@@ -164,13 +165,13 @@ test("finding 9: a run that throws after makeRunReporter still marks progress.js
       return;
     }
 
-    const res = spawnSync(process.execPath, [COMPANION, "audit", "fix", "--loop", "--per-tier", "--flat", "--allow-untested"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    const res = spawnSync(process.execPath, [COMPANION, "audit", "fix", "--from", "../escape.json"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
     if (isSandboxBlocked(res)) {
       t.skip("child_process.spawn is blocked by this sandbox");
       return;
     }
-    assert.notEqual(res.status, 0, "the contradictory flags fail the command (the throw still propagates to the exit code)");
-    assert.match(res.stderr, /contradictory/, "the handler threw its contradiction error…");
+    assert.notEqual(res.status, 0, "the escaping --from fails the command (the throw still propagates to the exit code)");
+    assert.match(res.stderr, /must stay within the project root/, "the handler threw its --from confinement error…");
     assert.match(res.stderr, /live dashboard/, "…AFTER makeRunReporter had announced the run (so progress.json exists, done:false at throw time)");
 
     const file = path.join(stateDirFor(workDir, env.AGENT_COUNCIL_STATE_DIR), "progress.json");
