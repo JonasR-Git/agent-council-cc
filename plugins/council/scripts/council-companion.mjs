@@ -49,6 +49,9 @@ import { evaluateResumeGuard, loadFixLoopCheckpoint, runFixLoop } from "./lib/au
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { parsePause5hOption, parseUsageCeiling } from "./lib/usage-guard.mjs";
 import { booleanOptionsFor, fixConfigBooleans, fixConfigValues, negatableFlags, valueOptionsFor } from "./lib/cli-registry.mjs";
+import { emitAliasNotes } from "./lib/cli-aliases.mjs";
+import { route } from "./lib/cli-dispatch.mjs";
+import { assertCodeWriteAllowed } from "./lib/cli-mutation.mjs";
 import { buildClaudeReviewArgs, makePatchReviewer, patchReviewerReady } from "./lib/audit-patch-reviewer.mjs";
 import { detectLogical } from "./lib/audit-logical.mjs";
 import { nodesFromGraph } from "./lib/import-graph.mjs";
@@ -95,7 +98,22 @@ const ROOT_DIR = councilPluginRoot();
 function printUsage() {
   console.log(
     [
-      "Usage:",
+      "Usage: node scripts/council-companion.mjs <verb> [flags]",
+      "",
+      "The 7 verbs (READ-only never touch tracked source/git; WRITE verbs are test-gated on an isolated branch, never auto-merged):",
+      "  review   [RO]  multi-model review — --mode quick|deliberate|adversarial|deep|endless|run  (NEVER writes)",
+      "  fix      [W]   the findings→fixes writer — review→fix→re-review loop from the `fix:` config",
+      "  plan     [RO]  multi-model design deliberation → a validated PlanSpec",
+      "  build    [W]   autonomous test-gated build of a PlanSpec",
+      "  solve    [RO]  independent solutions → scored cross-critique → ranking",
+      "  status   [RO]  --result|--watch|--wait|--cancel|--fixloop|--overview|--history|--metrics|--usage|--ledger (one action)",
+      "  setup    [RO/state]  tool config + diagnose — default | --check (doctor) | --usage",
+      "",
+      "Aliases (old names still work; each maps to a verb above):",
+      "  deliberate|deliberation|adversarial|adversarial-review → review --mode …   |   audit review|run|endless → review --mode deep|run|endless",
+      "  audit fix → fix   |   watch|wait|result|cancel|history|metrics|usage|ledger|overview|fixloop-status → status --…   |   doctor → setup --check",
+      "",
+      "Details:",
       "  node scripts/council-companion.mjs setup [--json]",
       "  node scripts/council-companion.mjs review [--mode quick|deliberate|adversarial] [flags] [focus text]",
       "      e.g.  review --mode quick        parallel Codex + Grok, single round (the CLI default)",
@@ -2281,7 +2299,7 @@ export function applyFixPolicyDefaults(options, policyFix, { emit = () => {} } =
   return fromConfig;
 }
 
-async function handleAudit(argv) {
+export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
   // Capture the run-start clock BEFORE any work so --usage-ceiling's token scan (tokens spent SINCE
   // the run began) and the loop's usage snapshots share one honest baseline. Date.now() is allowed
   // in the companion (this is not a workflow script).
@@ -2310,6 +2328,13 @@ async function handleAudit(argv) {
   applyNoFlagNegations(options);
   let fixFromConfig = new Set();
   if (positionals[0] === "fix") {
+    // mutationClass boundary (foundation #2) — the EARLIEST fix-detection point. `fix` is the ONE
+    // findings→fixes writer; assert the write is allowed BEFORE any fix work (policy load, codebase
+    // model, backend probe, and every downstream writer: runAuditFix, runFixLoop, the --resume loop,
+    // runStructureTransform). FAIL-CLOSED: an undefined/read-only verb THROWS (no default admits a
+    // write). main() always threads the resolved verb; review/plan/solve reroute to the review/run/
+    // endless positionals, never "fix", so this fires only on a genuine miswiring or a forged verb.
+    assertCodeWriteAllowed(dispatchVerb);
     const _fixPolicy = loadPolicy(process.cwd());
     fixFromConfig = applyFixPolicyDefaults(options, _fixPolicy.fix, {
       emit: (m) => { if (!options.json) console.error(m); }
@@ -2478,6 +2503,7 @@ async function handleAudit(argv) {
   // integration branch, each gated by the project's tests, reverted on failure.
   // Findings come from --from <json> (a prior review) or a fresh review run.
   if (positionals[0] === "fix") {
+    // (mutationClass already asserted at the earliest fix-detection point above, before any fix work.)
     const backends = probeBackends(cwd, ROOT_DIR);
     const _orPolicy = loadPolicy(cwd);
     const merged = mergeOptionsWithPolicy(options, _orPolicy);
@@ -4025,7 +4051,13 @@ function makeStructureTransformRunner(root, cwd, backends, options) {
   };
 }
 
-async function handleBuild(argv) {
+export async function handleBuild(argv, { verb: dispatchVerb } = {}) {
+  // mutationClass boundary (foundation #2) — at the ENTRANCE so a non-writing verb can NEVER reach any
+  // build path (not even the --dry-run preview). `build` WRITES tracked source on an isolated branch;
+  // FAIL-CLOSED — an undefined/read-only verb THROWS (no default admits a write). The --dry-run branch
+  // (below) is downstream of this guard and, for the build verb, still writes nothing (preflight + print
+  // only, no runBuild, no fs writes). main() always threads the resolved verb.
+  assertCodeWriteAllowed(dispatchVerb);
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["from", "base", "codex-model", "grok-model", "claude-model"],
     booleanOptions: ["json", "dry-run", "skip-openrouter"]
@@ -4107,85 +4139,87 @@ async function handleBuild(argv) {
 }
 
 async function main() {
-  const argv = process.argv.slice(2);
-  const command = argv[0];
-  const rest = argv.slice(1);
-  if (!command || command === "help" || command === "-h" || command === "--help") {
+  const rawArgv = process.argv.slice(2);
+  const first = rawArgv[0];
+  if (!first || first === "help" || first === "-h" || first === "--help") {
     printUsage();
     return;
   }
+  // Stage 3: normalize every OLD command/flag to a canonical verb FIRST (pure, table-driven), emit the
+  // one-line deprecation note for a deprecated spelling (stderr only — never --json stdout), then route
+  // the canonical verb to the EXISTING handler. `route` = expandAliases → resolveDispatch (both pure).
+  emitAliasNotes(rawArgv);
+  const r = route(rawArgv);
+  const args = r.args;
   try {
-    switch (command) {
-      case "setup":
-        await handleSetup(rest);
+    switch (r.handler) {
+      case "handleSetup":
+        await handleSetup(args);
         break;
-      case "review":
-        await handleReview(rest, false, false);
+      case "handleReview":
+        await handleReview(args, r.reviewAdversarial === true, r.reviewDeliberate === true, r.reviewSolve === true);
         break;
-      case "adversarial":
-      case "adversarial-review":
-        await handleReview(rest, true, false);
+      case "handleAudit":
+        // The resolved verb (fix vs review/run/endless/passthrough) drives the mutationClass guard.
+        await handleAudit(args, { verb: r.verb });
         break;
-      case "deliberate":
-      case "deliberation":
-        await handleReview(rest, false, true);
+      case "handleStatus":
+        handleStatus(args);
         break;
-      case "solve":
-        await handleReview(rest, false, false, true);
+      case "handleResult":
+        handleResult(args);
         break;
-      case "status":
-        handleStatus(rest);
+      case "handleWait":
+        await handleWait(args);
         break;
-      case "result":
-        handleResult(rest);
+      case "handleWatch":
+        await handleWatch(args);
         break;
-      case "wait":
-        await handleWait(rest);
+      case "handlePlan":
+        await handlePlan(args);
         break;
-      case "watch":
-        await handleWatch(rest);
+      case "handleBuild":
+        await handleBuild(args, { verb: r.verb });
         break;
-      case "audit":
-        await handleAudit(rest);
+      case "handleUsage":
+        await handleUsage(args);
         break;
-      case "plan":
-        await handlePlan(rest);
+      case "handleDoctor":
+        await handleDoctor(args);
         break;
-      case "build":
-        await handleBuild(rest);
+      case "handleMetrics":
+        handleMetrics(args);
         break;
-      case "usage":
-        await handleUsage(rest);
+      case "handleHistory":
+        handleHistory(args);
         break;
-      case "doctor":
-        await handleDoctor(rest);
+      case "handleFixloopStatus":
+        handleFixloopStatus(args);
         break;
-      case "metrics":
-        handleMetrics(rest);
+      case "handleBenchmark":
+        await handleBenchmark(args);
         break;
-      case "history":
-        handleHistory(rest);
+      case "handleWorktree":
+        handleWorktree(args);
         break;
-      case "fixloop-status":
-        handleFixloopStatus(rest);
+      case "handleLedger":
+        handleLedger(args);
         break;
-      case "benchmark":
-        await handleBenchmark(rest);
+      case "handleOverview":
+        handleOverview(args);
         break;
-      case "worktree":
-        handleWorktree(rest);
+      case "handleCancel":
+        handleCancel(args);
         break;
-      case "ledger":
-        handleLedger(rest);
+      case "handleWorker":
+        await handleWorker(args);
         break;
-      case "overview":
-        handleOverview(rest);
+      case "error":
+        console.error(r.error);
+        process.exitCode = 1;
         break;
-      case "cancel":
-        handleCancel(rest);
-        break;
-      case "worker":
-        await handleWorker(rest);
+      case "help":
+        printUsage();
         break;
       default:
         printUsage();

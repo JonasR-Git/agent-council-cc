@@ -116,8 +116,17 @@ always essential and always wins.
 | `benchmark` | `benchmark` (hidden alias; not in top --help) |
 | `worktree` | `worktree` (internal; hidden) |
 | `worker` | `worker` (internal; hidden; NEVER renamed — spawn protocol) |
-Flag aliases: `--flat`→`--no-per-tier`, `--max-units`→`--max-cells`, `--completeness-critic`→`--mode deep`
-implication, `--html`→`--format html`, `--follow`→`--watch`, `--codex-model`/etc.→`--model codex=<id>`.
+Flag aliases (LIVE in Stage 3, review verb only): `--adversarial`→`--mode adversarial`,
+`--deliberate`→`--mode deliberate`.
+Flag aliases (DEFERRED — target flags not yet wired into the handlers; the OLD spellings keep working
+UNCHANGED and are NOT rewritten, so behavior stays byte-identical until the unified flag parser lands):
+`--flat`→`--no-per-tier` (no `--no-per-tier` flag exists; `--flat` is the live flag, `per_tier` is a
+config-only inverse), `--max-units`→`--max-cells` (DISTINCT live knobs today — hotspot-unit count vs
+coverage-matrix cap; aliasing would change results), `--completeness-critic`→`--mode deep` implication
+(kept a standalone flag), `--html`→`--format html` (no `--format` flag; `--html` is a live boolean on
+`result`/`audit fix`), `--follow`→`--watch` (`--follow` is a live boolean on `wait`; `--watch` is the
+status action selector), `--codex-model`/`--grok-model`/`--claude-model`→`--model <seat>=<id>`
+(`--model <seat>=<id>` parsing not wired).
 
 ═══════════════════════════════════════════════════════════════════════════════════════════
 ## Appendix C — the NEVER-config list (safety)
