@@ -19,18 +19,52 @@ import { readUsageSnapshot } from "./usage-guard.mjs";
 import { MAX_AUTONOMOUS_WAIT_MS, evaluateBetweenPassGuards } from "./audit-loop-guards.mjs";
 import { retryOnRateLimit } from "./audit-retry.mjs";
 import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
+import { isProposeOnly, lensIds } from "./audit-lenses.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
 import { nowIso, resolveStateDir, writeFileAtomic } from "./state.mjs";
 import { findingsStorePath, makeFindingsAppender, readFindingsStore, requireDurableStore, resetFindingsStore } from "./audit-findings-store.mjs";
 import { makeMidPassGuard, makeReviewCursor, reviewCursorPath } from "./audit-midpass-guard.mjs";
 import { normalizeFindings } from "./audit-normalize.mjs";
 import { correlateFindings } from "./audit-correlate.mjs";
+import { STRUCTURE_LENSES } from "./structure-gate.mjs";
 
 // NOTE: an in-process multi-hour autonomous pause wait is FRAGILE — the machine/terminal must stay up —
 // but the checkpoint written FIRST makes a mid-wait death --resume-able. The MAX_AUTONOMOUS_WAIT_MS
 // bound + the between-pass guard DECISION now live in audit-loop-guards.mjs (SSOT with audit-endless).
 
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, Math.floor(Number.isFinite(n) ? n : lo)));
+
+// FIX #1 / F-B — the FIRST fixable tier: the LOWEST audit-tier that owns a lens the fixer can actually
+// apply IN THIS RUN'S CONFIGURATION. A lens is runtime-fixable when it is not propose-only, OR it is a
+// STRUCTURE lens (architecture_ssot/logical_sense) AND the operator consented to --structure-auto-apply
+// (structure-wiring's council-gated multi-file transformer can then apply it). DERIVED from the registry,
+// never hardcoded, so a lens→tier remap moves it automatically.
+//   - WITHOUT structureAutoApply: tiers 0 (logical_sense) and 1 (architecture_ssot,
+//     dependencies_supply_chain) are ENTIRELY propose-only, so staging them produces 0 fixes and only
+//     burns passes/quota (~50 min live, 0 fixes) before Correctness (tier 2) is reached → floor = 2. Their
+//     findings are STILL surfaced as proposals (the per-tier surfacing in runFixLoop + logicalProposals),
+//     so nothing is lost.
+//   - WITH structureAutoApply: the structure lenses become runtime-fixable → floor = 0. Tier 0
+//     (logical_sense) is never review-sourced so it dry-advances in ≤ dryStop passes to tier 1
+//     (architecture_ssot), which IS review-sourced and now gets STAGED → the transformer applies it.
+// `.filter(Number.isFinite)` also guards a lens whose tierOfLens is non-finite (nit F-H). Fallback 0
+// (stage everything) if the filter somehow yields no fixable lens.
+const runtimeFixable = (id, structureAutoApply) => !isProposeOnly(id) || (structureAutoApply && STRUCTURE_LENSES.includes(id));
+export function firstFixableTier({ structureAutoApply = false } = {}) {
+  const tiers = lensIds().filter((id) => runtimeFixable(id, structureAutoApply)).map(tierOfLens).filter(Number.isFinite);
+  return tiers.length ? Math.min(...tiers) : 0;
+}
+// The exported constant is the DEFAULT (no structure consent) floor === 2 on the current registry — kept
+// so downstream references + the tests that pin `=== 2` still hold. The RUN's effective floor is derived
+// per-call from options.structureAutoApply inside runFixLoop.
+export const FIRST_AUTOFIXABLE_TIER = firstFixableTier();
+
+// F-A — how many DETERMINISTIC test-reds a single-file fix may accrue before the loop stops retrying it
+// and SURFACES it as a proposal instead. A `testRed` entry already implies the fix stayed IN-FILE
+// (enforceTouched passed before tests ran) yet the suite went red — a strong cross-file-coupling /
+// semantic signal. Threshold 2 tolerates ONE flaky red, then surfaces on the second (immediate/N=1 is
+// defensible; 2 is safe against a flaky suite). Named so it is trivially tunable.
+const RED_ESCALATE_THRESHOLD = 2;
 
 /** SSOT for the --usage-ceiling terminal stop message — shared by the between-pass backstop AND the
  *  mid-pass quiesce so the two paths report the ceiling breach identically. PURE. */
@@ -213,6 +247,13 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const seenFixed = new Set();
   const seenProposed = new Set();
   const seenReview = new Set();
+  // F-A: per-finding count of DETERMINISTIC test-reds across passes (key = proposedKey). When a finding
+  // reaches RED_ESCALATE_THRESHOLD reds it is PROMOTED to a proposal and — via the same count — excluded
+  // from staging so its tier can dry-advance instead of being pinned by a coupled finding that fails
+  // tests forever. F-D: a small (key, reason) guard so a recurring failure is pushed to `failedAll`
+  // (the report list) only ONCE, while the escalation COUNT above keeps climbing every pass.
+  const seenFailed = new Map();
+  const seenFailedReports = new Set();
   const reviewedAll = []; // persisted so a resume can rebuild seenReview (mirrors audit-endless)
   let spent = 0;
   let dryStreak = 0;
@@ -240,12 +281,21 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // copies). The pure default is OFF so the function contract is stable; the audit-fix CLI defaults
   // it ON (B5, --per-tier) at the call site, where real findings carry a lens (see the wiring).
   const perTier = Boolean(options.perTierConvergence);
-  // Start at Tier 1 (Structure), NOT 0 (Logical): tier 0 = logical_sense is propose-only and is
-  // NEVER review-sourced (no category maps to it; categoryToLens falls back to correctness), so its
-  // proposals arrive once via logicalProposals → proposedAll and never enter gate/actionable.
-  // Starting at 0 therefore burned dryStop full review+fix passes of warm-up tax every run once
-  // per-tier became the CLI default (council B5 codex P1). Logical proposals are still surfaced.
-  const FIRST_TIER = 1;
+  // FIX #1 / F-B — start at the FIRST FIXABLE tier, derived per-run from the operator's structure consent.
+  //   - WITHOUT --structure-auto-apply: FIRST_TIER = 2 (Correctness). Tiers 0 (logical_sense) and 1
+  //     (architecture_ssot, dependencies_supply_chain) are ENTIRELY propose-only — they can only surface
+  //     proposals, never auto-fix — so staging them burned ~dryStop passes/tier (~50 min live) for 0 fixes
+  //     before Correctness was reached. Their findings are STILL surfaced (tier-0 via logicalProposals;
+  //     tier-1 via the per-tier surfacing below) — nothing is lost.
+  //   - WITH --structure-auto-apply: FIRST_TIER = 0. The council-gated multi-file transformer can now apply
+  //     the structure lenses, so the floor drops. Tier 0 (logical_sense) is never review-sourced → it
+  //     dry-advances in ≤ dryStop passes (a bounded warmup) to tier 1 (architecture_ssot), which IS
+  //     review-sourced and gets STAGED to the transformer. NOTE: detector-sourced logical_sense proposals
+  //     (options.logicalProposals) still bypass the fixer entirely — a pre-existing gap tracked separately,
+  //     NOT addressed here.
+  // The resume clamp (below), the re-entry floor, and the sub-FIRST_TIER surfacing loop all read FIRST_TIER,
+  // so they inherit the effective floor.
+  const FIRST_TIER = firstFixableTier({ structureAutoApply: Boolean(options.structureAutoApply) });
   let currentTier = FIRST_TIER;
   let tierDryStreak = 0;
   // v2 (council Codex P1): set when a tier advances over an INCOMPLETE pass (passStructuralOk false — a
@@ -267,7 +317,14 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     if (prior && Array.isArray(prior.fixed)) {
       fixedAll.push(...prior.fixed);
       for (const f of prior.fixed) seenFixed.add(fixKey(f));
-      if (Array.isArray(prior.failed)) failedAll.push(...prior.failed);
+      if (Array.isArray(prior.failed)) {
+        failedAll.push(...prior.failed);
+        // F-D: seed the (key, reason) report-dedupe from the checkpoint so a resumed run does not re-append
+        // a failure already recorded in the prior segment's `failed` list.
+        for (const e of prior.failed) {
+          if (e?.finding) seenFailedReports.add(`${proposedKey(e.finding)} ${e?.reason ?? ""}`);
+        }
+      }
       if (Array.isArray(prior.proposed)) for (const p of prior.proposed) {
         const k = proposedKey(p);
         if (!seenProposed.has(k)) { seenProposed.add(k); proposedAll.push(p); }
@@ -342,7 +399,10 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       // failing cell), disclose the review debt instead of a false "converged".
       return coverageIncomplete
         ? "all tiers converged over REVIEWED cells — coverage INCOMPLETE: some cells never completed six-eyes review (a seat kept failing them), so an auto-fixable bug there may remain — re-run to close the gap"
-        : "all tiers converged (structure -> correctness -> quality)";
+        // F-E: staging begins at FIRST_TIER (2 by default; 0 under --structure-auto-apply), so the message
+        // discloses the floor rather than implying every tier was STAGED. The lower tiers are still
+        // surfaced as proposals — see the sub-FIRST_TIER surfacing loop.
+        : `all tiers converged (structure -> correctness -> quality, staged from tier ${FIRST_TIER})`;
     }
     const bounded = endlessStopReason({ passNo, spent, dryStreak: perTier ? 0 : dryStreak }, { maxPasses, totalBudget, dryStop });
     if (bounded) return bounded;
@@ -563,6 +623,10 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
         ...gated.actionable
           .filter((f) => autoFixable(f) && !seenProposed.has(proposedKey(f)))
           .map((f) => (typeof f.tier === "number" ? f.tier : tierOfLens(f.lens)))
+          // FIX #1: never demote below the first auto-fixable tier. Tiers < FIRST_TIER are entirely
+          // propose-only (surfaced, never staged), so a stray sub-FIRST_TIER candidate must not pull
+          // currentTier below the floor the resume clamp + convergence also honor.
+          .filter((t) => t >= FIRST_TIER)
       );
       if (Number.isFinite(lowestActionableTier) && lowestActionableTier < currentTier) {
         currentTier = lowestActionableTier;
@@ -573,10 +637,34 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
 
     // Per-tier convergence restricts a pass to the CURRENT tier's actionable set.
     let actionable = perTier ? gated.actionable.filter((f) => (typeof f.tier === "number" ? f.tier : tierOfLens(f.lens)) === currentTier) : gated.actionable;
+    // FIX #1 (surfacing is NOT tier-gated): the tiers BELOW FIRST_TIER are entirely propose-only, so the
+    // loop never stages them and they never reach fix() to be rejected+surfaced. Surface those findings as
+    // proposals directly, so skipping the un-fixable structural tiers loses NO visibility — a review-sourced
+    // architecture_ssot / dependencies_supply_chain (tier 1) finding is still reported (tier-0 logical
+    // proposals arrive separately via options.logicalProposals). Deduped by proposedKey; these tiers can
+    // never become currentTier (currentTier >= FIRST_TIER, re-entry floored), so this never double-surfaces.
+    if (perTier) {
+      for (const f of gated.actionable) {
+        const t = typeof f.tier === "number" ? f.tier : tierOfLens(f.lens);
+        if (t >= FIRST_TIER) continue;
+        const p = { ...f, rejectedReason: `structure/logical tier ${t} — propose-only, surfaced (no auto-fixable lens below tier ${FIRST_TIER})` };
+        const k = proposedKey(p);
+        if (!seenProposed.has(k)) {
+          seenProposed.add(k);
+          proposedAll.push(p);
+        }
+      }
+    }
     // D (deterministic correlation, opt-in): give ONE writer each SAME-FILE anchor cluster (audit-fix
     // already serializes one writer per file + reverts a multi-file touch; enforceTouched) and ESCALATE
-    // multi-file / cross-cutting / SSOT clusters to PROPOSAL instead of auto-fixing a symptom. No LLM.
+    // cross-cutting / SSOT / propose-only clusters to PROPOSAL instead of auto-fixing a symptom. No LLM.
     // The escalated findings move from `actionable` to proposals; same-file clusters stay actionable.
+    // NOTE (FIX #0 / F-G): correlate NO LONGER escalates on an import edge between two files. That broad
+    // import-edge × lens-family rule starved the fixer to 0 fixes on interconnected repos. The RESIDUAL
+    // risk — a genuinely-coupled cross-file pair whose independent single-file fixes each keep tests green
+    // under thin coverage — is now MITIGATED (not eliminated) by the test-red promote-after-N escalation
+    // below (F-A), and is fully caught only when the suite (or the coverage gate) exercises the coupling.
+    // A documented, bounded trade-off — not equivalence to the removed pre-emptive escalation.
     if (options.correlate) {
       const { escalated } = correlateFindings(actionable, { importers: options.correlateImporters ?? {} });
       if (escalated.length) {
@@ -585,7 +673,8 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
         for (let i = 0; i < actionable.length; i += 1) {
           const f = actionable[i];
           if (!isEsc(f, i)) continue;
-          const p = { ...f, rejectedReason: "correlation: multi-file / cross-cutting cluster — escalated to proposal (not auto-fixed)" };
+          // F-E: the removed multi-file-dependency escalation is GONE — this reason must not claim it.
+          const p = { ...f, rejectedReason: "correlation: cross-cutting / SSOT / propose-only cluster — escalated to proposal (not auto-fixed)" };
           const k = proposedKey(p);
           if (!seenProposed.has(k)) {
             seenProposed.add(k);
@@ -595,6 +684,14 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
         actionable = actionable.filter((f, i) => !isEsc(f, i));
       }
     }
+    // F-A: exclude a TEST-RED-PROMOTED finding from staging so its tier can dry-advance instead of being
+    // pinned by a coupled finding that keeps failing tests. A finding is excluded ONLY once its
+    // deterministic test-red count reaches RED_ESCALATE_THRESHOLD (it was surfaced as a proposal below);
+    // a finding with fewer reds (flaky tolerance) STAYS actionable and is retried next pass. Keyed on the
+    // red COUNT (not seenProposed) so it excludes exactly the test-red-promoted findings — NOT the
+    // propose-only / correlate-escalated / surfaced findings that legitimately reach seenProposed via other
+    // channels and must keep being re-offered (e.g. a structure transform refusal is a per-pass verdict).
+    actionable = actionable.filter((f) => (seenFailed.get(proposedKey(f)) ?? 0) < RED_ESCALATE_THRESHOLD);
 
     let fx;
     try {
@@ -622,7 +719,29 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       return true;
     });
     fixedAll.push(...freshFixed);
-    failedAll.push(...(fx?.failed ?? []));
+    // F-A + F-D: process the fixer's failures. A `testRed` entry (tagged by audit-fix ONLY for a
+    // deterministic test-red, never a timeout) means the single-file fix stayed IN-FILE yet the suite went
+    // red — a cross-file-coupling signal. Count reds per finding; on the RED_ESCALATE_THRESHOLD-th red,
+    // PROMOTE the finding to a proposal (surfaced, not retried to budget exhaustion). The count keeps
+    // climbing every pass even after promotion (idempotent — seenProposed dedups the proposal). F-D: push
+    // each (finding-key, reason) to `failedAll` only the FIRST time this run so a recurring red does not
+    // flood the report list; failures without a finding (e.g. a generic gate-red) are not deduped.
+    for (const entry of fx?.failed ?? []) {
+      const fk = entry?.finding ? proposedKey(entry.finding) : null;
+      const reportKey = fk ? `${fk} ${entry?.reason ?? ""}` : null;
+      if (!reportKey || !seenFailedReports.has(reportKey)) {
+        if (reportKey) seenFailedReports.add(reportKey);
+        failedAll.push(entry);
+      }
+      if (entry?.testRed === true && fk) {
+        const count = (seenFailed.get(fk) ?? 0) + 1;
+        seenFailed.set(fk, count);
+        if (count >= RED_ESCALATE_THRESHOLD && !seenProposed.has(fk)) {
+          seenProposed.add(fk);
+          proposedAll.push({ ...entry.finding, rejectedReason: `test-red after single-file fix on ${count} passes — possible cross-file coupling (surfaced, not auto-retried)` });
+        }
+      }
+    }
     // Surface what the fixer deliberately did NOT touch (propose-only / cross-cutting /
     // protected) as proposals — otherwise the whole "found but not auto-fixed" product is
     // invisible in the report (§6 automation-bias counter).

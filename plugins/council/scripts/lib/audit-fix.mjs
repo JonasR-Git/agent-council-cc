@@ -764,7 +764,11 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             const t = await runTests();
             if (!t.ok) {
               revert(snapshot);
-              failed.push({ finding, file: task.file, reason: t.timedOut ? "tests timed out after fix" : "tests failed after fix", output: String(t.output ?? "").slice(-800) });
+              // F-A: tag ONLY a DETERMINISTIC test-red (not a timeout) with testRed:true. enforceTouched
+              // already passed above, so the fix stayed IN-FILE yet the suite went red — a strong cross-file
+              // coupling / semantic signal the fix loop escalates after N reds. A TIMEOUT is transient/flaky
+              // (no discriminator) → it keeps retrying, never escalates.
+              failed.push({ finding, file: task.file, reason: t.timedOut ? "tests timed out after fix" : "tests failed after fix", output: String(t.output ?? "").slice(-800), ...(t.timedOut ? {} : { testRed: true }) });
               log("  reverted — tests failed");
               continue;
             }

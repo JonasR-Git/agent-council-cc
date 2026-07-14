@@ -26,17 +26,22 @@ test("D: far-apart same-file findings of the same family split into separate wri
   assert.equal(clusters.length, 2, "line spans 390 apart do not share an anchor");
 });
 
-test("D: a MULTI-FILE dependency cluster escalates to proposal (never auto-fixed)", () => {
+test("FIX #0: two INDEPENDENT localized findings on IMPORT-LINKED files are NOT escalated — one writer each", () => {
   const findings = [
     f({ id: "a1", file: "a.mjs", line: 5, lens: "correctness" }),
     f({ id: "b1", file: "b.mjs", line: 5, lens: "correctness" })
   ];
-  // a.mjs imports b.mjs (importers[b.mjs] = [a.mjs]) → an edge; both hold a same-family localized finding.
+  // a.mjs imports b.mjs (importers[b.mjs] = [a.mjs]) → an import edge; both hold a same-family localized
+  // finding. PRE-FIX this escalated BOTH to a "multi-file-dependency" proposal — on an interconnected
+  // codebase (every lib file imports another) that escalated ~everything → 0 fixes. FIX #0: two independent
+  // localized bugs are two SEPARATE same-file fixes (one writer each); cross-file safety is the fix loop's
+  // test gate, not a pre-emptive escalation. An import edge alone must no longer escalate localized work.
   const { clusters, escalated } = correlateFindings(findings, { importers: { "b.mjs": ["a.mjs"] } });
-  assert.ok(escalated.some((c) => c.reason === "multi-file-dependency"), "a cross-file dependency cluster escalates");
-  const escIds = new Set(escalated.flatMap((c) => c.findingIds));
-  assert.ok(escIds.has("a1") && escIds.has("b1"));
-  assert.equal(clusters.length, 0, "neither file is auto-fixed as a symptom");
+  assert.equal(escalated.length, 0, "an import edge alone no longer escalates independent localized findings");
+  assert.equal(clusters.length, 2, "each file keeps its own single writer — both stay actionable/fixable");
+  assert.deepEqual(clusters.map((c) => c.file).sort(), ["a.mjs", "b.mjs"]);
+  const ids = new Set(clusters.flatMap((c) => c.findingIds));
+  assert.ok(ids.has("a1") && ids.has("b1"), "both findings survive as fixable same-file clusters, none dropped");
 });
 
 test("D: unrelated files (no import edge) stay SEPARATE same-file writers, not a multi-file escalation", () => {

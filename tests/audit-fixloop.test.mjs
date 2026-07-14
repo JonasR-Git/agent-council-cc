@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { evaluateResumeGuard, fixKey, gateFindings, runFixLoop } from "../plugins/council/scripts/lib/audit-fixloop.mjs";
+import { FIRST_AUTOFIXABLE_TIER, evaluateResumeGuard, firstFixableTier, fixKey, gateFindings, runFixLoop } from "../plugins/council/scripts/lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "../plugins/council/scripts/lib/audit-fixloop-deps.mjs";
 
 const finding = (o) => ({ lens: "correctness", severity: "P1", ...o });
@@ -219,35 +219,36 @@ test("tier-fix (RE-ENTRY demotion): a LATE localized lower-tier finding DEMOTES 
   assert.match(out.stopReason, /all tiers converged/);
 });
 
-test("tier-fix (RE-ENTRY no thrash vs correlate): a correlate-ESCALATED multi-file cluster settles instead of demoting forever", async () => {
-  // Council tier-review Grok P1: re-entry demotes on autoFixable findings, but correlate (ON by default)
-  // escalates a multi-file same-family cluster to a PROPOSAL — never fixed, so it stays in the ledger.
-  // Without excluding already-escalated findings (seenProposed), re-entry would demote → correlate re-
-  // escalates → the tier re-advances → demote FOREVER. The seenProposed exclusion settles it after one
-  // escalation. Discriminator: with the bug the loop thrashes to maxPasses; fixed, it converges cleanly.
-  let qualityFixed = false;
-  const review = async () => {
-    const findings = [];
-    if (!qualityFixed) findings.push(finding({ id: "q1", file: "q.mjs", title: "dead export", lens: "design_quality", scope: "localized", fixDisposition: "localized" }));
-    if (qualityFixed) {
-      // an import-linked, same-family (correctness) multi-file pair → correlate escalates it to a proposal
-      findings.push(finding({ id: "pa", file: "a.mjs", title: "pair A", lens: "correctness", scope: "localized", fixDisposition: "localized" }));
-      findings.push(finding({ id: "pb", file: "b.mjs", title: "pair B", lens: "correctness", scope: "localized", fixDisposition: "localized" }));
-    }
-    return { findings, coverage: { budgetSpent: 1, passComplete: true, completenessComplete: false } };
-  };
+test("FIX #0 (loop): import-linked LOCALIZED correctness findings are FIXED (one writer each), not escalated", async () => {
+  // The loop-level proof of FIX #0. correlate is ON (CLI default) with a REAL import edge a↔b. PRE-FIX,
+  // correlate's step-2 escalated any two same-family localized findings across an import edge to a
+  // "multi-file-dependency" PROPOSAL → on this repo's interconnected lib/ that meant ~everything escalated
+  // → 311 proposals, 0 fixes. FIX #0 removes that escalation: two independent localized bugs in
+  // import-linked files are two separate SAME-FILE fixes (one writer each). Cross-file safety is the loop's
+  // test gate (a fix that truly needed a coordinated cross-file change would go red → be reverted), not a
+  // pre-emptive escalation. Both correctness findings must now be FIXED, and no multi-file proposal emitted.
+  let fixed = false;
+  const review = async () => ({
+    findings: fixed
+      ? []
+      : [
+          finding({ id: "pa", file: "a.mjs", title: "bug A", lens: "correctness", scope: "localized", fixDisposition: "localized" }),
+          finding({ id: "pb", file: "b.mjs", title: "bug B", lens: "correctness", scope: "localized", fixDisposition: "localized" })
+        ],
+    coverage: { budgetSpent: 1, passComplete: true, completenessComplete: true }
+  });
   const fix = async (actionable) => {
-    const fixed = actionable.map((f) => ({ file: f.file, finding: f, commit: "x" }));
-    for (const f of fixed) if (f.finding.lens === "design_quality") qualityFixed = true;
-    return { fixed, failed: [], changedFiles: fixed.map((f) => f.file), spent: 1 };
+    if (actionable.length) fixed = true;
+    return { fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], changedFiles: actionable.map((f) => f.file), spent: 1 };
   };
   const out = await runFixLoop(
     "/x",
     { budget: 100, maxPasses: 40, dryStreak: 2, perTierConvergence: true, correlate: true, correlateImporters: { "a.mjs": ["b.mjs"], "b.mjs": ["a.mjs"] } },
     { review, fix, checkpoint: noCheckpoint }
   );
-  assert.match(out.stopReason, /all tiers converged/, "converges — no infinite demote↔escalate thrash");
-  assert.ok(out.fixed.every((f) => f.finding?.lens !== "correctness"), "the escalated multi-file correctness cluster was surfaced as a proposal, not auto-fixed (so it CAN trigger the thrash the fix prevents)");
+  assert.deepEqual(out.fixed.map((f) => f.file).sort(), ["a.mjs", "b.mjs"], "both import-linked localized correctness bugs were FIXED, not escalated");
+  assert.ok(!out.proposed.some((p) => /multi-file/.test(p.rejectedReason ?? "")), "no multi-file-dependency escalation is emitted");
+  assert.match(out.stopReason, /all tiers converged/, "the loop still converges cleanly");
 });
 
 test("tier-fix (NO THRASH): a propose-only / cross-cutting tier-1 finding does NOT demote (autoFixable guards re-entry)", async () => {
@@ -363,11 +364,11 @@ test("R9 (council round-2): a --groups fix loop converges on passComplete despit
 });
 
 test("council Codex C2: 'all tiers converged' wins over the max-passes ceiling when they coincide", async () => {
-  // dryStreak 1 → each empty pass advances a tier; starting tier 1, 3 passes reach tier 4 (converged)
-  // exactly at maxPasses 3. The convergence reason must win over the generic "reached max passes".
+  // dryStreak 1 → each empty pass advances a tier; starting at FIRST_TIER=2 (FIX #1), 2 passes reach tier 4
+  // (converged) exactly at maxPasses 2. The convergence reason must win over the generic "reached max passes".
   const review = async () => ({ findings: [], coverage: { budgetSpent: 1 } });
   const fix = async () => ({ fixed: [], failed: [], spent: 0 });
-  const out = await runFixLoop("/x", { budget: 100, dryStreak: 1, maxPasses: 3, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  const out = await runFixLoop("/x", { budget: 100, dryStreak: 1, maxPasses: 2, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
   assert.match(out.stopReason, /all tiers converged/, "reports convergence, not 'reached max passes', when the last tier finishes at the ceiling");
 });
 
@@ -403,16 +404,20 @@ test("B5 council (grok P2): per-tier position is checkpointed and restored on re
   assert.equal(out.fixed.length, 0);
 });
 
-test("B5 (council codex P1): per-tier starts at Tier 1 (Structure), skipping the empty Logical Tier 0", async () => {
-  // Tier 0 (logical_sense) is propose-only and never review-sourced, so starting there burned
-  // dryStop warm-up passes every run. currentTier now starts at 1.
+test("FIX #1: per-tier starts at the DERIVED first auto-fixable tier (Correctness/2), skipping propose-only tiers 0+1", async () => {
+  // FIX #1: tiers 0 (logical_sense) and 1 (architecture_ssot, dependencies_supply_chain) are ALL
+  // propose-only → staging them yields 0 fixes and burns passes/quota. FIRST_TIER is DERIVED as the lowest
+  // tier with an auto-fixable lens (Correctness, tier 2 on the current registry) — never hardcoded, so a
+  // lens→tier remap moves it. The very first checkpoint must record currentTier at that first auto-fixable
+  // tier, not tier 0 or 1.
   let saved = null;
   await runFixLoop(
     "/x",
     { budget: 4, dryStreak: 5, perTierConvergence: true, maxPasses: 2 },
     { review: async () => ({ findings: [], coverage: { budgetSpent: 1 } }), fix: async () => ({ fixed: [], failed: [], spent: 0 }), checkpoint: (s) => { saved = s; } }
   );
-  assert.ok(saved.currentTier >= 1, "no run wastes passes on the structurally-empty Logical tier 0");
+  assert.equal(saved.currentTier, FIRST_AUTOFIXABLE_TIER, "no run wastes passes on the propose-only Logical/Structure tiers");
+  assert.equal(FIRST_AUTOFIXABLE_TIER, 2, "on the current lens registry the first auto-fixable tier is Correctness (2)");
 });
 
 test("without --retry-on-limit, a rate-limited review still stops the loop (opt-in only)", async () => {
@@ -559,20 +564,29 @@ test("resume restores changedFiles so it continues the localized scope (not a st
   assert.deepEqual(scopes[0], ["a.mjs"], "resumed run continues the checkpointed scope");
 });
 
-test("per-tier convergence processes Structure (tier 1) before Correctness (tier 2)", async () => {
-  // Tier 0 (logical_sense) is structurally empty on the review path, so staging starts at Structure.
+test("FIX #1: per-tier stages Correctness (tier 2) on the FIRST pass; propose-only Structure (tier 1) is surfaced, not staged", async () => {
+  // FIX #1: tier 1 (architecture_ssot) is propose-only, so the loop no longer STAGES it (0 fixes, pure
+  // quota waste) — staging begins at the first auto-fixable tier (Correctness, 2). The correctness bug is
+  // fixed on the FIRST pass; the tier-1 structure finding is STILL surfaced as a proposal (nothing lost).
   let p = 0;
   const review = async () =>
     p++ === 0
-      ? { findings: [finding({ lens: "architecture_ssot", file: "s.mjs", title: "t1" }), finding({ lens: "correctness", file: "c.mjs", title: "t2" })], coverage: { budgetSpent: 1 } }
+      ? {
+          findings: [
+            finding({ lens: "architecture_ssot", file: "s.mjs", title: "t1", scope: "cross-cutting", fixDisposition: "propose-only" }),
+            finding({ lens: "correctness", file: "c.mjs", title: "t2" })
+          ],
+          coverage: { budgetSpent: 1 }
+        }
       : { findings: [], coverage: { budgetSpent: 1 } };
   const fixedPasses = [];
   const fix = async (actionable) => {
     fixedPasses.push(actionable.map((f) => f.file));
     return { ok: true, fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "c" })), changedFiles: [] };
   };
-  await runFixLoop("/x", { budget: 40, dryStreak: 1, maxPasses: 20, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
-  assert.deepEqual(fixedPasses[0], ["s.mjs"], "Structure (tier 1) is processed before Correctness (tier 2) — no wasted tier-0 pass");
+  const out = await runFixLoop("/x", { budget: 40, dryStreak: 1, maxPasses: 20, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  assert.deepEqual(fixedPasses[0], ["c.mjs"], "Correctness (tier 2, first auto-fixable) is fixed on the first pass — the propose-only Structure tier is skipped, not staged");
+  assert.ok(out.proposed.some((pr) => pr.file === "s.mjs"), "the propose-only tier-1 structure finding is still surfaced as a proposal (surfacing is not tier-gated)");
 });
 
 test("Tier-0 detector proposals are surfaced in the loop's proposals", async () => {
@@ -650,4 +664,107 @@ test("evaluateResumeGuard: a checkpoint branch that no longer exists FAILS CLOSE
   const g = evaluateResumeGuard({ checkpoint: { branch: "council/audit-fix-1" }, dirty: false, branchExists: false });
   assert.equal(g.ok, false);
   assert.match(g.reason, /no longer exists|cannot resume/i);
+});
+
+// --- F-A: test-red → surfaced (a coupled single-file fix must not PIN its tier) -------------------------
+
+test("F-A: a localized fix that goes test-red every pass is SURFACED after the red threshold (not retried to budget exhaustion); failedAll is deduped", async () => {
+  // A localized correctness finding whose single-file fix clears enforceTouched but the suite goes RED every
+  // pass (a genuinely COUPLED finding). Pre-F-A audit-fix pushed it to fx.failed WITHOUT promoting → the loop
+  // never surfaced it and never removed it from `actionable` → tierAuto stayed > 0 → the tier was PINNED and
+  // the budget burned to maxPasses. F-A tags the deterministic test-red, promotes after RED_ESCALATE_THRESHOLD
+  // reds, and excludes the promoted finding from staging so the tier dry-advances and the loop converges.
+  const coupled = () => finding({ file: "a.mjs", title: "coupled bug", lens: "correctness", scope: "localized", fixDisposition: "localized" });
+  const review = async () => ({ findings: [coupled()], coverage: { budgetSpent: 1, ran: true, passComplete: true, completenessComplete: true } });
+  const fix = async (actionable) => {
+    const target = actionable.find((f) => f.title === "coupled bug");
+    // audit-fix tags a DETERMINISTIC test-red with testRed:true (a timeout stays untagged, keeps retrying).
+    return { fixed: [], failed: target ? [{ finding: target, file: target.file, reason: "tests failed after fix", testRed: true }] : [], changedFiles: [], spent: 1 };
+  };
+  const out = await runFixLoop("/x", { budget: 100, maxPasses: 30, dryStreak: 2, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  const promoted = out.proposed.filter((p) => /test-red after single-file fix/.test(p.rejectedReason ?? ""));
+  assert.equal(promoted.length, 1, "surfaced EXACTLY ONCE as a proposal after the red threshold");
+  assert.ok(!out.fixed.some((f) => f.finding?.title === "coupled bug"), "the coupled finding is never reported fixed");
+  assert.match(out.stopReason, /all tiers converged/, "the tier dry-advanced after the promotion — converged, not pinned");
+  assert.ok(out.passesRun < 30, "converged well before maxPasses (no budget/pass exhaustion)");
+  assert.equal(out.failed.length, 1, "F-D: the recurring (finding, reason) red is recorded ONCE in failedAll, not once per pass");
+});
+
+// --- F-B: capability-aware FIRST_TIER (do not silently no-op --structure-auto-apply) -------------------
+
+test("F-B: firstFixableTier is capability-aware — structureAutoApply lowers the floor to a structure tier; the default stays 2", () => {
+  assert.ok(firstFixableTier({ structureAutoApply: true }) <= 1, "with structure consent the structure tiers (0/1) become fixable → floor ≤ 1");
+  assert.equal(firstFixableTier(), FIRST_AUTOFIXABLE_TIER, "the no-arg derivation equals the exported default constant");
+  assert.equal(FIRST_AUTOFIXABLE_TIER, 2, "the DEFAULT (no structure consent) floor is Correctness (2) on the current registry");
+});
+
+test("F-B: with structureAutoApply a review-sourced architecture_ssot (tier 1) is eventually STAGED to fix(); without it, only surfaced", async () => {
+  // architecture_ssot is tier 1. Model-labeled localized (a review-sourced structural finding the gated
+  // transformer can apply). WITH structureAutoApply the floor drops to 0 → tier 0 (logical, never
+  // review-sourced) dry-advances to tier 1, which is STAGED. WITHOUT it the floor is 2 → tier 1 (< 2) is
+  // only surfaced, never staged.
+  const mk = () => finding({ file: "s.mjs", title: "consolidate ssot", lens: "architecture_ssot", scope: "localized", fixDisposition: "localized" });
+
+  let fixedOn = false;
+  const reviewOn = async () => ({ findings: fixedOn ? [] : [mk()], coverage: { budgetSpent: 1, ran: true, passComplete: true, completenessComplete: true } });
+  const fixOn = async (actionable) => {
+    const t = actionable.filter((f) => f.lens === "architecture_ssot");
+    if (t.length) fixedOn = true;
+    return { fixed: t.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], changedFiles: t.map((f) => f.file), spent: 1 };
+  };
+  const outOn = await runFixLoop("/x", { budget: 100, maxPasses: 40, dryStreak: 2, perTierConvergence: true, structureAutoApply: true }, { review: reviewOn, fix: fixOn, checkpoint: noCheckpoint });
+  assert.ok(outOn.fixed.some((f) => f.finding?.lens === "architecture_ssot"), "structureAutoApply → the tier-1 structural finding is STAGED to fix() and fixed");
+
+  let staged = false;
+  const reviewOff = async () => ({ findings: [mk()], coverage: { budgetSpent: 1, ran: true, passComplete: true, completenessComplete: true } });
+  const fixOff = async (actionable) => {
+    if (actionable.some((f) => f.lens === "architecture_ssot")) staged = true;
+    return { fixed: [], failed: [], changedFiles: [], spent: 0 };
+  };
+  const outOff = await runFixLoop("/x", { budget: 40, maxPasses: 20, dryStreak: 2, perTierConvergence: true }, { review: reviewOff, fix: fixOff, checkpoint: noCheckpoint });
+  assert.equal(staged, false, "without structureAutoApply the tier-1 finding is NEVER staged to fix()");
+  assert.ok(outOff.proposed.some((p) => p.file === "s.mjs" && /tier 1/.test(p.rejectedReason ?? "")), "…it is surfaced as a proposal instead (nothing lost)");
+});
+
+// --- F-C: exercise the tier<FIRST_TIER surfacing loop specifically -------------------------------------
+
+test("F-C: a tier<FIRST_TIER finding in gated.actionable is surfaced by the sub-floor loop with the tier-specific reason (exactly once)", async () => {
+  // structureAutoApply OFF → FIRST_TIER=2. A model-MISLABELED architecture_ssot finding (fixDisposition
+  // localized, scope localized) lands in gated.actionable at tier 1 (< FIRST_TIER). It must be surfaced by
+  // the NEW sub-FIRST_TIER surfacing loop — proven by its SPECIFIC reason (/structure\/logical tier 1/),
+  // which the gated.surfaced path and correlate never emit — exactly once (no double-surface).
+  let p = 0;
+  const review = async () =>
+    p++ === 0
+      ? { findings: [finding({ file: "arch.mjs", title: "mislabeled structural", lens: "architecture_ssot", scope: "localized", fixDisposition: "localized" })], coverage: { budgetSpent: 1, ran: true, passComplete: true, completenessComplete: true } }
+      : { findings: [], coverage: { budgetSpent: 1, ran: true, passComplete: true, completenessComplete: true } };
+  const fix = async () => ({ fixed: [], failed: [], changedFiles: [], spent: 0 });
+  const out = await runFixLoop("/x", { budget: 40, maxPasses: 20, dryStreak: 2, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  const surfaced = out.proposed.filter((pr) => /structure\/logical tier 1/.test(pr.rejectedReason ?? ""));
+  assert.equal(surfaced.length, 1, "surfaced exactly once by the sub-FIRST_TIER loop (:599), not the :553 gated.surfaced path");
+  assert.equal(out.fixed.length, 0, "a tier-1 finding is never staged when the floor is 2");
+});
+
+// --- F-F: re-add the thrash-guard regression dropped by the #0/#1 test rewrite -------------------------
+
+test("F-F (RE-ENTRY no thrash vs correlate): a cross-cutting tier-2 finding escalated by correlate does NOT thrash the demotion path — the loop converges", async () => {
+  // Regression pin dropped by the #0/#1 rewrite. A tier-2 (correctness) finding with scope cross-cutting is
+  // escalated ONCE by correlate step-1 (mustEscalate) to a proposal. The demotion filter's exclusions
+  // (autoFixable() + !seenProposed) must keep it from re-demoting currentTier every pass — otherwise it
+  // would thrash demote↔escalate to maxPasses. The loop settles cleanly and currentTier never dips.
+  const xcut = () => finding({ file: "x.mjs", title: "cross-cut bug", lens: "correctness", scope: "cross-cutting", fixDisposition: "localized" });
+  const review = async () => ({ findings: [xcut()], coverage: { budgetSpent: 1, ran: true, passComplete: true, completenessComplete: true } });
+  const fix = async () => ({ fixed: [], failed: [], changedFiles: [], spent: 0 });
+  const tiers = [];
+  const checkpoint = (s) => { if (typeof s.currentTier === "number") tiers.push(s.currentTier); };
+  const out = await runFixLoop(
+    "/x",
+    { budget: 60, maxPasses: 25, dryStreak: 2, perTierConvergence: true, correlate: true, correlateImporters: {} },
+    { review, fix, checkpoint }
+  );
+  const esc = out.proposed.filter((pr) => pr.file === "x.mjs" && /cross-cutting/.test(pr.rejectedReason ?? ""));
+  assert.equal(esc.length, 1, "the cross-cutting finding is escalated to a proposal exactly once (fingerprint-deduped)");
+  assert.deepEqual(tiers, [...tiers].sort((a, b) => a - b), "currentTier never dipped — no demote↔escalate thrash");
+  assert.match(out.stopReason, /all tiers converged/, "the loop settles cleanly, not a maxPasses thrash");
+  assert.ok(out.passesRun < 25, "converged before the ceiling");
 });

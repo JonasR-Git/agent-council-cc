@@ -2629,6 +2629,12 @@ async function handleAudit(argv) {
       // opts out (single flat convergence).
       const loopOpts = {
         budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat,
+        // F-B: thread the structure consent into the loop so runFixLoop derives a CAPABILITY-AWARE
+        // FIRST_TIER. Without this the loop's static floor (2) filtered every tier-0/1 structure finding
+        // out BEFORE fix() saw it, so `audit fix --loop --structure-auto-apply` silently no-op'd the
+        // enabled transformer (only --flat worked). The inner :2619 runAuditFix `structureAutoApply:true`
+        // on the impl seam stays — that consents the PER-PASS fixer; this consents the tier FLOOR.
+        structureAutoApply,
         retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined,
         logicalProposals: logical.findings, usageCeiling, usageSince, pause5h, reporter, onProgress: reporter.line,
         // B: the mid-pass checkpoint-and-resume quota guard — on the grouped path a quota breach quiesces

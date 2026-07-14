@@ -1,10 +1,21 @@
 // D — cheap DETERMINISTIC correlation over the accumulated findings (NO LLM, no semantic merge). It
-// clusters findings by STABLE anchors — file × overlapping line span × lens-family, plus cross-file
-// dependency edges — so the fix layer can give ONE writer the whole SAME-FILE connected cluster (the
-// commit then names every finding id it resolves) while MULTI-FILE / cross-cutting / SSOT clusters
-// ESCALATE to proposal instead of being auto-patched into symptom fixes. Original finding ids +
-// provenance are preserved throughout. This is intentionally boring and reproducible: same input →
-// same clusters, no model call, so it can run every pass between the gate and the fixer for ~free.
+// clusters findings by STABLE anchors — file × overlapping line span × lens-family — so the fix layer
+// can give ONE writer the whole SAME-FILE connected cluster (the commit then names every finding id it
+// resolves) while genuinely CROSS-CUTTING / SSOT / propose-only findings ESCALATE to proposal instead of
+// being auto-patched into symptom fixes. Original finding ids + provenance are preserved throughout. This
+// is intentionally boring and reproducible: same input → same clusters, no model call, so it can run every
+// pass between the gate and the fixer for ~free.
+//
+// FIX #0: an import edge between two files no longer escalates their INDEPENDENT localized findings. Two
+// separate localized bugs in import-linked files are two separate same-file fixes (one writer each), not a
+// single "multi-file" cluster. Removing the broad import-edge × lens-family escalation was NECESSARY: on an
+// interconnected codebase (every lib file imports another) it escalated ~everything to proposals and the
+// fixer produced 0 fixes. The RESIDUAL risk it addressed — a genuinely-coupled cross-file pair whose
+// independent single-file fixes EACH keep tests green (thin / mocked coverage) — is NOT eliminated; it is
+// MITIGATED downstream: the fix loop reverts any red single-file fix, and F-A promotes a finding to a
+// proposal after N deterministic test-reds. The coupling is fully caught only when the suite (or the
+// coverage gate) actually exercises it — a documented, bounded trade-off, NOT equivalence to the removed
+// pre-emptive escalation. Genuinely cross-cutting work still escalates up-front via step 1 (mustEscalate).
 
 import { tierOfLens } from "./audit-tiers.mjs";
 
@@ -59,16 +70,18 @@ function sameAnchor(a, b, lineWindow) {
  * Rules (deterministic):
  *  - A `mustEscalate` finding (cross-cutting / propose-only / structure-family) never enters a same-file
  *    writer cluster; it is surfaced under `escalated` (reason "cross-cutting").
- *  - CROSS-FILE dependency edge: two DIFFERENT files that (a) each hold a localized finding of the SAME
- *    lens-family AND (b) are connected by an import edge (`importers[a]` names b, or vice-versa) form a
- *    multi-file cluster → escalated (reason "multi-file-dependency"), never auto-fixed. This is the
- *    cheap dependency-hash: a defect that spans a dependency edge is a consolidation, not a symptom fix.
- *  - The remaining localized findings cluster PER FILE (one writer per file, matching audit-fix's
- *    scheduleFixes), connected by the file × span × lens-family anchor; the cluster names every finding
- *    id its single writer resolves. `lineWindow` (default 25) bounds span overlap.
- * PURE over its inputs — `importers` is `{ file: [importerFile,...] }` from the codebase model graph.
+ *  - FIX #0: an import edge between two files does NOT escalate their independent localized findings. Two
+ *    localized bugs in import-linked files stay two SEPARATE same-file writers. The pre-emptive escalation
+ *    starved the fixer on interconnected codebases; its residual cross-file risk is MITIGATED (not
+ *    eliminated) downstream by the fix loop's test gate + F-A's promote-after-N-test-reds — caught in full
+ *    only when the suite/coverage exercises the coupling. A bounded trade-off, not equivalence.
+ *  - The localized findings cluster PER FILE (one writer per file, matching audit-fix's scheduleFixes),
+ *    connected by the file × span × lens-family anchor; the cluster names every finding id its single
+ *    writer resolves. `lineWindow` (default 25) bounds span overlap.
+ * PURE over its inputs. `importers` (`{ file: [importerFile,...] }` from the codebase model graph) is
+ * accepted for call-site compatibility but no longer drives escalation (see FIX #0 above).
  */
-export function correlateFindings(findings, { importers = {}, lineWindow = 25 } = {}) {
+export function correlateFindings(findings, { importers: _importers = {}, lineWindow = 25 } = {}) {
   const list = (findings ?? []).map((f, i) => ({ f, i, id: idOf(f, i), file: fileOf(f), fam: lensFamily(f) }));
 
   const escalated = [];
@@ -84,41 +97,19 @@ export function correlateFindings(findings, { importers = {}, lineWindow = 25 } 
   const crossCut = list.filter((x) => mustEscalate(x.f));
   if (crossCut.length) pushEscalated("cross-cutting", "cross-cutting", crossCut);
 
-  // 2) Cross-file dependency edges over the LOCALIZED remainder. Build file→family presence, then for
-  //    each import edge connecting two DISTINCT files sharing a family, escalate that family's findings
-  //    on both files as a multi-file cluster (deterministic over sorted keys).
+  // 2) FIX #0 — the localized remainder. The former "multi-file dependency edge" escalation is REMOVED:
+  //    an import edge between two files with independent same-family localized findings escalated ~all of
+  //    them to proposals on an interconnected codebase (188 correctness findings escalated while 117 were
+  //    scope:localized/auto-fixable) → the fixer produced 0 fixes. Two independent localized bugs in
+  //    import-linked files are two SEPARATE same-file fixes. The residual cross-file risk is not preserved
+  //    by anything as strong as the removed escalation; it is MITIGATED (not eliminated) downstream — the
+  //    fix loop reverts a red single-file fix and F-A promotes it to a proposal after N test-reds, but the
+  //    coupling is fully caught only when the suite/coverage exercises it (a bounded, documented trade-off).
+  //    Genuinely cross-cutting work still escalates via step 1 (mustEscalate: cross-cutting / propose-only /
+  //    SSOT family).
   const localized = list.filter((x) => !escalatedIds.has(x.id) && x.file);
-  const byFileFam = new Map(); // `${file}::${fam}` -> items
-  for (const x of localized) {
-    const k = `${x.file}::${x.fam}`;
-    if (!byFileFam.has(k)) byFileFam.set(k, []);
-    byFileFam.get(k).push(x);
-  }
-  const imp = importers && typeof importers === "object" ? importers : {};
-  const edge = (a, b) => (imp[a] ?? []).map(toPosix).includes(b) || (imp[b] ?? []).map(toPosix).includes(a);
-  const files = [...new Set(localized.map((x) => x.file))].sort();
-  const multiFileHandled = new Set();
-  for (let ai = 0; ai < files.length; ai += 1) {
-    for (let bi = ai + 1; bi < files.length; bi += 1) {
-      const a = files[ai];
-      const b = files[bi];
-      if (!edge(a, b)) continue;
-      const fams = new Set([...byFileFam.keys()].filter((k) => k.startsWith(`${a}::`) || k.startsWith(`${b}::`)).map((k) => k.split("::")[1]));
-      for (const fam of [...fams].sort()) {
-        const ka = `${a}::${fam}`;
-        const kb = `${b}::${fam}`;
-        if (!byFileFam.has(ka) || !byFileFam.has(kb)) continue; // the family must be present on BOTH sides of the edge
-        const items = [...byFileFam.get(ka), ...byFileFam.get(kb)];
-        const fresh = items.filter((x) => !escalatedIds.has(x.id));
-        if (!fresh.length) continue;
-        pushEscalated("multi-file", "multi-file-dependency", fresh);
-        multiFileHandled.add(ka);
-        multiFileHandled.add(kb);
-      }
-    }
-  }
 
-  // 3) The localized remainder clusters per file via the span×family anchor; each cluster is one writer.
+  // 3) The localized findings cluster per file via the span×family anchor; each cluster is one writer.
   const clusters = [];
   const remaining = localized.filter((x) => !escalatedIds.has(x.id));
   const byFile = new Map();
