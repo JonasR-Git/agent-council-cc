@@ -130,6 +130,138 @@ test("council Codex C2: a recurring PROPOSE-ONLY finding does not pin its tier (
   assert.match(out.stopReason, /all tiers converged/);
 });
 
+// tier-fix council (Grok "D + re-entry"): the tier-advance gate was DECOUPLED from the --deep completeness
+// critic. These four pins lock the fix + its invariants.
+test("tier-fix (LIVE-STALL regression): an EMPTY tier-1 with completenessComplete:false + a localized tier-2 bug ADVANCES and fixes it", async () => {
+  // The confirmed live stall: --deep turns on the completeness critic, which marks a windowed
+  // 40-of-~2000-cell pass "under-examined" (completenessComplete:false) EVERY pass. The OLD tier-advance
+  // gated on coverageComplete (which folds in completenessComplete) → an empty tier 1 (repo has no
+  // structure findings) never advanced → 300+ localized tier-2 correctness bugs were filtered out (wrong
+  // tier) → 0 fixes, whole budget burned (live: currentTier=1, tierDryStreak=0, fixed=0). Now tier-advance
+  // keys on passStructuralOk (the SCHEDULED band completed), NOT the critic → the empty tier advances after
+  // dryStop passes and the tier-2 bug is finally fixed.
+  let fixed = false;
+  const review = async () => ({
+    findings: fixed ? [] : [finding({ file: "c.mjs", title: "off-by-one", lens: "correctness" })],
+    coverage: { budgetSpent: 1, passComplete: true, completenessComplete: false } // critic: under-examined EVERY pass
+  });
+  const fix = async (actionable) => {
+    if (actionable.length > 0) fixed = true;
+    return { fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], changedFiles: ["c.mjs"], spent: 1 };
+  };
+  const out = await runFixLoop("/x", { budget: 60, maxPasses: 30, dryStreak: 2, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  assert.equal(out.fixed.length, 1, "the empty tier-1 advanced despite completenessComplete:false and the tier-2 bug was fixed (was 0 forever)");
+  assert.equal(out.fixed[0].finding.lens, "correctness", "the fixed finding is the tier-2 correctness bug");
+  assert.match(out.stopReason, /all tiers converged/);
+});
+
+test("tier-fix (RE-ENTRY demotion): a LATE localized lower-tier finding DEMOTES currentTier and is fixed before convergence", async () => {
+  // Consolidation-first net on the AUTO-FIXABLE tiers where re-entry actually acts (correctness↔quality):
+  // after staging reaches tier 3 (quality) and fixes it, a LOCALIZED tier-2 correctness bug DISCOVERED
+  // LATE must demote currentTier 3→2 so it is still fixed — else (no re-entry) it is filtered out at tier 3
+  // and lost. NB: structure/SSOT (tier 0/1) lenses are propose-only, so they surface as PROPOSALS and can
+  // never drive a demotion (council tier-review Grok P2 — the old fixture used an unnormalized tier-1 lens
+  // that is impossible in production; corrected to a real auto-fixable demotion).
+  let qualityFixed = false;
+  let correctnessFixed = false;
+  const review = async () => {
+    const findings = [];
+    if (!qualityFixed) findings.push(finding({ file: "q.mjs", title: "dead export", lens: "design_quality", scope: "localized", fixDisposition: "localized" }));
+    // the lower-tier bug is only DISCOVERED after quality was reached + fixed (a genuinely late finding)
+    if (qualityFixed && !correctnessFixed) findings.push(finding({ file: "c.mjs", title: "off-by-one", lens: "correctness", scope: "localized", fixDisposition: "localized" }));
+    return { findings, coverage: { budgetSpent: 1, passComplete: true, completenessComplete: false } };
+  };
+  const fixOrder = [];
+  const fix = async (actionable) => {
+    const fixed = actionable.map((f) => ({ file: f.file, finding: f, commit: "x" }));
+    for (const f of fixed) {
+      fixOrder.push(f.finding.lens);
+      if (f.finding.lens === "design_quality") qualityFixed = true;
+      if (f.finding.lens === "correctness") correctnessFixed = true;
+    }
+    return { fixed, failed: [], changedFiles: fixed.map((f) => f.file), spent: 1 };
+  };
+  const out = await runFixLoop("/x", { budget: 100, maxPasses: 40, dryStreak: 2, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  assert.deepEqual(fixOrder, ["design_quality", "correctness"], "quality fixed at tier 3, then the LATE correctness finding demoted the stage 3→2 and was fixed before convergence");
+  assert.equal(out.fixed.length, 2, "without re-entry the late tier-2 finding would be filtered out at tier 3 and lost");
+  assert.match(out.stopReason, /all tiers converged/);
+});
+
+test("tier-fix (RE-ENTRY no thrash vs correlate): a correlate-ESCALATED multi-file cluster settles instead of demoting forever", async () => {
+  // Council tier-review Grok P1: re-entry demotes on autoFixable findings, but correlate (ON by default)
+  // escalates a multi-file same-family cluster to a PROPOSAL — never fixed, so it stays in the ledger.
+  // Without excluding already-escalated findings (seenProposed), re-entry would demote → correlate re-
+  // escalates → the tier re-advances → demote FOREVER. The seenProposed exclusion settles it after one
+  // escalation. Discriminator: with the bug the loop thrashes to maxPasses; fixed, it converges cleanly.
+  let qualityFixed = false;
+  const review = async () => {
+    const findings = [];
+    if (!qualityFixed) findings.push(finding({ id: "q1", file: "q.mjs", title: "dead export", lens: "design_quality", scope: "localized", fixDisposition: "localized" }));
+    if (qualityFixed) {
+      // an import-linked, same-family (correctness) multi-file pair → correlate escalates it to a proposal
+      findings.push(finding({ id: "pa", file: "a.mjs", title: "pair A", lens: "correctness", scope: "localized", fixDisposition: "localized" }));
+      findings.push(finding({ id: "pb", file: "b.mjs", title: "pair B", lens: "correctness", scope: "localized", fixDisposition: "localized" }));
+    }
+    return { findings, coverage: { budgetSpent: 1, passComplete: true, completenessComplete: false } };
+  };
+  const fix = async (actionable) => {
+    const fixed = actionable.map((f) => ({ file: f.file, finding: f, commit: "x" }));
+    for (const f of fixed) if (f.finding.lens === "design_quality") qualityFixed = true;
+    return { fixed, failed: [], changedFiles: fixed.map((f) => f.file), spent: 1 };
+  };
+  const out = await runFixLoop(
+    "/x",
+    { budget: 100, maxPasses: 40, dryStreak: 2, perTierConvergence: true, correlate: true, correlateImporters: { "a.mjs": ["b.mjs"], "b.mjs": ["a.mjs"] } },
+    { review, fix, checkpoint: noCheckpoint }
+  );
+  assert.match(out.stopReason, /all tiers converged/, "converges — no infinite demote↔escalate thrash");
+  assert.ok(out.fixed.every((f) => f.finding?.lens !== "correctness"), "the escalated multi-file correctness cluster was surfaced as a proposal, not auto-fixed (so it CAN trigger the thrash the fix prevents)");
+});
+
+test("tier-fix (NO THRASH): a propose-only / cross-cutting tier-1 finding does NOT demote (autoFixable guards re-entry)", async () => {
+  // The re-entry filter reuses autoFixable(), so a recurring cross-cutting/propose-only tier-1 finding
+  // (architecture/SSOT) can NEVER pull currentTier back down — otherwise it would thrash the stage every
+  // pass and the tier-2 bug behind it would never be reached. The loop still converges; currentTier is
+  // monotonic non-decreasing (a demotion would show a 2→1 dip in the checkpointed tiers).
+  let pass = 0;
+  let correctnessFixed = false;
+  const review = async () => {
+    pass += 1;
+    const findings = [];
+    if (!correctnessFixed) findings.push(finding({ file: "c.mjs", title: "off-by-one", lens: "correctness" }));
+    if (pass >= 3) findings.push(finding({ file: "a.mjs", title: "god module", lens: "architecture_ssot", scope: "cross-cutting", fixDisposition: "propose-only" }));
+    return { findings, coverage: { budgetSpent: 1, passComplete: true, completenessComplete: false } };
+  };
+  const fix = async (actionable) => {
+    const auto = actionable.filter((f) => f.scope !== "cross-cutting" && f.fixDisposition !== "propose-only");
+    if (auto.some((f) => f.lens === "correctness")) correctnessFixed = true;
+    return { fixed: auto.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], changedFiles: auto.map((f) => f.file), spent: 1 };
+  };
+  const tiers = [];
+  const checkpoint = (s) => { if (typeof s.currentTier === "number") tiers.push(s.currentTier); };
+  const out = await runFixLoop("/x", { budget: 100, maxPasses: 40, dryStreak: 2, perTierConvergence: true }, { review, fix, checkpoint });
+  assert.ok(out.fixed.every((f) => f.finding.lens === "correctness"), "only the localized tier-2 bug was fixed; the propose-only tier-1 was never auto-applied");
+  assert.deepEqual(tiers, [...tiers].sort((a, b) => a - b), "currentTier never dipped — the propose-only tier-1 finding did NOT demote (no thrash)");
+  assert.ok(tiers.includes(2), "the stage did reach tier 2 (so a demotion, had it happened, would be observable)");
+  assert.match(out.stopReason, /all tiers converged/);
+});
+
+test("tier-fix (GLOBAL dry unchanged): completenessComplete still gates the flat global dryStreak (only tier-advance was decoupled)", async () => {
+  // Invariant #3: the split kept coverageComplete = passStructuralOk && completenessComplete for the GLOBAL
+  // dry streak. In FLAT mode a completenessComplete:false pass must NOT count toward dry; once the critic is
+  // satisfied (true) the run converges. If the split had leaked into global dry, this would false-converge
+  // at pass 2 instead of holding until the critic clears.
+  let pass = 0;
+  const review = async () => {
+    pass += 1;
+    return { findings: [], coverage: { budgetSpent: 1, passComplete: true, completenessComplete: pass >= 3 } };
+  };
+  const fix = async () => ({ fixed: [], failed: [], spent: 0 });
+  const out = await runFixLoop("/x", { budget: 40, dryStreak: 2, maxPasses: 20 }, { review, fix, checkpoint: noCheckpoint });
+  assert.match(out.stopReason, /diminishing returns/, "global dry converges once the completeness critic is satisfied");
+  assert.ok(pass >= 4, "completenessComplete:false blocked the global dry streak until the critic cleared (would be 2 if leaked)");
+});
+
 // Claude-P1 REGRESSION PIN: a propose-only finding read back from the DURABLE STORE (a raw record with
 // lens/category/file/line but NO scope/fixDisposition — exactly what toRecord persists) must be
 // RE-NORMALIZED before gating, so it reads back as cross-cutting / propose-only and does NOT pin its

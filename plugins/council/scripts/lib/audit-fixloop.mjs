@@ -248,6 +248,15 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const FIRST_TIER = 1;
   let currentTier = FIRST_TIER;
   let tierDryStreak = 0;
+  // AUTO-FIXABLE = a localized finding the fixer can actually apply. A propose-only / cross-cutting
+  // finding (architecture/SSOT/logical) is offered to fix() only to be surfaced as a proposal — it
+  // NEVER auto-applies, so counting it as live work would (a) falsely read as a stall and (b) pin a
+  // per-tier stage forever: it recurs every pass, keeps `actionable` non-empty, and the tier never
+  // advances while a Tier-2 correctness bug behind it is never reached (council Codex C2 P1). Defined
+  // here (hoisted above the loop) so the GLOBAL dry/stall counters, the tier-advance gate, AND the
+  // lower-tier RE-ENTRY check all reuse the SAME predicate — a propose-only / cross-cutting finding must
+  // never cause demotion thrash (tier-fix council: re-entry guarded by exactly this).
+  const autoFixable = (f) => f?.scope !== "cross-cutting" && f?.fixDisposition !== "propose-only";
 
   if (options.resume) {
     const prior = deps.loadCheckpoint ? deps.loadCheckpoint() : loadFixLoopCheckpoint(cwd);
@@ -524,6 +533,32 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       }
     }
 
+    // Lower-tier RE-ENTRY (demotion) — the consolidation-first safety net once tier-advance is decoupled
+    // from the completeness critic (tier-fix council: Grok's "D + re-entry"). If an AUTO-FIXABLE finding of
+    // a lower tier surfaces LATE (e.g. a localized correctness bug found only after we advanced to the
+    // quality tier), DEMOTE currentTier back to fix it first, so it is consolidated before the higher tier
+    // keeps running on copies. This is real for the AUTO-FIXABLE tiers (correctness↔quality); structure/
+    // SSOT lenses (tier 0/1) are propose-only, so they surface as PROPOSALS, never auto-fix, and correctly
+    // do NOT demote. TWO exclusions prevent thrash: (a) autoFixable() drops propose-only/cross-cutting;
+    // (b) a finding ALREADY escalated to a proposal (in seenProposed — correlate escalates multi-file/
+    // cross-cutting clusters, and correlate is ON by default) must NOT re-demote — else that cluster would
+    // demote → correlate re-escalates it → the tier re-advances → demote forever (council tier-review Grok
+    // P1). Scans the accumulated actionable set (this pass ∪ the ledger union in gateInput → gated.actionable).
+    // Runs BEFORE the per-tier filter so the demoted tier's findings are actionable THIS pass. §4: currentTier
+    // is the SAME variable the checkpoint persists below (~640/712) — a demotion is what gets written.
+    if (perTier) {
+      const lowestActionableTier = Math.min(
+        ...gated.actionable
+          .filter((f) => autoFixable(f) && !seenProposed.has(proposedKey(f)))
+          .map((f) => (typeof f.tier === "number" ? f.tier : tierOfLens(f.lens)))
+      );
+      if (Number.isFinite(lowestActionableTier) && lowestActionableTier < currentTier) {
+        currentTier = lowestActionableTier;
+        tierDryStreak = 0;
+        stalledStreak = 0; // re-entering a lower tier IS work — don't carry a stale streak into it
+      }
+    }
+
     // Per-tier convergence restricts a pass to the CURRENT tier's actionable set.
     let actionable = perTier ? gated.actionable.filter((f) => (typeof f.tier === "number" ? f.tier : tierOfLens(f.lens)) === currentTier) : gated.actionable;
     // D (deterministic correlation, opt-in): give ONE writer each SAME-FILE anchor cluster (audit-fix
@@ -607,25 +642,29 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // (completenessComplete === false: a structural gap OR a critic-found gap) does NOT count toward the
     // dry streak — the run keeps hunting. undefined (critic off or infra-degraded) is non-blocking, so
     // the default path is byte-identical to before.
-    const coverageComplete =
-      (rev?.coverage?.passComplete ?? rev?.coverage?.complete) !== false && rev?.coverage?.completenessComplete !== false;
-    // AUTO-FIXABLE = a localized finding the fixer can actually apply. A propose-only / cross-cutting
-    // finding (architecture/SSOT/logical) is offered to fix() only to be surfaced as a proposal — it
-    // NEVER auto-applies, so counting it as live work would (a) falsely read as a stall and (b) pin a
-    // per-tier stage forever: it recurs every pass, keeps `actionable` non-empty, and the tier never
-    // advances while a Tier-2 correctness bug behind it is never reached (council Codex C2 P1).
-    const autoFixable = (f) => f?.scope !== "cross-cutting" && f?.fixDisposition !== "propose-only";
+    // Split the coverage signal (tier-fix council). passStructuralOk = the SCHEDULED review band actually
+    // completed — a starved/failed grouped batch (passComplete/complete === false) still blocks, so failed
+    // work never counts as coverage. The TIER-advance gate uses ONLY this. coverageComplete ADDITIONALLY
+    // requires the --deep completeness critic's verdict and drives ONLY the GLOBAL dryStreak (+ flat-mode
+    // parity) — decoupled from tier-advance so an EMPTY tier is never pinned forever by a windowed
+    // 40-of-~2000-cell "under-examined" verdict that can never clear on a small responsive pass.
+    const passStructuralOk = (rev?.coverage?.passComplete ?? rev?.coverage?.complete) !== false;
+    const coverageComplete = passStructuralOk && rev?.coverage?.completenessComplete !== false;
+    // autoFixable() is hoisted above the loop (reused by the tier-advance gate + the lower-tier re-entry).
     const freshActionable = gate(freshFindings, { changedFiles, pass: passNo }).actionable.filter(autoFixable).length;
     dryStreak = freshFindings.length === 0 && coverageComplete ? dryStreak + 1 : 0;
     stalledStreak = freshActionable > 0 && freshFixed.length === 0 ? stalledStreak + 1 : 0;
     // Advance to the next tier once the current one has nothing new AUTO-FIXABLE for K passes AND the
-    // review's six-eyes coverage is complete (an incomplete grouped matrix still has cells to review —
-    // advancing then would declare "all tiers converged" over unreviewed work; council Codex C2 P1).
+    // review's SCHEDULED band completed (passStructuralOk — an incomplete/starved grouped batch still has
+    // cells to review). Gate on passStructuralOk, NEVER completenessComplete (tier-fix council): the
+    // completeness critic marks a windowed 40/2000-cell pass "under-examined" every time, which would pin
+    // an EMPTY tier forever (the live stall: currentTier=1, tierDryStreak=0, fixed=0). Consolidation-first
+    // is preserved by the lower-tier RE-ENTRY above, not by this gate.
     if (perTier) {
       const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier && autoFixable(f)).length;
       const tierAuto = actionable.filter(autoFixable).length;
       if (tierAuto > 0 || tierFresh > 0) tierDryStreak = 0;
-      else if (coverageComplete && (tierDryStreak += 1) >= dryStop) {
+      else if (passStructuralOk && (tierDryStreak += 1) >= dryStop) {
         currentTier += 1;
         tierDryStreak = 0;
         stalledStreak = 0; // a tier advance IS progress — never carry a stall from a done tier into the next (council B5 grok P1-b)
