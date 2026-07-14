@@ -112,7 +112,8 @@ function printUsage() {
       "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
       "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--structure-auto-apply] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
       "    audit fix --loop [--deep] [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]   (autonomous fix-until-dry on an isolated branch)",
-      "      --deep : ONE flag for max analysis depth — grouped six-eyes over the full lens partition (incl. SSOT/architecture), completeness critic, char-test gate, budget auto-sized to a full sweep. Auto-apply stays explicit (--structure-auto-apply/--sensitive-auto-apply).",
+      "      CONFIG-FIRST: a `fix:` block in .council.yml supplies the run-behavior DEFAULTS (loop/deep/epoch_sweep/per_tier/supervise/autonomy/the auto-apply consents/usage_ceiling/pause_at_5h/max_passes/budget), so a bare `audit fix` runs your configured autonomous profile. Flags are OVERRIDE-ONLY: an explicit flag > fix.<key> > built-in default. Turn a config-true OFF for one run with --no-<flag> (e.g. --no-deep, --no-structure-auto-apply). Run /council:setup --init to see a commented example.",
+      "      --deep : ONE flag for max analysis depth — grouped six-eyes over the full lens partition (incl. SSOT/architecture), completeness critic, char-test gate, budget auto-sized to a full sweep. Auto-apply stays explicit (--structure-auto-apply/--sensitive-auto-apply or the fix.* consents).",
       "      --usage-ceiling : WEEKLY hard stop on a confirmed per-model quota breach (default 40/50/40). --pause-at-5h : SOFT pause on the 5h window, ON BY DEFAULT at 85% (a plain run pauses safely with a manual-resume contract; `off` disables, `<pct>` retunes, `auto` waits in-process to the reset then resumes itself).",
       "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume] [--groups fine|tier|lens] [--max-cells <n>] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]   (bounded review/propose loop)",
       "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
@@ -409,6 +410,26 @@ function scaffoldPolicyFile(cwd, options) {
     "agent_timeout_minutes: 30",
     "verify_findings: false",
     "budget_guard: 0",
+    "",
+    "# Run-behavior DEFAULTS for `audit fix` (flag-reduction). With this block a BARE `audit fix`",
+    "# runs your configured profile; every CLI flag is override-only (explicit flag > fix.<key> >",
+    "# built-in default). Turn a config-true off for one run with --no-<flag> (e.g. --no-deep). The",
+    "# structure_auto_apply / sensitive_auto_apply CONSENTS are a deliberate trust entry — set them",
+    "# true ONLY on a repo you trust (the fixer runs LLM CLIs inside it). Uncomment to enable:",
+    "# fix:",
+    "#   loop: true",
+    "#   deep: true",
+    "#   epoch_sweep: true",
+    "#   per_tier: true                 # friendly inverse of `flat` (per-tier convergence is the default)",
+    "#   supervise: true",
+    "#   autonomy: aggressive",
+    "#   structure_auto_apply: true     # TRUSTED repo — may apply multi-file structural transforms",
+    "#   sensitive_auto_apply: true     # TRUSTED repo — may apply §6-gated security/sensitive fixes",
+    "#   retry_on_limit: true",
+    "#   usage_ceiling: 90/90/90",
+    "#   pause_at_5h: auto:90",
+    "#   max_passes: 100",
+    "#   budget: 2000",
     ""
   ].join("\n");
 
@@ -2172,6 +2193,116 @@ export function finalizeLoopReporter(reporter, out, { ok = null, stopReason = nu
   reporter.done({ ok, stopReason: stopReason ?? out?.stopReason ?? null });
 }
 
+// --- Flag reduction: a `fix:` block in .council.yml supplies DEFAULTS for `audit fix` -----------
+// Precedence for EVERY option: explicit CLI flag > policy.fix.<key> > built-in default. parseArgs
+// records an absent boolean as `undefined` (present ⇒ true, `--no-<flag>` ⇒ explicit false), so the
+// tri-state is captured directly: config fills ONLY the truly-absent (undefined) options.
+// Recognized boolean keys (snake_case config → the kebab option key parseArgs stores):
+const FIX_CONFIG_BOOLEANS = {
+  loop: "loop",
+  deep: "deep",
+  epoch_sweep: "epoch-sweep",
+  supervise: "supervise",
+  structure_auto_apply: "structure-auto-apply",
+  sensitive_auto_apply: "sensitive-auto-apply",
+  retry_on_limit: "retry-on-limit",
+  chartest: "chartest",
+  completeness_critic: "completeness-critic",
+  skip_openrouter: "skip-openrouter"
+};
+// The boolean flags that accept a `--no-<flag>` negation (so a config-true can be turned OFF for one
+// run). `flat` is here too — its config side is the friendlier `per_tier` (inverse), handled below.
+const FIX_NEGATABLE_FLAGS = [
+  "deep", "loop", "epoch-sweep", "supervise", "flat",
+  "structure-auto-apply", "sensitive-auto-apply", "retry-on-limit",
+  "chartest", "skip-openrouter", "completeness-critic"
+];
+function fixRequirePositive(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 1) throw new Error("must be a positive number");
+}
+// Value keys (config → kebab option) with the SAME validator the CLI flag uses. `validate` THROWS on
+// a bad value; the merge wraps that into a fail-loud "in .council.yml fix.<key>" error. autonomy /
+// min_severity match the CLI's lenient handling (unknown → safe fallback), so no validator.
+const FIX_CONFIG_VALUES = {
+  autonomy: { opt: "autonomy", validate: null },
+  min_severity: { opt: "min-severity", validate: null },
+  groups: { opt: "groups", validate: (v) => { if (!["fine", "tier", "lens"].includes(String(v))) throw new Error(`must be one of fine|tier|lens (got: ${v})`); } },
+  max_fixes: { opt: "max-fixes", validate: fixRequirePositive },
+  max_passes: { opt: "max-passes", validate: (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 1 || n > 100) throw new Error("must be between 1 and 100"); } },
+  dry_streak: { opt: "dry-streak", validate: fixRequirePositive },
+  max_cells: { opt: "max-cells", validate: fixRequirePositive },
+  budget: { opt: "budget", validate: (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 2) throw new Error("must be a number >= 2"); } },
+  usage_ceiling: { opt: "usage-ceiling", validate: (v) => { parseUsageCeiling(v); } },
+  pause_at_5h: { opt: "pause-at-5h", validate: (v) => { parsePause5hOption(v); } }
+};
+
+/**
+ * Fold each `--no-<flag>` (parseArgs stored it as options["no-<flag>"] === true) into an EXPLICIT
+ * `false` on the base flag, in place, and drop the `no-*` key. This is the tri-state maker: after
+ * this, a base boolean is `true` (--flag), `false` (--no-flag), or `undefined` (absent) — so
+ * applyFixPolicyDefaults can fill ONLY the truly-absent options without a --no-flag being clobbered.
+ */
+export function applyNoFlagNegations(options) {
+  for (const f of FIX_NEGATABLE_FLAGS) {
+    if (options[`no-${f}`] === true) {
+      options[f] = false;
+      delete options[`no-${f}`];
+    }
+  }
+  return options;
+}
+
+/**
+ * Merge a `.council.yml` `fix:` map into the parsed CLI `options`, in place, as DEFAULTS ONLY: a
+ * value is written ONLY when the user did not pass the corresponding flag (booleans undefined; value
+ * options undefined). Explicit flags — and `--no-<flag>` explicit-false — always win. Invalid config
+ * values fail LOUD ("Invalid .council.yml fix.<key>: …") instead of being silently ignored. Returns
+ * the Set of option keys that were sourced FROM config (so the consent warnings can note the source).
+ */
+export function applyFixPolicyDefaults(options, policyFix, { emit = () => {} } = {}) {
+  const fromConfig = new Set();
+  if (!policyFix || typeof policyFix !== "object" || Array.isArray(policyFix)) return fromConfig;
+
+  for (const [cfgKey, optKey] of Object.entries(FIX_CONFIG_BOOLEANS)) {
+    if (!(cfgKey in policyFix)) continue;
+    if (options[optKey] !== undefined) continue; // explicit --flag / --no-flag wins
+    options[optKey] = policyFix[cfgKey] === true;
+    if (options[optKey]) fromConfig.add(optKey);
+  }
+
+  // flat / per_tier: per_tier is the friendly INVERSE of flat (per-tier is already the default). Only
+  // when the user passed neither --flat nor --no-flat (options.flat === undefined). `flat` wins over
+  // `per_tier` with a note; else per_tier:true ⇒ flat=false, per_tier:false ⇒ flat=true.
+  if (options.flat === undefined) {
+    if ("flat" in policyFix) {
+      options.flat = policyFix.flat === true;
+      if ("per_tier" in policyFix) emit("note: .council.yml fix: has BOTH `flat` and `per_tier` — `flat` wins for this run.");
+      if (options.flat) fromConfig.add("flat");
+    } else if ("per_tier" in policyFix) {
+      options.flat = !(policyFix.per_tier === true);
+      if (options.flat) fromConfig.add("flat");
+    }
+  }
+
+  for (const [cfgKey, spec] of Object.entries(FIX_CONFIG_VALUES)) {
+    if (!(cfgKey in policyFix)) continue;
+    if (options[spec.opt] !== undefined) continue; // explicit flag wins
+    const raw = policyFix[cfgKey];
+    if (raw == null || raw === "") continue;
+    if (spec.validate) {
+      try {
+        spec.validate(raw);
+      } catch (e) {
+        throw new Error(`Invalid .council.yml fix.${cfgKey}: ${e.message}`);
+      }
+    }
+    options[spec.opt] = String(raw);
+    fromConfig.add(spec.opt);
+  }
+  return fromConfig;
+}
+
 async function handleAudit(argv) {
   // Capture the run-start clock BEFORE any work so --usage-ceiling's token scan (tokens spent SINCE
   // the run began) and the loop's usage snapshots share one honest baseline. Date.now() is allowed
@@ -2187,8 +2318,25 @@ async function handleAudit(argv) {
   );
   const { options, positionals } = parseCommandInput(preArgv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats", "usage-ceiling", "pause-at-5h"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep", "epoch-sweep"]
+    // The `no-*` twins negate the config-backed booleans (flag-reduction): `--no-deep` beats a
+    // `fix: { deep: true }` for one run. They are registered so parseArgs accepts them; the loop
+    // below folds each into an explicit `false` on the base key.
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep", "epoch-sweep",
+      "no-deep", "no-loop", "no-epoch-sweep", "no-supervise", "no-flat", "no-structure-auto-apply", "no-sensitive-auto-apply", "no-retry-on-limit", "no-chartest", "no-skip-openrouter", "no-completeness-critic"]
   });
+  // Flag-reduction (`audit fix` only): fold `--no-<flag>` into an EXPLICIT false so a `fix:` config
+  // default can't switch it back on for this run (explicit-false wins), then apply the `.council.yml`
+  // `fix:` block as DEFAULTS for the options the user did NOT pass. Runs BEFORE the --deep expansion
+  // so a config `deep: true` cascades to groups/chartest/budget exactly like the flag would. A repo
+  // with no `fix:` block sets nothing here ⇒ option resolution stays byte-identical to before.
+  applyNoFlagNegations(options);
+  let fixFromConfig = new Set();
+  if (positionals[0] === "fix") {
+    const _fixPolicy = loadPolicy(process.cwd());
+    fixFromConfig = applyFixPolicyDefaults(options, _fixPolicy.fix, {
+      emit: (m) => { if (!options.json) console.error(m); }
+    });
+  }
   // --deep: ONE flag for maximum ANALYSIS depth, so a thorough run needs no long flag list. It turns on
   // the grouped six-eyes review over a FULL lens partition (every lens — incl. SSOT/architecture — gets
   // its own deep pass, so none is starved), the completeness critic, and the char-test gate; and it
@@ -2380,6 +2528,9 @@ async function handleAudit(argv) {
       console.error(
         "⚠ SECURITY: the transform planner/author and the §6 reviewers run LLM CLIs inside this repository. --structure-auto-apply does NOT imply --sensitive-auto-apply — a structural finding that is ALSO §6-sensitive still needs BOTH consents. Enable --structure-auto-apply ONLY on repositories you trust."
       );
+      if (fixFromConfig.has("structure-auto-apply")) {
+        console.error("  (consent enabled from .council.yml fix.structure_auto_apply — a deliberate, written trust entry for THIS repo)");
+      }
     }
     const structureTransformRunner = structureAutoApply ? makeStructureTransformRunner(workspaceRoot(cwd), cwd, backends, merged) : null;
 
@@ -2581,6 +2732,9 @@ async function handleAudit(argv) {
           });
           console.error("§6 council-gated auto-apply ENABLED — sensitive fixes require UNANIMOUS Claude+Codex+Grok confirmation of the patch.");
           console.error("⚠ SECURITY: the §6 reviewers run LLM CLIs inside this repository. Project hooks/settings still fire. Enable --sensitive-auto-apply ONLY on repositories you trust.");
+          if (fixFromConfig.has("sensitive-auto-apply")) {
+            console.error("  (consent enabled from .council.yml fix.sensitive_auto_apply — a deliberate, written trust entry for THIS repo)");
+          }
         } else {
           // Name the ACTUAL unreachable seats, derived from every per-seat flag ready reports (built-ins
           // AND any configured or-* seat) — not a hardcoded three (council Codex P2). Otherwise an

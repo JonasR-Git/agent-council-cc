@@ -124,6 +124,35 @@ export function parseSimpleYaml(text) {
   return obj;
 }
 
+/**
+ * Parse an optional nested `fix:` block from raw YAML text into a plain object. The flat
+ * parseSimpleYaml can't nest, so the `audit fix` run-behavior map (the flag-reduction feature) is
+ * extracted here: a top-level `fix:` header line (empty value) followed by INDENTED `key: value`
+ * children. Values are coerced like any scalar (true/false/number/string). Returns null when there
+ * is no `fix:` block with children ⇒ `policy.fix` stays undefined ⇒ a bare `audit fix` behaves
+ * BYTE-IDENTICAL to having no config. Unknown children are kept (forward-compat); the consumer
+ * decides which keys it recognizes.
+ */
+export function parseFixBlock(text) {
+  const lines = String(text).split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    // A top-level `fix:` header: no leading whitespace, empty value (only an optional comment).
+    if (!/^fix:\s*(#.*)?$/.test(lines[i])) continue;
+    const out = {};
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const l = lines[j];
+      if (!l.trim() || l.trim().startsWith("#")) continue; // blank / comment line inside the block
+      if (!/^\s/.test(l)) break; // a non-indented, non-blank line ends the block
+      const m = l.match(/^\s+([A-Za-z0-9_]+):\s*(.*)$/);
+      if (!m) break;
+      const val = stripInlineComment(m[2].trimEnd()).trim();
+      out[m[1]] = coerceScalar(stripQuotes(val));
+    }
+    return Object.keys(out).length ? out : null;
+  }
+  return null;
+}
+
 function stripInlineComment(s) {
   const trimmed = String(s ?? "").trimStart();
   if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
@@ -173,6 +202,12 @@ export function loadPolicy(cwd) {
       parsed = JSON.parse(text);
     } else {
       parsed = parseSimpleYaml(text);
+      // The flat parser can't nest, so recover the optional `fix:` run-behavior map from the raw
+      // text. A childless/absent `fix:` leaves policy.fix UNDEFINED (drop the stray "" the flat
+      // parser writes for a bare header) so a repo with no `fix:` block resolves options unchanged.
+      const fixBlock = parseFixBlock(text);
+      if (fixBlock) parsed.fix = fixBlock;
+      else delete parsed.fix;
     }
     return {
       ...DEFAULT_POLICY,
