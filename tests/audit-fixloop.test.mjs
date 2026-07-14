@@ -132,27 +132,59 @@ test("council Codex C2: a recurring PROPOSE-ONLY finding does not pin its tier (
 
 // tier-fix council (Grok "D + re-entry"): the tier-advance gate was DECOUPLED from the --deep completeness
 // critic. These four pins lock the fix + its invariants.
-test("tier-fix (LIVE-STALL regression): an EMPTY tier-1 with completenessComplete:false + a localized tier-2 bug ADVANCES and fixes it", async () => {
-  // The confirmed live stall: --deep turns on the completeness critic, which marks a windowed
-  // 40-of-~2000-cell pass "under-examined" (completenessComplete:false) EVERY pass. The OLD tier-advance
-  // gated on coverageComplete (which folds in completenessComplete) → an empty tier 1 (repo has no
-  // structure findings) never advanced → 300+ localized tier-2 correctness bugs were filtered out (wrong
-  // tier) → 0 fixes, whole budget burned (live: currentTier=1, tierDryStreak=0, fixed=0). Now tier-advance
-  // keys on passStructuralOk (the SCHEDULED band completed), NOT the critic → the empty tier advances after
-  // dryStop passes and the tier-2 bug is finally fixed.
+test("tier-fix (LIVE-STALL regression): an EMPTY tier-1 with passComplete:FALSE (a failed cell) + a localized tier-2 bug ADVANCES and fixes it", async () => {
+  // The confirmed PRODUCTION stall (tier-fix v2). Two things are BOTH false every windowed pass:
+  //  - completenessComplete:false — the --deep critic marks a 40/2000-cell pass "under-examined";
+  //  - passComplete:false — over ~4 seats × 40 cells at least one cell always fails to be reviewed by
+  //    ALL seats (rate-limit / flaky seat), and that flips passComplete.
+  // v1 gated tier-advance on passStructuralOk (=passComplete), so a single failed cell pinned the empty
+  // tier FOREVER (observed live: currentTier=1, fixed=0, even after v1 shipped — the v1 test wrongly
+  // hardcoded passComplete:true). v2 gates on coverage.ran (the pass RAN a review band, failed cells
+  // notwithstanding) → the empty tier advances and the localized tier-2 bug is finally fixed.
   let fixed = false;
   const review = async () => ({
     findings: fixed ? [] : [finding({ file: "c.mjs", title: "off-by-one", lens: "correctness" })],
-    coverage: { budgetSpent: 1, passComplete: true, completenessComplete: false } // critic: under-examined EVERY pass
+    // PRODUCTION reality: a cell failed (passComplete:false) + critic under-examined, but the pass RAN.
+    coverage: { budgetSpent: 1, passComplete: false, ran: true, completenessComplete: false }
   });
   const fix = async (actionable) => {
     if (actionable.length > 0) fixed = true;
     return { fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "x" })), failed: [], changedFiles: ["c.mjs"], spent: 1 };
   };
   const out = await runFixLoop("/x", { budget: 60, maxPasses: 30, dryStreak: 2, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
-  assert.equal(out.fixed.length, 1, "the empty tier-1 advanced despite completenessComplete:false and the tier-2 bug was fixed (was 0 forever)");
+  assert.equal(out.fixed.length, 1, "the empty tier-1 advanced despite passComplete:false (a failed cell) and the tier-2 bug was fixed (v1 stalled at 0 forever here)");
   assert.equal(out.fixed[0].finding.lens, "correctness", "the fixed finding is the tier-2 correctness bug");
   assert.match(out.stopReason, /all tiers converged/);
+});
+
+test("tier-fix (STARVED pass does NOT fake-advance): a starved (ran:false) pass never advances an empty tier", async () => {
+  // The passRan gate must not let a STARVED pass (0 cells reviewable — budget tail below the seat count)
+  // advance a tier: that would converge over work never looked at. A run that only ever starves must NOT
+  // report "all tiers converged".
+  const review = async () => ({ findings: [], coverage: { budgetSpent: 0, ran: false, passComplete: false, completenessComplete: false } });
+  const fix = async () => ({ fixed: [], failed: [], changedFiles: [], spent: 0 });
+  const out = await runFixLoop("/x", { budget: 20, maxPasses: 6, dryStreak: 2, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  assert.doesNotMatch(out.stopReason ?? "", /all tiers converged/, "a starved run must not fake-converge the tier ladder");
+});
+
+test("tier-fix (HONEST convergence): converging over INCOMPLETE passes discloses review debt, not a clean sweep", async () => {
+  // Council v2 Codex P1: v2 lets an empty tier advance despite passComplete:false (a failed cell). It must
+  // NOT then claim a CLEAN "all tiers converged" — it must DISCLOSE that some cells never completed review
+  // (a persistently-failing cell could hide an auto-fixable bug). A fully-complete run keeps the clean msg.
+  const incompleteRun = await runFixLoop(
+    "/x",
+    { budget: 40, maxPasses: 20, dryStreak: 2, perTierConvergence: true },
+    { review: async () => ({ findings: [], coverage: { budgetSpent: 1, ran: true, passComplete: false, completenessComplete: false } }), fix: async () => ({ fixed: [], failed: [], changedFiles: [], spent: 1 }), checkpoint: noCheckpoint }
+  );
+  assert.match(incompleteRun.stopReason, /coverage INCOMPLETE/, "converging over passComplete:false discloses the review debt");
+
+  const cleanRun = await runFixLoop(
+    "/x",
+    { budget: 40, maxPasses: 20, dryStreak: 2, perTierConvergence: true },
+    { review: async () => ({ findings: [], coverage: { budgetSpent: 1, ran: true, passComplete: true, completenessComplete: true } }), fix: async () => ({ fixed: [], failed: [], changedFiles: [], spent: 1 }), checkpoint: noCheckpoint }
+  );
+  assert.match(cleanRun.stopReason, /all tiers converged \(structure/, "a fully-complete run keeps the clean converged message");
+  assert.doesNotMatch(cleanRun.stopReason, /INCOMPLETE/, "no false review-debt caveat on a clean run");
 });
 
 test("tier-fix (RE-ENTRY demotion): a LATE localized lower-tier finding DEMOTES currentTier and is fixed before convergence", async () => {

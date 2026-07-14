@@ -248,6 +248,10 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const FIRST_TIER = 1;
   let currentTier = FIRST_TIER;
   let tierDryStreak = 0;
+  // v2 (council Codex P1): set when a tier advances over an INCOMPLETE pass (passStructuralOk false — a
+  // cell failed six-eyes). The eventual "all tiers converged" then DISCLOSES the review debt instead of
+  // claiming a clean sweep over cells some seat never actually reviewed (persistent-failure honesty).
+  let coverageIncomplete = false;
   // AUTO-FIXABLE = a localized finding the fixer can actually apply. A propose-only / cross-cutting
   // finding (architecture/SSOT/logical) is offered to fix() only to be surfaced as a proposal — it
   // NEVER auto-applies, so counting it as live work would (a) falsely read as a stall and (b) pin a
@@ -287,6 +291,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       currentTier = clamp(prior.currentTier ?? FIRST_TIER, FIRST_TIER, 4);
       tierDryStreak = clamp(prior.tierDryStreak ?? 0, 0, dryStop);
       stalledStreak = clamp(prior.stalledStreak ?? 0, 0, dryStop);
+      coverageIncomplete = Boolean(prior.coverageIncomplete);
       branch = prior.branch ?? null;
       // Restore the pause anti-thrash guard so a resume that immediately re-pauses on the SAME 5h
       // window with no progress is caught across the exit/resume boundary (not just within one process).
@@ -331,7 +336,14 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // FAIL-CLOSED (C): if the durable store could not be opened, autonomous fixing must not run at all —
     // this is terminal BEFORE the first pass, so no untracked fix is ever applied.
     if (failClosedStop) return failClosedStop;
-    if (perTier && currentTier > 3) return "all tiers converged (structure -> correctness -> quality)";
+    if (perTier && currentTier > 3) {
+      // Honest terminal claim (council v2 Codex P1): only claim a CLEAN sweep when every advanced tier
+      // saw a fully-complete review band. If a tier advanced over an incomplete pass (a persistently
+      // failing cell), disclose the review debt instead of a false "converged".
+      return coverageIncomplete
+        ? "all tiers converged over REVIEWED cells — coverage INCOMPLETE: some cells never completed six-eyes review (a seat kept failing them), so an auto-fixable bug there may remain — re-run to close the gap"
+        : "all tiers converged (structure -> correctness -> quality)";
+    }
     const bounded = endlessStopReason({ passNo, spent, dryStreak: perTier ? 0 : dryStreak }, { maxPasses, totalBudget, dryStop });
     if (bounded) return bounded;
     if (!perTier && stalledStreak >= dryStop) return `stalled — actionable findings remain but none are auto-applicable (${stalledStreak} passes)`;
@@ -455,7 +467,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       charge(rev?.coverage?.budgetSpent, 1); // charge the cells this pass actually dispatched before quiescing
       const freshQ = dedupeNew(rev?.findings ?? [], seenReview);
       reviewedAll.push(...freshQ);
-      const cpQuiesce = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, quiesced: true, stopReason: null, done: false };
+      const cpQuiesce = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, quiesced: true, stopReason: null, done: false };
       passes.push({ pass: passNo, reviewed: (rev?.findings ?? []).length, fresh: freshQ.length, quiesced: quiesce.kind });
       if (quiesce.kind === "pause" && quiesce.pause) {
         onProgress(`⏸ mid-pass quiesce (pause) after finishing the in-flight cell — partial findings preserved, cursor checkpointed`);
@@ -643,28 +655,47 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // dry streak — the run keeps hunting. undefined (critic off or infra-degraded) is non-blocking, so
     // the default path is byte-identical to before.
     // Split the coverage signal (tier-fix council). passStructuralOk = the SCHEDULED review band actually
-    // completed — a starved/failed grouped batch (passComplete/complete === false) still blocks, so failed
-    // work never counts as coverage. The TIER-advance gate uses ONLY this. coverageComplete ADDITIONALLY
-    // requires the --deep completeness critic's verdict and drives ONLY the GLOBAL dryStreak (+ flat-mode
-    // parity) — decoupled from tier-advance so an EMPTY tier is never pinned forever by a windowed
-    // 40-of-~2000-cell "under-examined" verdict that can never clear on a small responsive pass.
+    // completed (all cells reviewed by all seats) — a failed grouped batch (passComplete/complete === false)
+    // does NOT count. It drives ONLY the GLOBAL dryStreak (via coverageComplete below), where a failed cell
+    // SHOULD retry rather than converge — the per-TIER advance does NOT use it (see passRan below).
+    // coverageComplete ADDITIONALLY requires the --deep completeness critic's verdict and drives ONLY the
+    // GLOBAL dryStreak (+ flat-mode parity) — decoupled from tier-advance so an EMPTY tier is never pinned
+    // forever by a windowed 40-of-~2000-cell "under-examined" verdict that can never clear on a small pass.
     const passStructuralOk = (rev?.coverage?.passComplete ?? rev?.coverage?.complete) !== false;
     const coverageComplete = passStructuralOk && rev?.coverage?.completenessComplete !== false;
+    // TIER-advance signal (tier-fix v2 — the live-re-stall fix). `passComplete`/`passStructuralOk` is FALSE
+    // as soon as ONE scheduled cell isn't reviewed by ALL seats, and over ~4 seats × 40 cells at least one
+    // cell almost ALWAYS fails (rate-limit / timeout / flaky seat), so gating tier-advance on it pins an
+    // EMPTY tier FOREVER in production (observed: currentTier=1, tierDryStreak=0, fixed=0, despite the
+    // tier-fix v1). A TRANSIENTLY-failed cell can't DURABLY hide an auto-fixable finding (passComplete is
+    // transient → the cell retries next pass), tier-0/1 structure is propose-only (never auto-fixed) so a
+    // missed structure finding doesn't affect auto-fix, and a late correctness/quality finding is netted by
+    // the lower-tier RE-ENTRY above. So the tier gate needs only that the pass actually RAN a review band
+    // (coverage.ran — reviewed cells, not a starved budget-tail no-op); a starved pass still can't
+    // fake-advance. RESIDUAL (honest): a cell that PERSISTENTLY fails on every seat, or is never windowed,
+    // contributes no finding → an empty tier can advance PAST it — that is the DEFERRED enumerate/window
+    // cell-skip coverage gap, NOT new to v2 (v1's passComplete gate never fixed those either — it just
+    // stalled at tier 1 instead). undefined (per-file path) → treated as ran.
+    const passRan = rev?.coverage?.ran !== false;
     // autoFixable() is hoisted above the loop (reused by the tier-advance gate + the lower-tier re-entry).
     const freshActionable = gate(freshFindings, { changedFiles, pass: passNo }).actionable.filter(autoFixable).length;
     dryStreak = freshFindings.length === 0 && coverageComplete ? dryStreak + 1 : 0;
     stalledStreak = freshActionable > 0 && freshFixed.length === 0 ? stalledStreak + 1 : 0;
-    // Advance to the next tier once the current one has nothing new AUTO-FIXABLE for K passes AND the
-    // review's SCHEDULED band completed (passStructuralOk — an incomplete/starved grouped batch still has
-    // cells to review). Gate on passStructuralOk, NEVER completenessComplete (tier-fix council): the
-    // completeness critic marks a windowed 40/2000-cell pass "under-examined" every time, which would pin
-    // an EMPTY tier forever (the live stall: currentTier=1, tierDryStreak=0, fixed=0). Consolidation-first
-    // is preserved by the lower-tier RE-ENTRY above, not by this gate.
+    // Advance to the next tier once the current one has nothing new AUTO-FIXABLE for K passes AND the pass
+    // actually RAN a review band (passRan — not a starved budget-tail no-op). Gate on passRan, NEVER
+    // completenessComplete (critic pins a windowed pass "under-examined" every time) and NOT passComplete/
+    // passStructuralOk either (one failed cell over 4×40 reviews makes it false almost every pass → an
+    // EMPTY tier pinned forever in production). Consolidation-first is preserved by the lower-tier RE-ENTRY
+    // above, not by a full-coverage gate that can never fire on a small responsive pass.
     if (perTier) {
       const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier && autoFixable(f)).length;
       const tierAuto = actionable.filter(autoFixable).length;
       if (tierAuto > 0 || tierFresh > 0) tierDryStreak = 0;
-      else if (passStructuralOk && (tierDryStreak += 1) >= dryStop) {
+      else if (passRan && (tierDryStreak += 1) >= dryStop) {
+        // If we advance a tier while the pass band was NOT fully complete (a cell failed six-eyes), the
+        // eventual "all tiers converged" must disclose that review debt (council v2 Codex P1) rather than
+        // claim a clean sweep over cells that a seat never reviewed.
+        if (!passStructuralOk) coverageIncomplete = true;
         currentTier += 1;
         tierDryStreak = 0;
         stalledStreak = 0; // a tier advance IS progress — never carry a stall from a done tier into the next (council B5 grok P1-b)
@@ -676,7 +707,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // so without this the dashboard/progress.json would under-report spend by a whole pass. Best-effort.
     reporter.budget(spent, totalBudget);
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
-    const cpState = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, stopReason: null, done: false };
+    const cpState = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, stopReason: null, done: false };
     checkpoint(cpState);
     // A pass that COMPLETED (not quiesced) clears the reviewed-cell cursor: the next pass reviews a
     // different scope/window, and even an overlapping file must be re-reviewed after a fix — the cursor
@@ -748,7 +779,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     }
   }
 
-  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, stopReason, done: true });
+  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, stopReason, done: true });
   const result = { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak, changedFiles: [...new Set(fixedAll.map((f) => f.file))] };
   // `pause` is present ONLY when a NON-autonomous (or autonomous-but-unschedulable) pause actually
   // STOPPED the run — the companion turns it into the resume contract + exit 75. An autonomous wait
