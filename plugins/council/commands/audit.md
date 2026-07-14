@@ -4,6 +4,18 @@ argument-hint: "[run|review|fix|endless] [--groups fine|tier|lens] [--loop] [--s
 allowed-tools: Bash(node:*)
 ---
 
+> **Compatibility pointer (7-verb surface).** `audit` maps onto the aligned verbs and
+> every invocation below still works (the CLI aliases them):
+> - `audit review` / `audit run` / `audit endless` → **read-only review** modes of the
+>   `review` verb (see **`/council:review`**) — deep whole-project review/propose sweeps
+>   that never edit source.
+> - `audit fix` (and `audit fix --loop`) → the **write** verb, **`/council:fix`** — the
+>   autonomous review → fix → re-review loop on an isolated, test-gated branch.
+>
+> Use this command when muscle memory says `audit`; reach for `/council:review` and
+> `/council:fix` for the canonical verbs. The reference below documents the underlying
+> engines those verbs drive.
+
 Run the whole-project audit:
 
 ```bash

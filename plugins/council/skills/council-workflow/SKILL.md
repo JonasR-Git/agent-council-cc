@@ -3,7 +3,8 @@ name: council-workflow
 description: >
   Multi-model code review: Claude + Codex + Grok. /council:review runs the 3-way
   deliberate protocol by default (independent then mutual critique); add --quick for a
-  cheaper dual review, --adversarial to challenge, or --loop to fix-and-re-review.
+  cheaper dual review or --adversarial to challenge — review is READ-ONLY and never
+  writes. To fix findings autonomously use /council:fix (the one write verb).
   /council:plan designs an approach; /council:solve implements it.
 ---
 
@@ -16,7 +17,7 @@ description: >
 | **Deliberate (best)** | `/council:review` | Before merge, risky changes, user wants mutual evaluation |
 | Dual review | `/council:review --quick` | Faster second opinions (no peer round) |
 | Adversarial | `/council:review --adversarial` | Challenge design/direction |
-| Fix-loop | `/council:review --loop` | Drive a change to approval (review -> fix -> re-review) |
+| **Fix (write)** | `/council:fix` | Autonomous review -> fix -> re-review loop on an isolated, test-gated branch — the ONE write verb (never a review flag) |
 | **Plan** | `/council:plan` | Design an approach: independent plans -> scored critique -> ranked synthesis (no code) |
 | **Solve** | `/council:solve` | Plan + one writer implements + council review |
 
@@ -66,6 +67,9 @@ Repo file `.council.yml` (scaffold with `/council:setup --init`): models, focus,
 
 ## Rules
 
+- **`/council:review` never writes** — it stops at a decision table. A human fix-loop
+  shells `/council:fix` (write) then `/council:review` (read-only) as SEPARATE verbs;
+  fixing is never a review flag.
 - One writer per branch; reviewers read-only.
 - Findings = hypotheses until verified (`file:line`).
 - Prefer consensus P0s; unique findings need extra scrutiny.

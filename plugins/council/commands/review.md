@@ -1,22 +1,28 @@
 ---
-description: Multi-agent code review — 3-way deliberate (default), quick dual, adversarial, or a bounded fix-loop
-argument-hint: "[--quick|--adversarial|--loop] [--wait|--background] [--base <ref>] [--reviewers claude,codex,grok] [--claude-backend session|spawn] [--claude-model <id>] [--codex-model <id>] [--grok-model <id>] [--verify] [focus text]"
+description: Multi-agent code review (READ-ONLY) — 3-way deliberate (default), quick dual, adversarial, plus read-only whole-project deep/endless/run sweeps
+argument-hint: "[--quick|--adversarial] [--wait|--background] [--base <ref>] [--reviewers claude,codex,grok] [--claude-backend session|spawn] [--claude-model <id>] [--codex-model <id>] [--grok-model <id>] [--verify] [focus text]"
 disable-model-invocation: true
-allowed-tools: Read, Glob, Grep, Edit, Write, Bash(node:*), Bash(git:*), AskUserQuestion
+allowed-tools: Read, Glob, Grep, Write, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
 # Council review
 
-Reviews local git changes with multiple agents. **Default mode is the full 3-way
-deliberate protocol** (independent review → peer critique → consensus). Pick a
-lighter or looped mode with a flag:
+**`/council:review` is READ-ONLY — it never writes source or fixes.** To fix findings
+autonomously, use **`/council:fix`** (the write verb). Reviews local git changes with
+multiple agents. **Default mode is the full 3-way deliberate protocol** (independent
+review → peer critique → consensus). Pick a lighter mode with a flag:
 
 | Mode | When | What runs |
 |------|------|-----------|
 | *(default)* | before merge, risky changes | 3-way: Claude + Codex + Grok independent, then peer critique + consensus |
 | `--quick` | fast dual check | Codex + Grok in parallel, no peer round; you synthesize |
 | `--adversarial` | challenge design/direction | Codex + Grok adversarial pass + focus text |
-| `--loop` | drive to approval | review → fix → re-review until ≥2 approve (max 3 rounds; you are the writer) |
+
+Read-only whole-project sweeps are the same review verb under different names —
+`deep` (≡ `/council:audit review`), `endless` (≡ `/council:audit endless`), and
+`run` (≡ `/council:audit run`). All are review/propose engines that never edit
+source; see `/council:audit` for their knobs. There is **no** write mode on this
+slash — the autonomous review → fix → re-review loop is **`/council:fix`**.
 
 Under the hood the companion exposes a single canonical `review --mode quick|deliberate|adversarial`
 selector. The bare `review` verb **is** that canonical entry point (`review` ≡ `review --mode quick`);
@@ -30,7 +36,8 @@ conflict — do not silently pick one; ask the user which mode they meant.
 
 Raw arguments: `$ARGUMENTS` (strip the single mode flag; the rest is focus text + review flags).
 
-Rules: review-only (except `--loop`, which fixes); prefer `--background` for
+Rules: **review-only — this slash never writes source** (to fix findings
+autonomously, hand off to `/council:fix`); prefer `--background` for
 non-trivial diffs; use **separate** `--codex-model`/`--grok-model` (not one
 `--model`); `--reviewers` / `--claude-backend` select who participates.
 
@@ -94,23 +101,18 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" adversarial [--backgr
 
 Then present the report + a short Claude synthesis (consensus, unique P0s).
 
-## `--loop` — review → fix → re-review (bounded)
+## Fixing findings — use `/council:fix` (not this slash)
 
-Drive a change to council approval; **you are the writer and orchestrator**. Treat
-`$ARGUMENTS` as focus text only (never pass loop knobs as companion flags).
+`/council:review` stops at a decision table; it does **not** edit code. To drive a
+change to council approval autonomously (review → fix → re-review until it goes dry),
+run the write verb:
 
-1. Clean branch; record `BASE=$(git rev-parse HEAD)` **once** (keep it fixed).
-2. Round 1..3:
-   - Review the diff since BASE (deliberate, your R1 first):
-     ```bash
-     node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --base "$BASE" --claude-findings-wait "<ostemp>/fixloop-claude-r<round>.json" --wait-timeout 600 "<focus>"
-     ```
-   - Read the decision (never eyeball it):
-     ```bash
-     node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" fixloop-status JOBID --writer claude --needed 2 --json
-     ```
-     `stop-approved` → stop (hand back for merge); `stop-escalate-to-human` or
-     `incomplete:true` → stop, summarize, ask; `fix-and-rereview` → fix the
-     `actionable` findings you agree with (verify each against the code), commit
-     `fixloop round <n>: ...`, continue.
-3. Stop at approval, escalation, or the 3-round cap. The writer never self-approves.
+```bash
+/council:fix                 # bare: reads the fix: config, propose-only by default
+/council:fix --dry-run       # preview the plan without touching files
+```
+
+`/council:fix` writes ONLY on an isolated branch, test-gated, and never auto-merges;
+auto-apply needs an explicit out-of-tree consent (see `/council:fix` for the consent
+model). A human fix-loop is `fix` then `review` as **separate** verbs — never a review
+flag.

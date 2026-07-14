@@ -1,7 +1,7 @@
 {
   "name": "council",
   "version": "3.0.0",
-  "description": "Multi-agent council for Claude Code: six-eyes review (Claude + Codex + Grok, independent then peer critique) with consensus/verification and a findings ledger, whole-project audit + safe test-gated autonomous auto-fix, plan/build, solve, benchmarking, and a live dashboard.",
+  "description": "Multi-agent council for Claude Code: six-eyes review (Claude + Codex + Grok, independent then peer critique) with consensus/verification and a findings ledger. Read-only `review` (never writes) is separate from the one write verb `fix` — the autonomous, test-gated review→fix→re-review loop on an isolated branch — plus whole-project audit, plan/build, solve, benchmarking, and a live dashboard.",
   "author": {
     "name": "JonasR-Git"
   },

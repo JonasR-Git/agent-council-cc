@@ -1,10 +1,13 @@
 ---
-description: Set up the council — check backends, scaffold .council.yml, or show provider usage/limits
-argument-hint: "[--init [--reviewers ...] [--claude-backend session|spawn] [--claude-model <id>] [--codex-model <id>] [--grok-model <id>] [--force]] [--usage [--days <n>]]"
+description: Set up the council — readiness report (default), diagnose (--check = doctor), scaffold .council.yml (--init), or provider usage/limits (--usage)
+argument-hint: "[--init [--reviewers ...] [--claude-backend session|spawn] [--claude-model <id>] [--codex-model <id>] [--grok-model <id>] [--force]] [--check [--no-ping] [--json]] [--usage [--days <n>]]"
 allowed-tools: Bash(node:*), Bash(grok:*), Bash(codex:*)
 ---
 
-If `--usage` is present, jump to **Usage mode** below. Otherwise run:
+The `setup` verb has four actions: the **readiness report** (default), **`--check`**
+(diagnose — the old `/council:doctor`), **`--init`** (scaffold), and **`--usage`**
+(provider limits). If `--check` is present, jump to **Check mode**; if `--usage` is
+present, jump to **Usage mode**. Otherwise (readiness report / `--init`) run:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" setup --json $ARGUMENTS
@@ -40,6 +43,23 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" setup --init \
 Install commands if a backend is missing: Codex `npm i -g @openai/codex`; Grok
 `curl -fsSL https://x.ai/cli/install.sh | bash` (binary at `~/.grok/bin/grok`; set
 `GROK_BIN` if it exists but isn't on PATH); Claude `npm i -g @anthropic-ai/claude-code`.
+
+## Check mode (`--check`)
+
+Diagnose the setup end-to-end — this is the old `/council:doctor` (the CLI aliases
+`doctor` → `setup --check`):
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" setup --check $ARGUMENTS
+```
+
+Runs a full self-test and prints an OK/PROBLEMS summary: CLI availability + versions,
+state dir writable, Claude window limits reachable, and **live pings** to Codex and
+Grok (a one-sentence round trip each — this is what catches a wrong model id or a stale
+app-server). It also warns (Appendix D) if a fix auto-apply consent is enabled without
+a valid out-of-tree trust record, or if the policy file is world-writable. Use
+`--no-ping` for a fast, quota-free offline check; exit code is non-zero when any check
+fails. Run it before a big deliberate/solve run, or first when a run behaves oddly.
 
 ## Usage mode (`--usage`)
 

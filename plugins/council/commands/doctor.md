@@ -4,6 +4,10 @@ argument-hint: "[--no-ping] [--json]"
 allowed-tools: Bash(node:*)
 ---
 
+> **Compatibility pointer (7-verb surface).** `/council:doctor` ≡ `/council:setup --check`
+> — the CLI aliases `doctor` → `setup --check`. Kept for muscle memory; the diagnose
+> action now lives under the `setup` verb. Both invocations run the same self-test.
+
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" doctor $ARGUMENTS
 ```
