@@ -27,6 +27,7 @@ import { makeMidPassGuard, makeReviewCursor, reviewCursorPath } from "./audit-mi
 import { normalizeFindings } from "./audit-normalize.mjs";
 import { correlateFindings } from "./audit-correlate.mjs";
 import { STRUCTURE_LENSES } from "./structure-gate.mjs";
+import { manifestDigest, posixKeyPath, reviewerSetHash, scopeGroupsForTier, sortManifest } from "./audit-tier-sweep.mjs";
 
 // NOTE: an in-process multi-hour autonomous pause wait is FRAGILE — the machine/terminal must stay up —
 // but the checkpoint written FIRST makes a mid-wait death --resume-able. The MAX_AUTONOMOUS_WAIT_MS
@@ -280,7 +281,22 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // on the consolidated code (a bug is then found once, post-consolidation, not N times across
   // copies). The pure default is OFF so the function contract is stable; the audit-fix CLI defaults
   // it ON (B5, --per-tier) at the call site, where real findings carry a lens (see the wiring).
-  const perTier = Boolean(options.perTierConvergence);
+  // WAVE 2 (epoch-sweep, docs/epoch-sweep-design.md): an OPT-IN mode that drives per-pass scheduling AND
+  // tier-advance from a DURABLE, run-wide cell-coverage LEDGER instead of the modulo window + passRan
+  // heuristic. Sweep mode REQUIRES the grouped path + per-tier (fail-closed at the CLI). With the flag
+  // OFF (`sweep === null`) EVERY sweep code path below is skipped and the loop is byte-identical to today.
+  const sweepMode = Boolean(options.epochSweep);
+  const sweep = sweepMode ? (deps.sweep ?? null) : null;
+  if (sweepMode && !sweep) throw new Error("runFixLoop: --epoch-sweep requires deps.sweep (grouped review); none was provided");
+  // Sweep mode drives coverage per tier, so it implies per-tier convergence regardless of the caller flag.
+  const perTier = Boolean(options.perTierConvergence) || sweepMode;
+  // The sealed-manifest denominator (built once at init / reconstructed on resume), the frozen epoch, and
+  // the checkpointed TIER PLAN the sweep walks (F-B: with --structure-auto-apply every tier is fix-staged;
+  // without it, fix stages [2,3] then REPORT-ONLY final-content sweeps [0,1]).
+  let sweepManifest = null;
+  const sweepEpoch = sweep?.epochHash ?? null;
+  let tierPlan = null;
+  let tierPlanIndex = 0;
   // FIX #1 / F-B — start at the FIRST FIXABLE tier, derived per-run from the operator's structure consent.
   //   - WITHOUT --structure-auto-apply: FIRST_TIER = 2 (Correctness). Tiers 0 (logical_sense) and 1
   //     (architecture_ssot, dependencies_supply_chain) are ENTIRELY propose-only — they can only surface
@@ -366,6 +382,92 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     }
   }
 
+  // ── WAVE 2 sweep init (once, before the loop; sweep mode only) ─────────────────────────────────
+  // Freeze the epoch + tier plan, then either (fresh) reset the ledger, append the header, build the
+  // sealed manifest from disk, and seal it — or (resume) FAIL CLOSED on any mismatch (epoch / corrupt /
+  // missing header / checkpoint-ahead / manifest-digest). The ledger lives in the state dir, NEVER the
+  // working tree; the resume validation touches nothing. `failClosedStop` (already the SSOT for a
+  // terminal-before-first-pass stop) carries a blocked resume so computeTerminalStop ends the run cleanly.
+  const deriveTierPlan = () =>
+    options.structureAutoApply
+      ? [{ tier: 0, fix: true }, { tier: 1, fix: true }, { tier: 2, fix: true }, { tier: 3, fix: true }]
+      : [{ tier: 2, fix: true }, { tier: 3, fix: true }, { tier: 0, fix: false }, { tier: 1, fix: false }];
+  if (sweepMode) {
+    tierPlan = deriveTierPlan();
+    const cursor = sweep.cursor;
+    if (options.resume) {
+      const prior = deps.loadCheckpoint ? deps.loadCheckpoint() : loadFixLoopCheckpoint(cwd);
+      const priorSweep = prior && typeof prior.sweep === "object" ? prior.sweep : null;
+      const loaded = cursor.load();
+      const blocked = (why) => { failClosedStop = `epoch-sweep resume blocked (fail-closed): ${why} — the working tree was left untouched; re-run without --resume to start a fresh sweep`; };
+      // FAIL-CLOSED resume validation (Wave 2 B). A torn TAIL line (droppedTail) is fine — that cell just
+      // re-reviews; only interior corruption, a missing/unsealed manifest, an epoch/reviewer/run/tier-plan
+      // mismatch, a checkpoint AHEAD of the ledger, or a validated digest mismatch aborts (tree untouched).
+      if (loaded.corrupt) blocked("the durable coverage ledger has an invalid interior record (corruption)");
+      else if (!loaded.header) blocked("the durable coverage ledger has no header record");
+      else if (!loaded.seal) blocked("the durable coverage ledger is UNSEALED (a torn or missing manifest-seal) — the denominator cannot be trusted");
+      else if (loaded.header.epochHash !== sweepEpoch) blocked("the run configuration changed since the ledger was written (epoch fingerprint mismatch)");
+      else if (reviewerSetHash(loaded.header.reviewers) !== reviewerSetHash(sweep.reviewerSet)) blocked("the frozen reviewer set changed since the ledger was written (reviewer identity mismatch)");
+      else if (!priorSweep) blocked("the checkpoint carries no sweep block (it was written by a legacy, non-sweep run)");
+      else if (priorSweep.runId != null && loaded.header.runId !== priorSweep.runId) blocked("the ledger header runId does not match the checkpoint (a different run wrote this ledger)");
+      else if (JSON.stringify(loaded.header.tierPlan ?? null) !== JSON.stringify(priorSweep.tierPlan ?? null)) blocked("the ledger header tier plan does not match the checkpoint tier plan");
+      else if (Number.isFinite(priorSweep.ledgerSeq) && loaded.seq < priorSweep.ledgerSeq) blocked("the checkpoint is AHEAD of the ledger (a lost durable append) — cannot safely continue");
+      if (!failClosedStop) {
+        // Reconstruct the manifest (files + DEBT) from the ledger via ordered last-wins replay (a post-fix
+        // re-hash supersedes the original; a verified deletion drops out; a debt row is carried) — canonical
+        // order makes the reconstructed digest INDEPENDENT of append order (B). Then REQUIRE the seal's
+        // digest+fileCount to match the reconstruction AND the reconstruction to match the checkpoint digest.
+        sweepManifest = sortManifest({ files: loaded.manifest.files, debt: loaded.manifest.debt });
+        sweepManifest.digest = manifestDigest(sweepManifest);
+        if (loaded.seal.digest != null && loaded.seal.digest !== sweepManifest.digest) blocked("the manifest-seal digest does not match the reconstructed manifest (a torn or tampered manifest)");
+        else if (Number.isFinite(loaded.seal.fileCount) && loaded.seal.fileCount !== sweepManifest.files.length) blocked("the manifest-seal file count does not match the reconstructed manifest");
+        else if (priorSweep.manifestDigest && sweepManifest.digest !== priorSweep.manifestDigest) blocked("the reconstructed manifest does not match the checkpoint digest (unexplained ledger drift)");
+        else {
+          tierPlan = Array.isArray(priorSweep.tierPlan) && priorSweep.tierPlan.length ? priorSweep.tierPlan : tierPlan;
+          tierPlanIndex = clamp(priorSweep.tierPlanIndex ?? 0, 0, tierPlan.length);
+        }
+      }
+    } else {
+      // RUN-FENCING (B, cheap): if a ledger already exists under a DIFFERENT header.runId (e.g. a concurrent
+      // --epoch-sweep run in the same state dir) and this is NOT a resume, FAIL CLOSED rather than reset() —
+      // never truncate another run's ledger. Only fences when both runIds are set (a runId-less run resets
+      // as before — byte-identical to the prior behaviour).
+      const existing = cursor.load();
+      if (existing.header && existing.header.runId != null && options.runId != null && existing.header.runId !== options.runId) {
+        failClosedStop = `epoch-sweep blocked (fail-closed): the durable coverage ledger belongs to a different run (runId ${existing.header.runId} ≠ ${options.runId}) — refusing to truncate it; use --resume or a clean state dir`;
+      } else {
+        cursor.reset();
+        cursor.appendHeader({ runId: options.runId ?? null, baseBranch: options.ledgerBaseBranch ?? null, baseHead: options.baseHead ?? null, epochHash: sweepEpoch, reviewers: sweep.reviewerSet, tierPlan });
+        sweepManifest = sweep.buildManifest();
+        for (const row of sweepManifest.files) cursor.appendManifest(row);
+        // PERSIST DEBT (B): the sealed digest INCLUDES debt, so any initial unreadable/oversize file must be
+        // written too — else a resume reconstructs debt:[] and can never re-match the digest.
+        for (const d of sweepManifest.debt ?? []) cursor.appendDebt(d);
+        cursor.sealManifest({ digest: sweepManifest.digest, fileCount: sweepManifest.files.length });
+        tierPlanIndex = 0;
+      }
+    }
+    if (!failClosedStop) currentTier = tierPlan[Math.min(tierPlanIndex, tierPlan.length - 1)].tier;
+  }
+
+  // WAVE 2: the checkpoint's sweep block — pins the mode + epoch + ledger position so a --resume cannot
+  // flip mode or lose the denominator. undefined (dropped by JSON) in legacy mode.
+  const sweepCheckpoint = () =>
+    sweepMode ? { v: 1, runId: options.runId ?? null, epochHash: sweepEpoch, ledgerSeq: sweep.cursor.seq, manifestDigest: sweepManifest?.digest ?? null, tierPlan, tierPlanIndex } : undefined;
+  // A per-tier pending-debt summary for the terminal coverage-incomplete disclosure (cheap, in-memory).
+  const sweepPendingSummary = () => {
+    if (!sweepMode || !sweepManifest) return "";
+    const parts = [];
+    for (const entry of tierPlan) {
+      const scoped = scopeGroupsForTier(sweep.baseGroups, entry.tier);
+      const p = sweep.cursor.tierPending(entry.tier, sweepManifest, scoped, sweep.reviewerSet, sweepEpoch);
+      if (p.count > 0) parts.push(`tier ${entry.tier}: ${p.count} cell(s)`);
+    }
+    const debt = sweepManifest.debt?.length ?? 0;
+    if (debt) parts.push(`${debt} unreadable/oversize file(s)`);
+    return parts.length ? parts.join(", ") : "no pending cells";
+  };
+
   // Tier-0 proposals (dead modules, over-layered indirection) the caller ran the detector
   // for once — surface them alongside the fixer's rejected set (they never gate below the
   // confidence floor, but a human should see them).
@@ -391,9 +493,25 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // guards are skipped on an already-terminal final pass. Reads the live counters via closure.
   const computeTerminalStop = () => {
     // FAIL-CLOSED (C): if the durable store could not be opened, autonomous fixing must not run at all —
-    // this is terminal BEFORE the first pass, so no untracked fix is ever applied.
+    // this is terminal BEFORE the first pass, so no untracked fix is ever applied. In sweep mode a blocked
+    // resume (epoch/manifest/corrupt) is surfaced here too, so the loop never touches the tree.
     if (failClosedStop) return failClosedStop;
-    if (perTier && currentTier > 3) {
+    // WAVE 2: sweep convergence = the tier PLAN was fully walked. Coverage is PROVEN per tier by the sealed
+    // manifest denominator, not by passRan — so this claim is exact. If any pending debt remained at a
+    // budget/pass ceiling, `coverageIncomplete` is set (below) and the disclosure names the per-tier debt.
+    if (sweepMode) {
+      if (tierPlanIndex >= tierPlan.length) {
+        // The whole plan was walked ⇒ EVERY tier reached tierPending==0 (that is the only way a sweep tier
+        // advances), so incompleteness is now DERIVED purely from run-level DEBT — never a stale restored
+        // coverageIncomplete flag (a resume that RE-COVERS an interrupt's pending must report clean). F: a
+        // permanently unreadable/oversize DEBT file (excluded from the per-tier gate) still means the run
+        // did NOT cover every byte, so it is disclosed as INCOMPLETE (the ledger persists it) here.
+        const debtRemains = (sweepManifest?.debt?.length ?? 0) > 0;
+        return debtRemains
+          ? `epoch-sweep converged over REVIEWED cells — coverage INCOMPLETE: ${sweepPendingSummary()}; the ledger persists it, so a re-run with the same epoch continues the denominator`
+          : "epoch-sweep converged — every tier reached 100% cell coverage under the sealed manifest";
+      }
+    } else if (perTier && currentTier > 3) {
       // Honest terminal claim (council v2 Codex P1): only claim a CLEAN sweep when every advanced tier
       // saw a fully-complete review band. If a tier advanced over an incomplete pass (a persistently
       // failing cell), disclose the review debt instead of a false "converged".
@@ -503,12 +621,19 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       : null;
 
     let rev;
+    // WAVE 2: in sweep mode the review tier is the ledger-driven current sweep tier (not the static
+    // options.reviewTier), and the review closure gets the sweep context (cursor + epoch + frozen
+    // reviewer set + the CURRENT manifest + this tier's scoped groups) so it can (a) select the files
+    // with pending cells and (b) mark each reviewed cell done through the SHARED cellSweepKey builder.
+    const scopedGroups = sweepMode ? scopeGroupsForTier(sweep.baseGroups, currentTier) : null;
+    const reviewTier = sweepMode ? currentTier : (options.reviewTier ?? null);
+    const reviewSweep = sweepMode ? { cursor: sweep.cursor, epochHash: sweepEpoch, reviewerSet: sweep.reviewerSet, manifest: sweepManifest, scopedGroups } : undefined;
     try {
       // Wave 1 Stage 2 (BB1): thread an OPTIONAL review tier into the grouped-review adapter so
       // enumeration is scoped to that tier's lenses. `options.reviewTier ?? null` — a NEW optional
       // option; default null = TODAY's behavior (no scoping, byte-identical). Wave 2 replaces this
       // static value with the ledger-driven current sweep tier.
-      rev = await withLimitRetry(() => review({ budget: passBudget, pass: passNo, changedFiles, guard, findingsAppender, tier: options.reviewTier ?? null }));
+      rev = await withLimitRetry(() => review({ budget: passBudget, pass: passNo, changedFiles, guard, findingsAppender, tier: reviewTier, sweep: reviewSweep }));
     } catch (err) {
       passes.push({ pass: passNo, error: String(err?.message ?? err) });
       stopReason = `review error on pass ${passNo}: ${String(err?.message ?? err)}`;
@@ -531,7 +656,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       charge(rev?.coverage?.budgetSpent, 1); // charge the cells this pass actually dispatched before quiescing
       const freshQ = dedupeNew(rev?.findings ?? [], seenReview);
       reviewedAll.push(...freshQ);
-      const cpQuiesce = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, quiesced: true, stopReason: null, done: false };
+      const cpQuiesce = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, sweep: sweepCheckpoint(), quiesced: true, stopReason: null, done: false };
       passes.push({ pass: passNo, reviewed: (rev?.findings ?? []).length, fresh: freshQ.length, quiesced: quiesce.kind });
       if (quiesce.kind === "pause" && quiesce.pause) {
         onProgress(`⏸ mid-pass quiesce (pause) after finishing the in-flight cell — partial findings preserved, cursor checkpointed`);
@@ -548,11 +673,31 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       checkpoint({ ...cpQuiesce, stopReason, done: false });
       break;
     }
+    // WAVE 2: a durable coverage-ledger write failed mid-pass (fsync). The sweep denominator can no
+    // longer be trusted (a "done" that isn't durable), so hard-stop sweep mode — never keep advancing
+    // over cells whose done-record may be lost. The findings themselves were flushed first (durable).
+    if (sweepMode && rev?.coverage?.sweepError) {
+      passes.push({ pass: passNo, error: `sweep ledger write failed: ${rev.coverage.sweepError}` });
+      stopReason = `epoch-sweep hard stop on pass ${passNo}: durable coverage ledger write failed (${rev.coverage.sweepError}) — resolve the state dir and --resume`;
+      checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, sweep: sweepCheckpoint(), stopReason, done: false });
+      break;
+    }
     // A review that DID NOT actually run (no reachable reviewer, or a rate-limit the
     // retries couldn't outlast) returns ran:false with zero findings. That is NOT a clean
     // "nothing to fix" — counting it toward the dry streak would let a throttled run declare
     // false convergence and exit reporting success while nothing was reviewed. Stop honestly.
+    // WAVE 2 EXCEPTION: a sweep pass STARVED by the per-pass budget tail (pending cells exist but not
+    // even one whole triple was affordable) is NOT a false-convergence and NOT backends-down — the OWED
+    // cells stay pending. Do not hard-stop; skip to the next pass (the budget/maxPasses ceiling bounds
+    // it, and the ledger persists the debt for a resume). It also must not advance the tier.
     if (rev && rev.ran === false) {
+      if (sweepMode && rev?.coverage?.starved) {
+        passes.push({ pass: passNo, starved: true });
+        onProgress(`  pass ${passNo}: starved (per-pass budget below one triple) — pending cells stay OWED`);
+        checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, sweep: sweepCheckpoint(), stopReason: null, done: false });
+        if (reviewCursor) reviewCursor.reset();
+        continue;
+      }
       passes.push({ pass: passNo, error: "review did not run (no reachable reviewer or rate-limited)" });
       stopReason = `review did not run on pass ${passNo} (backends unavailable or rate-limited) — stopped without false convergence`;
       break;
@@ -622,7 +767,10 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // P1). Scans the accumulated actionable set (this pass ∪ the ledger union in gateInput → gated.actionable).
     // Runs BEFORE the per-tier filter so the demoted tier's findings are actionable THIS pass. §4: currentTier
     // is the SAME variable the checkpoint persists below (~640/712) — a demotion is what gets written.
-    if (perTier) {
+    // WAVE 2: sweep mode does NOT use this finding-driven demotion (it would desync currentTier from the
+    // checkpointed tierPlanIndex). Its consolidation-first safety net is the manifest re-hash re-entry
+    // after a fix (below), which walks the plan and keeps tierPlanIndex in lockstep.
+    if (perTier && !sweepMode) {
       const lowestActionableTier = Math.min(
         ...gated.actionable
           .filter((f) => autoFixable(f) && !seenProposed.has(proposedKey(f)))
@@ -696,7 +844,23 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // propose-only / correlate-escalated / surfaced findings that legitimately reach seenProposed via other
     // channels and must keep being re-offered (e.g. a structure transform refusal is a per-pass verdict).
     actionable = actionable.filter((f) => (seenFailed.get(proposedKey(f)) ?? 0) < RED_ESCALATE_THRESHOLD);
+    // WAVE 2 (F-B): a REPORT-ONLY tier plan entry (the final-content sweeps [0,1] without
+    // --structure-auto-apply) advances on the SAME 100% coverage rule but NEVER calls fix() — its findings
+    // surface as proposals. Clear `actionable` so the fixer stays untouched while the tier's cells are
+    // still reviewed (covered) for six-eyes completeness.
+    if (sweepMode && tierPlan[tierPlanIndex] && tierPlan[tierPlanIndex].fix === false) {
+      for (const f of actionable) {
+        const p = { ...f, rejectedReason: `report-only sweep (tier ${currentTier}) — surfaced, not auto-fixed` };
+        const k = proposedKey(p);
+        if (!seenProposed.has(k)) { seenProposed.add(k); proposedAll.push(p); }
+      }
+      actionable = [];
+    }
 
+    // WAVE 2 (C): the isolation-branch HEAD BEFORE this fix batch — diffed against the HEAD after it to get
+    // the VERIFIED changed set for manifest invalidation. Captured only when a fix could actually run
+    // (actionable non-empty) so a fix-free pass never spawns git; null when git is unavailable (non-git test).
+    const sweepBeforeHead = sweepMode && actionable.length ? (sweep.gitHead?.() ?? null) : null;
     let fx;
     try {
       fx = await withLimitRetry(() => fix(actionable, { budget: Math.max(1, Math.min(perPassBudget, totalBudget - spent)), pass: passNo, branch, stayOnBranch: true }));
@@ -765,6 +929,79 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     const expanded = changed.length ? expandScope(changed) ?? changed : [];
     changedFiles = expanded.length ? expanded : null;
 
+    // WAVE 2 — FIX-INVALIDATION over a VERIFIED changed set (C+D). After a fix batch, derive the changed
+    // paths from a git diff of the isolation-branch HEAD before/after the batch (added/modified/deleted/
+    // renamed) — fx.changedFiles records only one file per finding, so a MULTI-FILE structure transform's
+    // co-edited files would otherwise keep STALE rows. NORMALIZE every path to posix ONCE and feed the SAME
+    // list to BOTH the changedSet AND refreshFiles (the Windows-backslash fix — a raw `lib\a.mjs` missed the
+    // posix-keyed chunkCache entry AND wrote backslash rows that never matched a cell). Falls back to
+    // fx.changedFiles when git is unavailable. Re-hashing gives free invalidation: the OLD done-rows carry
+    // the OLD chunk hashes, so they no longer match the new expectedKeys ⇒ those cells are PENDING again.
+    const sweepAfterHead = sweepMode && sweepBeforeHead ? (sweep.gitHead?.() ?? null) : null;
+    const verifiedDiff = sweepMode && sweepBeforeHead && sweepAfterHead ? (sweep.gitChangedSince?.(sweepBeforeHead, sweepAfterHead) ?? null) : null;
+    let presentChanged = [];
+    let deletedChanged = [];
+    if (sweepMode) {
+      if (verifiedDiff) {
+        presentChanged = [...new Set(verifiedDiff.changed.map((f) => posixKeyPath(f)))];
+        deletedChanged = [...new Set(verifiedDiff.deleted.map((f) => posixKeyPath(f)))];
+      } else {
+        // Fallback (no git): fx.changedFiles/freshFixed; classify a deletion by on-disk absence.
+        const all = [...new Set(changed.map((f) => posixKeyPath(f)))];
+        deletedChanged = all.filter((f) => sweep.fileExists && !sweep.fileExists(f));
+        presentChanged = all.filter((f) => !deletedChanged.includes(f));
+      }
+      // Restrict to the coverage UNIVERSE (the manifest's non-test file set). A co-edited SOURCE file
+      // belongs in the denominator (exactly what C fixes), but a touched TEST file or a newly-CREATED file
+      // is NOT schedulable by the model-bound window (created-file coverage is a deferred design caveat) —
+      // adding it would wedge the tier on a phantom, never-schedulable pending. Deletions likewise matter
+      // only for files the manifest actually tracked. (workspaceRoot === the git toplevel, so the diff's
+      // repo-relative paths key the same as the model's file ids.)
+      const universe = new Set(sweep.allFiles ?? []);
+      presentChanged = presentChanged.filter((f) => universe.has(f));
+      deletedChanged = deletedChanged.filter((f) => universe.has(f));
+    }
+    const changedSet = new Set([...presentChanged, ...deletedChanged]);
+    if (sweepMode && changedSet.size) {
+      // Re-hash only the PRESENT (non-deleted) files; a deleted file must not be re-read (it would look
+      // unreadable → false debt). D: MERGE the refreshed debt — a still-present file that grew >2 MB or
+      // became unreadable is DEBT that BLOCKS completion + persists; a VERIFIED deletion drops out with
+      // neither a row nor debt (never a phantom pending, never a silent vanish of live content).
+      const refreshed = sweep.refreshFiles(presentChanged); // { files:[fresh eligible], debt:[unreadable/oversize] }
+      sweepManifest = sortManifest({
+        files: [...sweepManifest.files.filter((r) => !changedSet.has(r.file)), ...refreshed.files],
+        debt: [...(sweepManifest.debt ?? []).filter((d) => !changedSet.has(d.file)), ...(refreshed.debt ?? [])]
+      });
+      sweepManifest.digest = manifestDigest(sweepManifest);
+      // Persist for --resume (B): append the fresh eligible rows, the new DEBT rows, and DROP records for
+      // verified deletions, then RE-SEAL the new digest so the reconstructed manifest matches on resume.
+      // Best-effort audit trail: the done-rows are the coverage SSOT (a torn tail is dropped on resume);
+      // only markDone (durability of a DONE claim) hard-stops. The re-seal keeps the LAST seal authoritative.
+      for (const row of refreshed.files) { try { sweep.cursor.appendManifest(row); } catch { /* best-effort */ } }
+      for (const d of refreshed.debt ?? []) { try { sweep.cursor.appendDebt(d); } catch { /* best-effort */ } }
+      for (const f of deletedChanged) { try { sweep.cursor.dropFile(f); } catch { /* best-effort */ } }
+      try { sweep.cursor.sealManifest({ digest: sweepManifest.digest, fileCount: sweepManifest.files.length }); } catch { /* best-effort */ }
+      // F-A / consolidation-first RE-ENTRY: if a fix re-opened cells in an EARLIER FIXABLE tier of the plan,
+      // demote to the earliest such tier so it is re-consolidated before the higher tier keeps running.
+      // Triggers on tierPending(T) > 0 after the fix (fixes can invalidate without producing new findings),
+      // mirroring the legacy finding-re-entry but in lockstep with tierPlanIndex.
+      // WAVE3: livelock circuit-breaker — a test-GREEN edit that changes content WITHOUT resolving the
+      // finding can be re-fixed forever; for Wave 2 the maxPasses/budget ceilings bound it. Deferred.
+      for (let i = 0; i < tierPlanIndex; i += 1) {
+        const entry = tierPlan[i];
+        if (!entry.fix) continue;
+        const scoped = scopeGroupsForTier(sweep.baseGroups, entry.tier);
+        const p = sweep.cursor.tierPending(entry.tier, sweepManifest, scoped, sweep.reviewerSet, sweepEpoch);
+        if (p.count > 0) {
+          tierPlanIndex = i;
+          currentTier = entry.tier;
+          tierDryStreak = 0;
+          stalledStreak = 0;
+          break;
+        }
+      }
+    }
+
     // Honest, cell-aware convergence (B5): DRY only when the review found nothing new AND its
     // six-eyes coverage is complete (unreviewed cells → still work → reset; absent coverage info
     // counts complete for the pre-cell-matrix path). STALLED only when fresh AUTO-FIXABLE findings
@@ -810,7 +1047,39 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // passStructuralOk either (one failed cell over 4×40 reviews makes it false almost every pass → an
     // EMPTY tier pinned forever in production). Consolidation-first is preserved by the lower-tier RE-ENTRY
     // above, not by a full-coverage gate that can never fire on a small responsive pass.
-    if (perTier) {
+    if (sweepMode) {
+      // WAVE 2 — LEDGER-GATED tier-advance. Replaces the passRan heuristic with a PROVABLE gate:
+      // tierPending(currentTier) === 0 (under the sealed manifest + current epoch) AND fix-free settle
+      // (this pass applied ZERO fixes — any fix invalidates the claim) AND the auto-fixable dry streak ≥
+      // dryStop. On advance we WALK THE PLAN (not currentTier+1).
+      // F (P2): the per-tier gate does NOT include the MANIFEST-WIDE debt — a single permanently >2 MB /
+      // unreadable file would otherwise block EVERY tier forever (no tier could advance → the loop spins
+      // empty passes to the ceiling and always ends COVERAGE INCOMPLETE). An unreadable file has NO cells
+      // to pend, so it is not a phantom pending; run-level debt is disclosed at TERMINAL instead (it sets
+      // coverageIncomplete + names the debt files), so a permanently-incurable-debt repo still CONVERGES
+      // over the coverable cells and reports the debt honestly rather than burning the pass ceiling.
+      const scoped = scopeGroupsForTier(sweep.baseGroups, currentTier);
+      const pend = sweep.cursor.tierPending(currentTier, sweepManifest, scoped, sweep.reviewerSet, sweepEpoch);
+      const tierPendingCount = pend.count;
+      const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier && autoFixable(f)).length;
+      const tierAuto = actionable.filter(autoFixable).length;
+      if (tierAuto > 0 || tierFresh > 0) tierDryStreak = 0;
+      else if (passRan) tierDryStreak += 1;
+      const fixFreeSettle = freshFixed.length === 0;
+      const dryReady = tierDryStreak >= dryStop;
+      // ADVANCE only when the tier is PROVABLY complete: pending==0 (every expected cell has a durable
+      // done-row) AND fix-free settle AND the auto-fixable dry streak is met. A dry streak reached while
+      // cells are still PENDING (maxUnits simply hasn't scheduled them yet) does NOT advance and does NOT
+      // flag incompleteness — those cells are OWED and get reviewed in a later pass. coverageIncomplete is
+      // DERIVED at TERMINAL only (a budget/pass ceiling with pending remaining, OR any run-level debt).
+      if (tierPendingCount === 0 && fixFreeSettle && dryReady) {
+        try { sweep.cursor.markTierClean({ tier: currentTier, manifestDigest: sweepManifest.digest }); } catch { /* audit-trail record; best-effort */ }
+        tierPlanIndex += 1;
+        tierDryStreak = 0;
+        stalledStreak = 0; // a tier advance IS progress — never carry a stall into the next plan entry
+        if (tierPlanIndex < tierPlan.length) currentTier = tierPlan[tierPlanIndex].tier;
+      }
+    } else if (perTier) {
       const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier && autoFixable(f)).length;
       const tierAuto = actionable.filter(autoFixable).length;
       if (tierAuto > 0 || tierFresh > 0) tierDryStreak = 0;
@@ -830,7 +1099,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // so without this the dashboard/progress.json would under-report spend by a whole pass. Best-effort.
     reporter.budget(spent, totalBudget);
     onProgress(`  pass ${passNo}: fixed ${freshFixed.length} (total ${fixedAll.length}); dry ${dryStreak}/${dryStop}, stalled ${stalledStreak}/${dryStop}`);
-    const cpState = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, stopReason: null, done: false };
+    const cpState = { passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, sweep: sweepCheckpoint(), stopReason: null, done: false };
     checkpoint(cpState);
     // A pass that COMPLETED (not quiesced) clears the reviewed-cell cursor: the next pass reviews a
     // different scope/window, and even an overlapping file must be re-reviewed after a fix — the cursor
@@ -902,8 +1171,25 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     }
   }
 
-  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, stopReason, done: true });
-  const result = { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak, changedFiles: [...new Set(fixedAll.map((f) => f.file))] };
+  // WAVE 2 — TERMINAL COVERAGE-INCOMPLETE. If a budget/pass ceiling stopped the sweep BEFORE the tier
+  // plan was fully walked, disclose the per-tier pending DEBT (the ledger persists it, so a later run
+  // with the same epoch continues the denominator — it does NOT restart at zero). A `failClosedStop`
+  // (blocked resume) or the clean "epoch-sweep converged" reason is left as-is.
+  // WAVE 2 — coverageIncomplete is DERIVED at terminal (never a sticky restored flag):
+  //   - plan NOT fully walked (a budget/pass ceiling): pending cells remain ⇒ INCOMPLETE (disclosed).
+  //   - plan FULLY walked: every tier hit pending==0, so incomplete IFF run-level DEBT remains (F) — this
+  //     CLEARS a coverageIncomplete restored from an interrupt whose pending the resume has now re-covered.
+  if (sweepMode && !failClosedStop) {
+    const debtRemains = (sweepManifest?.debt?.length ?? 0) > 0;
+    if (tierPlanIndex >= tierPlan.length) {
+      coverageIncomplete = debtRemains;
+    } else if (stopReason && !/epoch-sweep converged/.test(stopReason)) {
+      coverageIncomplete = true;
+      stopReason = `${stopReason} — epoch-sweep COVERAGE INCOMPLETE: ${sweepPendingSummary()} (the ledger persists the open debt; --resume with the same epoch continues the denominator)`;
+    }
+  }
+  checkpoint({ passNo, branch, changedFiles, fixed: fixedAll, failed: failedAll, proposed: proposedAll, reviewed: reviewedAll, passes, spent, dryStreak, currentTier, tierDryStreak, stalledStreak, coverageIncomplete, windowPasses: deps.windowState?.get?.() ?? 0, pauseGuard, staleSinceMs, sweep: sweepCheckpoint(), stopReason, done: true });
+  const result = { branch, fixed: fixedAll, failed: failedAll, proposed: proposedAll, passes, spent, budget: totalBudget, passesRun: passNo, stopReason, dryStreak, changedFiles: [...new Set(fixedAll.map((f) => f.file))], ...(sweepMode ? { coverageIncomplete } : {}) };
   // `pause` is present ONLY when a NON-autonomous (or autonomous-but-unschedulable) pause actually
   // STOPPED the run — the companion turns it into the resume contract + exit 75. An autonomous wait
   // that resumed in-process and later converged leaves pauseInfo null (a normal terminal result).

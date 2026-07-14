@@ -10,6 +10,10 @@
 import { interpolate, makeFenceNonce } from "./agents.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
 
+// Bump when the CHUNKING ALGORITHM (line-splitting, overlap clamp, boundary rule) changes so a chunker
+// change rotates the epoch fingerprint (audit-tier-sweep computeEpochHash) even at the SAME maxChars/
+// overlap — different chunk boundaries ⇒ different reviewed payloads ⇒ old done-rows must be re-owed.
+export const CHUNKER_VERSION = 1;
 export const CHUNK_MAX_CHARS = 16_000; // per-chunk source budget
 // Lines shared between consecutive chunks so a defect straddling a boundary is seen in both. 40
 // (up from 20, council grok-2) covers wider boundary defects; a defect whose necessary context

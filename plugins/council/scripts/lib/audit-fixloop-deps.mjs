@@ -25,10 +25,63 @@
 //   detectLogical (council-companion), whose above-floor, non-quarantined verdicts DO gate
 //   (prune/redirect) findings; {} only for a bare caller that injects no map.
 
+import fs from "node:fs";
+import path from "node:path";
+
 import { runAuditFix } from "./audit-fix.mjs";
 import { normalizeFindings } from "./audit-normalize.mjs";
-import { runAuditReview } from "./audit-review.mjs";
-import { runGroupedReview } from "./audit-grouped-review.mjs";
+import { runAuditReview, selectUnits } from "./audit-review.mjs";
+import { runGroupedReview, READ_MAX_BYTES } from "./audit-grouped-review.mjs";
+import { resolveLensGroups } from "./audit-lens-groups.mjs";
+import { chunkSource, CHUNK_MAX_CHARS, CHUNK_OVERLAP_LINES, CHUNKER_VERSION } from "./audit-group-prompt.mjs";
+import { activeSeatNames } from "./seats.mjs";
+import { buildManifest, computeEpochHash, fileOfKey, groupSpecHash, makeTierSweepCursor, posixKeyPath } from "./audit-tier-sweep.mjs";
+import { resolveStateDir, workspaceRoot } from "./state.mjs";
+import { runCommand } from "./process.mjs";
+
+// WAVE 2 (epoch-sweep, G — SSOT): the sweep manifest chunks each file through the EXACT same read+chunk
+// path the review uses, so it imports grouped-review's READ_MAX_BYTES (and matches its `>` comparison)
+// rather than hand-mirroring the value — manifest eligibility and review eligibility can never drift.
+
+/**
+ * Parse `git diff --name-status -z A B` into `{ changed:[posix present], deleted:[posix gone] }`.
+ * A/M/T → present (added/modified/type-changed); D → deleted; R<score> → OLD deleted + NEW present;
+ * C<score> → NEW present (the copy source is unchanged). Every path folded to posix so it keys the SAME
+ * way as the manifest (the Windows-backslash consistency the C-fix guarantees for changedSet+refreshFiles).
+ */
+function parseDiffNameStatusZ(raw) {
+  const parts = String(raw ?? "").split("\0").filter((s) => s.length);
+  const changed = [];
+  const deleted = [];
+  for (let i = 0; i < parts.length; i += 1) {
+    const code = parts[i][0];
+    if (code === "R" || code === "C") {
+      const oldPath = parts[i + 1];
+      const newPath = parts[i + 2];
+      i += 2;
+      if (code === "R" && oldPath) deleted.push(posixKeyPath(oldPath));
+      if (newPath) changed.push(posixKeyPath(newPath));
+    } else {
+      const p = parts[i + 1];
+      i += 1;
+      if (!p) continue;
+      if (code === "D") deleted.push(posixKeyPath(p));
+      else changed.push(posixKeyPath(p));
+    }
+  }
+  return { changed, deleted };
+}
+
+/** The frozen review identity of one seat (backend/model/effort) for the epoch fingerprint + key. The
+ *  built-in seats read their model/effort pins off the same options the seat runners do; an OpenRouter
+ *  seat carries its configured model. Empty strings when unpinned (deterministic + stable per config). */
+function seatIdentity(seat, options = {}, backends = null) {
+  if (seat === "codex") return { seat, backend: "codex", model: String(options.codexModel ?? ""), effort: String(options.codexEffort ?? "") };
+  if (seat === "grok") return { seat, backend: "grok", model: String(options.grokModel ?? ""), effort: String(options.grokEffort ?? "") };
+  if (seat === "claude") return { seat, backend: "claude", model: String(options.claudeModel ?? ""), effort: String(options.claudeEffort ?? "") };
+  const or = (backends?.openrouter?.seats ?? []).find((s) => s.id === seat);
+  return { seat, backend: "openrouter", model: String(or?.model ?? ""), effort: String(options.openrouterEffort ?? "") };
+}
 
 /** file -> Set(peer files that share a duplicate cluster with it). */
 function buildDupPeers(dupClusters = []) {
@@ -148,7 +201,119 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     agentTimeoutMs: options.agentTimeoutMs
   };
 
-  const review = async ({ budget, changedFiles, pass, guard, findingsAppender, tier } = {}) => {
+  const filesById = new Map(files.map((f) => [f?.id, f]).filter(([id]) => id));
+
+  // WAVE 2 (epoch-sweep, docs/epoch-sweep-design.md) — the DURABLE run-wide coverage machinery, built
+  // ONCE and injected into the loop as `deps.sweep`. It is constructed ONLY on the grouped path with
+  // `--epoch-sweep` on; otherwise it is null and every sweep code path (in runFixLoop + the review
+  // closure) is skipped ⇒ behaviour is byte-identical to today. This factory holds the IMPURE materials
+  // (frozen reviewer identities, the epoch fingerprint, the on-disk ledger, the disk read/chunk path);
+  // runFixLoop drives the pure orchestration (build/seal, tier plan, pending scheduling, advance,
+  // invalidation, resume) over them. fs/state access lives here so the loop stays unit-testable with an
+  // injected fake `deps.sweep`.
+  let sweep = null;
+  if (options.epochSweep && options.lensGroups) {
+    const reviewerSet = activeSeatNames(backends, options).map((s) => seatIdentity(s, options, backends));
+    const baseGroups = resolveLensGroups(options.lensGroups);
+    const epochHash = computeEpochHash({
+      reviewers: reviewerSet,
+      scopedGroupSpecs: baseGroups.map((g) => groupSpecHash(g)),
+      // WAVE 2 (G): fold the LIVE chunker identity into the epoch — the actual maxChars/overlap the manifest
+      // + review chunk with (chunkSource defaults) + a CHUNKER_VERSION. A CHUNK_MAX_CHARS / overlap / algorithm
+      // change now ROTATES the epoch (old chunk boundaries ⇒ old done-rows re-owed); fail-closed on skew.
+      chunkerVersion: CHUNKER_VERSION,
+      chunkMaxChars: CHUNK_MAX_CHARS,
+      chunkOverlapLines: CHUNK_OVERLAP_LINES,
+      deep: options.deep,
+      presetId: options.lensGroups
+    });
+    // The full non-test file universe in the SAME deterministic order the scheduler + selectUnits use
+    // (hotspot desc, id asc) — the manifest denominator (every eligible file, NOT the per-pass window).
+    const allFiles = selectUnits(model, { maxUnits: Number.MAX_SAFE_INTEGER, offset: 0 });
+    const root = workspaceRoot(cwd);
+    // chunksOf mirrors grouped-review.mjs:89-104 EXACTLY (same READ_MAX_BYTES guard, same chunkSource),
+    // so the manifest's chunk hashes equal the reviewed cells' chunk hashes. A cache keyed by file id;
+    // `null` = unsupplied (oversize/unreadable) so isSupplied can report DEBT, `[]` = a 0-byte file
+    // (vacuously clean, no cells). `bust` re-reads a file after a fix so invalidation re-hashes it.
+    const chunkCache = new Map();
+    const readChunks = (fileId) => {
+      if (chunkCache.has(fileId)) return chunkCache.get(fileId);
+      let chunks = null;
+      try {
+        const p = path.join(root, fileId);
+        if (fs.statSync(p).size > READ_MAX_BYTES) chunks = null;
+        else {
+          const text = fs.readFileSync(p, "utf8");
+          chunks = text ? chunkSource(text) : [];
+        }
+      } catch {
+        chunks = null;
+      }
+      chunkCache.set(fileId, chunks);
+      return chunks;
+    };
+    const isSupplied = (fileId) => readChunks(fileId) !== null;
+    const chunksOf = (fileId) => readChunks(fileId) ?? [];
+    sweep = {
+      epochHash,
+      reviewerSet,
+      baseGroups,
+      cursor: impl.tierSweepCursor ?? makeTierSweepCursor(path.join(resolveStateDir(cwd), "audit-tier-sweep-cursor.jsonl")),
+      allFiles,
+      fileObjById: (id) => filesById.get(id),
+      // Build the WHOLE manifest (all eligible files × chunks) from disk. Tier-independent.
+      buildManifest: () => buildManifest({ files: allFiles, chunksOf, isSupplied }),
+      // Re-hash a set of files from DISK after a fix batch (bust the cache first) → fresh manifest rows
+      // whose chunk hashes no longer match the old done-rows ⇒ those cells become pending again.
+      refreshFiles: (fileIds) => {
+        for (const f of fileIds) chunkCache.delete(f);
+        return buildManifest({ files: fileIds, chunksOf, isSupplied });
+      },
+      // WAVE 2 (C): the VERIFIED changed set. Capture HEAD before/after a fix batch and diff the two
+      // commits on the isolation branch (added/modified/deleted/renamed) — fx.changedFiles records only
+      // one file per finding, so a MULTI-FILE structure transform's co-edited files are otherwise left with
+      // STALE manifest rows. Uses the SAME git port (runCommand at the workspace root) the fix layer shells
+      // through — no new dep. Returns null when git is unavailable (e.g. a non-git test workspace) so the
+      // loop falls back to fx.changedFiles.
+      gitHead: () => {
+        const r = runCommand("git", ["rev-parse", "HEAD"], { cwd: root });
+        return r.status === 0 ? r.stdout.trim() || null : null;
+      },
+      gitChangedSince: (before, after) => {
+        if (!before || !after) return null;
+        const r = runCommand("git", ["diff", "--name-status", "-z", before, after], { cwd: root });
+        if (r.status !== 0) return null;
+        return parseDiffNameStatusZ(r.stdout);
+      },
+      // Fallback (no git) deletion probe: does a changed path still exist on disk?
+      fileExists: (fileId) => {
+        try {
+          return fs.existsSync(path.join(root, String(fileId)));
+        } catch {
+          return false;
+        }
+      }
+    };
+  }
+
+  // WAVE 2: order a tier's PENDING files for scheduling — `changedFiles` (a localized pass) are PRIORITY
+  // (touched files' pending cells first), then the rest of the pending set in the SAME deterministic
+  // selectUnits order (hotspot desc, id asc) the full-scope window uses. Never a RESTRICTION on the
+  // expected universe — just the order the bounded window walks it.
+  const orderPendingFiles = (keys, changed) => {
+    const pendingSet = new Set(keys.map(fileOfKey).filter(Boolean));
+    const rank = new Map((sweep?.allFiles ?? []).map((id, i) => [id, i]));
+    const out = [];
+    const seen = new Set();
+    for (const c of changed ?? []) {
+      const id = String(c).replace(/\\/g, "/");
+      if (pendingSet.has(id) && !seen.has(id)) { out.push(id); seen.add(id); }
+    }
+    const rest = [...pendingSet].filter((f) => !seen.has(f)).sort((a, b) => (rank.get(a) ?? Infinity) - (rank.get(b) ?? Infinity) || String(a).localeCompare(String(b)));
+    return [...out, ...rest];
+  };
+
+  const review = async ({ budget, changedFiles, pass, guard, findingsAppender, tier, sweep: reviewSweep } = {}) => {
     // Fold the PRIOR pass's flagged gap files (if any) into this pass's scope: they ride ALONGSIDE
     // an existing localized changedFiles scope, or — absent one — BECOME it, so the loop actually
     // re-targets the gap next pass instead of only resetting the dry streak.
@@ -157,7 +322,20 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     let reviewFiles;
     let offset = 0;
     let fullScopePass = false;
-    if (scopedFiles && scopedFiles.length) {
+    if (reviewSweep) {
+      // WAVE 2 — PENDING-DRIVEN scheduling REPLACES the modulo window in sweep mode. Select the files
+      // that still have ≥1 pending cell for the current tier (OWED = manifest − done), in selectUnits
+      // order, up to maxUnits. The uncapped remainder is simply not reviewed this pass → stays pending
+      // (free OWED persistence — no windowState desync). windowState/fullPasses are untouched here.
+      const pend = reviewSweep.cursor.tierPending(tier, reviewSweep.manifest, reviewSweep.scopedGroups, reviewSweep.reviewerSet, reviewSweep.epochHash);
+      if (pend.count === 0) {
+        // The current tier is fully COVERED — nothing to schedule. Return a clean DRY pass (0 spend,
+        // complete) so the loop's ledger-gated tier-advance can fire. This is NOT a starved/undispatched
+        // pass (which must never advance the tier); it is genuine completion, so ran:true.
+        return { findings: [], ran: true, coverage: { ran: true, passComplete: true, complete: true, budgetSpent: 0, unitsSelected: 0, unitsReviewed: 0, sweepNoPending: true } };
+      }
+      reviewFiles = orderPendingFiles(pend.keys, changedFiles).slice(0, maxUnits).map((id) => filesById.get(id)).filter(Boolean);
+    } else if (scopedFiles && scopedFiles.length) {
       reviewFiles = scopedFiles; // localized pass: review the changed (+ folded gap) band from the top
     } else {
       // Full scope (first pass, hub-forced full, or empty-scoped fallback): advance the window by
@@ -205,6 +383,11 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       // runGroupedReview scopes the groups to that tier's lenses before enumerateCells. `tier == null`
       // (today's default) ⇒ no scoping ⇒ byte-identical enumeration. runAuditReview ignores it.
       tier,
+      // Wave 2 (epoch-sweep): the durable coverage cursor + epoch + frozen reviewer set. When present,
+      // runGroupedReview appends each reviewed cell's DONE-key to the ledger (after its findings flush).
+      // The SAME frozen reviewerSet + scoped groups + epoch feed the loop's expectedKeys, so the done-key
+      // is byte-identical to the expected key (the Wave 2 invariant). runAuditReview ignores it.
+      sweep: reviewSweep ? { cursor: reviewSweep.cursor, epochHash: reviewSweep.epochHash, reviewerSet: reviewSweep.reviewerSet } : undefined,
       // RESERVE the pass's NON-CELL agent calls before capping the cells, so a grouped pass's TOTAL spend
       // stays within its per-pass budget (council Codex/Claude P2 + A1 wiring):
       //   - the completeness critic is 1 call when enabled;
@@ -332,5 +515,8 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   // the checkpoint and restores it here on resume.
   const windowState = { get: () => fullPasses, set: (n) => { fullPasses = Math.max(0, Math.floor(Number(n) || 0)); } };
 
-  return { review, fix, expandScope, verdictsFor, windowState };
+  // WAVE 2: `sweep` (null unless --epoch-sweep on the grouped path) carries the durable coverage
+  // machinery runFixLoop drives — the frozen reviewer set, the epoch fingerprint, the on-disk ledger
+  // cursor, the file universe, and the disk-backed manifest builders. null ⇒ the loop runs legacy.
+  return { review, fix, expandScope, verdictsFor, windowState, sweep };
 }

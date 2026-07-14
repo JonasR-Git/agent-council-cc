@@ -192,7 +192,70 @@ export function sweepCellKey({ schemaV, epochHash, tier, groupSpecHash, groupId,
   ]);
 }
 
+/**
+ * THE SINGLE SHARED KEY-BUILDER (Wave 2 invariant). Both the grouped-review `markDone` side AND the
+ * `expectedKeys`/`pending` side derive a cell's DONE-key through THIS one function, from the SAME raw
+ * semantic inputs (the scoped group OBJECT, the seat NAME, the frozen reviewer set, the file, the chunk
+ * index, and either the chunk text or its precomputed hash). Deriving every component (groupSpecHash,
+ * reviewerSetHash, the seat's modelIdentityHash, the content hash) through one place is what GUARANTEES
+ * the two sides produce a byte-identical key — if either side hand-assembled the key, a subtly different
+ * gsh/mih/rsh/hash would silently break coverage (pending never reaches 0, or a false 100%).
+ *
+ * `chunkHash` (precomputed, from the manifest row) wins over `chunkText`; `reviewerSetHash` may be passed
+ * precomputed (a per-call micro-opt) but defaults to `reviewerSetHash(reviewerSet)` — same value either way.
+ * The seat's identity is looked up IN the frozen reviewer set by seat name, so a temporarily-absent seat
+ * still resolves to its frozen identity (never a shrinking denominator).
+ */
+export function cellSweepKey({ epochHash, tier, group, seat, reviewerSet, reviewerSetHash: rshIn, file, chunkIndex, chunkHash: hIn, chunkText } = {}) {
+  const set = Array.isArray(reviewerSet) ? reviewerSet : [];
+  const rsh = rshIn != null ? rshIn : reviewerSetHash(set);
+  const identity = set.find((m) => String(m?.seat ?? "") === String(seat ?? "")) ?? {};
+  return sweepCellKey({
+    schemaV: SCHEMA_VERSION,
+    epochHash,
+    tier,
+    groupSpecHash: groupSpecHash(group),
+    groupId: group?.id,
+    reviewerSetHash: rsh,
+    modelSeat: String(seat ?? ""),
+    modelIdentityHash: modelIdentityHash(identity),
+    file,
+    chunkIndex,
+    chunkHash: hIn != null ? hIn : chunkHash(chunkText ?? "")
+  });
+}
+
+/** The repo-relative POSIX file carried in a sweep key (array index 8), or null on a malformed key. Lets
+ *  the scheduler group a tier's pending keys back to their files without re-deriving them. */
+export function fileOfKey(key) {
+  try {
+    const arr = JSON.parse(key);
+    return Array.isArray(arr) ? arr[8] ?? null : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── sealed manifest denominator (Building Block 2) ──────────────────────────────────────────────
+
+/** Order two manifest/debt rows by their posix file path (ascending, deterministic). */
+function byFile(a, b) {
+  const x = String(a?.file ?? "");
+  const y = String(b?.file ?? "");
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/**
+ * A CANONICAL copy of a manifest: `files` + `debt` each sorted by posix path (chunks keep their
+ * intra-file order). Every digest is computed over this canonical form, so
+ * digest(build) == digest(resume-reconstruct) == digest(post-fix-invalidation) regardless of the order
+ * rows were enumerated/appended in — the Wave 2 (B) ordering invariant that lets a routine interrupt
+ * after fixing a NON-FINAL file --resume cleanly (the in-memory invalidation appends refreshed rows at
+ * the END, so without canonical ordering the reconstructed insertion order would digest-mismatch).
+ */
+export function sortManifest(manifest = {}) {
+  return { files: [...(manifest?.files ?? [])].sort(byFile), debt: [...(manifest?.debt ?? [])].sort(byFile) };
+}
 
 /**
  * Build the sealed MANIFEST — the denominator. Mirrors enumerateCells→supplied: for every ELIGIBLE
@@ -227,8 +290,23 @@ export function buildManifest({ files, chunksOf, isSupplied, revisionOf } = {}) 
     }));
     fileRows.push({ file: posixKeyPath(file), revision: typeof revisionOf === "function" ? revisionOf(file) : null, status: "eligible", chunks: rows });
   }
+  // CANONICAL ORDER (Wave 2 B): sort files + debt by posix path so the sealed digest is INDEPENDENT of
+  // the order the files were enumerated in — the SAME property the resume reconstruction relies on.
+  fileRows.sort(byFile);
+  debt.sort(byFile);
   const digest = sha256(stableStringify({ files: fileRows, debt }));
   return { files: fileRows, debt, digest };
+}
+
+/**
+ * Recompute a manifest's canonical digest from its `{ files, debt }` — the SAME hash `buildManifest`
+ * seals. Wave 2 uses it after fix-invalidation replaces file rows in the in-memory manifest (so the
+ * new digest can be re-sealed / checkpointed) and on resume to validate the reconstructed manifest
+ * against the checkpoint's `manifestDigest` (a mismatch fails closed).
+ */
+export function manifestDigest(manifest = {}) {
+  const c = sortManifest(manifest);
+  return sha256(stableStringify({ files: c.files, debt: c.debt }));
 }
 
 /**
@@ -248,26 +326,32 @@ export function expected(manifest, scopedGroups, models) {
  * The full ordered list of EXPECTED sweep keys for a tier under an epoch — the SSOT both the ledger's
  * done-rows and `pending()` derive from. Order: file → chunk → group → model (deterministic + resumable).
  * `models` entries are reviewer identities `{ seat, backend, model, effort }`.
+ *
+ * WAVE 2 KEY-CONSISTENCY: every key here is built through `cellSweepKey` — THE SAME single builder the
+ * grouped-review `markDone` side uses. Routing both sides through one function (from the same raw
+ * semantic inputs: the scoped group OBJECT, the seat NAME, the frozen reviewer set, the file, the chunk
+ * index, and the content hash) is what GUARANTEES a reviewed cell's done-key is byte-identical to the key
+ * this function generates for it. `reviewerSetHash` is computed ONCE and passed in (a micro-opt — the
+ * per-call default derives the identical value). The manifest's chunk `{i,h}` are the same index+hash the
+ * reviewed cell carries (both from the same chunksOf path over stable content), so the keys match.
  */
 export function expectedKeys(manifest, tier, scopedGroups, models, epochHash) {
   const rsh = reviewerSetHash(models);
-  const groups = (Array.isArray(scopedGroups) ? scopedGroups : []).map((g) => ({ id: g.id, gsh: groupSpecHash(g) }));
-  const reviewers = (Array.isArray(models) ? models : []).map((m) => ({ seat: String(m?.seat ?? ""), mih: modelIdentityHash(m) }));
+  const groups = Array.isArray(scopedGroups) ? scopedGroups : [];
+  const reviewers = Array.isArray(models) ? models : [];
   const keys = [];
   for (const f of manifest?.files ?? []) {
     for (const c of f?.chunks ?? []) {
       for (const g of groups) {
         for (const r of reviewers) {
           keys.push(
-            sweepCellKey({
-              schemaV: SCHEMA_VERSION,
+            cellSweepKey({
               epochHash,
               tier,
-              groupSpecHash: g.gsh,
-              groupId: g.id,
+              group: g,
+              seat: r?.seat,
+              reviewerSet: reviewers,
               reviewerSetHash: rsh,
-              modelSeat: r.seat,
-              modelIdentityHash: r.mih,
               file: f.file,
               chunkIndex: c.i,
               chunkHash: c.h
@@ -349,6 +433,7 @@ export function makeTierSweepCursor(filePath, { deps = {} } = {}) {
   const tierCleanSet = new Set();
   const manifestRows = [];
   let header = null;
+  let seal = null;
 
   // Append + fsync a complete record. fsync failure propagates (BEFORE any in-memory commit) so a
   // markDone whose durability is not guaranteed is NOT counted done.
@@ -375,6 +460,22 @@ export function makeTierSweepCursor(filePath, { deps = {} } = {}) {
     sealManifest({ digest, fileCount } = {}) {
       return writeRecord({ v: LEDGER_VERSION, type: "manifest-seal", seq, digest, fileCount: fileCount ?? null });
     },
+    // Wave 2 (B/D): persist a DEBT row (a still-present file that is unreadable/oversize) so a resume
+    // reconstructs the SAME {files,debt} the sealed digest covers. The seal's digest INCLUDES debt, so a
+    // manifest with any debt could never re-match its seal (→ "cannot resume") unless debt is persisted.
+    appendDebt(debtRow = {}) {
+      const rec = { v: LEDGER_VERSION, type: "file-debt", seq, file: posixKeyPath(debtRow.file), reason: debtRow.reason ?? "unreadable-or-oversize" };
+      writeRecord(rec);
+      return rec;
+    },
+    // Wave 2 (C/D): a VERIFIED deletion — the path is gone from the git tree, so it leaves the denominator
+    // entirely (no row, no debt). Distinct from appendDebt (a still-present unreadable/oversize file that
+    // BLOCKS completion): reconstruction drops the file from BOTH the eligible set and the debt set.
+    dropFile(file) {
+      const rec = { v: LEDGER_VERSION, type: "file-drop", seq, file: posixKeyPath(file) };
+      writeRecord(rec);
+      return rec;
+    },
     markDone(sweepKey, { pass } = {}) {
       const rec = writeRecord({ v: LEDGER_VERSION, type: "done", seq, k: sweepKey, pass: pass ?? null }); // throws ⇒ NOT counted done
       doneSet.add(sweepKey);
@@ -390,18 +491,35 @@ export function makeTierSweepCursor(filePath, { deps = {} } = {}) {
       tierCleanSet.clear();
       manifestRows.length = 0;
       header = null;
+      seal = null;
       seq = 0;
-      if (!existsFile(filePath)) return { header: null, manifestRows: [], done: new Set(), tierClean: new Set(), corrupt: false, droppedTail: false };
+      if (!existsFile(filePath)) return { header: null, manifestRows: [], manifest: { files: [], debt: [] }, seal: null, done: new Set(), tierClean: new Set(), corrupt: false, droppedTail: false };
       const { records, corrupt, droppedTail } = parseLedger(readFile(filePath) ?? "");
+      // ORDERED replay (Wave 2 B/D): file / file-debt / file-drop are LAST-WINS per path ACROSS their
+      // interleaving, so a path that went eligible→debt→eligible (or was deleted) reconstructs to its
+      // FINAL state. The reconstructed {files,debt} is sorted canonically so its digest matches the seal.
+      const fileMap = new Map();
+      const debtMap = new Map();
       for (const rec of records) {
         if (!rec || typeof rec !== "object") continue;
         if (rec.type === "header") header = rec;
-        else if (rec.type === "file") manifestRows.push(rec);
+        else if (rec.type === "file") {
+          manifestRows.push(rec);
+          fileMap.set(rec.file, { file: rec.file, revision: rec.revision ?? null, status: "eligible", chunks: rec.chunks ?? [] });
+          debtMap.delete(rec.file);
+        } else if (rec.type === "file-debt") {
+          debtMap.set(rec.file, { file: rec.file, reason: rec.reason ?? "unreadable-or-oversize" });
+          fileMap.delete(rec.file);
+        } else if (rec.type === "file-drop") {
+          fileMap.delete(rec.file);
+          debtMap.delete(rec.file);
+        } else if (rec.type === "manifest-seal") seal = rec;
         else if (rec.type === "done" && typeof rec.k === "string") doneSet.add(rec.k);
         else if (rec.type === "tier-clean") tierCleanSet.add(rec.tier);
       }
       seq = records.length;
-      return { header, manifestRows: [...manifestRows], done: new Set(doneSet), tierClean: new Set(tierCleanSet), corrupt, droppedTail };
+      const manifest = sortManifest({ files: [...fileMap.values()], debt: [...debtMap.values()] });
+      return { header, manifestRows: [...manifestRows], manifest, seal, done: new Set(doneSet), tierClean: new Set(tierCleanSet), corrupt, droppedTail };
     },
     isDone(sweepKey) {
       return doneSet.has(sweepKey);
@@ -424,6 +542,7 @@ export function makeTierSweepCursor(filePath, { deps = {} } = {}) {
       tierCleanSet.clear();
       manifestRows.length = 0;
       header = null;
+      seal = null;
       seq = 0;
     },
     // Introspection (tests / callers).

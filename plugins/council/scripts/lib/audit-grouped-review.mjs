@@ -11,7 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { resolveLensGroups } from "./audit-lens-groups.mjs";
-import { scopeGroupsForTier } from "./audit-tier-sweep.mjs";
+import { cellSweepKey, scopeGroupsForTier } from "./audit-tier-sweep.mjs";
 import { chunkSource } from "./audit-group-prompt.mjs";
 import { DEFAULT_MAX_CELLS, capCells, cellKey, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
 import { makeBudget, reviewerActive, selectUnits } from "./audit-review.mjs";
@@ -26,7 +26,10 @@ import { shouldVerify, verifyFindings } from "./verify.mjs";
 import { nowIso, workspaceRoot } from "./state.mjs";
 import { NOOP_REPORTER } from "./progress.mjs";
 
-const READ_MAX_BYTES = 2_000_000; // don't slurp a giant file into a chunker
+// SSOT (Wave 2 G): the review-eligibility size ceiling. EXPORTED so the sweep manifest builder
+// (audit-fixloop-deps) imports the SAME constant AND the same `>` comparison — manifest eligibility and
+// review eligibility can then never drift (a drift would silently OWE or under-owe a boundary-size file).
+export const READ_MAX_BYTES = 2_000_000; // don't slurp a giant file into a chunker
 // Ceiling on the refutation fan-out per pass. Each refutation is one PAID agent call ON TOP of the
 // cells (the grouped path prices its work in cells, and the caller's cell cap already claimed that
 // budget), so a pass surfacing a hundred single-agent P0/P1s must not silently double its bill. Any
@@ -112,16 +115,48 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   // does NOT force incomplete). Council round-2 (Grok): the earlier filter dropped only unsupplied.
   const noContent = new Set(files.filter((f) => (chunkCache.get(f)?.length ?? 0) === 0));
   const supplied = noContent.size ? allCells.filter((c) => !noContent.has(c.file)) : allCells;
+  // WAVE 2 (epoch-sweep): the durable run-wide coverage cursor (sweep mode only, else null). Declared
+  // HERE because the A-fix pending filter below needs it BEFORE capCells; the markDone side (onCell) uses
+  // the same object.
+  const sweep = options.sweep ?? null;
+  // WAVE 2 (A — THE P0 FIX): in sweep mode, DROP cells already DONE in the durable ledger BEFORE capCells.
+  // capCells takes a deterministic PREFIX rounded to whole triples. If it prefixes over the FULL cell set,
+  // a file with more cells than maxCells re-schedules the SAME done prefix EVERY pass while cells past the
+  // cap stay pending FOREVER → tierPending never reaches 0 → the tier never advances (the P0). Filtering to
+  // PENDING cells first makes the cap's whole-triple budget land on UN-reviewed cells, so successive passes
+  // DRAIN the tail (⌈cells/maxCells⌉ passes) with NO re-review of done cells (no waste). The SAME
+  // cellSweepKey builder the ledger's done-rows use ⇒ a done cell is dropped byte-exactly. A PARTIAL triple
+  // (some seats done, some pending) is CORRECT to schedule — its pending cell(s) COMPLETE the triple
+  // against the durable done-rows; capCells' whole-triple rounding still applies to the pending set (it
+  // never schedules a fraction that can't complete this pass, and the pending tail shrinks each pass).
+  const pending =
+    sweep && sweep.cursor && typeof sweep.cursor.isDone === "function"
+      ? supplied.filter(
+          (c) =>
+            !sweep.cursor.isDone(
+              cellSweepKey({
+                epochHash: sweep.epochHash,
+                tier: options.tier,
+                group: c.group,
+                seat: c.model,
+                reviewerSet: sweep.reviewerSet,
+                file: c.file,
+                chunkIndex: c.chunk,
+                chunkText: c.chunkData?.text ?? ""
+              })
+            )
+        )
+      : supplied;
   // Pass the ACTIVE seat count explicitly (council Grok P2): capCells caps on TRIPLE boundaries, and
   // inferring the model count from the cell slice alone would mis-round if the enumeration order ever
   // changed or a test injected a partial list — planning an uncompletable triple again.
-  const { cells, dropped, capped } = capCells(supplied, options.maxCells ?? DEFAULT_MAX_CELLS, { modelCount: models.length });
+  const { cells, dropped, capped } = capCells(pending, options.maxCells ?? DEFAULT_MAX_CELLS, { modelCount: models.length });
 
   // Surface the planned cost BEFORE spending it (council Grok P1 / Claude nit): a grouped run can
   // dispatch ~1000+ paid spawns; the operator sees the count (and any cap / oversize skip) up front.
   if (progress) {
     progress(
-      `  grouped review: ${models.length} seat(s) × ${groups.length} group(s) × ${files.length - noContent.size} file(s) → ${supplied.length} cell(s)` +
+      `  grouped review: ${models.length} seat(s) × ${groups.length} group(s) × ${files.length - noContent.size} file(s) → ${pending.length} cell(s)` +
         `${capped ? `, capped to ${cells.length} (${dropped} deferred — raise --max-cells)` : ""}` +
         `${unsupplied.length ? `; ${unsupplied.length} file(s) too large or unreadable → coverage PARTIAL` : ""}`
     );
@@ -134,6 +169,16 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   // by the loop; when absent (a plain one-shot review, or a unit test) the path is byte-identical.
   const guard = options.reviewGuard ?? deps.reviewGuard ?? null;
   const appender = options.findingsAppender ?? deps.findingsAppender ?? null;
+  // WAVE 2 (epoch-sweep): the durable run-wide coverage cursor. When present (sweep mode only), a
+  // reviewed cell's DONE-key is appended to the ledger AFTER its findings are durably flushed. The key
+  // is built through `cellSweepKey` — THE SAME builder `expectedKeys` uses — from the cell's scoped
+  // group object, seat, the frozen reviewer set, file, chunk index, and chunk text, so a reviewed
+  // cell's done-key is byte-identical to the key coverage expects for it (the Wave 2 invariant).
+  // (`sweep` is declared above the cell enumeration — the A-fix pending filter reads it before capCells.)
+  let sweepError = null; // set if cursor.markDone THROWS (fsync failure) → the loop hard-stops sweep mode
+  // WAVE3: findings-store sweepCellKey staleness exclusion — stamp each durable finding with its source
+  // sweepCellKey + epoch + fileRevision and EXCLUDE stored findings whose source key is no longer expected
+  // (so the append-only store stops re-offering a stale finding after its content moved). Deferred.
   // Cell-granular live progress (the FINEST resolution): after each cell completes, fold its findings
   // into the per-lens matrix and advance unitsDone. The grouped path is the one place a completed unit
   // is a single (file, group, model) cell, so the dashboard's Findings-by-lens table fills fastest here.
@@ -169,6 +214,30 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
           }
         }
         if (flushed && guard && r.cell) guard.markDone(cellKey(r.cell));
+        // WAVE 2: durable coverage ledger. ORDER IS LOAD-BEARING — the durable findings flush (fsync)
+        // above ran FIRST; only now (and only if it succeeded) do we append the cell's DONE-key. A crash
+        // between the two leaves the cell PENDING → re-reviewed (findings re-appended, deduped), never a
+        // false-done with lost findings. markDone fsyncs the ledger and THROWS on a persistence failure;
+        // we capture it (onCell throws are swallowed by the scheduler) so the loop can hard-stop sweep
+        // mode instead of silently under-covering. After the first error we stop appending (a persistent
+        // fsync failure must not spam) — the pass finishes its in-flight cells and the loop then stops.
+        if (flushed && sweep && sweep.cursor && r.cell && sweepError === null) {
+          try {
+            const key = cellSweepKey({
+              epochHash: sweep.epochHash,
+              tier: options.tier,
+              group: r.cell.group,
+              seat: r.cell.model,
+              reviewerSet: sweep.reviewerSet,
+              file: r.cell.file,
+              chunkIndex: r.cell.chunk,
+              chunkText: r.cell.chunkData?.text ?? ""
+            });
+            sweep.cursor.markDone(key, { pass: options.pass });
+          } catch (err) {
+            sweepError = String(err?.message ?? err);
+          }
+        }
       }
     }
   });
@@ -348,6 +417,9 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
       // reporting ran:true let the loop count it toward the dry streak and stop as "converged" (Fable P1).
       ran: !starved,
       ...(starved ? { ranReason: `budget tail below the active-seat count — 0 whole triples affordable (${dropped} cell(s) deferred)`, starved: true } : {}),
+      // WAVE 2: a durable-ledger persistence failure during markDone. The loop turns this into a hard
+      // stop (the sweep's coverage denominator can no longer be trusted). null on a normal pass.
+      ...(sweepError ? { sweepError } : {}),
       groupPreset: options.lensGroups ?? "fine",
       reviewers: reviewerMap(backends, options),
       unitsSelected: files.length,

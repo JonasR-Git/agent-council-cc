@@ -2187,7 +2187,7 @@ async function handleAudit(argv) {
   );
   const { options, positionals } = parseCommandInput(preArgv, {
     valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats", "usage-ceiling", "pause-at-5h"],
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep"]
+    booleanOptions: ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep", "epoch-sweep"]
   });
   // --deep: ONE flag for maximum ANALYSIS depth, so a thorough run needs no long flag list. It turns on
   // the grouped six-eyes review over a FULL lens partition (every lens — incl. SSOT/architecture — gets
@@ -2504,6 +2504,21 @@ async function handleAudit(argv) {
           console.error(`note: the loop reviews up to ${loopMaxCells} cell(s)/pass by default (small passes → frequent review→fix cycles + fast quota response); the GATE + SSOT reduce run over the ACCUMULATED findings ledger across passes, so bounding per-pass work does not fragment cross-file/SSOT issues. Raise --max-cells for bigger passes.`);
         }
       }
+      // WAVE 2 (epoch-sweep): opt into the DURABLE, run-wide cell-coverage ledger that drives per-pass
+      // scheduling + tier-advance from a sealed manifest denominator instead of the modulo window +
+      // passRan heuristic. FAIL CLOSED — it REQUIRES the grouped path (the per-file path has no cell
+      // ledger) and per-tier convergence, and REJECTS --flat; never silently fall back to legacy.
+      // WAVE3: after the coverage guarantee is proven by the property test, flip the DEFAULT ON for
+      // `fix --loop --groups --per-tier` runs (the modulo skip hole is a confirmed correctness bug).
+      // Deferred — Wave 2 keeps --epoch-sweep strictly opt-in.
+      const epochSweep = options["epoch-sweep"] === true;
+      if (epochSweep) {
+        if (!loopLensGroups) throw new Error("--epoch-sweep requires --groups (the durable coverage ledger is cell-granular; the per-file path has no cells to track)");
+        if (options.flat) throw new Error("--epoch-sweep is incompatible with --flat (the sweep drives per-tier coverage; --flat is a single flat convergence)");
+        if (!options.json) {
+          console.error("note: --epoch-sweep active — per-pass scheduling + tier-advance are driven by a DURABLE run-wide cell-coverage ledger (audit-tier-sweep-cursor.jsonl in the state dir, never the working tree). Coverage is PROVEN per tier by a sealed manifest denominator; a budget/pass ceiling stops with an explicit COVERAGE INCOMPLETE debt the ledger persists so a same-epoch --resume continues the denominator (it does not restart at zero).");
+        }
+      }
       // The loop budget is in AGENT CALLS. A per-file pass is a handful; a GROUPED pass is up to
       // maxCells calls, so a grouped loop's budget must be CELL-SCALE — else one pass blows the 60
       // default and the loop stops after a single pass (council Grok R9). Default a grouped run to ~4
@@ -2584,6 +2599,21 @@ async function handleAudit(argv) {
         verdictMap: logical.verdictMap,
         lensGroups: loopLensGroups,
         maxCells: loopMaxCells,
+        // WAVE 2: build the durable sweep machinery (deps.sweep) — the frozen reviewer identities, the
+        // epoch fingerprint, the on-disk ledger, the disk read/chunk path. Only when --epoch-sweep is on
+        // (and the grouped path is active); null otherwise ⇒ the loop runs legacy. The epoch fingerprint
+        // folds `deep` + the seat model/effort pins, so re-pinning a model re-owes its cells.
+        epochSweep,
+        deep: options.deep,
+        codexModel: merged["codex-model"] ?? merged.codexModel,
+        grokModel: merged["grok-model"] ?? merged.grokModel,
+        // G: thread claudeModel like codex/grok so seatIdentity('claude') gets a real model — else the
+        // Claude seat's epoch identity is always "" and a Claude model re-pin does NOT rotate the epoch.
+        claudeModel: merged["claude-model"] ?? merged.claudeModel,
+        codexEffort: merged["codex-effort"] ?? merged.codexEffort,
+        grokEffort: merged["grok-effort"] ?? merged.grokEffort,
+        claudeEffort: merged["claude-effort"] ?? merged.claudeEffort,
+        openrouterEffort: merged["openrouter-effort"] ?? merged.openrouterEffort,
         completenessCritic: completenessCritic && Boolean(loopLensGroups), // M8: only on the grouped loop
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
@@ -2598,7 +2628,6 @@ async function handleAudit(argv) {
         // characterization test green across the change, else revert to propose-only. null when off;
         // fail-loud when requested but no generator seat is reachable (never silently ungated).
         charTestGate: resolveCharTestGate(cwd, backends, merged, options),
-        claudeModel: merged["claude-model"] ?? merged.claudeModel,
         sensitiveAutoApply,
         reviewPatch,
         retryOnLimit: options["retry-on-limit"],
@@ -2635,6 +2664,9 @@ async function handleAudit(argv) {
         // enabled transformer (only --flat worked). The inner :2619 runAuditFix `structureAutoApply:true`
         // on the impl seam stays — that consents the PER-PASS fixer; this consents the tier FLOOR.
         structureAutoApply,
+        // WAVE 2: pin the sweep mode + the ledger's true base branch into the run so runFixLoop drives
+        // scheduling/tier-advance off the durable ledger and a resume can't flip the mode.
+        epochSweep, ledgerBaseBranch: baseBranch,
         retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined,
         logicalProposals: logical.findings, usageCeiling, usageSince, pause5h, reporter, onProgress: reporter.line,
         // B: the mid-pass checkpoint-and-resume quota guard — on the grouped path a quota breach quiesces
