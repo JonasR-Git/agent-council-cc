@@ -53,6 +53,7 @@ import { CONSENT_ENV_VAR, LOCAL_CONSENT_FILE, evaluateAckWrite, formatConsentBan
 import { emitAliasNotes } from "./lib/cli-aliases.mjs";
 import { route } from "./lib/cli-dispatch.mjs";
 import { assertCodeWriteAllowed } from "./lib/cli-mutation.mjs";
+import { explainHintsFromDispatch, formatExplainTable, hasExplainFlag, hasJsonFlag, isExplainableVerb, resolveExplain } from "./lib/cli-explain.mjs";
 import { buildClaudeReviewArgs, makePatchReviewer, patchReviewerReady } from "./lib/audit-patch-reviewer.mjs";
 import { detectLogical } from "./lib/audit-logical.mjs";
 import { nodesFromGraph } from "./lib/import-graph.mjs";
@@ -1423,6 +1424,9 @@ async function handleDoctor(argv) {
   const consentRoot = workspaceRoot(cwd);
   const consentResolution = resolveConsents({ cwd: consentRoot, options: {}, stateDir: resolveStateDir(cwd), deps: {} });
   const effectivePolicyLine = formatConsentBanner(consentResolution, { verb: "fix" });
+  // Align `setup --check` with `--explain`: surface the SAME resolved fix policy (knob + source) from the
+  // ONE resolver, reusing the already-loaded policy + consent resolution (no extra work, no writes).
+  const resolvedPolicy = resolveExplain({ verb: "fix", args: [], cwd, stateDir: resolveStateDir(cwd), deps: { policy, consent: consentResolution } });
   const consentWarnings = [];
   // The tracked-config-consent warning (from loadPolicy) + EVERY consent-resolution warning — the
   // commonest misconfig is the missing-ack case, so surface it too (do NOT filter by /trust_fingerprint/).
@@ -1442,7 +1446,7 @@ async function handleDoctor(argv) {
 
   const ready = checks.every((c) => c.ok);
   if (options.json) {
-    outputResult({ ready, checks, stateDir: resolveStateDir(cwd), effectivePolicy: effectivePolicyLine, consentWarnings }, true);
+    outputResult({ ready, checks, stateDir: resolveStateDir(cwd), effectivePolicy: effectivePolicyLine, resolvedPolicy: resolvedPolicy.knobs, consentWarnings }, true);
     return;
   }
   const lines = [`Council doctor: ${ready ? "ALL OK" : "PROBLEMS FOUND"}`];
@@ -1450,6 +1454,7 @@ async function handleDoctor(argv) {
     lines.push(`  [${c.ok ? "ok" : "!!"}] ${c.name.padEnd(20)} ${c.detail ?? ""}`);
   }
   lines.push(`  ${effectivePolicyLine}`);
+  lines.push(`  resolved fix policy (flag > fix: config > built-in): ${resolvedPolicy.knobs.map((k) => `${k.key}=${k.value === null ? "default" : k.value}(${k.source})`).join(" ")}`);
   for (const w of consentWarnings) lines.push(`  [!!] ${w}`);
   console.log(`${lines.join("\n")}\n`);
   if (!ready) process.exitCode = 1;
@@ -4226,6 +4231,23 @@ export async function handleBuild(argv, { verb: dispatchVerb } = {}) {
   if (!out?.ok || out?.stranded) process.exitCode = 1;
 }
 
+/**
+ * `--explain` handler (Stage 6): print the verb's resolved effective policy and RETURN. Runs no work and
+ * writes nothing — it only calls the read-only resolver (lib/cli-explain.mjs → loadPolicy + resolveConsents).
+ * Under `--json` stdout is PURE JSON (the resolved knobs + sources); the human table + any resolver warnings
+ * go to stdout/stderr respectively so `--json` stdout stays parseable.
+ */
+function runExplain(r) {
+  const args = r.args;
+  const cwd = process.cwd();
+  const result = resolveExplain({ verb: r.verb, args, cwd, stateDir: resolveStateDir(cwd), hints: explainHintsFromDispatch(r) });
+  // Resolver warnings (e.g. an unacknowledged consent) always go to STDERR — never stdout — so a --json
+  // consumer sees pure JSON while a human still sees the caveats (mirrors the fix-run banner contract).
+  for (const w of result.warnings ?? []) console.error(w);
+  if (hasJsonFlag(args)) outputResult({ explain: true, ...result }, true);
+  else console.log(formatExplainTable(result));
+}
+
 async function main() {
   const rawArgv = process.argv.slice(2);
   const first = rawArgv[0];
@@ -4239,6 +4261,14 @@ async function main() {
   emitAliasNotes(rawArgv);
   const r = route(rawArgv);
   const args = r.args;
+  // `--explain` (Stage 6): resolve the verb's EFFECTIVE options + their sources and EXIT — no review/fix/
+  // build work, no writes, no model calls. Reuses the ONE resolver (lib/cli-explain.mjs), which imports no
+  // code writer and only READS (loadPolicy + resolveConsents). Intercepts BEFORE dispatch so the handler
+  // never runs. Recognized on every user-facing verb via the registry/config; hidden verbs are excluded.
+  if (isExplainableVerb(r.verb) && hasExplainFlag(args)) {
+    runExplain(r);
+    return;
+  }
   try {
     switch (r.handler) {
       case "handleSetup":
