@@ -6,6 +6,10 @@ import { loadCouncilEnv } from "./dotenv.mjs";
 
 export const DEFAULT_POLICY = {
   version: 1,
+  // Schema-version marker for the per-verb config blocks (review:/fix:/plan:/build:/status:/defaults:).
+  // Parsed from the file if present (see loadPolicy), defaults to 1. No behavior change today — it is a
+  // forward-compat hook so a future schema bump can migrate/validate without a silent misread.
+  config_version: 1,
   codex_model: null,
   grok_model: null,
   codex_effort: null,
@@ -125,32 +129,107 @@ export function parseSimpleYaml(text) {
 }
 
 /**
- * Parse an optional nested `fix:` block from raw YAML text into a plain object. The flat
- * parseSimpleYaml can't nest, so the `audit fix` run-behavior map (the flag-reduction feature) is
- * extracted here: a top-level `fix:` header line (empty value) followed by INDENTED `key: value`
- * children. Values are coerced like any scalar (true/false/number/string). Returns null when there
- * is no `fix:` block with children ⇒ `policy.fix` stays undefined ⇒ a bare `audit fix` behaves
- * BYTE-IDENTICAL to having no config. Unknown children are kept (forward-compat); the consumer
- * decides which keys it recognizes.
+ * The one-level-nested config blocks the redesign recognizes. Each is a MAP of scalar `key: value`
+ * children under a top-level `<block>:` header. `parseSimpleYaml` is FLAT (it silently drops these
+ * indented children and leaves a stray "" for the bare header), so `parseVerbBlocks` recovers them.
  */
-export function parseFixBlock(text) {
+export const KNOWN_BLOCKS = ["review", "fix", "plan", "build", "status", "defaults"];
+
+/**
+ * Recognized child keys per block — the source of truth for the LOUD unknown-key warnings (a typo
+ * like `epoch_sweeps:` must WARN, never silently no-op). Membership follows the frozen CLI-surface
+ * design (docs/cli-surface-design.md: the config schema + Appendix A CONFIG lists + Appendix C's HARD
+ * `defaults:` whitelist). `fix` mirrors council-companion's FIX_CONFIG_* maps exactly so the repo's
+ * own tracked `.council.yml` warns on nothing. Unknown keys are WARNED but still parsed into the
+ * block object (forward-compat, non-destructive) — the consumer decides what it acts on.
+ */
+export const KNOWN_BLOCK_KEYS = {
+  // Appendix A `review:` CONFIG: default mode/scope, groups/max_cells (deep/endless), areas, churn_days.
+  review: new Set(["default_mode", "scope", "groups", "max_cells", "areas", "churn_days"]),
+  // Mirrors council-companion FIX_CONFIG_BOOLEANS + per_tier/flat + FIX_CONFIG_VALUES.
+  fix: new Set([
+    "loop", "deep", "epoch_sweep", "supervise", "structure_auto_apply", "sensitive_auto_apply",
+    "retry_on_limit", "chartest", "completeness_critic", "skip_openrouter", "per_tier", "flat",
+    "autonomy", "min_severity", "groups", "max_fixes", "max_passes", "dry_streak", "max_cells",
+    "budget", "usage_ceiling", "pause_at_5h"
+  ]),
+  // Appendix A `plan:` CONFIG: synthesizer, seats.
+  plan: new Set(["synthesizer", "seats"]),
+  // Appendix A `build:` CONFIG: budgets/timeouts ONLY — never a skip-gate/auto-merge key.
+  build: new Set(["budget", "timeout", "timeout_minutes"]),
+  // Config schema example `status: { interval: 2 }` (Appendix A: otherwise no config).
+  status: new Set(["interval"]),
+  // Appendix C HARD whitelist: budget, groups, max_cells ONLY.
+  defaults: new Set(["budget", "groups", "max_cells"])
+};
+
+/**
+ * Recover EVERY one-level-nested known block (review/fix/plan/build/status/defaults) from raw YAML
+ * text into a `{ <block>: { key: value, … } }` map. BOUNDED by design: exactly ONE level of nesting
+ * under a recognized top-level header — a `<block>:` line with an EMPTY value (only an optional inline
+ * comment) followed by INDENTED `key: value` scalar children. Not arbitrary-depth YAML: a nested map
+ * or list under a child ENDS the block (a child line that isn't `<indent>key: scalar` breaks it), and
+ * deeper indentation is not descended into. Values are coerced like any scalar (true/false/number/
+ * string) via the shared stripInlineComment/stripQuotes/coerceScalar helpers. A childless block is
+ * OMITTED from the result (its key stays absent) so an empty `build:` behaves like no block at all.
+ * First header wins per block name (matches the historical single-`fix:` extractor's first-return).
+ * Zero-dep, single pass.
+ */
+export function parseVerbBlocks(text) {
   const lines = String(text).split(/\r?\n/);
+  const blocks = {};
+  const seen = new Set();
   for (let i = 0; i < lines.length; i += 1) {
-    // A top-level `fix:` header: no leading whitespace, empty value (only an optional comment).
-    if (!/^fix:\s*(#.*)?$/.test(lines[i])) continue;
+    // A top-level block header: no leading whitespace, a known name, empty value (only a comment).
+    const header = lines[i].match(/^([A-Za-z0-9_]+):\s*(#.*)?$/);
+    if (!header) continue;
+    const name = header[1];
+    if (!KNOWN_BLOCKS.includes(name) || seen.has(name)) continue;
+    seen.add(name); // first header for a given block wins (byte-compatible with the old fix: extractor)
     const out = {};
     for (let j = i + 1; j < lines.length; j += 1) {
       const l = lines[j];
       if (!l.trim() || l.trim().startsWith("#")) continue; // blank / comment line inside the block
       if (!/^\s/.test(l)) break; // a non-indented, non-blank line ends the block
       const m = l.match(/^\s+([A-Za-z0-9_]+):\s*(.*)$/);
-      if (!m) break;
+      if (!m) break; // a list item or non-scalar child ends the block (bounded: no deeper nesting)
       const val = stripInlineComment(m[2].trimEnd()).trim();
       out[m[1]] = coerceScalar(stripQuotes(val));
     }
-    return Object.keys(out).length ? out : null;
+    if (Object.keys(out).length) blocks[name] = out;
   }
-  return null;
+  return blocks;
+}
+
+/**
+ * Collect LOUD unknown-key warnings for the recovered blocks: any child key not in that block's
+ * KNOWN_BLOCK_KEYS set (a typo like `fix.epoch_sweeps` or a non-whitelisted `defaults.loop`). Returns
+ * a string[] (empty when clean) so callers can PRINT to stderr AND surface programmatically (loadPolicy
+ * attaches them as `_warnings`; `setup --check`/doctor include them in its report). Never throws.
+ */
+export function verbBlockWarnings(blocks, source = ".council.yml") {
+  const warnings = [];
+  for (const name of KNOWN_BLOCKS) {
+    const obj = blocks[name];
+    if (!obj) continue;
+    const known = KNOWN_BLOCK_KEYS[name];
+    for (const key of Object.keys(obj)) {
+      if (!known.has(key)) {
+        warnings.push(`Warning: ${source} ${name}.${key} is not a recognized ${name}: key (ignored - check for a typo).`);
+      }
+    }
+  }
+  return warnings;
+}
+
+/**
+ * Parse an optional nested `fix:` block from raw YAML text into a plain object. Thin delegate over the
+ * generalized parseVerbBlocks (a top-level `fix:` header + INDENTED scalar children). Returns null when
+ * there is no `fix:` block with children ⇒ `policy.fix` stays undefined ⇒ a bare `audit fix` behaves
+ * BYTE-IDENTICAL to having no config. Kept as a named export so existing callers/tests are unchanged.
+ */
+export function parseFixBlock(text) {
+  return parseVerbBlocks(text).fix ?? null;
 }
 
 function stripInlineComment(s) {
@@ -198,26 +277,50 @@ export function loadPolicy(cwd) {
     if (!fs.existsSync(file)) continue;
     const text = fs.readFileSync(file, "utf8");
     let parsed;
+    let warnings = [];
     if (file.endsWith(".json")) {
       parsed = JSON.parse(text);
     } else {
       parsed = parseSimpleYaml(text);
-      // The flat parser can't nest, so recover the optional `fix:` run-behavior map from the raw
-      // text. A childless/absent `fix:` leaves policy.fix UNDEFINED (drop the stray "" the flat
-      // parser writes for a bare header) so a repo with no `fix:` block resolves options unchanged.
-      const fixBlock = parseFixBlock(text);
-      if (fixBlock) parsed.fix = fixBlock;
-      else delete parsed.fix;
+      // The flat parser can't nest, so recover EVERY one-level-nested known block (review/fix/plan/
+      // build/status/defaults) from the raw text. For each recognized block: a present-with-children
+      // block replaces the stray "" the flat parser wrote for the bare header; a childless/absent
+      // block is DELETED so `block in policy` is false — i.e. a missing verb block leaves resolution
+      // BYTE-IDENTICAL to today (this is Stage 1's whole safety contract). `policy.fix` is unchanged.
+      const blocks = parseVerbBlocks(text);
+      for (const name of KNOWN_BLOCKS) {
+        if (blocks[name]) parsed[name] = blocks[name];
+        else delete parsed[name];
+      }
+      // LOUD unknown-key warnings: a typo like `epoch_sweeps:` must warn, never silently no-op.
+      warnings = verbBlockWarnings(blocks, file);
     }
+    // Emit each warning once per (file, message) per process so a repeated loadPolicy doesn't spam,
+    // while the FIRST load stays loud on stderr. Never pollutes stdout (safe under --json).
+    for (const w of warnings) emitPolicyWarningOnce(file, w);
     return {
       ...DEFAULT_POLICY,
       ...parsed,
+      // `config_version` is parsed from `parsed` if the file set it (parseSimpleYaml already surfaces
+      // the top-level scalar); otherwise DEFAULT_POLICY supplies 1. No behavior change today.
       _source: file,
-      _root: root
+      _root: root,
+      // Returned (not only printed) so `setup --check`/doctor can surface the same warnings.
+      _warnings: warnings
     };
   }
 
-  return { ...DEFAULT_POLICY, _source: null, _root: root };
+  return { ...DEFAULT_POLICY, _source: null, _root: root, _warnings: [] };
+}
+
+// Per-process de-dupe for policy load warnings: loadPolicy runs many times per command, so a naive
+// print would repeat each warning ~15×. Keyed by `${file}\n${message}` → first occurrence prints.
+const _printedPolicyWarnings = new Set();
+function emitPolicyWarningOnce(file, message) {
+  const key = `${file}\n${message}`;
+  if (_printedPolicyWarnings.has(key)) return;
+  _printedPolicyWarnings.add(key);
+  console.error(message);
 }
 
 export function mergeOptionsWithPolicy(options, policy) {

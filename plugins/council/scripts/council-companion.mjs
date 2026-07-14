@@ -290,13 +290,17 @@ async function handleSetup(argv) {
     },
     policy: {
       source: policy._source,
+      config_version: policy.config_version,
       default_mode: policy.default_mode,
       codex_model: policy.codex_model,
       grok_model: policy.grok_model,
       claude_backend: claudeBackend,
       claude_model: policy.claude_model,
       focus: policy.focus,
-      agent_timeout_minutes: policy.agent_timeout_minutes
+      agent_timeout_minutes: policy.agent_timeout_minutes,
+      // Unknown-key warnings for the per-verb config blocks (loadPolicy already printed them to stderr
+      // during this load; surfaced here too so --json consumers and the human text see them).
+      warnings: policy._warnings ?? []
     },
     stateDir: resolveStateDir(cwd),
     nextSteps: []
@@ -353,6 +357,7 @@ async function handleSetup(argv) {
       backends.grok.cli.available ? backends.grok.cli.detail : "not found"
     ),
     `  policy: ${policy._source ?? "(none - using defaults)"}`,
+    ...(policy._warnings ?? []).map((w) => `  config: ${w}`),
     `  state: ${report.stateDir}`,
     "Next:"
   ];
