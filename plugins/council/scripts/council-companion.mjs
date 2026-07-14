@@ -48,6 +48,7 @@ import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./l
 import { evaluateResumeGuard, loadFixLoopCheckpoint, runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { parsePause5hOption, parseUsageCeiling } from "./lib/usage-guard.mjs";
+import { booleanOptionsFor, fixConfigBooleans, fixConfigValues, negatableFlags, valueOptionsFor } from "./lib/cli-registry.mjs";
 import { buildClaudeReviewArgs, makePatchReviewer, patchReviewerReady } from "./lib/audit-patch-reviewer.mjs";
 import { detectLogical } from "./lib/audit-logical.mjs";
 import { nodesFromGraph } from "./lib/import-graph.mjs";
@@ -2202,45 +2203,17 @@ export function finalizeLoopReporter(reporter, out, { ok = null, stopReason = nu
 // Precedence for EVERY option: explicit CLI flag > policy.fix.<key> > built-in default. parseArgs
 // records an absent boolean as `undefined` (present ⇒ true, `--no-<flag>` ⇒ explicit false), so the
 // tri-state is captured directly: config fills ONLY the truly-absent (undefined) options.
-// Recognized boolean keys (snake_case config → the kebab option key parseArgs stores):
-const FIX_CONFIG_BOOLEANS = {
-  loop: "loop",
-  deep: "deep",
-  epoch_sweep: "epoch-sweep",
-  supervise: "supervise",
-  structure_auto_apply: "structure-auto-apply",
-  sensitive_auto_apply: "sensitive-auto-apply",
-  retry_on_limit: "retry-on-limit",
-  chartest: "chartest",
-  completeness_critic: "completeness-critic",
-  skip_openrouter: "skip-openrouter"
-};
+// Recognized boolean keys (snake_case config → the kebab option key parseArgs stores). DERIVED from the
+// flag registry (lib/cli-registry.mjs) — the single source of truth for the CLI surface (Stage 2). The
+// registry reproduces these maps byte-identically; see tests/cli-registry.test.mjs for the golden pins.
+const FIX_CONFIG_BOOLEANS = fixConfigBooleans();
 // The boolean flags that accept a `--no-<flag>` negation (so a config-true can be turned OFF for one
 // run). `flat` is here too — its config side is the friendlier `per_tier` (inverse), handled below.
-const FIX_NEGATABLE_FLAGS = [
-  "deep", "loop", "epoch-sweep", "supervise", "flat",
-  "structure-auto-apply", "sensitive-auto-apply", "retry-on-limit",
-  "chartest", "skip-openrouter", "completeness-critic"
-];
-function fixRequirePositive(v) {
-  const n = Number(v);
-  if (!Number.isFinite(n) || n < 1) throw new Error("must be a positive number");
-}
+const FIX_NEGATABLE_FLAGS = negatableFlags("audit");
 // Value keys (config → kebab option) with the SAME validator the CLI flag uses. `validate` THROWS on
 // a bad value; the merge wraps that into a fail-loud "in .council.yml fix.<key>" error. autonomy /
 // min_severity match the CLI's lenient handling (unknown → safe fallback), so no validator.
-const FIX_CONFIG_VALUES = {
-  autonomy: { opt: "autonomy", validate: null },
-  min_severity: { opt: "min-severity", validate: null },
-  groups: { opt: "groups", validate: (v) => { if (!["fine", "tier", "lens"].includes(String(v))) throw new Error(`must be one of fine|tier|lens (got: ${v})`); } },
-  max_fixes: { opt: "max-fixes", validate: fixRequirePositive },
-  max_passes: { opt: "max-passes", validate: (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 1 || n > 100) throw new Error("must be between 1 and 100"); } },
-  dry_streak: { opt: "dry-streak", validate: fixRequirePositive },
-  max_cells: { opt: "max-cells", validate: fixRequirePositive },
-  budget: { opt: "budget", validate: (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 2) throw new Error("must be a number >= 2"); } },
-  usage_ceiling: { opt: "usage-ceiling", validate: (v) => { parseUsageCeiling(v); } },
-  pause_at_5h: { opt: "pause-at-5h", validate: (v) => { parsePause5hOption(v); } }
-};
+const FIX_CONFIG_VALUES = fixConfigValues();
 
 /**
  * Fold each `--no-<flag>` (parseArgs stored it as options["no-<flag>"] === true) into an EXPLICIT
@@ -2322,12 +2295,12 @@ async function handleAudit(argv) {
     (tok === "--usage-ceiling" || tok === "--pause-at-5h") && (a[i + 1] == null || String(a[i + 1]).startsWith("-")) ? `${tok}=` : tok
   );
   const { options, positionals } = parseCommandInput(preArgv, {
-    valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats", "usage-ceiling", "pause-at-5h"],
-    // The `no-*` twins negate the config-backed booleans (flag-reduction): `--no-deep` beats a
-    // `fix: { deep: true }` for one run. They are registered so parseArgs accepts them; the loop
-    // below folds each into an explicit `false` on the base key.
-    booleanOptions: ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep", "epoch-sweep",
-      "no-deep", "no-loop", "no-epoch-sweep", "no-supervise", "no-flat", "no-structure-auto-apply", "no-sensitive-auto-apply", "no-retry-on-limit", "no-chartest", "no-skip-openrouter", "no-completeness-critic"]
+    // DERIVED from the flag registry (lib/cli-registry.mjs, Stage 2 SSOT). valueOptionsFor / booleanOptionsFor
+    // reproduce the previous hand-written arrays byte-for-byte, incl. the `--no-*` twins that negate the
+    // config-backed booleans (`--no-deep` beats a `fix: { deep: true }` for one run — registered so parseArgs
+    // accepts them; applyNoFlagNegations folds each into an explicit `false` on the base key).
+    valueOptions: valueOptionsFor("audit"),
+    booleanOptions: booleanOptionsFor("audit")
   });
   // Flag-reduction (`audit fix` only): fold `--no-<flag>` into an EXPLICIT false so a `fix:` config
   // default can't switch it back on for this run (explicit-false wins), then apply the `.council.yml`
