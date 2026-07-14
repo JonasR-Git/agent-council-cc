@@ -22,7 +22,7 @@ import { applyTierGating, orderByTier, tierOfLens } from "./audit-tiers.mjs";
 import { isProposeOnly, lensIds } from "./audit-lenses.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
 import { nowIso, resolveStateDir, writeFileAtomic } from "./state.mjs";
-import { findingsStorePath, makeFindingsAppender, readFindingsStore, requireDurableStore, resetFindingsStore } from "./audit-findings-store.mjs";
+import { findingCountsByFile, findingsStorePath, makeFindingsAppender, readFindingsStore, requireDurableStore, resetFindingsStore } from "./audit-findings-store.mjs";
 import { makeMidPassGuard, makeReviewCursor, reviewCursorPath } from "./audit-midpass-guard.mjs";
 import { normalizeFindings } from "./audit-normalize.mjs";
 import { correlateFindings } from "./audit-correlate.mjs";
@@ -708,12 +708,22 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     const scopedGroups = sweepMode ? scopeGroupsForTier(sweep.baseGroups, currentTier) : null;
     const reviewTier = sweepMode ? currentTier : (options.reviewTier ?? null);
     const reviewSweep = sweepMode ? { cursor: sweep.cursor, epochHash: sweepEpoch, reviewerSet: sweep.reviewerSet, manifest: sweepManifest, scopedGroups } : undefined;
+    // Brocken B (six-eyes-preserving front-loading): the DYNAMIC finding-density signal for the pending-cell
+    // scheduler — how many findings each posix file has produced so far THIS RUN (the durable store union
+    // readAccumulated already reads). SWEEP MODE ONLY (P1 fix): it is threaded into review → orderPendingFiles
+    // so a file that already surfaced findings is scheduled AHEAD of an equal-hotspot clean file — the ledger
+    // guarantees every cell still drains regardless of order (coverage untouched). In the NON-sweep loop the
+    // review walks a progressive-OFFSET window over the STATIC hotspot order; feeding it a per-pass-changing
+    // sort would shift band boundaries and could SKIP a file — a real coverage regression — so we pass
+    // `undefined` there and the legacy static bands are preserved. Empty for a bare/non-durable sweep caller
+    // (readAccumulated → []) ⇒ pure hotspot order (byte-identical; coverage/tier-advance unchanged).
+    const findingCounts = sweepMode ? findingCountsByFile(readAccumulated()) : undefined;
     try {
       // Wave 1 Stage 2 (BB1): thread an OPTIONAL review tier into the grouped-review adapter so
       // enumeration is scoped to that tier's lenses. `options.reviewTier ?? null` — a NEW optional
       // option; default null = TODAY's behavior (no scoping, byte-identical). Wave 2 replaces this
       // static value with the ledger-driven current sweep tier.
-      rev = await withLimitRetry(() => review({ budget: passBudget, pass: passNo, changedFiles, guard, findingsAppender, tier: reviewTier, sweep: reviewSweep }));
+      rev = await withLimitRetry(() => review({ budget: passBudget, pass: passNo, changedFiles, guard, findingsAppender, tier: reviewTier, sweep: reviewSweep, findingCounts }));
     } catch (err) {
       passes.push({ pass: passNo, error: String(err?.message ?? err) });
       stopReason = `review error on pass ${passNo}: ${String(err?.message ?? err)}`;

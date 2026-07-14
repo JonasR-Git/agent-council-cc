@@ -68,6 +68,9 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   // compat). `tier` may be 0 (a real tier), so the guard is `!= null`, never a truthiness check.
   const baseGroups = resolveLensGroups(options.lensGroups ?? "fine");
   const groups = options.tier != null ? scopeGroupsForTier(baseGroups, options.tier) : baseGroups;
+  // NOTE (Brocken B): honors the progressive `unitOffset` window, so it MUST stay a STATIC hotspot sort —
+  // NO findingCounts here (a moving window over a dynamic sort could skip a file). Front-loading lives only
+  // in the epoch-sweep pending scheduler (orderPendingFiles), where the durable ledger guarantees the drain.
   const files = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
   const progress = typeof options.onProgress === "function" ? options.onProgress : null;
   const reporter = options.reporter ?? NOOP_REPORTER;

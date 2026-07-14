@@ -30,7 +30,7 @@ import path from "node:path";
 
 import { runAuditFix } from "./audit-fix.mjs";
 import { normalizeFindings } from "./audit-normalize.mjs";
-import { runAuditReview, selectUnits } from "./audit-review.mjs";
+import { runAuditReview, selectUnits, suspicionRank } from "./audit-review.mjs";
 import { runGroupedReview, READ_MAX_BYTES } from "./audit-grouped-review.mjs";
 import { resolveLensGroups } from "./audit-lens-groups.mjs";
 import { chunkSource, CHUNK_MAX_CHARS, CHUNK_OVERLAP_LINES, CHUNKER_VERSION } from "./audit-group-prompt.mjs";
@@ -298,11 +298,17 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
 
   // WAVE 2: order a tier's PENDING files for scheduling — `changedFiles` (a localized pass) are PRIORITY
   // (touched files' pending cells first), then the rest of the pending set in the SAME deterministic
-  // selectUnits order (hotspot desc, id asc) the full-scope window uses. Never a RESTRICTION on the
-  // expected universe — just the order the bounded window walks it.
-  const orderPendingFiles = (keys, changed) => {
+  // order the full-scope window uses. Never a RESTRICTION on the expected universe — just the ORDER the
+  // bounded window walks it (so the reorder can never skip a pending cell → coverage/union unchanged).
+  // Brocken B (front-loading): the `rank` is RE-DERIVED from suspicionRank over the SAME file universe
+  // (sweep.allFiles) blended with the DYNAMIC finding-density `findingCounts` the loop threads in, so a
+  // pending file that already produced findings THIS RUN is drawn AHEAD of an equal-hotspot pending file
+  // with none. `findingCounts` absent/empty ⇒ suspicionRank yields the identical hotspot order allFiles is
+  // already in ⇒ the rank map is byte-identical to the prior `(id, i)` mapping (backward-compat).
+  const orderPendingFiles = (keys, changed, findingCounts) => {
     const pendingSet = new Set(keys.map(fileOfKey).filter(Boolean));
-    const rank = new Map((sweep?.allFiles ?? []).map((id, i) => [id, i]));
+    const universe = (sweep?.allFiles ?? []).map((id) => filesById.get(id) ?? { id, hotspot: 0 });
+    const rank = new Map(suspicionRank(universe, { findingCounts }).map((f, i) => [f.id, i]));
     const out = [];
     const seen = new Set();
     for (const c of changed ?? []) {
@@ -313,7 +319,7 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     return [...out, ...rest];
   };
 
-  const review = async ({ budget, changedFiles, pass, guard, findingsAppender, tier, sweep: reviewSweep } = {}) => {
+  const review = async ({ budget, changedFiles, pass, guard, findingsAppender, tier, sweep: reviewSweep, findingCounts } = {}) => {
     // Fold the PRIOR pass's flagged gap files (if any) into this pass's scope: they ride ALONGSIDE
     // an existing localized changedFiles scope, or — absent one — BECOME it, so the loop actually
     // re-targets the gap next pass instead of only resetting the dry streak.
@@ -334,7 +340,7 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
         // pass (which must never advance the tier); it is genuine completion, so ran:true.
         return { findings: [], ran: true, coverage: { ran: true, passComplete: true, complete: true, budgetSpent: 0, unitsSelected: 0, unitsReviewed: 0, sweepNoPending: true } };
       }
-      reviewFiles = orderPendingFiles(pend.keys, changedFiles).slice(0, maxUnits).map((id) => filesById.get(id)).filter(Boolean);
+      reviewFiles = orderPendingFiles(pend.keys, changedFiles, findingCounts).slice(0, maxUnits).map((id) => filesById.get(id)).filter(Boolean);
     } else if (scopedFiles && scopedFiles.length) {
       reviewFiles = scopedFiles; // localized pass: review the changed (+ folded gap) band from the top
     } else {
@@ -365,6 +371,11 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       budget,
       maxUnits,
       unitOffset: offset,
+      // Brocken B (front-loading): findingCounts is deliberately NOT forwarded to doReview — its selectUnits
+      // walks the progressive `unitOffset` window, which must stay a STATIC hotspot sort (a per-pass-changing
+      // order shifts band boundaries and can SKIP a file → coverage regression). Front-loading is applied
+      // ONLY in orderPendingFiles above (the pending-driven SWEEP scheduler), where the durable ledger drains
+      // every cell regardless of order. The doReview windows stay byte-identical to their pre-Brocken-B order.
       skipReduce: effectiveFullPasses > 1, // the SSOT reduce is over static input — run it once
       skipCodex: options.skipCodex,
       skipGrok: options.skipGrok,

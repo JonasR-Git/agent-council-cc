@@ -58,17 +58,65 @@ export function activeReviewerCount(backends, options = {}) {
   return activeSeatNames(backends, options).length;
 }
 
+// FRONT-LOADING (Brocken B): the finding-density weight. It dominates the ~0..100 static `hotspot` range
+// so a file that already produced findings THIS RUN (a live bug-cluster signal, stronger than static
+// complexity) sorts AHEAD of a merely complex-but-clean file. The boost SATURATES: any file with ≥1
+// finding gets at least HALF the weight (a fixed floor), so it front-loads regardless of how many findings
+// pile up on the busiest file; the other half is count/maxCount so findings still ORDER the finding-files
+// among themselves. When NO file has findings the boost is exactly 0 and the score collapses to `hotspot`.
+const SUSPICION_FINDING_WEIGHT = 1000;
+const SUSPICION_FLOOR = 0.5; // a finding-file always beats an equal-hotspot clean file by ≥ FLOOR·WEIGHT
+
+/** posix-normalize an id so it keys the SAME way findingCounts is built (mirrors posixKeyPath). */
+function suspicionPosix(id) {
+  return String(id ?? "").replace(/\\/g, "/");
+}
+
 /**
- * Non-test units ranked by hotspot, a `maxUnits` window starting at `offset`.
- * The offset lets the endless loop advance to the NEXT band of hotspots each pass
- * (progressive coverage) instead of re-reviewing the same top-N every time.
+ * PURE, deterministic front-loading order over `files` (each at least `{ id, hotspot }`). Blends the
+ * static `hotspot` with a DYNAMIC finding-density signal: `findingCounts` is `{ [posixFile]: n }` — the
+ * number of findings recorded so far THIS RUN per file (from the durable findings-store union). Returns a
+ * NEW array (never mutates the input). Ordering: blended score desc, then the EXISTING selectUnits
+ * tiebreak `hotspot desc, id asc`. A file with findings sorts ahead of an equal-hotspot file with none; a
+ * lower-hotspot file with findings can outrank a higher-hotspot file with none (the SATURATING boost — a
+ * ≥ FLOOR·WEIGHT floor for any finding-file — dominates the hotspot range without diluting as findings pile
+ * up elsewhere). When `findingCounts` is absent/empty (or no file has a positive count) EVERY boost is
+ * exactly 0, so `score === hotspot` and the result is BYTE-IDENTICAL to the pure-hotspot order. No clock or
+ * random; pure over (files, findingCounts). suspicionRank is a pure REORDER — it never adds/removes a file.
+ *
+ * COVERAGE NOTE: reordering preserves coverage only where the CONSUMER drains the whole set regardless of
+ * order — i.e. the pending-driven epoch-SWEEP scheduler (orderPendingFiles), whose durable ledger guarantees
+ * every cell is eventually scheduled. It must NOT drive a MOVING progressive-offset window (selectUnits with
+ * a growing offset): a per-pass-changing sort shifts the band boundaries, so a file can be skipped entirely
+ * or re-reviewed before the dry-streak stop. The non-sweep loop therefore calls selectUnits WITHOUT
+ * findingCounts (static hotspot bands); front-loading is wired ONLY into the sweep scheduler.
+ * NOTE: a cheap-MODEL `--triage` reorder pass is an opt-in follow-up, intentionally OUT of scope here.
  */
-export function selectUnits(model, { maxUnits = 12, offset = 0 } = {}) {
+export function suspicionRank(files, { findingCounts } = {}) {
+  const list = Array.isArray(files) ? files : [];
+  const counts = findingCounts && typeof findingCounts === "object" ? findingCounts : null;
+  let maxCount = 0;
+  if (counts) for (const f of list) { const c = counts[suspicionPosix(f?.id)] || 0; if (c > maxCount) maxCount = c; }
+  // Saturating dominance: c==0 ⇒ 0 (⇒ score===hotspot, byte-identical); c>0 ⇒ WEIGHT·(FLOOR + (1-FLOOR)·c/maxCount).
+  const boost = (f) => {
+    const c = counts ? (counts[suspicionPosix(f?.id)] || 0) : 0;
+    return c > 0 ? SUSPICION_FINDING_WEIGHT * (SUSPICION_FLOOR + (1 - SUSPICION_FLOOR) * (maxCount > 0 ? c / maxCount : 0)) : 0;
+  };
+  const score = (f) => f.hotspot + boost(f);
+  return list.slice().sort((a, b) => score(b) - score(a) || b.hotspot - a.hotspot || a.id.localeCompare(b.id));
+}
+
+/**
+ * Non-test units ranked by hotspot, a `maxUnits` window starting at `offset`. The offset lets the endless
+ * loop advance to the NEXT band each pass (progressive coverage) instead of re-reviewing the same top-N
+ * every time — so the per-pass SORT must stay STATIC across passes or a band boundary shifts and a file is
+ * skipped. `findingCounts` is therefore an OPT-IN front-loading blend (suspicionRank) for callers that do
+ * NOT walk a moving offset (e.g. a one-shot top-N selection); the progressive-offset loop and the sweep
+ * denominator MUST omit it. Absent/empty ⇒ pure hotspot order (byte-identical to before).
+ */
+export function selectUnits(model, { maxUnits = 12, offset = 0, findingCounts } = {}) {
   const off = Math.max(0, Math.floor(offset));
-  return model.files
-    .filter((x) => !x.isTest)
-    .slice()
-    .sort((a, b) => b.hotspot - a.hotspot || a.id.localeCompare(b.id))
+  return suspicionRank(model.files.filter((x) => !x.isTest), { findingCounts })
     .slice(off, off + Math.max(0, maxUnits))
     .map((x) => x.id);
 }
@@ -342,6 +390,9 @@ export async function globalReduce(cwd, backends, options, model, budget, deps =
 export async function runAuditReview(cwd, model, backends, options = {}, deps = {}) {
   const reporter = options.reporter ?? NOOP_REPORTER;
   const budget = makeBudget(options.budget ?? 30);
+  // NOTE (Brocken B): this walks a progressive `offset` window, so it MUST stay a STATIC hotspot sort —
+  // no findingCounts here (a per-pass-changing sort would shift band boundaries and skip a file). Front-
+  // loading is wired only into the pending-driven sweep scheduler, where the ledger guarantees the drain.
   const units = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
   reporter.phase("review", `${units.length} units`);
   reporter.progress({ unitsDone: 0, unitsTotal: units.length });

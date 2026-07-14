@@ -61,6 +61,25 @@ export function readFindingsStore(file, { readFile } = {}) {
   return out;
 }
 
+/**
+ * Count durable findings per posix-normalized file → `{ [posixFile]: n }`. PURE over a records array
+ * (the findings-store union readFindingsStore returns). Used by the fix loop to build the DYNAMIC
+ * finding-density signal (Brocken B front-loading): suspicionRank front-loads pending files that already
+ * produced findings THIS RUN ahead of equal-hotspot clean files — ORDERING ONLY, never coverage. A record
+ * with no file is skipped; an empty/absent list → {} (⇒ suspicionRank falls back to the pure-hotspot order,
+ * byte-identical). Paths are folded to posix so they key the SAME way the model file ids / manifest do.
+ */
+export function findingCountsByFile(records) {
+  const counts = {};
+  for (const rec of Array.isArray(records) ? records : []) {
+    const file = rec?.file ?? rec?.location?.path ?? null;
+    if (!file) continue;
+    const key = String(file).replace(/\\/g, "/");
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
+}
+
 /** The set of fingerprints already durably recorded (for dedupe + the accumulated-evidence gate). */
 export function storedFingerprints(file, opts = {}) {
   const set = new Set();
