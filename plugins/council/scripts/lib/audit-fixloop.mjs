@@ -27,7 +27,7 @@ import { makeMidPassGuard, makeReviewCursor, reviewCursorPath } from "./audit-mi
 import { normalizeFindings } from "./audit-normalize.mjs";
 import { correlateFindings } from "./audit-correlate.mjs";
 import { STRUCTURE_LENSES } from "./structure-gate.mjs";
-import { manifestDigest, posixKeyPath, reviewerSetHash, scopeGroupsForTier, sortManifest } from "./audit-tier-sweep.mjs";
+import { expectedKeys, manifestDigest, posixKeyPath, reviewerSetHash, scopeGroupsForTier, sortManifest } from "./audit-tier-sweep.mjs";
 
 // NOTE: an in-process multi-hour autonomous pause wait is FRAGILE — the machine/terminal must stay up —
 // but the checkpoint written FIRST makes a mid-wait death --resume-able. The MAX_AUTONOMOUS_WAIT_MS
@@ -66,6 +66,15 @@ export const FIRST_AUTOFIXABLE_TIER = firstFixableTier();
 // semantic signal. Threshold 2 tolerates ONE flaky red, then surfaces on the second (immediate/N=1 is
 // defensible; 2 is safe against a flaky suite). Named so it is trivially tunable.
 const RED_ESCALATE_THRESHOLD = 2;
+
+// WAVE 3 — the (file,tier) LIVELOCK CIRCUIT-BREAKER threshold. A test-GREEN fix that CHANGES a file's
+// content without RESOLVING the finding re-hashes the file → its cells re-open → the SAME finding recurs →
+// it is re-fixed → oscillation, bounded today only by maxPasses/budget. After this many invalidation cycles
+// on one (file,tier) with a finding that keeps coming back (no net reduction), OR on the exact recurrence of
+// a prior (file,tier,beforeHash,afterHash,fingerprint) content transition, the file is QUARANTINED from
+// further auto-fix and its findings are surfaced as proposals so the tier can SETTLE. Small on purpose (a
+// non-converging file is caught fast); deterministic (content hashes + fingerprints, never a clock).
+export const LIVELOCK_MAX_CYCLES = 3;
 
 /** SSOT for the --usage-ceiling terminal stop message — shared by the between-pass backstop AND the
  *  mid-pass quiesce so the two paths report the ceiling breach identically. PURE. */
@@ -297,6 +306,26 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const sweepEpoch = sweep?.epochHash ?? null;
   let tierPlan = null;
   let tierPlanIndex = 0;
+  // WAVE 3 — the (file,tier) LIVELOCK CIRCUIT-BREAKER state (sweep mode). A test-GREEN fix that CHANGES a
+  // file's content without RESOLVING the finding re-hashes it → cells re-open → the same finding recurs →
+  // re-fixed → forever (neither F-A's test-red counter — the fix "succeeded" — nor seenFixed — dedupes
+  // REPORTING only — catches it). These make the oscillation observable + deterministically bounded:
+  //  - sweepFixExcluded:   posix files QUARANTINED from further auto-fix run-wide (findings surface as
+  //                        proposals). A FIX-exclusion ONLY — it NEVER subtracts from the coverage
+  //                        denominator (correction A); a quarantined file's cells stay COUNTED until they are
+  //                        actually reviewed. (A livelocking file is distrusted for auto-fix everywhere; its
+  //                        coverage is unaffected, so file-global vs (tier,file) is only an auto-fix policy.)
+  //  - livelockState:      JSON([tier,file]) → { cycles, fixedFps, firstOpen } — invalidation cycles, per-
+  //                        fingerprint re-fix counts (a fingerprint fixed ≥2× is a finding that came back =
+  //                        no progress), and the file's open-finding count at the FIRST cycle (correction C:
+  //                        the fp-AGNOSTIC "no net reduction" baseline, for a defect whose fix DRIFTS its fp).
+  //  - livelockTransitions: seen JSON([tier,file,beforeHash,afterHash,fingerprint]) transitions — an EXACT
+  //                        repeat is a proven content oscillation (A↔B). All three are CHECKPOINTED via
+  //                        sweepCheckpoint so a --resume keeps the oscillation memory (never re-fixes a
+  //                        quarantined file afresh, never re-counts cycles from zero).
+  const sweepFixExcluded = new Set();
+  const livelockState = new Map();
+  const livelockTransitions = new Set();
   // FIX #1 / F-B — start at the FIRST FIXABLE tier, derived per-run from the operator's structure consent.
   //   - WITHOUT --structure-auto-apply: FIRST_TIER = 2 (Correctness). Tiers 0 (logical_sense) and 1
   //     (architecture_ssot, dependencies_supply_chain) are ENTIRELY propose-only — they can only surface
@@ -425,6 +454,17 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
         else {
           tierPlan = Array.isArray(priorSweep.tierPlan) && priorSweep.tierPlan.length ? priorSweep.tierPlan : tierPlan;
           tierPlanIndex = clamp(priorSweep.tierPlanIndex ?? 0, 0, tierPlan.length);
+          // WAVE 3: restore the livelock breaker state so a --resume KEEPS the oscillation memory — a file
+          // quarantined before the interrupt stays quarantined (never re-fixed afresh), and cycle/transition
+          // counts continue instead of resetting to zero (which would let a proven livelock burn budget again).
+          const lc = priorSweep.livelock;
+          if (lc && typeof lc === "object") {
+            for (const f of Array.isArray(lc.excluded) ? lc.excluded : []) sweepFixExcluded.add(String(f));
+            for (const row of Array.isArray(lc.state) ? lc.state : []) {
+              if (Array.isArray(row) && row.length >= 2) livelockState.set(String(row[0]), { cycles: clamp(row[1], 0, 1e9), fixedFps: new Map(Array.isArray(row[2]) ? row[2] : []), firstOpen: row.length >= 4 && Number.isFinite(row[3]) ? row[3] : null });
+            }
+            for (const t of Array.isArray(lc.transitions) ? lc.transitions : []) livelockTransitions.add(String(t));
+          }
         }
       }
     } else {
@@ -450,22 +490,62 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     if (!failClosedStop) currentTier = tierPlan[Math.min(tierPlanIndex, tierPlan.length - 1)].tier;
   }
 
+  // WAVE 3: serialize the livelock breaker state into the checkpoint's sweep block (Maps/Sets → arrays) so
+  // a --resume keeps the oscillation memory. Empty structures on a run that never tripped ⇒ trivially small.
+  const livelockCheckpoint = () => ({
+    excluded: [...sweepFixExcluded],
+    state: [...livelockState].map(([k, v]) => [k, v.cycles, [...v.fixedFps], v.firstOpen ?? null]),
+    transitions: [...livelockTransitions]
+  });
   // WAVE 2: the checkpoint's sweep block — pins the mode + epoch + ledger position so a --resume cannot
-  // flip mode or lose the denominator. undefined (dropped by JSON) in legacy mode.
+  // flip mode or lose the denominator. undefined (dropped by JSON) in legacy mode. WAVE 3 folds the livelock
+  // breaker state in here (one place) so every checkpoint call site carries it automatically.
   const sweepCheckpoint = () =>
-    sweepMode ? { v: 1, runId: options.runId ?? null, epochHash: sweepEpoch, ledgerSeq: sweep.cursor.seq, manifestDigest: sweepManifest?.digest ?? null, tierPlan, tierPlanIndex } : undefined;
+    sweepMode ? { v: 1, runId: options.runId ?? null, epochHash: sweepEpoch, ledgerSeq: sweep.cursor.seq, manifestDigest: sweepManifest?.digest ?? null, tierPlan, tierPlanIndex, livelock: livelockCheckpoint() } : undefined;
+  // WAVE 3 (correction A — coverage-guarantee): coverage / tier-advance / re-entry / terminal / summary ALL
+  // read the RAW ledger denominator. The livelock quarantine is a FIX-EXCLUSION ONLY, NEVER a coverage-
+  // exclusion — a quarantined file's cells stay COUNTED until they are actually reviewed. SUBTRACTING them
+  // (the earlier `genuinePending`) let a tier advance over NEVER-reviewed cells and falsely claim 100%
+  // coverage — the exact silent coverage-guarantee violation this feature exists to prevent. The tier still
+  // SETTLES after a quarantine WITHOUT any subtraction, because the fixer STOPS mutating the file (the
+  // actionable filter surfaces its findings as proposals): the pending-driven scheduler reviews its re-opened
+  // cells, marks them done, and — with no fix to re-hash them — they STAY done → raw tierPending reaches 0
+  // NATURALLY → the tier advances with GENUINE 100% coverage. This helper only spares repeating the scoped /
+  // reviewerSet args. Reads the LIVE `sweepManifest` (reassigned across the run) via the default arg.
+  const tierPendingRaw = (tier, manifest = sweepManifest) => {
+    const scoped = scopeGroupsForTier(sweep.baseGroups, tier);
+    return sweep.cursor.tierPending(tier, manifest, scoped, sweep.reviewerSet, sweepEpoch);
+  };
   // A per-tier pending-debt summary for the terminal coverage-incomplete disclosure (cheap, in-memory).
+  // Uses the RAW ledger denominator (correction A) — a quarantined file's un-reviewed cells are still real
+  // pending debt until they are reviewed, never hidden from the disclosure.
   const sweepPendingSummary = () => {
     if (!sweepMode || !sweepManifest) return "";
     const parts = [];
     for (const entry of tierPlan) {
-      const scoped = scopeGroupsForTier(sweep.baseGroups, entry.tier);
-      const p = sweep.cursor.tierPending(entry.tier, sweepManifest, scoped, sweep.reviewerSet, sweepEpoch);
+      const p = tierPendingRaw(entry.tier);
       if (p.count > 0) parts.push(`tier ${entry.tier}: ${p.count} cell(s)`);
     }
     const debt = sweepManifest.debt?.length ?? 0;
     if (debt) parts.push(`${debt} unreadable/oversize file(s)`);
     return parts.length ? parts.join(", ") : "no pending cells";
+  };
+  // WAVE 3 (findings-store staleness): the durable store is APPEND-ONLY, so a finding whose source cell's
+  // CONTENT has since moved (a fix re-chunked the file) — or whose epoch changed — would be re-offered from
+  // the store union to the gate FOREVER (a stale-actionable set). In sweep mode, DROP any STAMPED store
+  // record whose sweepCellKey is no longer an expected key under the current sealed manifest + epoch (its
+  // cell vanished). A record whose cell is still expected stays; a legacy / unstamped record (non-sweep, or
+  // pre-Wave-3) is ALWAYS-CURRENT and untouched — so a bare / non-sweep caller is byte-identical. The
+  // expected-key set (union over the tier plan) is built ONCE per call, and only when a stamped record is
+  // actually present (the common no-store / no-stamp pass pays nothing).
+  const excludeStaleSweepFindings = (records) => {
+    if (!sweepMode || !sweepManifest || !Array.isArray(records) || !records.some((r) => r && typeof r.sweepCellKey === "string")) return records;
+    const expected = new Set();
+    for (const entry of tierPlan) {
+      const scoped = scopeGroupsForTier(sweep.baseGroups, entry.tier);
+      for (const k of expectedKeys(sweepManifest, entry.tier, scoped, sweep.reviewerSet, sweepEpoch)) expected.add(k);
+    }
+    return records.filter((r) => !(r && typeof r.sweepCellKey === "string") || expected.has(r.sweepCellKey));
   };
 
   // Tier-0 proposals (dead modules, over-layered indirection) the caller ran the detector
@@ -713,7 +793,9 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // pass's findings with the durable accumulated store (deduped by fingerprint), then gate the union.
     // readAccumulated() is [] for a bare caller → union == findings → byte-identical to before.
     const gateInput = (() => {
-      const acc = readAccumulated() ?? [];
+      // WAVE 3: in sweep mode drop stale store records (their source cell's content moved / epoch changed)
+      // BEFORE the union, so a content-moved finding is not re-offered to the gate forever. No-op otherwise.
+      const acc = excludeStaleSweepFindings(readAccumulated() ?? []);
       if (!acc.length) return findings;
       const seenFp = new Set(findings.map((f) => fingerprintFinding(f)));
       // Don't re-surface a finding this run already FIXED (the store is an append-only discovery log, not
@@ -844,6 +926,21 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // propose-only / correlate-escalated / surfaced findings that legitimately reach seenProposed via other
     // channels and must keep being re-offered (e.g. a structure transform refusal is a per-pass verdict).
     actionable = actionable.filter((f) => (seenFailed.get(proposedKey(f)) ?? 0) < RED_ESCALATE_THRESHOLD);
+    // WAVE 3 (livelock quarantine): a file the breaker QUARANTINED (repeated fixes that changed content but
+    // never resolved the finding) is EXCLUDED from further auto-fix — its still-open findings surface as
+    // PROPOSALS (human review of the oscillation) and the fixer never mutates it again (which is what let its
+    // cells re-open every pass). This is what lets the tier SETTLE instead of spinning to maxPasses.
+    if (sweepMode && sweepFixExcluded.size) {
+      const kept = [];
+      for (const f of actionable) {
+        if (sweepFixExcluded.has(posixKeyPath(f.file ?? f.location?.path))) {
+          const p = { ...f, rejectedReason: `livelock: ${posixKeyPath(f.file ?? f.location?.path)} quarantined — repeated fixes did not resolve its findings; surfaced for human review` };
+          const k = proposedKey(p);
+          if (!seenProposed.has(k)) { seenProposed.add(k); proposedAll.push(p); }
+        } else kept.push(f);
+      }
+      actionable = kept;
+    }
     // WAVE 2 (F-B): a REPORT-ONLY tier plan entry (the final-content sweeps [0,1] without
     // --structure-auto-apply) advances on the SAME 100% coverage rule but NEVER calls fix() — its findings
     // surface as proposals. Clear `actionable` so the fixer stays untouched while the tier's cells are
@@ -963,6 +1060,11 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     }
     const changedSet = new Set([...presentChanged, ...deletedChanged]);
     if (sweepMode && changedSet.size) {
+      // WAVE 3 (livelock): the DETERMINISTIC content fingerprint of each present-changed file BEFORE this
+      // batch's re-hash (the OLD manifest's chunk-hash list, captured before sweepManifest is replaced
+      // below). Joined with the AFTER fingerprint it forms the (before→after) transition the breaker keys on.
+      const fileHashOf = (mf, f) => { const r = (mf?.files ?? []).find((x) => x.file === f); return r ? r.chunks.map((c) => c.h).join("|") : ""; };
+      const livelockBefore = new Map(presentChanged.map((f) => [f, fileHashOf(sweepManifest, f)]));
       // Re-hash only the PRESENT (non-deleted) files; a deleted file must not be re-read (it would look
       // unreadable → false debt). D: MERGE the refreshed debt — a still-present file that grew >2 MB or
       // became unreadable is DEBT that BLOCKS completion + persists; a VERIFIED deletion drops out with
@@ -981,17 +1083,83 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       for (const d of refreshed.debt ?? []) { try { sweep.cursor.appendDebt(d); } catch { /* best-effort */ } }
       for (const f of deletedChanged) { try { sweep.cursor.dropFile(f); } catch { /* best-effort */ } }
       try { sweep.cursor.sealManifest({ digest: sweepManifest.digest, fileCount: sweepManifest.files.length }); } catch { /* best-effort */ }
+      // WAVE 3 — (file,tier) LIVELOCK CIRCUIT-BREAKER. A test-GREEN fix that CHANGES a file's content
+      // without RESOLVING the finding re-hashes it (above) → its cells re-open → the SAME finding recurs
+      // next pass → it is re-fixed → oscillation. Neither F-A's test-red counter (the fix "succeeded") nor
+      // seenFixed (dedupes REPORTING only) catches it — only maxPasses/budget bound it, burning the whole
+      // budget on one file. Record every fix on a re-hashed file as a transition keyed by (tier, file,
+      // beforeHash, afterHash, findingFingerprint) plus a per-(file,tier) cycle + per-fingerprint re-fix
+      // count + the file's OPEN-finding count at the first cycle. TRIP when ANY of: (a) an EXACT transition
+      // RECURS (a proven A↔B content oscillation); (b) LIVELOCK_MAX_CYCLES cycles while a fixed FINGERPRINT
+      // keeps coming back (no net reduction); or (c) [correction C — fp-AGNOSTIC] LIVELOCK_MAX_CYCLES cycles
+      // with the file's open-finding count NOT net-decreased — this catches a defect whose fix SHIFTS lines so
+      // the SAME defect re-reports under a DRIFTED fingerprint, which (a)/(b) both miss (they need a STABLE
+      // fp) and which would otherwise burn to maxPasses. On trip: QUARANTINE the file — the actionable filter
+      // surfaces its findings as proposals instead of re-fixing; with the fixer no longer mutating it
+      // (correction A) its re-opened cells get REVIEWED to done and are NOT re-hashed, so raw tierPending
+      // settles to 0 NATURALLY and the TIER ADVANCES with genuine coverage rather than spinning. Deterministic:
+      // content hashes + fingerprints + a counted finding total, no clock. Keyed off fx.fixed (ALL fixes this
+      // pass), not freshFixed — a RECURRING fingerprint is deduped out of freshFixed (seenFixed) yet is
+      // exactly the oscillation signal.
+      const livelockFixedByFile = new Map();
+      for (const item of fx?.fixed ?? []) {
+        const f = posixKeyPath(item?.file ?? item?.finding?.file ?? "");
+        if (!f || !presentChanged.includes(f) || sweepFixExcluded.has(f)) continue;
+        if (!livelockFixedByFile.has(f)) livelockFixedByFile.set(f, []);
+        livelockFixedByFile.get(f).push(item);
+      }
+      // The file's OPEN-finding count THIS pass (correction C). The review surfaced these BEFORE this pass's
+      // fix, so comparing a later cycle's count to the first cycle's baseline detects "no net reduction" even
+      // when the recurring defect DRIFTS its fingerprint (a line-shift → new line/title → new fp).
+      const openCountFor = (file) => (findings ?? []).filter((x) => posixKeyPath(x?.file ?? x?.location?.path ?? "") === file).length;
+      for (const [f, allItems] of livelockFixedByFile) {
+        // D (correction): DEDUPE the batch by fixKey. Two fx.fixed items with the SAME fixKey in ONE pass are
+        // a duplicate WITHIN this pass, not a cross-pass recurrence — without this the second would see the
+        // first's just-added transition (or double-count fixedFps) and FALSE-TRIP on the first legitimate fix.
+        const items = [];
+        const batchFixKeys = new Set();
+        for (const item of allItems) { const fk = fixKey(item); if (batchFixKeys.has(fk)) continue; batchFixKeys.add(fk); items.push(item); }
+        const lkey = JSON.stringify([currentTier, f]);
+        const st = livelockState.get(lkey) ?? { cycles: 0, fixedFps: new Map(), firstOpen: null };
+        st.cycles += 1;
+        const openNow = openCountFor(f);
+        if (st.firstOpen == null) st.firstOpen = openNow; // baseline captured at the FIRST cycle
+        const before = livelockBefore.get(f) ?? "";
+        const after = fileHashOf(sweepManifest, f);
+        let trip = false;
+        let recurring = false;
+        for (const item of items) {
+          const fp = fixKey(item);
+          const tk = JSON.stringify([currentTier, f, before, after, fp]);
+          if (livelockTransitions.has(tk)) trip = true; // (a) the EXACT (before→after,fp) transition RECURRED
+          livelockTransitions.add(tk);
+          const c = (st.fixedFps.get(fp) ?? 0) + 1;
+          st.fixedFps.set(fp, c);
+          if (c >= 2) recurring = true; // this SAME finding was "fixed" before and came back → no reduction
+        }
+        livelockState.set(lkey, st);
+        // (b) K cycles with a RECURRING fp, OR (c) fp-AGNOSTIC: K cycles with NO net reduction in the file's
+        // open-finding count (openNow ≥ the first-cycle baseline) — catches a drifting-fp oscillation.
+        if (!trip && st.cycles >= LIVELOCK_MAX_CYCLES && (recurring || openNow >= st.firstOpen)) trip = true;
+        if (trip) {
+          sweepFixExcluded.add(f);
+          for (const item of items) {
+            const finding = item?.finding ?? item;
+            const p = { ...finding, file: finding.file ?? f, rejectedReason: `livelock: repeated fix on ${f} did not resolve "${finding.title ?? "finding"}" — surfaced for human review` };
+            const k = proposedKey(p);
+            if (!seenProposed.has(k)) { seenProposed.add(k); proposedAll.push(p); }
+          }
+        }
+      }
       // F-A / consolidation-first RE-ENTRY: if a fix re-opened cells in an EARLIER FIXABLE tier of the plan,
       // demote to the earliest such tier so it is re-consolidated before the higher tier keeps running.
-      // Triggers on tierPending(T) > 0 after the fix (fixes can invalidate without producing new findings),
-      // mirroring the legacy finding-re-entry but in lockstep with tierPlanIndex.
-      // WAVE3: livelock circuit-breaker — a test-GREEN edit that changes content WITHOUT resolving the
-      // finding can be re-fixed forever; for Wave 2 the maxPasses/budget ceilings bound it. Deferred.
+      // Triggers on RAW tier pending (correction A — a quarantined file's re-opened cells are still REAL
+      // pending that must be reviewed, just never re-FIXED) after the fix; fixes can invalidate without
+      // producing new findings, in lockstep with tierPlanIndex.
       for (let i = 0; i < tierPlanIndex; i += 1) {
         const entry = tierPlan[i];
         if (!entry.fix) continue;
-        const scoped = scopeGroupsForTier(sweep.baseGroups, entry.tier);
-        const p = sweep.cursor.tierPending(entry.tier, sweepManifest, scoped, sweep.reviewerSet, sweepEpoch);
+        const p = tierPendingRaw(entry.tier);
         if (p.count > 0) {
           tierPlanIndex = i;
           currentTier = entry.tier;
@@ -1058,10 +1226,14 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       // to pend, so it is not a phantom pending; run-level debt is disclosed at TERMINAL instead (it sets
       // coverageIncomplete + names the debt files), so a permanently-incurable-debt repo still CONVERGES
       // over the coverable cells and reports the debt honestly rather than burning the pass ceiling.
-      const scoped = scopeGroupsForTier(sweep.baseGroups, currentTier);
-      const pend = sweep.cursor.tierPending(currentTier, sweepManifest, scoped, sweep.reviewerSet, sweepEpoch);
+      const pend = tierPendingRaw(currentTier);
       const tierPendingCount = pend.count;
-      const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier && autoFixable(f)).length;
+      // A livelock-QUARANTINED file's findings are surfaced as PROPOSALS, never auto-fixed, so they are not
+      // "new auto-fixable work" and must NOT reset the tier dry streak (correction A/C): otherwise a defect
+      // whose fix drifts its fingerprint would keep reading as FRESH every pass, pinning the tier hot forever
+      // and preventing the post-quarantine settle. tierAuto already excludes them (the actionable filter);
+      // tierFresh must too. Off the quarantine path this is byte-identical (the predicate is never true).
+      const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier && autoFixable(f) && !(sweepMode && sweepFixExcluded.has(posixKeyPath(f.file ?? f.location?.path)))).length;
       const tierAuto = actionable.filter(autoFixable).length;
       if (tierAuto > 0 || tierFresh > 0) tierDryStreak = 0;
       else if (passRan) tierDryStreak += 1;

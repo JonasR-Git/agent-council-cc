@@ -2508,9 +2508,11 @@ async function handleAudit(argv) {
       // scheduling + tier-advance from a sealed manifest denominator instead of the modulo window +
       // passRan heuristic. FAIL CLOSED — it REQUIRES the grouped path (the per-file path has no cell
       // ledger) and per-tier convergence, and REJECTS --flat; never silently fall back to legacy.
-      // WAVE3: after the coverage guarantee is proven by the property test, flip the DEFAULT ON for
-      // `fix --loop --groups --per-tier` runs (the modulo skip hole is a confirmed correctness bug).
-      // Deferred — Wave 2 keeps --epoch-sweep strictly opt-in.
+      // WAVE3: the coverage guarantee is now proven by the property test (tests/audit-tier-sweep-guarantee.
+      // test.mjs), but flipping the DEFAULT ON for `fix --loop --groups --per-tier` runs (the modulo skip
+      // hole is a confirmed correctness bug) is a SEPARATE FOLLOW-UP after the first successful LIVE run —
+      // the positional-chunking cost caveat (a fix early in a large file re-opens its later chunks) needs a
+      // real-repo budget validation before it becomes the default. Wave 3 keeps --epoch-sweep strictly opt-in.
       const epochSweep = options["epoch-sweep"] === true;
       if (epochSweep) {
         if (!loopLensGroups) throw new Error("--epoch-sweep requires --groups (the durable coverage ledger is cell-granular; the per-file path has no cells to track)");

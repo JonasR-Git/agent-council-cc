@@ -145,6 +145,7 @@ isolated branch — nothing auto-merged), `endless` (bounded review/propose loop
 | `--deep` | deeper analysis scope | all |
 | `--groups fine\|tier\|lens` | cell-granular grouped six-eyes review | review / endless |
 | `--loop` | autonomous **fix-until-dry** loop on one isolated branch | fix |
+| `--epoch-sweep` | **opt-in** provable per-tier **100% cell coverage** via a durable run-wide ledger (replaces the modulo window's coverage hole); requires `--groups` + per-tier, rejects `--flat` | fix --loop |
 | `--supervise` | survive rate-limit resets across a multi-hour run | fix --loop / endless |
 | `--usage-ceiling [c/x/g]` | **WEEKLY** hard stop at a per-model quota % (bare = 40/50/40; opt-in, off by default) | fix --loop / endless |
 | `--pause-at-5h off\|<pct>\|auto[:<pct>]` | **5h** soft pause (default **ON at 85%**); `auto` waits in-process to the reset then resumes; `off` disables; `<pct>` retunes | fix --loop / endless |

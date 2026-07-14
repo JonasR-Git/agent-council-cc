@@ -208,3 +208,61 @@ knowingly-unsound default is itself a fail-open).
 Existing legacy tests MUST stay byte-compatible with the flag off. The highest-value assertion is
 adversarial: **no tier may advance while any expected current-content key is absent, regardless of pass count
 or `coverage.ran`.**
+
+## STATUS (implemented)
+
+**Wave 1 / Wave 2 / Wave 3 all landed — the feature is complete and behind `--epoch-sweep`, opt-in.** With
+the flag absent the behaviour + every existing test is byte-identical (`deps.sweep === null`, every sweep
+code path skipped); the flag is validated at the CLI (requires `--groups`, rejects `--flat`).
+
+- **Wave 1** — the pure, deterministic foundation (`audit-tier-sweep.mjs`): SHA-256 chunk hashing, the
+  canonical cross-platform `sweepCellKey`, `scopeGroupsForTier`, the sealed-manifest denominator + `epochHash`
+  config fingerprint, the durable append-only ledger with fsync-after-append + corrupt-tail recovery, and
+  `expected()/pending()/tierPending()`. Built + unit-tested in isolation.
+- **Wave 2** — wired into the loop behind `--epoch-sweep`: tier-scoped enumeration (BB1), pending-driven
+  scheduling replacing the modulo window (the P0 cap-drain fix), ledger-gated tier-advance (`tierPending==0`
+  + fix-free settle + dry streak), git-tree-verified fix invalidation + re-hash re-open + F-A/consolidation
+  re-entry, the checkpointed tier plan (F-B), and fail-closed resume (epoch / reviewer / runId / tier-plan /
+  manifest-digest / corrupt-tail / ledger-ahead-vs-checkpoint-ahead). The ledger lives in the state dir,
+  never the working tree.
+- **Wave 3 (final hardening)** — the three residual correctness gaps closed, then hardened by a 4-model
+  council review (corrections A–F below):
+  - the **(file,tier) livelock circuit-breaker**: a test-GREEN fix that changes content without resolving
+    the finding (caught by neither F-A's test-red counter nor `seenFixed`) trips a deterministic breaker on
+    ANY of: `(tier,file,beforeHash,afterHash,fingerprint)` transition recurrence (a); `LIVELOCK_MAX_CYCLES`
+    cycles with a RECURRING fingerprint (b); or `LIVELOCK_MAX_CYCLES` cycles with the file's open-finding
+    count NOT net-decreased (c) — the fp-AGNOSTIC condition that catches a defect whose fix DRIFTS its
+    fingerprint (correction C). On trip the file is quarantined (`sweepFixExcluded`) and its findings are
+    surfaced as proposals; the breaker state (incl. the per-cycle open-count baseline) is checkpointed so a
+    `--resume` keeps the oscillation memory. The batch is deduped by `fixKey` so a duplicate item in one
+    `fx.fixed` batch never false-trips (correction D).
+  - **the quarantine is a FIX-EXCLUSION ONLY, never a coverage-exclusion (correction A, the P1 fix)**: an
+    earlier `genuinePending()` SUBTRACTED a quarantined file's cells from the advance / re-entry / terminal /
+    summary denominator — letting a tier advance over NEVER-reviewed cells and falsely claim 100% coverage
+    (the exact silent hole this feature prevents). Coverage now reads the RAW ledger denominator everywhere;
+    the tier settles because the fixer STOPS mutating the quarantined file, so the pending-driven scheduler
+    reviews its re-opened cells to done with no fix to re-hash them → raw `tierPending` reaches 0 naturally.
+    A quarantined file's fresh (possibly drifting) finding does not reset the tier dry streak (it is a
+    proposal, not auto-fixable work), so the settle actually completes.
+  - the **findings-store `sweepCellKey` staleness exclusion**: durable store records are stamped with their
+    source cell identity in sweep mode, and the loop drops any stamped record whose key is no longer an
+    expected key under the current sealed manifest/epoch (its content moved) — backward-tolerant, legacy /
+    non-sweep records are always-current. A finding whose content MOVES is RE-STAMPED with its current key on
+    re-report (correction B), so a still-live re-discovered finding is never dropped forever by the combination
+    of the stale-exclusion and the store's fingerprint dedupe. The cell sweep key is computed inside the
+    fail-closed `sweepError` try (correction E), so a malformed cell hard-stops rather than silently spinning;
+    the always-null `fileRevision` provenance param was dropped (the sweepCellKey embeds the content identity).
+  - the **coverage-guarantee property test** (`tests/audit-tier-sweep-guarantee.test.mjs`): over several
+    scenarios (file-level drain, `maxCells << cells/file` capCells drain, a mid-sweep fix, a varied seat set,
+    a QUARANTINE × capped-scheduler drain that would have caught correction A, and a fail-closed throwing-key
+    stop) it drives the real `runFixLoop` sweep path and asserts the core invariant at the exact advance point
+    — no tier advances while any expected current-content key is absent, the scheduled union equals the
+    manifest (no skip), and no cell is re-scheduled at an unchanged hash (no waste).
+
+**Default-flip: a deliberate follow-up.** The `--epoch-sweep` default stays OFF until after the FIRST
+successful live validation run (`council-companion.mjs` keeps the lone remaining `WAVE3` marker for it). The
+gate is the **documented cost caveat**: positional chunking means a fix EARLY in a large file re-hashes and
+re-opens ALL of its later chunks across every tier/model — conservative-correct but a real budget
+amplification on fix-heavy runs — and the livelock breaker only quarantines a *non-converging* file (it does
+not reduce the re-open cost of a legitimately-fixed one). That cost needs a real-repo budget check before the
+skip-hole fix becomes the knowingly-sound default. Content-defined re-chunking is the deferred mitigation.

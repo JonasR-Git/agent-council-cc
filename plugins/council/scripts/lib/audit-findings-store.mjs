@@ -85,7 +85,7 @@ export function resetFindingsStore(file, { deps = {} } = {}) {
 }
 
 /** Normalize a finding into a durable record. PURE. */
-function toRecord(finding, { session, seq, pass, nowIso }) {
+function toRecord(finding, { session, seq, pass, nowIso, sweepCellKey = null, epochHash = null }) {
   const fp = fingerprintFinding(finding);
   const id = finding.id != null ? String(finding.id) : fp;
   // Provenance is kept many-to-many (never destructive): a fingerprint seen by several seats records the
@@ -108,6 +108,15 @@ function toRecord(finding, { session, seq, pass, nowIso }) {
     seats,
     ids,
     pass: pass ?? null,
+    // WAVE 3 (epoch-sweep, docs/epoch-sweep-design.md) — SOURCE-CELL IDENTITY. In sweep mode the caller
+    // passes the finding's source `sweepCellKey` (+ epoch); the loop then EXCLUDES any stored finding whose
+    // key is no longer an expected key under the current sealed manifest/epoch (its content moved), so the
+    // append-only store stops re-offering a stale finding forever. Stamped ONLY when supplied — a legacy /
+    // non-sweep record simply omits it and is treated as always-current, so the record shape (and every
+    // existing test) is byte-identical when no key is passed. (correction E: the always-null `fileRevision`
+    // param was DROPPED — the sweepCellKey embeds the chunkHash, which IS the content identity the staleness
+    // exclusion judges by, so a separate file revision was dead provenance the sole call site never threaded.)
+    ...(sweepCellKey != null ? { sweepCellKey, epochHash: epochHash ?? null } : {}),
     ts: nowIso
   };
 }
@@ -132,20 +141,45 @@ export function makeFindingsAppender(file, { session = null, nowIso = null, deps
     /* dir may already exist; a real failure surfaces on the first append */
   }
   const seen = new Set();
+  // WAVE 3 (correction B): the sweepCellKey of each fingerprint's MOST-RECENT record. The store dedupes by
+  // fingerprint, but in sweep mode a fix can MOVE a finding's content so the SAME defect is re-reported from
+  // a NEW cell (a fresh sweepCellKey). The loop's stale-exclusion drops the record stamped with the OLD key;
+  // if the re-report were skipped as a plain dup, NO surviving record would carry the CURRENT key and a
+  // still-LIVE finding would vanish forever. So when a known fingerprint is re-reported under a DIFFERENT,
+  // non-null sweepCellKey, RE-STAMP it — append a fresh record with the current key — so a finding whose
+  // current cell is still expected survives the stale-exclusion. Non-sweep (null key) stays a plain dup.
+  const lastSweepKey = new Map();
   let seq = 0;
   for (const rec of readFindingsStore(file, deps)) {
-    if (rec && rec.fingerprint) seen.add(rec.fingerprint);
+    if (rec && rec.fingerprint) {
+      seen.add(rec.fingerprint);
+      if (typeof rec.sweepCellKey === "string") lastSweepKey.set(rec.fingerprint, rec.sweepCellKey);
+    }
     if (Number.isFinite(rec?.seq)) seq = Math.max(seq, rec.seq + 1);
   }
 
-  function append(findings, { pass = null } = {}) {
+  function append(findings, { pass = null, sweepCellKey = null, epochHash = null } = {}) {
     const records = [];
     const newFps = [];
+    const stampedFps = []; // fps RE-STAMPED this batch (already seen, but their source cell MOVED)
     for (const f of findings ?? []) {
       const fp = fingerprintFinding(f);
-      if (seen.has(fp) || newFps.includes(fp)) continue; // dedupe vs stored AND within this batch
+      if (newFps.includes(fp) || stampedFps.includes(fp)) continue; // at most one record per fp per batch
+      if (seen.has(fp)) {
+        // A re-report of a known finding is normally a dup → skip. But in sweep mode, if its source cell
+        // MOVED (a new, non-null sweepCellKey ≠ the last recorded one), RE-STAMP it (correction B) so a
+        // record carrying the CURRENT key exists — else the stale-exclusion drops the only (old-key) record
+        // and the live finding is lost. A null key (non-sweep) or an unchanged key stays a plain dup → skip.
+        if (sweepCellKey != null && lastSweepKey.get(fp) !== sweepCellKey) {
+          stampedFps.push(fp);
+          records.push(toRecord(f, { session, seq: seq + records.length, pass, nowIso: now(), sweepCellKey, epochHash }));
+        }
+        continue;
+      }
       newFps.push(fp);
-      records.push(toRecord(f, { session, seq: seq + records.length, pass, nowIso: now() }));
+      // A batch is the findings of ONE reviewed cell, so they all share that cell's sweep identity (sweep
+      // mode only; null otherwise → an unstamped, always-current legacy record).
+      records.push(toRecord(f, { session, seq: seq + records.length, pass, nowIso: now(), sweepCellKey, epochHash }));
     }
     if (!records.length) return { appended: 0, records: [] };
     // One complete newline-terminated line per record → a crash leaves at most a torn trailing line.
@@ -160,6 +194,9 @@ export function makeFindingsAppender(file, { session = null, nowIso = null, deps
     // Advance the in-memory dedupe set + seq ONLY after the durable write succeeds — otherwise a throw
     // during toRecord/write poisons `seen`, and a same-process re-append silently drops the finding.
     for (const fp of newFps) seen.add(fp);
+    // WAVE 3 (correction B): track the latest key per fp for BOTH new AND re-stamped records, so a FURTHER
+    // content move re-stamps again (a null key never overwrites a known key — non-sweep is inert here).
+    if (sweepCellKey != null) { for (const fp of newFps) lastSweepKey.set(fp, sweepCellKey); for (const fp of stampedFps) lastSweepKey.set(fp, sweepCellKey); }
     seq += records.length;
     return { appended: records.length, records };
   }

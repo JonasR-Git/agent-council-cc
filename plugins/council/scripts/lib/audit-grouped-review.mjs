@@ -176,9 +176,11 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   // cell's done-key is byte-identical to the key coverage expects for it (the Wave 2 invariant).
   // (`sweep` is declared above the cell enumeration — the A-fix pending filter reads it before capCells.)
   let sweepError = null; // set if cursor.markDone THROWS (fsync failure) → the loop hard-stops sweep mode
-  // WAVE3: findings-store sweepCellKey staleness exclusion — stamp each durable finding with its source
-  // sweepCellKey + epoch + fileRevision and EXCLUDE stored findings whose source key is no longer expected
-  // (so the append-only store stops re-offering a stale finding after its content moved). Deferred.
+  // WAVE 3 (findings-store staleness): in sweep mode each reviewed cell's SWEEP KEY (computed once in
+  // onCell) is passed to the durable appender so its findings are STAMPED with their source cell identity.
+  // The loop then EXCLUDES any stored finding whose stamped key is no longer an expected key under the
+  // current sealed manifest/epoch (its chunk content moved), so the append-only store stops re-offering a
+  // stale finding forever. Backward-tolerant: a non-sweep run passes no key ⇒ unstamped, always-current.
   // Cell-granular live progress (the FINEST resolution): after each cell completes, fold its findings
   // into the per-lens matrix and advance unitsDone. The grouped path is the one place a completed unit
   // is a single (file, group, model) cell, so the dashboard's Findings-by-lens table fills fastest here.
@@ -205,10 +207,33 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
         // A failed durable flush must NOT mark the cell done — else --resume skips it and its findings
         // are lost forever (the unsafe direction the design forbids). Only mark done when there was
         // nothing to flush OR the flush actually succeeded; a throw => re-review the cell on resume.
+        // WAVE 3 (correction E): the reviewed cell's SWEEP KEY, computed ONCE (sweep mode only) INSIDE a try
+        // that sets sweepError on throw — RESTORING the fail-closed hard-stop. It is used BOTH to STAMP this
+        // cell's durable findings (source-cell identity for the staleness exclusion) AND to mark the cell done
+        // below — the SAME cellSweepKey builder expectedKeys uses, so the two are byte-identical. A throw here
+        // (a malformed cell) must HARD-STOP sweep mode via sweepError, NOT be swallowed by the scheduler
+        // (onCell throws are swallowed) into a silently-pending cell that spins with its findings unappended.
+        let sweepKey = null;
+        if (sweep && sweep.cursor && r.cell && sweepError === null) {
+          try {
+            sweepKey = cellSweepKey({
+              epochHash: sweep.epochHash,
+              tier: options.tier,
+              group: r.cell.group,
+              seat: r.cell.model,
+              reviewerSet: sweep.reviewerSet,
+              file: r.cell.file,
+              chunkIndex: r.cell.chunk,
+              chunkText: r.cell.chunkData?.text ?? ""
+            });
+          } catch (err) {
+            sweepError = String(err?.message ?? err);
+          }
+        }
         let flushed = true;
         if (appender && Array.isArray(r.findings) && r.findings.length) {
           try {
-            appender.append(r.findings, { pass: options.pass });
+            appender.append(r.findings, { pass: options.pass, sweepCellKey: sweepKey, epochHash: sweep?.epochHash ?? null });
           } catch {
             flushed = false; // REVIEW is best-effort, but the cursor must reflect the durable truth
           }
@@ -221,19 +246,9 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
         // we capture it (onCell throws are swallowed by the scheduler) so the loop can hard-stop sweep
         // mode instead of silently under-covering. After the first error we stop appending (a persistent
         // fsync failure must not spam) — the pass finishes its in-flight cells and the loop then stops.
-        if (flushed && sweep && sweep.cursor && r.cell && sweepError === null) {
+        if (flushed && sweepKey && sweep && sweep.cursor && sweepError === null) {
           try {
-            const key = cellSweepKey({
-              epochHash: sweep.epochHash,
-              tier: options.tier,
-              group: r.cell.group,
-              seat: r.cell.model,
-              reviewerSet: sweep.reviewerSet,
-              file: r.cell.file,
-              chunkIndex: r.cell.chunk,
-              chunkText: r.cell.chunkData?.text ?? ""
-            });
-            sweep.cursor.markDone(key, { pass: options.pass });
+            sweep.cursor.markDone(sweepKey, { pass: options.pass });
           } catch (err) {
             sweepError = String(err?.message ?? err);
           }
