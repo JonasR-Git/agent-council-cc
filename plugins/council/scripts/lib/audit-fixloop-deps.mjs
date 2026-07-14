@@ -148,7 +148,7 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
     agentTimeoutMs: options.agentTimeoutMs
   };
 
-  const review = async ({ budget, changedFiles, pass, guard, findingsAppender } = {}) => {
+  const review = async ({ budget, changedFiles, pass, guard, findingsAppender, tier } = {}) => {
     // Fold the PRIOR pass's flagged gap files (if any) into this pass's scope: they ride ALONGSIDE
     // an existing localized changedFiles scope, or — absent one — BECOME it, so the loop actually
     // re-targets the gap next pass instead of only resetting the dry streak.
@@ -201,6 +201,10 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
       // loop budget → a 1-pass stop with under-reported spend (council Grok R9 P0/P1). budgetSpent then
       // stays ≤ budget and the loop iterates honestly.
       lensGroups: options.lensGroups,
+      // Wave 1 Stage 2 (BB1): OPTIONAL tier-scoped enumeration. When the loop supplies a `tier`,
+      // runGroupedReview scopes the groups to that tier's lenses before enumerateCells. `tier == null`
+      // (today's default) ⇒ no scoping ⇒ byte-identical enumeration. runAuditReview ignores it.
+      tier,
       // RESERVE the pass's NON-CELL agent calls before capping the cells, so a grouped pass's TOTAL spend
       // stays within its per-pass budget (council Codex/Claude P2 + A1 wiring):
       //   - the completeness critic is 1 call when enabled;

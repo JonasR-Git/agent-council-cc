@@ -504,7 +504,11 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
 
     let rev;
     try {
-      rev = await withLimitRetry(() => review({ budget: passBudget, pass: passNo, changedFiles, guard, findingsAppender }));
+      // Wave 1 Stage 2 (BB1): thread an OPTIONAL review tier into the grouped-review adapter so
+      // enumeration is scoped to that tier's lenses. `options.reviewTier ?? null` — a NEW optional
+      // option; default null = TODAY's behavior (no scoping, byte-identical). Wave 2 replaces this
+      // static value with the ledger-driven current sweep tier.
+      rev = await withLimitRetry(() => review({ budget: passBudget, pass: passNo, changedFiles, guard, findingsAppender, tier: options.reviewTier ?? null }));
     } catch (err) {
       passes.push({ pass: passNo, error: String(err?.message ?? err) });
       stopReason = `review error on pass ${passNo}: ${String(err?.message ?? err)}`;

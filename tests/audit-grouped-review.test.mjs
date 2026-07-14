@@ -7,6 +7,8 @@ import { normalizeFindings } from "../plugins/council/scripts/lib/audit-normaliz
 import { partitionByRefutation, shouldVerify } from "../plugins/council/scripts/lib/verify.mjs";
 import { tierOfLens } from "../plugins/council/scripts/lib/audit-tiers.mjs";
 import { getLens } from "../plugins/council/scripts/lib/audit-lenses.mjs";
+import { resolveLensGroups } from "../plugins/council/scripts/lib/audit-lens-groups.mjs";
+import { scopeGroupsForTier } from "../plugins/council/scripts/lib/audit-tier-sweep.mjs";
 
 const MODEL = { files: [{ id: "a.mjs", loc: 10, branches: 2, maxNesting: 1, fanIn: 0, fanOut: 1, churn: 3, smellCount: 0, tested: false, hotspot: 5 }] };
 const ALL_BACKENDS = { codex: { companionAvailable: true }, grok: { cli: { available: true } }, claude: { cli: { available: true } } };
@@ -437,4 +439,69 @@ test("runGroupedReview: onProgress surfaces the planned cell count BEFORE dispat
   const runMatrix = async () => ({ findings: [], matrix: { summary: () => ({}) }, complete: true });
   await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "lens", ledger: false, onProgress: (m) => msgs.push(m) }, { runMatrix, ...FS });
   assert.ok(msgs.some((m) => /grouped review:.*39 cell/.test(m)), "the cost is announced up front");
+});
+
+// ── Wave 1 Stage 2 (BB1): OPTIONAL tier-scoped enumeration ───────────────────────────────────────
+
+// Capture the enumerated cells so the tier-scoping wiring can be inspected without disk or CLI.
+function captureCells() {
+  const seen = { cells: [] };
+  const runMatrix = async (cells) => {
+    seen.cells = cells;
+    return { findings: [], matrix: { summary: () => ({ models: 3, done: cells.length, failed: 0 }) }, complete: true };
+  };
+  return { seen, runMatrix };
+}
+
+test("runGroupedReview: options.tier=2 enumerates ONLY tier-2 lenses' groups (off-tier lenses excluded)", async () => {
+  const { seen, runMatrix } = captureCells();
+  await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "fine", tier: 2, ledger: false, ...NO_VERIFY }, { runMatrix, ...FS });
+
+  // Every enumerated cell references a group whose lenses are ALL tier-2, with the derived @t2 id.
+  assert.ok(seen.cells.length > 0);
+  for (const cell of seen.cells) {
+    assert.match(cell.groupId, /@t2$/);
+    for (const lens of cell.group.lenses) assert.equal(tierOfLens(lens), 2, `${lens} must be a tier-2 lens`);
+  }
+  // The distinct group set equals scopeGroupsForTier(fine, 2) — the wiring actually applied the projection.
+  const scopedGroupCount = scopeGroupsForTier(resolveLensGroups("fine"), 2).length;
+  const distinctGroups = new Set(seen.cells.map((c) => c.groupId));
+  assert.equal(distinctGroups.size, scopedGroupCount);
+  // 1 file × 1 chunk × 3 models per scoped group.
+  assert.equal(seen.cells.length, scopedGroupCount * 3);
+});
+
+test("runGroupedReview: tier=null enumerates the FULL fine group set (byte-identical to today)", async () => {
+  const { seen, runMatrix } = captureCells();
+  await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "fine", tier: null, ledger: false, ...NO_VERIFY }, { runMatrix, ...FS });
+
+  const distinctGroups = new Set(seen.cells.map((c) => c.groupId));
+  const fullIds = new Set(resolveLensGroups("fine").map((g) => g.id));
+  assert.deepEqual([...distinctGroups].sort(), [...fullIds].sort()); // unchanged group set
+  for (const id of distinctGroups) assert.doesNotMatch(id, /@t\d+$/); // no tier suffix when unscoped
+});
+
+test("runGroupedReview: an OMITTED tier is identical to tier=null (default backward-compat path)", async () => {
+  const a = captureCells();
+  const b = captureCells();
+  await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "fine", ledger: false, ...NO_VERIFY }, { runMatrix: a.runMatrix, ...FS });
+  await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "fine", tier: null, ledger: false, ...NO_VERIFY }, { runMatrix: b.runMatrix, ...FS });
+  assert.equal(a.seen.cells.length, b.seen.cells.length);
+  assert.deepEqual(new Set(a.seen.cells.map((c) => c.groupId)), new Set(b.seen.cells.map((c) => c.groupId)));
+});
+
+test("runGroupedReview: sixEyesComplete reaches true on the REDUCED tier-scoped matrix", async () => {
+  // Drive the REAL runCellMatrix (only reviewCell injected) so the coverage matrix + sixEyesComplete
+  // run against the tier-scoped cell set. Every cell succeeds ⇒ every reduced triple is six-eyes complete.
+  const lensesSeen = [];
+  const reviewCell = async (cell) => {
+    lensesSeen.push(...cell.group.lenses);
+    return { ok: true, cell, findings: [] };
+  };
+  const out = await runGroupedReview("/x", MODEL, ALL_BACKENDS, { lensGroups: "tier", tier: 2, ledger: false, ...NO_VERIFY }, { reviewCell, ...FS });
+  assert.equal(out.coverage.complete, true, "the reduced matrix is fully six-eyes complete");
+  assert.equal(out.coverage.passComplete, true);
+  // tier preset scoped to tier 2 = a single group (tier-correctness@t2) × 1 file × 1 chunk × 3 models.
+  assert.equal(out.coverage.cellsScheduled, 3);
+  for (const lens of lensesSeen) assert.equal(tierOfLens(lens), 2, `${lens} must be a tier-2 lens`);
 });

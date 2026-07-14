@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { resolveLensGroups } from "./audit-lens-groups.mjs";
+import { scopeGroupsForTier } from "./audit-tier-sweep.mjs";
 import { chunkSource } from "./audit-group-prompt.mjs";
 import { DEFAULT_MAX_CELLS, capCells, cellKey, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
 import { makeBudget, reviewerActive, selectUnits } from "./audit-review.mjs";
@@ -57,7 +58,13 @@ function factsFor(model, unitId) {
 export async function runGroupedReview(cwd, model, backends, options = {}, deps = {}) {
   const root = workspaceRoot(cwd);
   const models = activeModels(backends, options);
-  const groups = resolveLensGroups(options.lensGroups ?? "fine");
+  // BB1 (Wave 1 Stage 2): OPTIONAL tier-scoping. Resolve the full preset (unchanged), then — only when
+  // an explicit `options.tier` is supplied — project each group onto that tier's lenses by INTERSECTION
+  // (scopeGroupsForTier) BEFORE enumeration, so a tier-scoped pass enumerates ONLY that tier's lenses.
+  // `tier == null/undefined` skips this entirely ⇒ enumeration is byte-identical to today (backward
+  // compat). `tier` may be 0 (a real tier), so the guard is `!= null`, never a truthiness check.
+  const baseGroups = resolveLensGroups(options.lensGroups ?? "fine");
+  const groups = options.tier != null ? scopeGroupsForTier(baseGroups, options.tier) : baseGroups;
   const files = selectUnits(model, { maxUnits: options.maxUnits ?? 12, offset: options.unitOffset ?? 0 });
   const progress = typeof options.onProgress === "function" ? options.onProgress : null;
   const reporter = options.reporter ?? NOOP_REPORTER;
