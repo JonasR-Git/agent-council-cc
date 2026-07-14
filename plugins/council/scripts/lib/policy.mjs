@@ -223,6 +223,29 @@ export function verbBlockWarnings(blocks, source = ".council.yml") {
 }
 
 /**
+ * The auto-apply consent keys that MUST NOT be honored from the TRACKED `.council.yml` (Stage 4 / Appendix
+ * D): they spread to clones/forks/PR-checkouts and make a bare `fix` auto-apply WRITE with no consent from
+ * THAT operator. If a tracked `fix:` block still carries either key, emit a LOUD warning (kept in
+ * KNOWN_BLOCK_KEYS so the generic "unrecognized key" warning does NOT also fire — this is the specific,
+ * actionable message). Consents are resolved ONLY from a gitignored `.council.local.yml` / env +
+ * fingerprint + per-clone ack (see lib/consent.mjs). Returns a string[] (empty when clean).
+ */
+export function trackedConsentWarnings(fixBlock, source = ".council.yml") {
+  if (!fixBlock || typeof fixBlock !== "object" || Array.isArray(fixBlock)) return [];
+  const warnings = [];
+  for (const key of ["structure_auto_apply", "sensitive_auto_apply"]) {
+    if (key in fixBlock) {
+      warnings.push(
+        `Warning: ${source} fix.${key} is IGNORED for consent — auto-apply consents no longer come from the ` +
+          "tracked config (they spread to clones/forks/PR-checkouts). Move it to a gitignored .council.local.yml " +
+          "with a matching trust_fingerprint, then run `fix --acknowledge-consents` once. See Appendix D."
+      );
+    }
+  }
+  return warnings;
+}
+
+/**
  * Parse an optional nested `fix:` block from raw YAML text into a plain object. Thin delegate over the
  * generalized parseVerbBlocks (a top-level `fix:` header + INDENTED scalar children). Returns null when
  * there is no `fix:` block with children ⇒ `policy.fix` stays undefined ⇒ a bare `audit fix` behaves
@@ -292,8 +315,10 @@ export function loadPolicy(cwd) {
         if (blocks[name]) parsed[name] = blocks[name];
         else delete parsed[name];
       }
-      // LOUD unknown-key warnings: a typo like `epoch_sweeps:` must warn, never silently no-op.
-      warnings = verbBlockWarnings(blocks, file);
+      // LOUD unknown-key warnings: a typo like `epoch_sweeps:` must warn, never silently no-op. PLUS the
+      // Stage-4 tracked-consent warning (a tracked fix.structure_auto_apply/sensitive_auto_apply is ignored
+      // for consent) so both the load-time print AND `setup --check` surface it.
+      warnings = [...verbBlockWarnings(blocks, file), ...trackedConsentWarnings(blocks.fix, file)];
     }
     // Emit each warning once per (file, message) per process so a repeated loadPolicy doesn't spam,
     // while the FIRST load stays loud on stderr. Never pollutes stdout (safe under --json).

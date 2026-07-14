@@ -86,11 +86,16 @@ export const CLI_FLAGS = [
   { flag: "flat", type: "boolean", verbs: ["audit"], block: null, configKey: null, validate: null, negatable: true, negOrder: 5, aliasOf: null, mutationClass: "none", help: "flat (non-per-tier) review; inverse of per_tier config" },
   { flag: "html", type: "boolean", verbs: ["audit"], block: null, configKey: null, validate: null, negatable: false, negOrder: null, aliasOf: null, mutationClass: "state-only", help: "emit an HTML report" },
   { flag: "retry-on-limit", type: "boolean", verbs: ["audit"], block: "fix", configKey: "retry_on_limit", validate: null, negatable: true, negOrder: 8, aliasOf: null, mutationClass: "none", help: "retry when a rate limit is hit" },
-  // NOTE: the two auto-apply consents are STILL fix-config-backed today (byte-identical requirement).
-  // Appendix D moves consents out of the tracked `fix:` block to a gitignored channel — that is Stage 4,
-  // NOT Stage 2. Do not drop the fix binding here or the fix-merge changes behavior.
-  { flag: "sensitive-auto-apply", type: "boolean", verbs: ["audit"], block: "fix", configKey: "sensitive_auto_apply", validate: null, negatable: true, negOrder: 7, aliasOf: null, mutationClass: "working-tree", help: "auto-apply sensitive fixes (consent)" },
-  { flag: "structure-auto-apply", type: "boolean", verbs: ["audit"], block: "fix", configKey: "structure_auto_apply", validate: null, negatable: true, negOrder: 6, aliasOf: null, mutationClass: "working-tree", help: "auto-apply structure fixes (consent)" },
+  // Stage 4 (Appendix D — consent containment): the two auto-apply consents are DELIBERATELY NOT
+  // fix-config-backed (block:null/configKey:null). They spread with the tracked tree, so a tracked
+  // `.council.yml` consent is IGNORED + warned; consent is resolved ONLY from a gitignored
+  // `.council.local.yml` / env COUNCIL_TRUST_FIX + fingerprint + per-clone ack (lib/consent.mjs), or a
+  // per-invocation `--<consent>` flag. The FLAGS stay registered (type:boolean, negatable) so `--<consent>`
+  // and `--no-<consent>` still parse — only the CONFIG binding is removed.
+  { flag: "sensitive-auto-apply", type: "boolean", verbs: ["audit"], block: null, configKey: null, validate: null, negatable: true, negOrder: 7, aliasOf: null, mutationClass: "working-tree", help: "auto-apply sensitive fixes (consent; Stage 4: .council.local.yml + ack, not tracked config)" },
+  { flag: "structure-auto-apply", type: "boolean", verbs: ["audit"], block: null, configKey: null, validate: null, negatable: true, negOrder: 6, aliasOf: null, mutationClass: "working-tree", help: "auto-apply structure fixes (consent; Stage 4: .council.local.yml + ack, not tracked config)" },
+  // Stage 4: record a per-clone auto-apply consent acknowledgment in the STATE dir (never the repo).
+  { flag: "acknowledge-consents", type: "boolean", verbs: ["audit"], block: null, configKey: null, validate: null, negatable: false, negOrder: null, aliasOf: null, mutationClass: "state-only", help: "record this clone's consent acknowledgment (enables .council.local.yml / env consents here)" },
   { flag: "supervise", type: "boolean", verbs: ["audit"], block: "fix", configKey: "supervise", validate: null, negatable: true, negOrder: 4, aliasOf: null, mutationClass: "none", help: "run under the supervisor" },
   { flag: "completeness-critic", type: "boolean", verbs: ["audit"], block: "fix", configKey: "completeness_critic", validate: null, negatable: true, negOrder: 11, aliasOf: null, mutationClass: "none", help: "add the completeness critic pass" },
   { flag: "skip-openrouter", type: "boolean", verbs: ["audit"], block: "fix", configKey: "skip_openrouter", validate: null, negatable: true, negOrder: 10, aliasOf: null, mutationClass: "none", help: "skip the OpenRouter seat" },

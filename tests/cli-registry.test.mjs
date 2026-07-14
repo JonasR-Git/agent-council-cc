@@ -21,18 +21,20 @@ import { parsePause5hOption, parseUsageCeiling } from "../plugins/council/script
 // council-companion.mjs handleAudit parseCommandInput valueOptions (verbatim @ ef93217):
 const GOLDEN_AUDIT_VALUE_OPTIONS = ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats", "usage-ceiling", "pause-at-5h"];
 
-// council-companion.mjs handleAudit parseCommandInput booleanOptions (verbatim @ ef93217, incl. no-* twins):
-const GOLDEN_AUDIT_BOOLEAN_OPTIONS = ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep", "epoch-sweep",
+// council-companion.mjs handleAudit parseCommandInput booleanOptions (incl. no-* twins). Stage 4
+// (Appendix D — consent containment) ADDED the `acknowledge-consents` base flag (records a per-clone
+// consent ack); the consent flags + their --no-* twins are UNCHANGED (only their CONFIG binding moved).
+const GOLDEN_AUDIT_BOOLEAN_OPTIONS = ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "acknowledge-consents", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep", "epoch-sweep",
   "no-deep", "no-loop", "no-epoch-sweep", "no-supervise", "no-flat", "no-structure-auto-apply", "no-sensitive-auto-apply", "no-retry-on-limit", "no-chartest", "no-skip-openrouter", "no-completeness-critic"];
 
-// council-companion.mjs FIX_CONFIG_BOOLEANS (verbatim @ ef93217):
+// council-companion.mjs FIX_CONFIG_BOOLEANS. Stage 4 (Appendix D) REMOVED structure_auto_apply /
+// sensitive_auto_apply from the tracked-config binding — consents are resolved out-of-tree (gitignored
+// .council.local.yml / env + fingerprint + per-clone ack), never from the committed `fix:` block.
 const GOLDEN_FIX_CONFIG_BOOLEANS = {
   loop: "loop",
   deep: "deep",
   epoch_sweep: "epoch-sweep",
   supervise: "supervise",
-  structure_auto_apply: "structure-auto-apply",
-  sensitive_auto_apply: "sensitive-auto-apply",
   retry_on_limit: "retry-on-limit",
   chartest: "chartest",
   completeness_critic: "completeness-critic",

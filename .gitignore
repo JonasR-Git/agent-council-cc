@@ -7,6 +7,10 @@ node_modules/
 .council-*.json
 # Local secrets (OPENROUTER_API_KEY etc.) auto-loaded by loadPolicy — NEVER commit a key.
 .council.env
+# Auto-apply CONSENTS live OUT OF TREE (Appendix D — consent containment): a gitignored, per-clone,
+# fingerprint-bound trust file. NEVER commit it — a tracked consent would spread to clones/forks/
+# PR-checkouts and let a bare `fix` auto-apply writes with no consent from that operator.
+.council.local.yml
 # §5 char-test transient test files + coverage dirs (created/deleted per phase; listed so a hard-crash
 # residue never dirties the tree or gets picked up by tooling)
 .council-chartest-*

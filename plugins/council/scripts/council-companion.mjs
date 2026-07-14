@@ -49,6 +49,7 @@ import { evaluateResumeGuard, loadFixLoopCheckpoint, runFixLoop } from "./lib/au
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { parsePause5hOption, parseUsageCeiling } from "./lib/usage-guard.mjs";
 import { booleanOptionsFor, fixConfigBooleans, fixConfigValues, negatableFlags, valueOptionsFor } from "./lib/cli-registry.mjs";
+import { CONSENT_ENV_VAR, LOCAL_CONSENT_FILE, evaluateAckWrite, formatConsentBanner, resolveConsents, writeConsentAck } from "./lib/consent.mjs";
 import { emitAliasNotes } from "./lib/cli-aliases.mjs";
 import { route } from "./lib/cli-dispatch.mjs";
 import { assertCodeWriteAllowed } from "./lib/cli-mutation.mjs";
@@ -129,10 +130,11 @@ function printUsage() {
       "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
       "      --budget : ADVANCED/LEGACY agent-call cap — most runs never need it; steer cost with --deep (analysis scope) + --usage-ceiling / --pause-at-5h (quota) instead.",
       "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
-      "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--structure-auto-apply] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
+      "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--structure-auto-apply] [--acknowledge-consents] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
       "    audit fix --loop [--deep] [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]   (autonomous fix-until-dry on an isolated branch)",
-      "      CONFIG-FIRST: a `fix:` block in .council.yml supplies the run-behavior DEFAULTS (loop/deep/epoch_sweep/per_tier/supervise/autonomy/the auto-apply consents/usage_ceiling/pause_at_5h/max_passes/budget), so a bare `audit fix` runs your configured autonomous profile. Flags are OVERRIDE-ONLY: an explicit flag > fix.<key> > built-in default. Turn a config-true OFF for one run with --no-<flag> (e.g. --no-deep, --no-structure-auto-apply). Run /council:setup --init to see a commented example.",
-      "      --deep : ONE flag for max analysis depth — grouped six-eyes over the full lens partition (incl. SSOT/architecture), completeness critic, char-test gate, budget auto-sized to a full sweep. Auto-apply stays explicit (--structure-auto-apply/--sensitive-auto-apply or the fix.* consents).",
+      "      CONFIG-FIRST: a `fix:` block in .council.yml supplies the run-behavior DEFAULTS (loop/deep/epoch_sweep/per_tier/supervise/autonomy/usage_ceiling/pause_at_5h/max_passes/budget), so a bare `audit fix` runs your configured autonomous profile. Flags are OVERRIDE-ONLY: an explicit flag > fix.<key> > built-in default. Turn a config-true OFF for one run with --no-<flag> (e.g. --no-deep, --no-structure-auto-apply). Run /council:setup --init to see a commented example.",
+      "      CONSENTS (auto-apply) are NOT config-sourced: a tracked .council.yml fix.structure_auto_apply/sensitive_auto_apply is IGNORED + warned (it would spread to clones). Enable auto-apply ONLY via (a) an explicit --structure-auto-apply/--sensitive-auto-apply flag (per-invocation, no persistence), (b) a gitignored .council.local.yml (consents + trust_fingerprint matching this repo's git origin) acknowledged once per clone with `fix --acknowledge-consents`, or (c) COUNCIL_TRUST_FIX + that same per-clone ack. No channel + no flag ⇒ propose-only.",
+      "      --deep : ONE flag for max analysis depth — grouped six-eyes over the full lens partition (incl. SSOT/architecture), completeness critic, char-test gate, budget auto-sized to a full sweep. Auto-apply stays explicit (--structure-auto-apply/--sensitive-auto-apply, or a gitignored+acknowledged .council.local.yml / COUNCIL_TRUST_FIX — never the tracked config).",
       "      --usage-ceiling : WEEKLY hard stop on a confirmed per-model quota breach (default 40/50/40). --pause-at-5h : SOFT pause on the 5h window, ON BY DEFAULT at 85% (a plain run pauses safely with a manual-resume contract; `off` disables, `<pct>` retunes, `auto` waits in-process to the reset then resumes itself).",
       "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume] [--groups fine|tier|lens] [--max-cells <n>] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]   (bounded review/propose loop)",
       "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
@@ -437,9 +439,13 @@ function scaffoldPolicyFile(cwd, options) {
     "",
     "# Run-behavior DEFAULTS for `audit fix` (flag-reduction). With this block a BARE `audit fix`",
     "# runs your configured profile; every CLI flag is override-only (explicit flag > fix.<key> >",
-    "# built-in default). Turn a config-true off for one run with --no-<flag> (e.g. --no-deep). The",
-    "# structure_auto_apply / sensitive_auto_apply CONSENTS are a deliberate trust entry — set them",
-    "# true ONLY on a repo you trust (the fixer runs LLM CLIs inside it). Uncomment to enable:",
+    "# built-in default). Turn a config-true off for one run with --no-<flag> (e.g. --no-deep).",
+    "# NOTE (Appendix D): the auto-apply CONSENTS (structure_auto_apply / sensitive_auto_apply) are",
+    "# DELIBERATELY NOT placed here — a consent in this TRACKED file spreads to every clone/fork/",
+    "# PR-checkout and would let a bare `fix` auto-apply WRITES with no consent from that operator.",
+    "# Put consents ONLY in a gitignored .council.local.yml (or env COUNCIL_TRUST_FIX), fingerprint-",
+    "# bound, then run `fix --acknowledge-consents` once per clone. See docs/cli-surface-design.md.",
+    "# Uncomment to enable the (non-consent) run-behavior profile:",
     "# fix:",
     "#   loop: true",
     "#   deep: true",
@@ -447,13 +453,20 @@ function scaffoldPolicyFile(cwd, options) {
     "#   per_tier: true                 # friendly inverse of `flat` (per-tier convergence is the default)",
     "#   supervise: true",
     "#   autonomy: aggressive",
-    "#   structure_auto_apply: true     # TRUSTED repo — may apply multi-file structural transforms",
-    "#   sensitive_auto_apply: true     # TRUSTED repo — may apply §6-gated security/sensitive fixes",
     "#   retry_on_limit: true",
     "#   usage_ceiling: 90/90/90",
     "#   pause_at_5h: auto:90",
     "#   max_passes: 100",
     "#   budget: 2000",
+    "",
+    "# --- Auto-apply consents live OUT OF TREE (Appendix D) -------------------------------------",
+    "# Create a gitignored `.council.local.yml` (NOT this file) in the repo root:",
+    "#   fix:",
+    "#     structure_auto_apply: true   # may apply multi-file structural transforms",
+    "#     sensitive_auto_apply: true   # may apply §6-gated security/sensitive fixes",
+    "#   trust_fingerprint: <hash>      # must match this repo's git origin (see `fix --acknowledge-consents`)",
+    "# then run `/council:fix --acknowledge-consents` ONCE in this clone to enable them. A fresh clone",
+    "# (no .council.local.yml, no ack) stays propose-only — the safe default.",
     ""
   ].join("\n");
 
@@ -1403,15 +1416,41 @@ async function handleDoctor(argv) {
   ]);
   checks.push(...agentChecks);
 
+  // Stage 4 (Appendix D) consent audit: print the RESOLVED auto-apply policy + WARN on the three
+  // misconfigurations that make a bare `fix` unsafe or silently different — a tracked-config consent
+  // (ignored but present), a `.council.local.yml` whose fingerprint mismatches this repo, or a
+  // world-writable policy file. These are advisory warnings; they do not flip the ping-based readiness.
+  const consentRoot = workspaceRoot(cwd);
+  const consentResolution = resolveConsents({ cwd: consentRoot, options: {}, stateDir: resolveStateDir(cwd), deps: {} });
+  const effectivePolicyLine = formatConsentBanner(consentResolution, { verb: "fix" });
+  const consentWarnings = [];
+  // The tracked-config-consent warning (from loadPolicy) + EVERY consent-resolution warning — the
+  // commonest misconfig is the missing-ack case, so surface it too (do NOT filter by /trust_fingerprint/).
+  for (const w of policy._warnings ?? []) if (/IGNORED for consent/.test(w)) consentWarnings.push(w);
+  for (const w of consentResolution.warnings) consentWarnings.push(w);
+  // World-writable policy files (POSIX only; Windows ACLs are not mode bits). Cover BOTH the tracked
+  // .council.yml AND the gitignored .council.local.yml — a writable consent file is the stricter risk.
+  if (process.platform !== "win32") {
+    for (const f of [policy._source, path.join(consentRoot, LOCAL_CONSENT_FILE)]) {
+      if (!f) continue;
+      try {
+        const mode = fs.statSync(f).mode;
+        if (mode & 0o002) consentWarnings.push(`Warning: ${f} is WORLD-WRITABLE (mode ${(mode & 0o777).toString(8)}) — any local user could inject run-behavior/consents. chmod go-w it.`);
+      } catch { /* absent / stat failure is non-fatal */ }
+    }
+  }
+
   const ready = checks.every((c) => c.ok);
   if (options.json) {
-    outputResult({ ready, checks, stateDir: resolveStateDir(cwd) }, true);
+    outputResult({ ready, checks, stateDir: resolveStateDir(cwd), effectivePolicy: effectivePolicyLine, consentWarnings }, true);
     return;
   }
   const lines = [`Council doctor: ${ready ? "ALL OK" : "PROBLEMS FOUND"}`];
   for (const c of checks) {
     lines.push(`  [${c.ok ? "ok" : "!!"}] ${c.name.padEnd(20)} ${c.detail ?? ""}`);
   }
+  lines.push(`  ${effectivePolicyLine}`);
+  for (const w of consentWarnings) lines.push(`  [!!] ${w}`);
   console.log(`${lines.join("\n")}\n`);
   if (!ready) process.exitCode = 1;
 }
@@ -2327,6 +2366,10 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
   // with no `fix:` block sets nothing here ⇒ option resolution stays byte-identical to before.
   applyNoFlagNegations(options);
   let fixFromConfig = new Set();
+  // Stage 4 (Appendix D): the RESOLVED auto-apply consents for the fix run. Computed from the OUT-OF-TREE
+  // channel (gitignored .council.local.yml / env COUNCIL_TRUST_FIX) + fingerprint + per-clone ack — never
+  // the tracked config. Consumed by the structure/sensitive wiring below.
+  let consent = null;
   if (positionals[0] === "fix") {
     // mutationClass boundary (foundation #2) — the EARLIEST fix-detection point. `fix` is the ONE
     // findings→fixes writer; assert the write is allowed BEFORE any fix work (policy load, codebase
@@ -2335,6 +2378,40 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
     // write). main() always threads the resolved verb; review/plan/solve reroute to the review/run/
     // endless positionals, never "fix", so this fires only on a genuine miswiring or a forged verb.
     assertCodeWriteAllowed(dispatchVerb);
+    // Consent containment: resolve from the workspace ROOT (where .council.local.yml lives) + this
+    // workspace's STATE dir (where the ack lives). Resolve + print the effective-policy banner FIRST —
+    // BEFORE any policy load / ack write / early error — so a recognized fix invocation can NEVER exit
+    // without the stderr banner (the silent-behavior-change defense). All git/fs/tracked come from real deps.
+    const consentRoot = workspaceRoot(process.cwd());
+    const consentStateDir = resolveStateDir(process.cwd());
+    consent = resolveConsents({ cwd: consentRoot, options, stateDir: consentStateDir, deps: {} });
+    for (const w of consent.warnings) console.error(w); // stderr — safe under --json
+    console.error(formatConsentBanner(consent, { verb: "fix" })); // ONE stderr line, EVEN under --json
+    // `--acknowledge-consents` is a one-time per-clone enable gesture: it records the ack and exits (the
+    // operator re-runs `fix` to apply). It writes ONLY when a valid channel + non-null fingerprint exist
+    // NOW (never pre-created to later validate a force-added file), and under --dry-run it prints-only.
+    if (options["acknowledge-consents"]) {
+      const evalAck = evaluateAckWrite({ cwd: consentRoot, deps: {} });
+      if (!evalAck.ok) {
+        if (options.json) outputResult({ acknowledged: false, reason: evalAck.reason, stateDir: consentStateDir }, true);
+        else console.error(`Cannot record consent acknowledgment: ${evalAck.reason}`);
+        return;
+      }
+      if (options["dry-run"]) {
+        const msg = `--dry-run: WOULD record this workspace's consent ack (channel=${evalAck.channel}, fingerprint=${evalAck.fingerprint.slice(0, 12)}…, path=${path.join(consentStateDir, "consent-ack.json")}); wrote nothing.`;
+        if (options.json) outputResult({ acknowledged: false, dryRun: true, wouldRecord: { channel: evalAck.channel, fingerprint: evalAck.fingerprint, cwd: consentRoot }, stateDir: consentStateDir }, true);
+        else console.error(msg);
+        return;
+      }
+      const rec = writeConsentAck(consentStateDir, { fingerprint: evalAck.fingerprint, cwd: consentRoot });
+      if (options.json) {
+        outputResult({ acknowledged: true, ...rec, channel: evalAck.channel, stateDir: consentStateDir }, true);
+      } else {
+        console.error(`Recorded this workspace's auto-apply consent acknowledgment (channel=${evalAck.channel}, fingerprint=${evalAck.fingerprint.slice(0, 12)}…, at ${rec.acknowledgedAt}).`);
+        console.error(`Consents in ${LOCAL_CONSENT_FILE} / ${CONSENT_ENV_VAR} now apply in THIS workspace — re-run \`fix\` to use them.`);
+      }
+      return;
+    }
     const _fixPolicy = loadPolicy(process.cwd());
     fixFromConfig = applyFixPolicyDefaults(options, _fixPolicy.fix, {
       emit: (m) => { if (!options.json) console.error(m); }
@@ -2524,7 +2601,9 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
     // multi-file structure transform (structure-wiring.mjs). Applies to BOTH the single-shot and the
     // --loop path. Without the flag, NOTHING is threaded — the default runAuditFix options/deps stay
     // byte-identical and structural findings remain propose-only proposals, exactly as before.
-    const structureAutoApply = options["structure-auto-apply"] === true;
+    // Stage 4: consent is RESOLVED from the out-of-tree channel (never the tracked config) — see the
+    // effective-policy banner already printed above. `consent` is always set on the fix path.
+    const structureAutoApply = consent ? consent.structureAutoApply : false;
     if (structureAutoApply) {
       console.error(
         "M9 structure auto-apply ENABLED — cross-cutting architecture_ssot/logical_sense findings may be applied AUTONOMOUSLY as MULTI-FILE consolidations. Every transform must clear the full ladder (plan-declared file boundary, full test suite green, public API provably unchanged, UNANIMOUS §6 council over the exact staged multi-file diff) or it is reverted to a proposal."
@@ -2532,8 +2611,9 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
       console.error(
         "⚠ SECURITY: the transform planner/author and the §6 reviewers run LLM CLIs inside this repository. --structure-auto-apply does NOT imply --sensitive-auto-apply — a structural finding that is ALSO §6-sensitive still needs BOTH consents. Enable --structure-auto-apply ONLY on repositories you trust."
       );
-      if (fixFromConfig.has("structure-auto-apply")) {
-        console.error("  (consent enabled from .council.yml fix.structure_auto_apply — a deliberate, written trust entry for THIS repo)");
+      const src = consent?.sources?.structure;
+      if (src === "local" || src === "env") {
+        console.error(`  (consent from the gitignored ${LOCAL_CONSENT_FILE}${src === "env" ? ` / ${CONSENT_ENV_VAR}` : ""}, acknowledged for THIS clone — never from the tracked .council.yml)`);
       }
     }
     const structureTransformRunner = structureAutoApply ? makeStructureTransformRunner(workspaceRoot(cwd), cwd, backends, merged) : null;
@@ -2717,7 +2797,7 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
       // sensitive findings propose-only (fail-safe, never a silent never-approve).
       let sensitiveAutoApply = false;
       let reviewPatch;
-      if (options["sensitive-auto-apply"]) {
+      if (consent && consent.sensitiveAutoApply) {
         const ready = patchReviewerReady(backends, merged);
         if (ready.ready) {
           sensitiveAutoApply = true;
@@ -2736,8 +2816,9 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
           });
           console.error("§6 council-gated auto-apply ENABLED — sensitive fixes require UNANIMOUS Claude+Codex+Grok confirmation of the patch.");
           console.error("⚠ SECURITY: the §6 reviewers run LLM CLIs inside this repository. Project hooks/settings still fire. Enable --sensitive-auto-apply ONLY on repositories you trust.");
-          if (fixFromConfig.has("sensitive-auto-apply")) {
-            console.error("  (consent enabled from .council.yml fix.sensitive_auto_apply — a deliberate, written trust entry for THIS repo)");
+          const src = consent?.sources?.sensitive;
+          if (src === "local" || src === "env") {
+            console.error(`  (consent from the gitignored ${LOCAL_CONSENT_FILE}${src === "env" ? ` / ${CONSENT_ENV_VAR}` : ""}, acknowledged for THIS clone — never from the tracked .council.yml)`);
           }
         } else {
           // Name the ACTUAL unreachable seats, derived from every per-seat flag ready reports (built-ins
@@ -2984,8 +3065,10 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
     // §6 council-gated auto-apply is wired ONLY in the --loop path (it injects the patch reviewer);
     // single-shot `audit fix` has no reviewer, so runAuditFix forces sensitiveAutoApply off. Warn so a
     // user passing --sensitive-auto-apply single-shot isn't misled into thinking it took effect (F3).
-    if (options["sensitive-auto-apply"] && !options.json) {
-      console.error("note: --sensitive-auto-apply has no effect on single-shot `audit fix` (§6 council review runs only in `audit fix --loop`); sensitive fixes stay propose-only");
+    if (consent && consent.sensitiveAutoApply && !options.json) {
+      const srcMap = { flag: "--sensitive-auto-apply", local: `${LOCAL_CONSENT_FILE} (acknowledged)`, env: `${CONSENT_ENV_VAR} (acknowledged)` };
+      const src = srcMap[consent.sources.sensitive] ?? "the sensitive consent";
+      console.error(`note: sensitive auto-apply consent (from ${src}) has no effect on single-shot \`audit fix\` (§6 council review runs only in \`audit fix --loop\`); sensitive fixes stay propose-only`);
     }
     const tFix = Date.now();
     // A12: same token bracket as the loop path — snapshot before the run, diff after it, only when --html
@@ -4064,6 +4147,11 @@ export async function handleBuild(argv, { verb: dispatchVerb } = {}) {
   });
   const cwd = process.cwd();
   const root = workspaceRoot(cwd);
+  // Effective-policy banner (Stage 4): ONE stderr line, EVEN under --json, printed BEFORE any PlanSpec
+  // read / validation error so a recognized build invocation can NEVER exit without it. `build` has NO
+  // auto-apply consent knob — it always writes on an isolated branch behind a UNANIMOUS §6 gate and never
+  // auto-merges — so the banner states that invariant explicitly.
+  console.error(`effective-policy [build]: isolated_branch=true six_eyes_gated=true auto_merge=false dry_run=${options["dry-run"] === true} (build has no auto-apply consent; §6 gates every step)`);
   if (!options.from) throw new Error("council build needs a PlanSpec: council build --from <plan.json> (produce one with `council plan`)");
 
   const planPath = confinedPlanPath(cwd, options.from);

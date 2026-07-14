@@ -15,7 +15,7 @@ import {
 // SAME parse → negate → merge pipeline the CLI runs (minus the git/backends plumbing).
 const AUDIT_PARSE = {
   valueOptions: ["areas", "churn-days", "budget", "max-units", "doc-path", "from", "min-severity", "max-fixes", "max-passes", "dry-streak", "sarif-path", "autonomy", "base", "retry-limit", "groups", "max-cells", "skip-seats", "usage-ceiling", "pause-at-5h"],
-  booleanOptions: ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep", "epoch-sweep",
+  booleanOptions: ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "acknowledge-consents", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep", "epoch-sweep",
     "no-deep", "no-loop", "no-epoch-sweep", "no-supervise", "no-flat", "no-structure-auto-apply", "no-sensitive-auto-apply", "no-retry-on-limit", "no-chartest", "no-skip-openrouter", "no-completeness-critic"]
 };
 
@@ -86,7 +86,7 @@ test("loadPolicy reads the nested fix: block from YAML (and per_tier stays a rea
 
 // --- fix: block supplies defaults ---------------------------------------------------------------
 
-test("fix: config sets defaults for a bare `audit fix` (booleans, values, consents)", () => {
+test("fix: config sets defaults for a bare `audit fix` (booleans, values) — but NOT the consents", () => {
   const policyFix = {
     loop: true, deep: true, epoch_sweep: true, per_tier: true, supervise: true,
     autonomy: "aggressive", structure_auto_apply: true, sensitive_auto_apply: true,
@@ -97,8 +97,6 @@ test("fix: config sets defaults for a bare `audit fix` (booleans, values, consen
   assert.equal(options.deep, true);
   assert.equal(options["epoch-sweep"], true);
   assert.equal(options.supervise, true);
-  assert.equal(options["structure-auto-apply"], true);
-  assert.equal(options["sensitive-auto-apply"], true);
   assert.equal(options["retry-on-limit"], true);
   assert.equal(options.flat, false); // per_tier: true ⇒ flat false
   assert.equal(options.autonomy, "aggressive");
@@ -106,9 +104,13 @@ test("fix: config sets defaults for a bare `audit fix` (booleans, values, consen
   assert.equal(options["pause-at-5h"], "auto:90");
   assert.equal(options["max-passes"], "100");
   assert.equal(options.budget, "2000");
-  // The consents are reported as coming FROM config so the warnings can note the source.
-  assert.equal(fromConfig.has("structure-auto-apply"), true);
-  assert.equal(fromConfig.has("sensitive-auto-apply"), true);
+  // Stage 4 (Appendix D — consent containment): the tracked `fix:` block is IGNORED for consent. Even
+  // with structure_auto_apply/sensitive_auto_apply true in policyFix, applyFixPolicyDefaults must NOT
+  // set the consent options and must NOT report them in fromConfig. They are resolved out-of-tree only.
+  assert.equal(options["structure-auto-apply"], undefined);
+  assert.equal(options["sensitive-auto-apply"], undefined);
+  assert.equal(fromConfig.has("structure-auto-apply"), false);
+  assert.equal(fromConfig.has("sensitive-auto-apply"), false);
 });
 
 // --- precedence: explicit flag > fix.<key> > default --------------------------------------------

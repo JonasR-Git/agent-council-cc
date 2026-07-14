@@ -157,9 +157,11 @@ test("parseFixBlock is byte-identical to the pre-Stage-1 extractor across fixtur
 
 test("the repo's current .council.yml parses policy.fix byte-identical to the known snapshot", () => {
   const text = fs.readFileSync(REPO_COUNCIL_YML, "utf8");
+  // Stage 4 (Appendix D — consent containment): structure_auto_apply/sensitive_auto_apply were REMOVED
+  // from the tracked `fix:` block (they now live in a gitignored .council.local.yml + per-clone ack).
   assert.deepEqual(parseFixBlock(text), {
     loop: true, deep: true, epoch_sweep: true, per_tier: true, supervise: true,
-    autonomy: "aggressive", structure_auto_apply: true, sensitive_auto_apply: true,
+    autonomy: "aggressive",
     retry_on_limit: true, usage_ceiling: "90/90/90", pause_at_5h: "auto:90",
     max_passes: 100, budget: 2000
   });
