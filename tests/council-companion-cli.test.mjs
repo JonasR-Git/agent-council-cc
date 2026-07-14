@@ -65,7 +65,7 @@ test("audit fix --chartest (single-shot) fails loud when no generator seat is re
   withCli((workDir, baseEnv) => {
     const fakeClaudeBin = makeAllSeatsUnreachable(workDir);
     const env = { ...baseEnv, CLAUDE_BIN: fakeClaudeBin };
-    const res = spawnSync(process.execPath, [COMPANION, "audit", "fix", "--chartest"], {
+    const res = spawnSync(process.execPath, [COMPANION, "fix", "--chartest"], {
       cwd: workDir,
       env,
       encoding: "utf8",
@@ -93,7 +93,7 @@ test("audit fix --groups (single-shot, no --from) actually dispatches the groupe
     const env = { ...baseEnv, CLAUDE_BIN: fakeClaudeBin };
     const res = spawnSync(
       process.execPath,
-      [COMPANION, "audit", "fix", "--groups", "fine", "--budget", "20"],
+      [COMPANION, "fix", "--groups", "fine", "--budget", "20"],
       { cwd: workDir, env, encoding: "utf8", timeout: 60_000 }
     );
     if (isSandboxBlocked(res)) {
@@ -391,7 +391,7 @@ function runStructureFixCli(repo, extraArgs) {
   try {
     return spawnSync(
       process.execPath,
-      [COMPANION, "audit", "fix", "--from", "findings.json", "--json", ...extraArgs],
+      [COMPANION, "fix", "--from", "findings.json", "--json", ...extraArgs],
       {
         cwd: repo.workDir,
         env: { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot, CLAUDE_BIN: repo.fakeClaudeBin },
@@ -533,7 +533,7 @@ test("buildPausePayload emits the versioned council.pause.v1 contract (schedulab
   assert.equal(p.resumeAt, "2026-07-13T02:02:00Z");
   assert.equal(p.observedAt, "2026-07-13T00:00:00Z");
   assert.equal(p.resume.cwd, "/repo");
-  assert.deepEqual(p.resume.argv, ["audit", "fix", "--loop", "--pause-at-5h", "85", "--resume"], "the resume argv re-invokes with --resume appended");
+  assert.deepEqual(p.resume.argv, ["fix", "--loop", "--pause-at-5h", "85", "--resume"], "the resume argv re-invokes the canonical `fix` verb with --resume appended");
 });
 
 test("buildPausePayload marks an UNSCHEDULABLE pause as manual_stop and never duplicates an existing --resume", async () => {
@@ -543,7 +543,7 @@ test("buildPausePayload marks an UNSCHEDULABLE pause as manual_stop and never du
   assert.equal(p.state, "manual_stop", "an unschedulable pause is a manual stop (still exit 75; state distinguishes it)");
   assert.equal(p.resumeAt, null);
   assert.equal(p.blockers[0].usedPercent, 99);
-  assert.deepEqual(p.resume.argv, ["audit", "fix", "--loop", "--resume"], "an already-present --resume is not doubled (idempotent)");
+  assert.deepEqual(p.resume.argv, ["fix", "--loop", "--resume"], "an already-present --resume is not doubled (idempotent)");
 });
 
 // --- B (codex-5): a paused run is NOT finalized as done+ok on the dashboard --------------------------
@@ -605,8 +605,8 @@ test("F: buildResumeArgv reuses the original audit argv + --resume, and is the S
   const argv = ["fix", "--loop", "--usage-ceiling", "40/50/40", "--max-passes", "9"];
   assert.deepEqual(
     buildResumeArgv(argv),
-    ["audit", "fix", "--loop", "--usage-ceiling", "40/50/40", "--max-passes", "9", "--resume"],
-    "the run's original flags are preserved and --resume appended (not the flag-less hint of before)"
+    ["fix", "--loop", "--usage-ceiling", "40/50/40", "--max-passes", "9", "--resume"],
+    "the run's original flags are preserved and --resume appended under the canonical `fix` verb"
   );
   // The human hint (emitPauseContract builds `node <self> <buildResumeArgv...>`) and the JSON resume.argv
   // now derive from ONE function — so a copied stderr line matches the machine contract exactly.
@@ -617,10 +617,10 @@ test("F: buildResumeArgv reuses the original audit argv + --resume, and is the S
   assert.deepEqual(p.resume.argv, buildResumeArgv(argv), "machine resume.argv and the human hint share one source (SSOT)");
   assert.deepEqual(
     buildResumeArgv(["endless", "--pause-at-5h", "auto:90"]),
-    ["audit", "endless", "--pause-at-5h", "auto:90", "--resume"],
-    "the endless subcommand's flags are preserved too"
+    ["review", "--mode", "endless", "--pause-at-5h", "auto:90", "--resume"],
+    "the endless engine resumes via `review --mode endless`, flags preserved"
   );
-  assert.deepEqual(buildResumeArgv(["fix", "--loop", "--resume"]), ["audit", "fix", "--loop", "--resume"], "an existing --resume is idempotent");
+  assert.deepEqual(buildResumeArgv(["fix", "--loop", "--resume"]), ["fix", "--loop", "--resume"], "an existing --resume is idempotent");
 });
 
 // --- `audit endless` accepts + normalizes the two quota-guard flags at the CLI boundary -------------
@@ -633,7 +633,7 @@ test("audit endless: valued --usage-ceiling 50/50/50 + --pause-at-5h auto:90 par
   withCli((workDir, baseEnv) => {
     const fakeClaudeBin = makeAllSeatsUnreachable(workDir);
     const env = { ...baseEnv, CLAUDE_BIN: fakeClaudeBin };
-    const res = spawnSync(process.execPath, [COMPANION, "audit", "endless", "--usage-ceiling", "50/50/50", "--pause-at-5h", "auto:90"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    const res = spawnSync(process.execPath, [COMPANION, "review", "--mode", "endless", "--usage-ceiling", "50/50/50", "--pause-at-5h", "auto:90"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
     if (isSandboxBlocked(res)) { t.skip("spawn blocked in this sandbox"); return; }
     const err = String(res.stderr ?? "");
     assert.match(err, /no callable reviewers/, "the flags parsed; endless reached its reviewer preflight");
@@ -646,7 +646,7 @@ test("audit endless: BARE --usage-ceiling + --pause-at-5h are normalized (no 'Mi
   withCli((workDir, baseEnv) => {
     const fakeClaudeBin = makeAllSeatsUnreachable(workDir);
     const env = { ...baseEnv, CLAUDE_BIN: fakeClaudeBin };
-    const res = spawnSync(process.execPath, [COMPANION, "audit", "endless", "--usage-ceiling", "--pause-at-5h"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    const res = spawnSync(process.execPath, [COMPANION, "review", "--mode", "endless", "--usage-ceiling", "--pause-at-5h"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
     if (isSandboxBlocked(res)) { t.skip("spawn blocked in this sandbox"); return; }
     const err = String(res.stderr ?? "");
     assert.doesNotMatch(err, /Missing value for --usage-ceiling|Missing value for --pause-at-5h/, "the bare-flag → `=` normalization applies to the endless path too");
@@ -670,7 +670,7 @@ test("audit fix --loop --resume FAILS CLOSED on a dirty tree (resume_blocked, tr
   try {
     const res = spawnSync(
       process.execPath,
-      [COMPANION, "audit", "fix", "--loop", "--resume", "--json"],
+      [COMPANION, "fix", "--loop", "--resume", "--json"],
       { cwd: repo.workDir, env: { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot, CLAUDE_BIN: repo.fakeClaudeBin }, encoding: "utf8", timeout: 120_000 }
     );
     if (isSandboxBlocked(res)) {
@@ -789,7 +789,7 @@ test("incompatibleReviewFlags: deliberate-only flags are flagged only outside de
   assert.deepEqual(incompatibleReviewFlags("quick", {}), []);
 });
 
-test("CLI: a --mode conflicting with the verb alias is rejected before any job is created", (t) => {
+test("CLI: the removed `deliberate` command is a clean unknown-command error before any job is created", (t) => {
   withCli((workDir, baseEnv) => {
     const res = spawnSync(process.execPath, [COMPANION, "deliberate", "--mode", "adversarial", "--background", "--json"], {
       cwd: workDir,
@@ -801,9 +801,9 @@ test("CLI: a --mode conflicting with the verb alias is rejected before any job i
       t.skip("child_process.spawn is blocked by this sandbox");
       return;
     }
-    assert.notEqual(res.status, 0, "a mode conflict must fail loud (non-zero exit)");
-    assert.match(res.stderr, /Conflicting review mode/);
-    assert.equal(readCouncilJobs(baseEnv.AGENT_COUNCIL_STATE_DIR).length, 0, "no job file may be persisted on a rejected mode");
+    assert.notEqual(res.status, 0, "the removed `deliberate` name must fail loud (non-zero exit)");
+    assert.match(res.stderr, /unknown command 'deliberate'\. Verbs: review fix plan build solve status setup\. Run --help\./);
+    assert.equal(readCouncilJobs(baseEnv.AGENT_COUNCIL_STATE_DIR).length, 0, "no job file may be persisted on a rejected command");
   });
 });
 
@@ -843,7 +843,7 @@ function rmBestEffort(dir) {
   }
 }
 
-test("CLI: persisted job.kind is unchanged — bare review=review, --mode maps 1:1, alias verb still stores deliberate", (t) => {
+test("CLI: persisted job.kind is unchanged — bare review=review, --mode maps 1:1 on disk", (t) => {
   const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "council-cli-state-"));
   const workDir = makeWorkDir();
   // reviewers:[claude] + a CLAUDE_BIN that exits non-zero ⇒ every seat unreachable, so any spawned
@@ -879,7 +879,6 @@ test("CLI: persisted job.kind is unchanged — bare review=review, --mode maps 1
     assert.equal(bare.kind, "review", "the bare review verb still persists kind review (quick)");
     assert.equal(kindFor(["review", "--mode", "deliberate"]).kind, "deliberate", "review --mode deliberate persists kind deliberate");
     assert.equal(kindFor(["review", "--mode", "adversarial"]).kind, "adversarial", "review --mode adversarial persists kind adversarial");
-    assert.equal(kindFor(["deliberate"]).kind, "deliberate", "the deliberate alias verb still persists kind deliberate — unchanged on disk");
   } finally {
     rmBestEffort(workDir);
     rmBestEffort(stateRoot);

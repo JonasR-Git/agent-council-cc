@@ -79,10 +79,10 @@ const PROGRESS = (over = {}) => ({
 
 // --- Task 5 (write side): a real command instantiates + reaches the reporter --------------------
 
-test("`audit review` writes the universal progress.json via the wired reporter (no backends needed)", (t) => {
+test("`review --mode deep` writes the universal progress.json via the wired reporter (no backends needed)", (t) => {
   withCli((workDir, env) => {
     makeAllSeatsUnreachable(workDir);
-    const res = spawnSync(process.execPath, [COMPANION, "audit", "review"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    const res = spawnSync(process.execPath, [COMPANION, "review", "--mode", "deep"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
     if (isSandboxBlocked(res)) {
       t.skip("child_process.spawn is blocked by this sandbox");
       return;
@@ -103,13 +103,13 @@ test("`audit review` writes the universal progress.json via the wired reporter (
 
 // --- Task 6 (read side): `council watch` renders progress.json when there is NO legacy job -------
 
-test("`council watch --once` renders the universal progress.json as a fallback (no legacy job)", (t) => {
+test("`status --watch --once` renders the universal progress.json as a fallback (no legacy job)", (t) => {
   withCli((workDir, env) => {
     const dir = stateDirFor(workDir, env.AGENT_COUNCIL_STATE_DIR);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "progress.json"), `${JSON.stringify(PROGRESS({ done: true }))}\n`, "utf8");
 
-    const res = spawnSync(process.execPath, [COMPANION, "watch", "--once"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    const res = spawnSync(process.execPath, [COMPANION, "status", "--watch", "--once"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
     if (isSandboxBlocked(res)) {
       t.skip("child_process.spawn is blocked by this sandbox");
       return;
@@ -120,13 +120,13 @@ test("`council watch --once` renders the universal progress.json as a fallback (
   });
 });
 
-test("`council watch --json` emits the progress dashboard payload from progress.json", (t) => {
+test("`status --watch --json` emits the progress dashboard payload from progress.json", (t) => {
   withCli((workDir, env) => {
     const dir = stateDirFor(workDir, env.AGENT_COUNCIL_STATE_DIR);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "progress.json"), `${JSON.stringify(PROGRESS({ done: true }))}\n`, "utf8");
 
-    const res = spawnSync(process.execPath, [COMPANION, "watch", "--json"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    const res = spawnSync(process.execPath, [COMPANION, "status", "--watch", "--json"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
     if (isSandboxBlocked(res)) {
       t.skip("child_process.spawn is blocked by this sandbox");
       return;
@@ -149,7 +149,7 @@ test("finding 9: a run that throws after makeRunReporter still marks progress.js
     fs.writeFileSync(path.join(workDir, ".council.yml"), "version: 1\nreviewers: [claude]\n", "utf8");
     const env = { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot };
     // A committed, CLEAN git tree so state resolution keys on this workspace and the handler reaches
-    // makeRunReporter (single-shot `audit fix` announces the run); an escaping --from is then a throw
+    // makeRunReporter (single-shot `fix` announces the run); an escaping --from is then a throw
     // it raises AFTER the reporter exists, so main()'s finally must still mark progress.json terminal.
     const git = (args) => spawnSync("git", args, { cwd: workDir, env, encoding: "utf8", timeout: 30_000 });
     const init = git(["init", "-q"]);
@@ -165,7 +165,7 @@ test("finding 9: a run that throws after makeRunReporter still marks progress.js
       return;
     }
 
-    const res = spawnSync(process.execPath, [COMPANION, "audit", "fix", "--from", "../escape.json"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    const res = spawnSync(process.execPath, [COMPANION, "fix", "--from", "../escape.json"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
     if (isSandboxBlocked(res)) {
       t.skip("child_process.spawn is blocked by this sandbox");
       return;
@@ -187,9 +187,9 @@ test("finding 9: a run that throws after makeRunReporter still marks progress.js
   }
 });
 
-test("`council watch` still errors when there is neither a job NOR a progress.json", (t) => {
+test("`status --watch` still errors when there is neither a job NOR a progress.json", (t) => {
   withCli((workDir, env) => {
-    const res = spawnSync(process.execPath, [COMPANION, "watch", "--once"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
+    const res = spawnSync(process.execPath, [COMPANION, "status", "--watch", "--once"], { cwd: workDir, env, encoding: "utf8", timeout: 60_000 });
     if (isSandboxBlocked(res)) {
       t.skip("child_process.spawn is blocked by this sandbox");
       return;

@@ -50,7 +50,6 @@ import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { parsePause5hOption, parseUsageCeiling } from "./lib/usage-guard.mjs";
 import { booleanOptionsFor, fixConfigBooleans, fixConfigValues, negatableFlags, valueOptionsFor } from "./lib/cli-registry.mjs";
 import { CONSENT_ENV_VAR, LOCAL_CONSENT_FILE, evaluateAckWrite, formatConsentBanner, resolveConsents, writeConsentAck } from "./lib/consent.mjs";
-import { emitAliasNotes } from "./lib/cli-aliases.mjs";
 import { route } from "./lib/cli-dispatch.mjs";
 import { assertCodeWriteAllowed } from "./lib/cli-mutation.mjs";
 import { explainHintsFromDispatch, formatExplainTable, hasExplainFlag, hasJsonFlag, isExplainableVerb, resolveExplain } from "./lib/cli-explain.mjs";
@@ -111,49 +110,28 @@ function printUsage() {
       "  status   [RO]  --result|--watch|--wait|--cancel|--fixloop|--overview|--history|--metrics|--usage|--ledger (one action)",
       "  setup    [RO/state]  tool config + diagnose — default | --check (doctor) | --usage",
       "",
-      "Aliases (old names still work; each maps to a verb above):",
-      "  deliberate|deliberation|adversarial|adversarial-review → review --mode …   |   audit review|run|endless → review --mode deep|run|endless",
-      "  audit fix → fix   |   watch|wait|result|cancel|history|metrics|usage|ledger|overview|fixloop-status → status --…   |   doctor → setup --check",
-      "",
-      "Details:",
-      "  node scripts/council-companion.mjs setup [--json]",
-      "  node scripts/council-companion.mjs review [--mode quick|deliberate|adversarial] [flags] [focus text]",
-      "      e.g.  review --mode quick        parallel Codex + Grok, single round (the CLI default)",
-      "      e.g.  review --mode deliberate   R1 independent -> R2 peer critique (+ optional Claude file)",
-      "      e.g.  review --mode adversarial  same as quick, adversarial framing",
-      "      legacy aliases (still work): `adversarial` = review --mode adversarial; `deliberate` = review --mode deliberate",
-      "  node scripts/council-companion.mjs solve [flags] [problem text]",
-      "  node scripts/council-companion.mjs wait [job-id] [--follow] [--timeout <s>] [--interval <s>]",
-      "  node scripts/council-companion.mjs watch [job-id] [--interval <s>] [--once] [--json]",
-      "  node scripts/council-companion.mjs plan <feature-request> [--synthesizer <seat>] [--json]   (multi-model design deliberation → a validated PlanSpec; READ-ONLY)",
-      "  node scripts/council-companion.mjs build --from <plan.json> [--dry-run] [--json]   (autonomous test-gated build of a PlanSpec on an isolated branch; never auto-merged)",
-      "  node scripts/council-companion.mjs audit run|review|fix|endless [flags] (see below)",
-      "    audit review [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map] [--json]",
-      "      --budget : ADVANCED/LEGACY agent-call cap — most runs never need it; steer cost with --deep (analysis scope) + --usage-ceiling / --pause-at-5h (quota) instead.",
-      "    audit run [--sarif [--sarif-path <p>]] [--base <ref>] [--doc] [--json]   (self-driving audit → risk register + gate)",
-      "    audit fix [--from <json>] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--sensitive-auto-apply] [--structure-auto-apply] [--acknowledge-consents] [--skip-openrouter] [--html] [--retry-on-limit] [--dry-run]",
-      "    audit fix --loop [--deep] [--supervise] [--flat] [--max-passes <n>] [--dry-streak <n>] [--resume] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]   (autonomous fix-until-dry on an isolated branch)",
-      "      CONFIG-FIRST: a `fix:` block in .council.yml supplies the run-behavior DEFAULTS (loop/deep/epoch_sweep/per_tier/supervise/autonomy/usage_ceiling/pause_at_5h/max_passes/budget), so a bare `audit fix` runs your configured autonomous profile. Flags are OVERRIDE-ONLY: an explicit flag > fix.<key> > built-in default. Turn a config-true OFF for one run with --no-<flag> (e.g. --no-deep, --no-structure-auto-apply). Run /council:setup --init to see a commented example.",
+      "Details (the 7 verbs are the whole surface):",
+      "  node scripts/council-companion.mjs setup [--check|--usage|--init] [--json]",
+      "      default        readiness report;  --check  full diagnose (self-test + live pings);  --usage  provider window limits + token/job stats;  --init  scaffold .council.yml",
+      "  node scripts/council-companion.mjs review [--mode quick|deliberate|adversarial|deep|endless|run] [flags] [focus text]   (READ-ONLY — never writes)",
+      "      --mode quick        parallel Codex + Grok, single round (the CLI default)",
+      "      --mode deliberate   R1 independent -> R2 peer critique (+ optional Claude file)",
+      "      --mode adversarial  same as quick, adversarial framing",
+      "      --mode deep         grouped whole-project hotspot review (six-eyes); knobs: [--groups fine|tier|lens] [--max-cells <n>] [--completeness-critic] [--areas a,b] [--churn-days <n>] [--budget <n>] [--max-units <n>] [--doc] [--write-map]",
+      "      --mode run          self-driving audit → risk register + gate; knobs: [--sarif [--sarif-path <p>]] [--base <ref>] [--doc]",
+      "      --mode endless      bounded review/propose loop (never writes); knobs: [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume] [--groups fine|tier|lens] [--max-cells <n>] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]",
+      "  node scripts/council-companion.mjs fix [--from <json>] [--loop|--no-loop] [--deep] [--supervise] [--flat] [--autonomy <lvl>] [--min-severity P0|P1|P2] [--max-fixes <n>] [--max-passes <n>] [--dry-streak <n>] [--resume] [--sensitive-auto-apply] [--structure-auto-apply] [--acknowledge-consents] [--skip-openrouter] [--html] [--retry-on-limit] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]] [--dry-run] [--json]   (the ONE findings→fixes writer; test-gated on an isolated branch, never auto-merged)",
+      "      CONFIG-FIRST: a `fix:` block in .council.yml supplies the run-behavior DEFAULTS (loop/deep/epoch_sweep/per_tier/supervise/autonomy/usage_ceiling/pause_at_5h/max_passes/budget), so a bare `fix` runs your configured autonomous profile. Flags are OVERRIDE-ONLY: an explicit flag > fix.<key> > built-in default. Turn a config-true OFF for one run with --no-<flag> (e.g. --no-deep, --no-loop). Run `setup --init` to see a commented example.",
       "      CONSENTS (auto-apply) are NOT config-sourced: a tracked .council.yml fix.structure_auto_apply/sensitive_auto_apply is IGNORED + warned (it would spread to clones). Enable auto-apply ONLY via (a) an explicit --structure-auto-apply/--sensitive-auto-apply flag (per-invocation, no persistence), (b) a gitignored .council.local.yml (consents + trust_fingerprint matching this repo's git origin) acknowledged once per clone with `fix --acknowledge-consents`, or (c) COUNCIL_TRUST_FIX + that same per-clone ack. No channel + no flag ⇒ propose-only.",
-      "      --deep : ONE flag for max analysis depth — grouped six-eyes over the full lens partition (incl. SSOT/architecture), completeness critic, char-test gate, budget auto-sized to a full sweep. Auto-apply stays explicit (--structure-auto-apply/--sensitive-auto-apply, or a gitignored+acknowledged .council.local.yml / COUNCIL_TRUST_FIX — never the tracked config).",
+      "      --deep : ONE flag for max analysis depth — grouped six-eyes over the full lens partition (incl. SSOT/architecture), completeness critic, char-test gate, budget auto-sized to a full sweep.",
       "      --usage-ceiling : WEEKLY hard stop on a confirmed per-model quota breach (default 40/50/40). --pause-at-5h : SOFT pause on the 5h window, ON BY DEFAULT at 85% (a plain run pauses safely with a manual-resume contract; `off` disables, `<pct>` retunes, `auto` waits in-process to the reset then resumes itself).",
-      "    audit endless [--supervise] [--max-passes <n>] [--dry-streak <n>] [--resume] [--groups fine|tier|lens] [--max-cells <n>] [--usage-ceiling [pct]] [--pause-at-5h off|<pct>|auto[:<pct>]]   (bounded review/propose loop)",
-      "  node scripts/council-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/council-companion.mjs cancel [job-id]",
-      "  node scripts/council-companion.mjs usage [--tokens] [--limits] [--days <n>] [--json]",
-      "  node scripts/council-companion.mjs doctor [--no-ping] [--json]",
-      "  node scripts/council-companion.mjs metrics [--days <n>] [--json]",
-      "  node scripts/council-companion.mjs history [--kind <k>] [--since <days>] [--global] [--json]",
-      "  node scripts/council-companion.mjs fixloop-status [job-id] [--writer <agent>] [--needed <n>] [--json]",
-      "  node scripts/council-companion.mjs benchmark [--task-file <path>] [--claude-answer <path>] [--category <c>] [task text]",
-      "  node scripts/council-companion.mjs benchmark --stats [--json]",
-      "  node scripts/council-companion.mjs ledger [--status ...] [--resolve <fp> fixed|dismissed|ignored]",
-      "  node scripts/council-companion.mjs overview [--limit <n>] [--json]",
-      "  node scripts/council-companion.mjs result [job-id] [--summary|--html] [--json]",
-      "  node scripts/council-companion.mjs worktree add|remove|list <slug> [--base <ref>] [--force]",
+      "  node scripts/council-companion.mjs plan <feature-request> [--synthesizer <seat>] [--json]   (multi-model design deliberation → a validated PlanSpec; READ-ONLY)",
+      "  node scripts/council-companion.mjs build --from <plan.json> [--dry-run] [--base <ref>] [--json]   (autonomous test-gated build of a PlanSpec on an isolated branch; never auto-merged)",
+      "  node scripts/council-companion.mjs solve [flags] [problem text]   (independent solutions → scored cross-critique → ranking; READ-ONLY)",
+      "  node scripts/council-companion.mjs status [job-id] [--result|--watch|--wait|--cancel|--history|--metrics|--usage|--ledger|--fixloop|--overview] [--summary|--html] [--follow] [--all] [--json]   (one action; default = list + status; READ-ONLY observation)",
       "",
       "Flags:",
-      "  --mode quick|deliberate|adversarial  (canonical review-mode selector; the alias verbs are legacy sugar)",
+      "  --mode quick|deliberate|adversarial|deep|endless|run  (the canonical review-mode selector)",
       "  --background  --base <ref>  --scope auto|working-tree|branch",
       "  --codex-model <id>  --grok-model <id>  --codex-effort <l>  --grok-effort <l>",
       "  --skip-codex  --skip-grok  --claude-findings <path>  --claude-findings-wait <path>",
@@ -2177,11 +2155,23 @@ async function computeFixReportMeta(cwd, out, ctx = {}) {
  * emitted resume argv re-invokes the companion with `--resume` appended (idempotent). `state`
  * distinguishes a schedulable pause ("pause_requested") from a manual stop ("manual_stop"); both exit 75.
  */
+// The internal audit-engine subcommand → the CANONICAL verb that re-invokes it. The old top-level `audit`
+// verb was removed, so a resume line must re-run through the 7-verb surface: `fix` stays `fix`; the
+// read-only engines are reached via `review --mode deep|run|endless`.
+const RESUME_VERB_FOR_SUB = { review: ["review", "--mode", "deep"], run: ["review", "--mode", "run"], endless: ["review", "--mode", "endless"] };
+
 export function buildResumeArgv(argv) {
-  // The resume argv BOTH the machine payload (resume.argv) and the human resume hint reuse: the
-  // original audit tokens + --resume (idempotent). Keeping them derived from ONE place is what makes a
-  // copied stderr line carry the run's original flags exactly like the JSON contract (grok-hint / F).
-  const resumeArgv = ["audit", ...(Array.isArray(argv) ? argv : [])];
+  // The resume argv BOTH the machine payload (resume.argv) and the human resume hint reuse: the run's
+  // original engine tokens re-expressed as the CANONICAL verb + --resume (idempotent). Keeping them
+  // derived from ONE place is what makes a copied stderr line carry the run's original flags exactly like
+  // the JSON contract (grok-hint / F). Only the fix-loop + endless loops pause, so `sub` is "fix"/"endless".
+  const tokens = Array.isArray(argv) ? argv.slice() : [];
+  const sub = tokens[0];
+  const rest = tokens.slice(1);
+  let resumeArgv;
+  if (sub === "fix") resumeArgv = ["fix", ...rest];
+  else if (RESUME_VERB_FOR_SUB[sub]) resumeArgv = [...RESUME_VERB_FOR_SUB[sub], ...rest];
+  else resumeArgv = tokens.slice(); // best-effort passthrough for an unexpected subcommand
   if (!resumeArgv.includes("--resume")) resumeArgv.push("--resume");
   return resumeArgv;
 }
@@ -4255,10 +4245,9 @@ async function main() {
     printUsage();
     return;
   }
-  // Stage 3: normalize every OLD command/flag to a canonical verb FIRST (pure, table-driven), emit the
-  // one-line deprecation note for a deprecated spelling (stderr only — never --json stdout), then route
-  // the canonical verb to the EXISTING handler. `route` = expandAliases → resolveDispatch (both pure).
-  emitAliasNotes(rawArgv);
+  // Normalize the argv (tokenize a single "$ARGUMENTS" rest; keep hidden verbs raw) and route it to the
+  // EXISTING handler. `route` = expandAliases → resolveDispatch (both pure). The legacy old-name alias layer
+  // is GONE: an unknown top-level token resolves to a clean unknown-command error (handler "error").
   const r = route(rawArgv);
   const args = r.args;
   // `--explain` (Stage 6): resolve the verb's EFFECTIVE options + their sources and EXIT — no review/fix/

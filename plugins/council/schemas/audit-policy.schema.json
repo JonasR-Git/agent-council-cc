@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://local/agent-council/audit-policy.schema.json",
   "title": "AuditPolicy",
-  "description": "Drives /council:audit (docs/audit-schema.md §1): enabled lenses, targeting, budget, gate rules, external tools, standards profiles and per-lens routes. Lives in .council-audit.json; unknown enum values are rejected.",
+  "description": "Drives the council audit engine (`/council:review --mode run|deep`; docs/audit-schema.md §1): enabled lenses, targeting, budget, gate rules, external tools, standards profiles and per-lens routes. Lives in .council-audit.json; unknown enum values are rejected.",
   "type": "object",
   "required": ["schemaVersion"],
   "properties": {

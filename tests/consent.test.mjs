@@ -574,7 +574,7 @@ function makeFixRepo() {
   return { dir, fakeClaude };
 }
 
-test("audit fix --json prints the effective-policy banner to STDERR while stdout stays pure JSON", (t) => {
+test("fix --json prints the effective-policy banner to STDERR while stdout stays pure JSON", (t) => {
   const repo = makeFixRepo();
   if (!repo) {
     t.skip("git is unavailable in this environment");
@@ -584,7 +584,7 @@ test("audit fix --json prints the effective-policy banner to STDERR while stdout
   try {
     const res = spawnSync(
       process.execPath,
-      [COMPANION, "audit", "fix", "--from", "findings.json", "--json"],
+      [COMPANION, "fix", "--from", "findings.json", "--json"],
       { cwd: repo.dir, env: { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot, CLAUDE_BIN: repo.fakeClaude }, encoding: "utf8", timeout: 120_000 }
     );
     if (isSandboxBlocked(res)) {

@@ -448,7 +448,7 @@ function readCoverageDir(dir) {
 // some other parent runner too — confirmed empirically: with it present the grandchild silently exits 0
 // with EMPTY stdout even when the sandbox denies the spawn it should have failed on, masking exactly the
 // bug this integration test exists to catch. A real (non-test-nested) invocation of this harness — e.g.
-// the actual `audit fix --chartest` CLI — never has this var set, so stripping it here is what makes the
+// the actual `fix --chartest` CLI — never has this var set, so stripping it here is what makes the
 // nested test faithfully reproduce a top-level run, not a workaround for a product bug.
 function realRunCommand(cmd, args, opts) {
   const env = { ...opts?.env };

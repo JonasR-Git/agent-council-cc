@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://local/agent-council/audit-report.schema.json",
   "title": "AuditReport",
-  "description": "The /council:audit output envelope (docs/audit-schema.md §8): gate verdict, prioritized risk register, coverage matrix, governance decisions, false-positive rate and provenance.",
+  "description": "The council audit-engine output envelope (`/council:review --mode run`; docs/audit-schema.md §8): gate verdict, prioritized risk register, coverage matrix, governance decisions, false-positive rate and provenance.",
   "type": "object",
   "required": ["schemaVersion", "gate", "register", "coverage"],
   "properties": {

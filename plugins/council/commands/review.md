@@ -18,17 +18,23 @@ review → peer critique → consensus). Pick a lighter mode with a flag:
 | `--quick` | fast dual check | Codex + Grok in parallel, no peer round; you synthesize |
 | `--adversarial` | challenge design/direction | Codex + Grok adversarial pass + focus text |
 
-Read-only whole-project sweeps are the same review verb under different names —
-`deep` (≡ `/council:audit review`), `endless` (≡ `/council:audit endless`), and
-`run` (≡ `/council:audit run`). All are review/propose engines that never edit
-source; see `/council:audit` for their knobs. There is **no** write mode on this
-slash — the autonomous review → fix → re-review loop is **`/council:fix`**.
+Read-only whole-project sweeps are the same `review` verb under deeper `--mode`s —
+all review/propose engines that never edit source:
 
-Under the hood the companion exposes a single canonical `review --mode quick|deliberate|adversarial`
-selector. The bare `review` verb **is** that canonical entry point (`review` ≡ `review --mode quick`);
-`deliberate` and `adversarial` are equivalent **legacy alias verbs** (`deliberate` ≡ `review --mode
-deliberate`, `adversarial` ≡ `review --mode adversarial`). This skill keeps **deliberate** as its
-default and runs Phase A first — do not collapse it to a raw quick command.
+| `--mode` | What runs | Key knobs |
+|----------|-----------|-----------|
+| `deep` | grouped six-eyes whole-project hotspot review (Codex + Grok + Claude), plus a global SSOT/architecture reduce | `--groups fine\|tier\|lens` `--max-cells <n>` `--completeness-critic` `--areas a,b` `--churn-days <n>` `--budget <n>` `--max-units <n>` `--doc` `--write-map` |
+| `run` | self-driving audit → risk register + pass/fail gate as one schema-valid report | `--sarif [--sarif-path <p>]` `--base <ref>` `--doc` |
+| `endless` | bounded review/propose loop — each pass advances the reviewed window until returns diminish; never edits code | `--supervise` `--max-passes <n>` `--dry-streak <n>` `--resume` `--groups …` `--max-cells <n>` `--usage-ceiling [pct]` `--pause-at-5h off\|<pct>\|auto[:<pct>]` |
+
+Their only writes are the opt-in artifacts `--doc` (`docs/AUDIT.md`, proposals — cross-cutting/SSOT items
+are documented migrations, deliberately NOT auto-patched) and `--write-map` (`docs/codebase-map.json`),
+both confined to the project root. There is **no** write mode on this slash — the autonomous
+review → fix → re-review loop is **`/council:fix`**. See `docs/audit-design.md` for the engine rationale.
+
+The companion exposes a single canonical `review --mode quick|deliberate|adversarial|deep|endless|run`
+selector; the bare `review` verb **is** that canonical entry point (`review` ≡ `review --mode quick`).
+This skill keeps **deliberate** as its default and runs Phase A first — do not collapse it to a raw quick command.
 
 The mode flags above are **mutually exclusive**: if the raw arguments contain more than one
 (e.g. `--quick --adversarial`), or a flag that disagrees with an explicit `--mode`, treat it as a
@@ -62,13 +68,13 @@ With `--claude-backend spawn`, **skip Phase A** — an independent `claude -p` p
 ### Phase B — Codex + Grok (R1 independent + R2 peer critique)
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings "$TMPDIR/council-claude-r1.json" $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" review --mode deliberate --claude-findings "$TMPDIR/council-claude-r1.json" $ARGUMENTS
 ```
 
 Parallel: start the companion first, then write the file when Phase A ends:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings-wait "$TMPDIR/council-claude-r1.json" --wait-timeout 600 --background $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" review --mode deliberate --claude-findings-wait "$TMPDIR/council-claude-r1.json" --wait-timeout 600 --background $ARGUMENTS
 ```
 
 The companion runs Round 1 (Codex + Grok independent, parallel) and Round 2 (each
@@ -96,7 +102,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" review [--background]
 ## `--adversarial` — challenge review
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" adversarial [--background] $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" review --mode adversarial [--background] $ARGUMENTS
 ```
 
 Then present the report + a short Claude synthesis (consensus, unique P0s).

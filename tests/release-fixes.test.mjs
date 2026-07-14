@@ -22,7 +22,7 @@ const COMPANION = path.resolve(
 );
 
 function fixloopStatus(cwd, stateRoot, jobId, args) {
-  const res = spawnSync(process.execPath, [COMPANION, "fixloop-status", jobId, ...args, "--json"], {
+  const res = spawnSync(process.execPath, [COMPANION, "status", "--fixloop", jobId, ...args, "--json"], {
     cwd,
     env: { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot },
     encoding: "utf8"

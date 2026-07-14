@@ -1,4 +1,4 @@
-// SARIF 2.1.0 output (docs/audit-schema.md §6) so /council:audit results plug into
+// SARIF 2.1.0 output (docs/audit-schema.md §6) so `/council:review --mode run` results plug into
 // GitHub code scanning / dashboards / SIEM. Pure: canonical findings -> SARIF log.
 // Waived findings are emitted with a suppression so the sink sees them as accepted,
 // not silently dropped.

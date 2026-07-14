@@ -95,7 +95,7 @@ test("archiveJobResults writes sidecars, truncates inline copies; wait/usage sub
     const env = { ...process.env, AGENT_COUNCIL_STATE_DIR: stateRoot };
     const wait = spawnSync(
       process.execPath,
-      [COMPANION, "wait", "council-testjob", "--timeout", "3", "--json"],
+      [COMPANION, "status", "--wait", "council-testjob", "--timeout", "3", "--json"],
       { cwd: workDir, env, encoding: "utf8" }
     );
     assert.equal(wait.status, 0, wait.stderr);
@@ -105,7 +105,7 @@ test("archiveJobResults writes sidecars, truncates inline copies; wait/usage sub
 
     const summary = spawnSync(
       process.execPath,
-      [COMPANION, "result", "council-testjob", "--summary", "--json"],
+      [COMPANION, "status", "--result", "council-testjob", "--summary", "--json"],
       { cwd: workDir, env, encoding: "utf8" }
     );
     assert.equal(summary.status, 0, summary.stderr);
@@ -113,7 +113,7 @@ test("archiveJobResults writes sidecars, truncates inline copies; wait/usage sub
     assert.equal(sections.header, "H");
     assert.equal(sections.merged, "M");
 
-    const usage = spawnSync(process.execPath, [COMPANION, "usage", "--json"], {
+    const usage = spawnSync(process.execPath, [COMPANION, "status", "--usage", "--json"], {
       cwd: workDir,
       env,
       encoding: "utf8"

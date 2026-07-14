@@ -6,7 +6,7 @@ import { findDuplicateClusters } from "./dup-detect.mjs";
 import { runCommand } from "./process.mjs";
 import { workspaceRoot } from "./state.mjs";
 
-// The static fact base for /council:audit v1 (read-only). Zero-dep. The static
+// The static fact base for the council audit engine (`/council:review --mode deep`) v1 (read-only). Zero-dep. The static
 // analysis is deterministic for a given snapshot; git churn is time-relative (its
 // window ends at run time) and is recorded explicitly. Everything emitted is a
 // CANDIDATE (confidence-tagged), never authority to change anything - regex

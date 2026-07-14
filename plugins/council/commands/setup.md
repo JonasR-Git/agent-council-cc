@@ -5,9 +5,9 @@ allowed-tools: Bash(node:*), Bash(grok:*), Bash(codex:*)
 ---
 
 The `setup` verb has four actions: the **readiness report** (default), **`--check`**
-(diagnose — the old `/council:doctor`), **`--init`** (scaffold), and **`--usage`**
-(provider limits). If `--check` is present, jump to **Check mode**; if `--usage` is
-present, jump to **Usage mode**. Otherwise (readiness report / `--init`) run:
+(diagnose), **`--init`** (scaffold), and **`--usage`** (provider limits). If `--check`
+is present, jump to **Check mode**; if `--usage` is present, jump to **Usage mode**.
+Otherwise (readiness report / `--init`) run:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" setup --json $ARGUMENTS
@@ -46,8 +46,7 @@ Install commands if a backend is missing: Codex `npm i -g @openai/codex`; Grok
 
 ## Check mode (`--check`)
 
-Diagnose the setup end-to-end — this is the old `/council:doctor` (the CLI aliases
-`doctor` → `setup --check`):
+Diagnose the setup end-to-end:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" setup --check $ARGUMENTS
@@ -66,7 +65,7 @@ fails. Run it before a big deliberate/solve run, or first when a run behaves odd
 Provider window limits + local token/job stats:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" usage --limits --tokens $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" setup --usage --limits --tokens $ARGUMENTS
 ```
 
 - `--limits`: Claude 5h + weekly % (live OAuth endpoint), Codex 5h + weekly % (local
@@ -75,4 +74,4 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" usage --limits --toke
   session logs of all three CLIs.
 - Always included: this workspace's job stats (per-kind, per-agent call/failure/timeout).
 
-For a deeper health check (live agent pings), use `/council:doctor`.
+For a deeper health check (live agent pings), use `/council:setup --check`.

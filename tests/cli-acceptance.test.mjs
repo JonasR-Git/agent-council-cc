@@ -8,9 +8,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  COMMAND_ALIASES,
-  AUDIT_SUBCOMMAND_ALIASES,
-  FLAG_ALIASES,
   CANONICAL_VERBS,
   HIDDEN_VERBS,
   expandAliases
@@ -45,89 +42,88 @@ function isSandboxBlocked(result) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────────────────────
-// (a) ALIAS + FLAG COMPLETENESS — one golden table for EVERY Appendix-B row + the flag-carrying/flag-first
-//     forms + the status/setup action forms. Each row pins old→canonical (expandAliases) AND the resolved
-//     dispatch (verb + handler + mutationClass). A completeness guard enumerated from the alias tables +
-//     the registry proves no alias/verb/flag can silently escape coverage.
+// (a) SURFACE COMPLETENESS — one golden table for the WHOLE 7-verb surface: each canonical verb, its
+//     modes/actions, and the hidden verbs, pinning verb + handler + mutationClass (+ auditSub for the
+//     engine modes). The legacy old-name alias layer is GONE — a companion REJECTED table proves each old
+//     name is now a clean unknown-command error. A completeness guard enumerated from CANONICAL/HIDDEN_VERBS
+//     + the registry proves no verb/flag can silently escape coverage.
 // ────────────────────────────────────────────────────────────────────────────────────────────────
 
-// { old, canonical, verb, handler, mutationClass, auditSub? }
+// { argv, verb, handler, mutationClass, auditSub? } — the canonical surface (expandAliases is a fixed point).
 const GOLDEN = [
-  // the 7 canonical verbs (pass through unchanged)
-  { old: ["review"], canonical: ["review"], verb: "review", handler: "handleReview", mc: "none" },
-  { old: ["fix"], canonical: ["fix"], verb: "fix", handler: "handleAudit", mc: "working-tree", auditSub: "fix" },
-  { old: ["plan"], canonical: ["plan"], verb: "plan", handler: "handlePlan", mc: "none" },
-  { old: ["build"], canonical: ["build"], verb: "build", handler: "handleBuild", mc: "working-tree" },
-  { old: ["solve"], canonical: ["solve"], verb: "solve", handler: "handleReview", mc: "none" },
-  { old: ["status"], canonical: ["status"], verb: "status", handler: "handleStatus", mc: "state-only" },
-  { old: ["setup"], canonical: ["setup"], verb: "setup", handler: "handleSetup", mc: "state-only" },
-  // review-mode command aliases
-  { old: ["deliberate"], canonical: ["review", "--mode", "deliberate"], verb: "review", handler: "handleReview", mc: "none" },
-  { old: ["deliberation"], canonical: ["review", "--mode", "deliberate"], verb: "review", handler: "handleReview", mc: "none" },
-  { old: ["adversarial"], canonical: ["review", "--mode", "adversarial"], verb: "review", handler: "handleReview", mc: "none" },
-  { old: ["adversarial-review"], canonical: ["review", "--mode", "adversarial"], verb: "review", handler: "handleReview", mc: "none" },
-  // audit subcommands → review --mode … (DISTINCT engines) / fix
-  { old: ["audit", "run"], canonical: ["review", "--mode", "run"], verb: "review", handler: "handleAudit", mc: "none", auditSub: "run" },
-  { old: ["audit", "review"], canonical: ["review", "--mode", "deep"], verb: "review", handler: "handleAudit", mc: "none", auditSub: "review" },
-  { old: ["audit", "endless"], canonical: ["review", "--mode", "endless"], verb: "review", handler: "handleAudit", mc: "none", auditSub: "endless" },
-  { old: ["audit", "fix"], canonical: ["fix"], verb: "fix", handler: "handleAudit", mc: "working-tree", auditSub: "fix" },
-  { old: ["audit", "fix", "--loop"], canonical: ["fix", "--loop"], verb: "fix", handler: "handleAudit", mc: "working-tree", auditSub: "fix" },
-  // status folds (each selects a DISTINCT existing handler)
-  { old: ["result"], canonical: ["status", "--result"], verb: "status", handler: "handleResult", mc: "state-only" },
-  { old: ["watch"], canonical: ["status", "--watch"], verb: "status", handler: "handleWatch", mc: "state-only" },
-  { old: ["wait"], canonical: ["status", "--wait"], verb: "status", handler: "handleWait", mc: "state-only" },
-  { old: ["cancel"], canonical: ["status", "--cancel"], verb: "status", handler: "handleCancel", mc: "state-only" },
-  { old: ["fixloop-status"], canonical: ["status", "--fixloop"], verb: "status", handler: "handleFixloopStatus", mc: "state-only" },
-  { old: ["overview"], canonical: ["status", "--overview"], verb: "status", handler: "handleOverview", mc: "state-only" },
-  { old: ["history"], canonical: ["status", "--history"], verb: "status", handler: "handleHistory", mc: "state-only" },
-  { old: ["metrics"], canonical: ["status", "--metrics"], verb: "status", handler: "handleMetrics", mc: "state-only" },
-  { old: ["usage"], canonical: ["status", "--usage"], verb: "status", handler: "handleUsage", mc: "state-only" },
-  { old: ["ledger"], canonical: ["status", "--ledger"], verb: "status", handler: "handleLedger", mc: "state-only" },
-  // setup fold
-  { old: ["doctor"], canonical: ["setup", "--check"], verb: "setup", handler: "handleDoctor", mc: "state-only" },
+  // the 7 canonical verbs (bare)
+  { argv: ["review"], verb: "review", handler: "handleReview", mc: "none" },
+  { argv: ["fix"], verb: "fix", handler: "handleAudit", mc: "working-tree", auditSub: "fix" },
+  { argv: ["plan"], verb: "plan", handler: "handlePlan", mc: "none" },
+  { argv: ["build"], verb: "build", handler: "handleBuild", mc: "working-tree" },
+  { argv: ["solve"], verb: "solve", handler: "handleReview", mc: "none" },
+  { argv: ["status"], verb: "status", handler: "handleStatus", mc: "state-only" },
+  { argv: ["setup"], verb: "setup", handler: "handleSetup", mc: "state-only" },
+  // review modes — the light modes stay on handleReview; deep/run/endless reach the DISTINCT audit engines
+  { argv: ["review", "--mode", "deliberate"], verb: "review", handler: "handleReview", mc: "none" },
+  { argv: ["review", "--mode", "adversarial"], verb: "review", handler: "handleReview", mc: "none" },
+  { argv: ["review", "--mode", "deep"], verb: "review", handler: "handleAudit", mc: "none", auditSub: "review" },
+  { argv: ["review", "--mode", "run"], verb: "review", handler: "handleAudit", mc: "none", auditSub: "run" },
+  { argv: ["review", "--mode", "endless"], verb: "review", handler: "handleAudit", mc: "none", auditSub: "endless" },
+  // fix (write) with flags
+  { argv: ["fix", "--loop"], verb: "fix", handler: "handleAudit", mc: "working-tree", auditSub: "fix" },
+  { argv: ["fix", "--loop", "--deep"], verb: "fix", handler: "handleAudit", mc: "working-tree", auditSub: "fix" },
+  // status action forms (each selects a DISTINCT existing handler)
+  { argv: ["status", "--result"], verb: "status", handler: "handleResult", mc: "state-only" },
+  { argv: ["status", "--watch"], verb: "status", handler: "handleWatch", mc: "state-only" },
+  { argv: ["status", "--wait"], verb: "status", handler: "handleWait", mc: "state-only" },
+  { argv: ["status", "--cancel"], verb: "status", handler: "handleCancel", mc: "state-only" },
+  { argv: ["status", "--fixloop"], verb: "status", handler: "handleFixloopStatus", mc: "state-only" },
+  { argv: ["status", "--overview"], verb: "status", handler: "handleOverview", mc: "state-only" },
+  { argv: ["status", "--history"], verb: "status", handler: "handleHistory", mc: "state-only" },
+  { argv: ["status", "--metrics"], verb: "status", handler: "handleMetrics", mc: "state-only" },
+  { argv: ["status", "--usage"], verb: "status", handler: "handleUsage", mc: "state-only" },
+  { argv: ["status", "--ledger"], verb: "status", handler: "handleLedger", mc: "state-only" },
+  { argv: ["status", "--result", "j1"], verb: "status", handler: "handleResult", mc: "state-only" },
+  { argv: ["status", "--watch", "job1", "--interval", "3"], verb: "status", handler: "handleWatch", mc: "state-only" },
+  // setup action forms
+  { argv: ["setup", "--check"], verb: "setup", handler: "handleDoctor", mc: "state-only" },
+  { argv: ["setup", "--usage"], verb: "setup", handler: "handleUsage", mc: "state-only" },
   // hidden verbs (kept callable, not in --help)
-  { old: ["benchmark"], canonical: ["benchmark"], verb: "benchmark", handler: "handleBenchmark", mc: null },
-  { old: ["worktree"], canonical: ["worktree"], verb: "worktree", handler: "handleWorktree", mc: null },
-  { old: ["worker"], canonical: ["worker"], verb: "worker", handler: "handleWorker", mc: null },
-  // flag-CARRYING + flag-FIRST audit forms (the historical surface most likely to regress)
-  { old: ["audit", "fix", "--loop", "--deep"], canonical: ["fix", "--loop", "--deep"], verb: "fix", handler: "handleAudit", mc: "working-tree", auditSub: "fix" },
-  { old: ["audit", "--json", "fix"], canonical: ["fix", "--json"], verb: "fix", handler: "handleAudit", mc: "working-tree", auditSub: "fix" },
-  { old: ["audit", "--from", "r.json", "fix"], canonical: ["fix", "--from", "r.json"], verb: "fix", handler: "handleAudit", mc: "working-tree", auditSub: "fix" },
-  { old: ["audit", "--json", "review"], canonical: ["review", "--mode", "deep", "--json"], verb: "review", handler: "handleAudit", mc: "none", auditSub: "review" },
-  { old: ["audit", "--loop", "endless"], canonical: ["review", "--mode", "endless", "--loop"], verb: "review", handler: "handleAudit", mc: "none", auditSub: "endless" },
-  { old: ["watch", "job1", "--interval", "3"], canonical: ["status", "--watch", "job1", "--interval", "3"], verb: "status", handler: "handleWatch", mc: "state-only" },
-  // FLAG aliases (review verb only)
-  { old: ["review", "--adversarial"], canonical: ["review", "--mode", "adversarial"], verb: "review", handler: "handleReview", mc: "none" },
-  { old: ["review", "--deliberate"], canonical: ["review", "--mode", "deliberate"], verb: "review", handler: "handleReview", mc: "none" },
-  // status/setup ACTION forms (canonical spellings, not aliases)
-  { old: ["status", "--result", "j1"], canonical: ["status", "--result", "j1"], verb: "status", handler: "handleResult", mc: "state-only" },
-  { old: ["setup", "--check"], canonical: ["setup", "--check"], verb: "setup", handler: "handleDoctor", mc: "state-only" },
-  { old: ["setup", "--usage"], canonical: ["setup", "--usage"], verb: "setup", handler: "handleUsage", mc: "state-only" }
+  { argv: ["benchmark"], verb: "benchmark", handler: "handleBenchmark", mc: null },
+  { argv: ["worktree"], verb: "worktree", handler: "handleWorktree", mc: null },
+  { argv: ["worker"], verb: "worker", handler: "handleWorker", mc: null }
 ];
 
-test("(a) GOLDEN: every historical argv expands to its canonical form AND routes to the right handler/mutationClass", () => {
+// Every OLD command name that used to alias — now a clean unknown-command error, no handler, no writer.
+const REJECTED_OLD_NAMES = [
+  ["deliberate"], ["deliberation"], ["adversarial"], ["adversarial-review"],
+  ["audit"], ["audit", "fix"], ["audit", "review"], ["audit", "run"], ["audit", "endless"], ["endless"],
+  ["watch"], ["wait"], ["result"], ["cancel"], ["fixloop-status"], ["overview"],
+  ["history"], ["metrics"], ["usage"], ["ledger"], ["doctor"]
+];
+
+test("(a) GOLDEN: every canonical argv routes to the right handler/mutationClass and is an expandAliases fixed point", () => {
   for (const row of GOLDEN) {
-    assert.deepEqual(expandAliases(row.old), row.canonical, `expandAliases ${JSON.stringify(row.old)}`);
-    const r = route(row.old);
-    assert.equal(r.verb, row.verb, `verb for ${JSON.stringify(row.old)}`);
-    assert.equal(r.handler, row.handler, `handler for ${JSON.stringify(row.old)}`);
-    assert.equal(r.mutationClass, row.mc, `mutationClass for ${JSON.stringify(row.old)}`);
-    if (row.auditSub != null) assert.equal(r.auditSub, row.auditSub, `auditSub for ${JSON.stringify(row.old)}`);
-    // routing a row's own canonical form again is a fixed point (the surface is idempotent)
-    assert.deepEqual(expandAliases(row.canonical), row.canonical, `not idempotent: ${JSON.stringify(row.canonical)}`);
+    assert.deepEqual(expandAliases(row.argv), row.argv, `not a fixed point: ${JSON.stringify(row.argv)}`);
+    const r = route(row.argv);
+    assert.equal(r.verb, row.verb, `verb for ${JSON.stringify(row.argv)}`);
+    assert.equal(r.handler, row.handler, `handler for ${JSON.stringify(row.argv)}`);
+    assert.equal(r.mutationClass, row.mc, `mutationClass for ${JSON.stringify(row.argv)}`);
+    if (row.auditSub != null) assert.equal(r.auditSub, row.auditSub, `auditSub for ${JSON.stringify(row.argv)}`);
   }
 });
 
-test("(a) COMPLETENESS: every alias-table key + canonical/hidden verb is covered by a golden row (no silent escape)", () => {
-  const coveredHead = new Set(GOLDEN.map((r) => r.old[0]));
-  for (const k of Object.keys(COMMAND_ALIASES)) assert.ok(coveredHead.has(k), `command alias "${k}" has no golden row — add one`);
+test("(a) REJECTED: every old command name resolves to the clean unknown-command error (never a writer)", () => {
+  for (const argv of REJECTED_OLD_NAMES) {
+    const r = route(argv);
+    assert.equal(r.handler, "error", `old name ${JSON.stringify(argv)} must be rejected`);
+    assert.notEqual(r.mutationClass, "working-tree", `rejected ${JSON.stringify(argv)} may not carry working-tree`);
+    assert.match(r.error, /^unknown command '.+'\. Verbs: review fix plan build solve status setup\. Run --help\.$/);
+  }
+});
+
+test("(a) COMPLETENESS: every canonical + hidden verb has a golden row (no silent escape)", () => {
+  const coveredHead = new Set(GOLDEN.map((r) => r.argv[0]));
   for (const v of [...CANONICAL_VERBS, ...HIDDEN_VERBS]) assert.ok(coveredHead.has(v), `verb "${v}" has no golden row — add one`);
-
-  const coveredAuditSub = new Set(GOLDEN.filter((r) => r.old[0] === "audit").map((r) => r.old[1]));
-  for (const k of Object.keys(AUDIT_SUBCOMMAND_ALIASES)) assert.ok(coveredAuditSub.has(k), `audit subcommand alias "${k}" has no golden row — add one`);
-
-  const coveredTokens = new Set(GOLDEN.flatMap((r) => r.old));
-  for (const k of Object.keys(FLAG_ALIASES)) assert.ok(coveredTokens.has(k), `flag alias "${k}" has no golden row — add one`);
+  // every deep audit engine mode is exercised
+  const auditSubs = new Set(GOLDEN.filter((r) => r.auditSub != null).map((r) => r.auditSub));
+  for (const sub of ["fix", "review", "run", "endless"]) assert.ok(auditSubs.has(sub), `audit engine "${sub}" has no golden row`);
 });
 
 test("(a) COMPLETENESS: every registry flag is accepted by the audit parser (a new flag cannot escape parsing)", () => {
@@ -152,18 +148,19 @@ function reachesCodeWriter(r) {
   return false;
 }
 
-// Every historical READ-ONLY invocation (review family + the deep engines + plan + solve + status + setup).
+// Every CANONICAL READ-ONLY invocation (review family + the deep engines + plan + solve + status + setup).
 const READ_ONLY_INVOCATIONS = [
   ["review"], ["review", "--mode", "quick", "focus"],
-  ["deliberate"], ["deliberation"], ["adversarial"], ["adversarial-review"],
-  ["audit", "review"], ["audit", "review", "--groups", "lens"],
-  ["audit", "run"], ["audit", "run", "--sarif"],
-  ["audit", "endless"], ["audit", "endless", "--max-passes", "1"],
+  ["review", "--mode", "deliberate"], ["review", "--mode", "adversarial"],
+  ["review", "--mode", "deep"], ["review", "--mode", "deep", "--groups", "lens"],
+  ["review", "--mode", "run"], ["review", "--mode", "run", "--sarif"],
+  ["review", "--mode", "endless"], ["review", "--mode", "endless", "--max-passes", "1"],
   ["solve"], ["solve", "make it faster"],
   ["plan"], ["plan", "add a helper"],
-  ["status"], ["watch"], ["wait"], ["result"], ["cancel", "j1"], ["fixloop-status"],
-  ["overview"], ["history"], ["metrics"], ["usage"], ["ledger"],
-  ["setup"], ["doctor"], ["setup", "--usage"]
+  ["status"], ["status", "--watch"], ["status", "--wait"], ["status", "--result"],
+  ["status", "--cancel", "j1"], ["status", "--fixloop"], ["status", "--overview"],
+  ["status", "--history"], ["status", "--metrics"], ["status", "--usage"], ["status", "--ledger"],
+  ["setup"], ["setup", "--check"], ["setup", "--usage"]
 ];
 
 test("(b) STRUCTURAL: no read-only invocation reaches a code writer, and the mutation guard refuses each", () => {
@@ -232,9 +229,9 @@ test("(b) WORKTREE SNAPSHOT: every read-only verb leaves EVERY tracked source fi
     ["review"],
     ["review", "--mode", "deliberate"],
     ["review", "--mode", "adversarial"],
-    ["audit", "review"],
-    ["audit", "endless", "--max-passes", "1"],
-    ["audit", "run"],
+    ["review", "--mode", "deep"],
+    ["review", "--mode", "endless", "--max-passes", "1"],
+    ["review", "--mode", "run"],
     ["plan", "add a small helper"],
     ["solve", "make the helper faster"]
   ];
@@ -318,25 +315,25 @@ function runCli(args, extraEnv = {}) {
   }
 }
 
-// { args, expectNote? } — every case is model-free (--explain for the run-verbs; observation for status/setup).
+// Every case is model-free (--explain for the run-verbs; observation for status/setup). All CANONICAL —
+// the old-name aliases are gone, so there is no deprecation note to keep off stdout any more.
 const PURITY_MATRIX = [
   { args: ["fix", "--explain", "--json"] },
   { args: ["build", "--explain", "--json"] },
   { args: ["review", "--explain", "--json"] },
+  { args: ["review", "--mode", "deliberate", "--explain", "--json"] },
   { args: ["plan", "--explain", "--json"] },
   { args: ["solve", "--explain", "--json"] },
   { args: ["status", "--explain", "--json"] },
   { args: ["setup", "--explain", "--json"] },
   { args: ["status", "--json"] },
-  { args: ["setup", "--check", "--no-ping", "--json"] },
-  { args: ["metrics", "--json"], expectNote: true }, // alias status --metrics → deprecation note on stderr
-  { args: ["usage", "--json"], expectNote: true }, // alias status --usage → deprecation note on stderr
-  { args: ["deliberate", "--explain", "--json"], expectNote: true }, // alias review --mode deliberate
-  { args: ["audit", "fix", "--explain", "--json"], expectNote: true } // alias fix
+  { args: ["status", "--metrics", "--json"] },
+  { args: ["status", "--usage", "--json"] },
+  { args: ["setup", "--check", "--no-ping", "--json"] }
 ];
 
-test("(d) JSON PURITY: every verb + sampled aliases emit PURE JSON on stdout; notes/banner/warnings only on stderr", (t) => {
-  for (const { args, expectNote } of PURITY_MATRIX) {
+test("(d) JSON PURITY: every verb emits PURE JSON on stdout; banners/warnings only on stderr", (t) => {
+  for (const { args } of PURITY_MATRIX) {
     const { res } = runCli(args);
     if (isSandboxBlocked(res)) {
       t.skip("child_process.spawn is blocked by this sandbox");
@@ -346,14 +343,14 @@ test("(d) JSON PURITY: every verb + sampled aliases emit PURE JSON on stdout; no
     // usage) may exit non-zero on an empty/offline environment, but their stdout must STILL be pure JSON.
     if (args.includes("--explain")) assert.equal(res.status, 0, `${JSON.stringify(args)} exited non-zero: ${res.stderr}`);
     // stdout is ENTIRELY valid JSON (0 non-JSON bytes) — the whole point of --json.
-    // stdout parsing cleanly IS the "0 non-JSON bytes" proof: a leaked note/banner/warning LINE (they are
-    // plain text, not JSON) would coexist with the JSON object and break JSON.parse. A note/banner that is
-    // a legitimate JSON *field value* (e.g. doctor's effectivePolicy) is structured data, not a leak.
+    // stdout parsing cleanly IS the "0 non-JSON bytes" proof: a leaked banner/warning LINE (plain text, not
+    // JSON) would coexist with the JSON object and break JSON.parse. A banner that is a legitimate JSON
+    // *field value* (e.g. doctor's effectivePolicy) is structured data, not a leak.
     let parsed;
     assert.doesNotThrow(() => { parsed = JSON.parse(res.stdout); }, `${JSON.stringify(args)} stdout is not pure JSON:\n${res.stdout.slice(0, 200)}`);
     assert.ok(parsed && typeof parsed === "object", `${JSON.stringify(args)} stdout did not parse to an object`);
-    // the deprecation note is emitted for a deprecated spelling — to STDERR, never stdout (proven above).
-    if (expectNote) assert.match(res.stderr, /note:/, `${JSON.stringify(args)} should emit its deprecation note on STDERR`);
+    // no stray note/banner ever leaks onto stdout
+    assert.doesNotMatch(res.stdout, /^note:/m, `${JSON.stringify(args)} leaked a note onto stdout`);
   }
 });
 
@@ -501,17 +498,29 @@ test("SMOKE: `setup --check --json` is pure JSON and surfaces the SAME resolved 
   assert.ok(j.resolvedPolicy.some((k) => k.key === "structure_auto_apply"), "the consent knobs appear in setup --check's resolved policy");
 });
 
-test("SMOKE: the `deliberate` alias emits its stderr note but pure JSON on stdout under --json", (t) => {
-  const { res } = runCli(["deliberate", "--explain", "--json"]);
+test("SMOKE: `review --mode deliberate --explain --json` resolves the mode as pure JSON", (t) => {
+  const { res } = runCli(["review", "--mode", "deliberate", "--explain", "--json"]);
   if (isSandboxBlocked(res)) {
     t.skip("child_process.spawn is blocked by this sandbox");
     return;
   }
   assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stderr, /`deliberate` is now `review --mode deliberate`/, "the alias deprecation note goes to stderr");
   const j = JSON.parse(res.stdout); // stdout stays pure JSON
   assert.equal(j.verb, "review");
-  assert.equal(j.knobs.find((k) => k.key === "mode").value, "deliberate", "the resolved mode reflects the alias");
+  assert.equal(j.knobs.find((k) => k.key === "mode").value, "deliberate", "the resolved mode reflects --mode");
+});
+
+test("SMOKE: an OLD command name is a clean unknown-command error (exit 1, message on stderr, no stdout leak)", (t) => {
+  for (const old of ["deliberate", "audit", "watch", "doctor"]) {
+    const { res } = runCli([old, "--json"]);
+    if (isSandboxBlocked(res)) {
+      t.skip("child_process.spawn is blocked by this sandbox");
+      return;
+    }
+    assert.notEqual(res.status, 0, `${old} must exit non-zero`);
+    assert.match(res.stderr, new RegExp(`unknown command '${old}'\\. Verbs: review fix plan build solve status setup\\. Run --help\\.`), `${old} must print the clean error`);
+    assert.equal(res.stdout.trim(), "", `${old} must not print anything to stdout`);
+  }
 });
 
 test("SMOKE: `status --watch --json` routes to the watch handler (no action-collision error)", (t) => {

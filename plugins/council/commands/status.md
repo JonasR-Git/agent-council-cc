@@ -13,11 +13,6 @@ it never edits source). Pick **one** action by flag (default = list + status). N
 
 `--result | --watch | --wait | --cancel | --history | --metrics | --usage | --ledger | --fixloop | --overview`
 
-The old bare verb names still work and alias to `status --<action>` (the CLI maps
-`watch|wait|result|cancel|history|metrics|usage|ledger|overview|fixloop-status →
-status --…`), so `/council:status --watch` and the legacy `watch` invocation are the
-same thing.
-
 Raw arguments: `$ARGUMENTS`
 
 ## Default — status
@@ -29,7 +24,7 @@ Present the output (running + recent jobs, or one job's state).
 
 ## `--watch` — live dashboard
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" watch $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" status --watch $ARGUMENTS
 ```
 Per-agent R1 state, R2 progress, elapsed + ETA, and (on completion) a findings
 breakdown. Redraws in a real terminal (**tip:** run it in your own pane via `!` for
@@ -42,7 +37,7 @@ call). Use this to post the state in chat; use the plain box for a terminal pane
 
 ## `--result` — stored report
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" result $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" status --result $ARGUMENTS
 ```
 Prefer `--summary` (merged findings / ranking / debate only, saves tokens); `--html`
 writes a self-contained styled report to the job's artifacts dir. Present the report,
@@ -50,30 +45,29 @@ then a brief Claude synthesis (consensus vs unique P0). Do not re-run the review
 
 ## `--wait` — block until done
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" wait $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" status --wait $ARGUMENTS
 ```
 Run in the background so the process exit wakes the session. `--follow` streams each
 phase to stderr; exits 0 when finished, 1 on `--timeout` (default 3600s).
 
 ## `--cancel` — stop a running job
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" cancel $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" status --cancel $ARGUMENTS
 ```
 Present the cancel result.
 
 ## Other read-only actions
 
-Each maps to `status --<action>` (bare-verb aliases in parentheses still work):
+Each is an action flag on `status`:
 
-- **`--history`** (`history`) — recent jobs across this workspace with their kind /
-  agents / verdict.
-- **`--metrics`** (`metrics`) — per-kind / per-agent call, failure, and timeout stats.
-- **`--usage`** (`usage`) — this workspace's job-level token/usage stats (for provider
-  window limits use `/council:setup --usage`).
-- **`--ledger`** (`ledger`) — the findings ledger (open/resolved/dismissed findings
-  tracked across runs).
-- **`--fixloop`** (`fixloop-status`) — the decision state of an autonomous
-  `/council:fix` loop (`stop-approved` / `fix-and-rereview` / `stop-escalate-to-human`).
-- **`--overview`** (`overview`) — a combined snapshot across the above.
+- **`--history`** — recent jobs across this workspace with their kind / agents / verdict.
+- **`--metrics`** — per-kind / per-agent call, failure, and timeout stats.
+- **`--usage`** — this workspace's job-level token/usage stats (for provider window
+  limits use `/council:setup --usage`).
+- **`--ledger`** — the findings ledger (open/resolved/dismissed findings tracked across
+  runs).
+- **`--fixloop`** — the decision state of an autonomous `/council:fix` loop
+  (`stop-approved` / `fix-and-rereview` / `stop-escalate-to-human`).
+- **`--overview`** — a combined snapshot across the above.
 
 All are read-only reporting; add `--json` for machine output. Present the output.

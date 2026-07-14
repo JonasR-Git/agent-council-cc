@@ -35,13 +35,13 @@ Claude **must** write its R1 JSON outside the repo, preferably to an OS temp pat
 Run after Claude R1 is written:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings "$TMPDIR/council-claude-r1.json"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" review --mode deliberate --claude-findings "$TMPDIR/council-claude-r1.json"
 ```
 
 Or start Codex/Grok first and wait for the file:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" deliberate --claude-findings-wait "$TMPDIR/council-claude-r1.json" --wait-timeout 600
+node "${CLAUDE_PLUGIN_ROOT}/scripts/council-companion.mjs" review --mode deliberate --claude-findings-wait "$TMPDIR/council-claude-r1.json" --wait-timeout 600
 ```
 
 ## Solve protocol (plans instead of findings)

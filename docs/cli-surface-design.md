@@ -1,10 +1,19 @@
 # CLI surface redesign — FROZEN DESIGN (council-cabd31b4)
 
 > Converged by a 3-model council (Claude + Codex + Grok). This is the AUTHORITATIVE spec for the redesign —
-> freeze it BEFORE implementing so all builders produce ONE surface. Backward-compat via a thin ALIAS layer:
-> zero flag/command deletions in v1 (aliases only; deprecations warn on stderr, removed only after a major
-> version + changelog). The INVIOLABLE rule: **read-only verbs never modify tracked project source or git;
-> writing verbs (fix, build) are always test-gated on an isolated branch, never auto-merged.**
+> freeze it BEFORE implementing so all builders produce ONE surface. The INVIOLABLE rule: **read-only verbs
+> never modify tracked project source or git; writing verbs (fix, build) are always test-gated on an
+> isolated branch, never auto-merged.**
+>
+> **STATUS (migration complete): the backward-compat ALIAS layer has been REMOVED.** The 7 canonical verbs
+> (`review`, `fix`, `plan`, `build`, `solve`, `status`, `setup`) — plus the hidden internal verbs `worker`
+> (spawn protocol; never renamed), `worktree`, `benchmark` — are the WHOLE surface. Every OLD command name
+> (`deliberate`, `adversarial`, `audit`, `watch`, `wait`, `result`, `cancel`, `doctor`, `usage`, `ledger`,
+> `history`, `metrics`, `fixloop-status`, `overview`, `endless`) now resolves to a clean unknown-command
+> error: `unknown command '<x>'. Verbs: review fix plan build solve status setup. Run --help.` The INTERNAL
+> engine routing is unchanged — `review --mode deep|run|endless` reaches the audit review/run/endless
+> engines, `fix` the audit-fix engine, `status --<action>` the observability handlers, `setup --check|--usage`
+> the doctor/usage handlers. Appendix B below is retained as the record of the completed old→new migration.
 
 ## The 7 user-facing verbs
 | Verb | mutationClass | Folds | Notes |
@@ -86,9 +95,14 @@ Cross-cutting NEVER-config (Appendix C): `--json`, `--dry-run`, `--from`, `--bas
 always essential and always wins.
 
 ═══════════════════════════════════════════════════════════════════════════════════════════
-## Appendix B — complete old→new ALIAS table (nothing breaks; table-driven tests for every row)
+## Appendix B — the completed old→new MIGRATION table (historical record; old names now ERROR)
 ═══════════════════════════════════════════════════════════════════════════════════════════
-| Old argv | New argv |
+> This table was the transitional alias map. That alias layer is now REMOVED: the "Old argv" column no
+> longer resolves (each is a clean unknown-command error) — it documents the migration a caller must have
+> made. The "New argv" column is the canonical surface. The `worker`/`worktree`/`benchmark` rows are the
+> hidden internal verbs, still callable by name.
+
+| Old argv (now ERRORS) | New argv (canonical) |
 |----------|----------|
 | `review` | `review` (default mode unchanged — do NOT silent-flip the CLI default) |
 | `deliberate` / `deliberation` | `review --mode deliberate` (done) |
@@ -116,8 +130,8 @@ always essential and always wins.
 | `benchmark` | `benchmark` (hidden alias; not in top --help) |
 | `worktree` | `worktree` (internal; hidden) |
 | `worker` | `worker` (internal; hidden; NEVER renamed — spawn protocol) |
-Flag aliases (LIVE in Stage 3, review verb only): `--adversarial`→`--mode adversarial`,
-`--deliberate`→`--mode deliberate`.
+Flag aliases (REMOVED with the alias layer — use `--mode` directly): `--adversarial` / `--deliberate` are
+gone; use `review --mode adversarial` / `review --mode deliberate`.
 Flag aliases (DEFERRED — target flags not yet wired into the handlers; the OLD spellings keep working
 UNCHANGED and are NOT rewritten, so behavior stays byte-identical until the unified flag parser lands):
 `--flat`→`--no-per-tier` (no `--no-per-tier` flag exists; `--flat` is the live flag, `per_tier` is a
