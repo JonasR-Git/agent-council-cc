@@ -17,6 +17,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { isProposeOnly } from "./audit-lenses.mjs";
 import { fingerprintFinding } from "./ledger.mjs";
 import { resolveStateDir } from "./state.mjs";
 
@@ -111,6 +112,14 @@ function toRecord(finding, { session, seq, pass, nowIso, sweepCellKey = null, ep
   // union of the raising seats + the original finding ids, so a later dedupe can't erase who found it.
   const seats = Array.isArray(finding.agents) ? finding.agents : finding.seat ? [finding.seat] : finding.agent ? [finding.agent] : [];
   const ids = Array.isArray(finding.ids) ? finding.ids.map(String) : [id];
+  // SCOPE PERSISTENCE (fix-loop unblock): the fix loop's classifyFixable fail-closes any finding whose
+  // scope !== "localized", but toRecord previously DROPPED scope/fixDisposition — so a finding read back
+  // from this durable store had scope=undefined and could never be auto-fixed. The loop worked around it
+  // by RE-normalizing accumulated records before the gate (audit-fixloop.mjs ~821), a fragile step whose
+  // absence once caused a convergence bug. Persist scope here with the SAME rule as normalizeFindings
+  // (audit-normalize.mjs) so the store is self-describing and the classification survives the round-trip.
+  const scope = finding.scope === "cross-cutting" || isProposeOnly(finding.lens) ? "cross-cutting" : "localized";
+  const fixDisposition = finding.fixDisposition ?? (scope === "cross-cutting" ? "propose-only" : "localized");
   return {
     schemaVersion: FINDINGS_SCHEMA_VERSION,
     session: session ?? null,
@@ -124,6 +133,8 @@ function toRecord(finding, { session, seq, pass, nowIso, sweepCellKey = null, ep
     detail: finding.detail ?? null,
     file: finding.file ?? finding.location?.path ?? null,
     line: finding.line ?? finding.location?.startLine ?? null,
+    scope,
+    fixDisposition,
     seats,
     ids,
     pass: pass ?? null,

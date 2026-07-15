@@ -36,6 +36,28 @@ test("C: findings are appended as COMPLETE newline-terminated records with the f
   assert.ok(recs[0].fingerprint, "each record carries a stable ledger fingerprint");
 });
 
+test("C: toRecord PERSISTS scope + fixDisposition so the fix loop's classifyFixable survives the round-trip (regression: a dropped scope made EVERY finding read back as scope=undefined → propose-only → 0 auto-fixes)", () => {
+  const dir = tmp();
+  const file = path.join(dir, "audit-findings.jsonl");
+  const app = makeFindingsAppender(file, { session: "s1", nowIso: () => "2026-07-13T00:00:00Z" });
+  app.append([
+    finding({ title: "localized correctness", lens: "correctness", file: "a.mjs" }),
+    finding({ title: "structural", lens: "architecture_ssot", file: "b.mjs" }),
+    finding({ title: "explicit x-cut on a fixable lens", lens: "correctness", scope: "cross-cutting", file: "c.mjs" })
+  ], { pass: 1 });
+  const byTitle = Object.fromEntries(readFindingsStore(file).map((r) => [r.title, r]));
+
+  // A localized correctness finding round-trips as fixable — the exact property classifyFixable gates on.
+  assert.equal(byTitle["localized correctness"].scope, "localized");
+  assert.equal(byTitle["localized correctness"].fixDisposition, "localized");
+  // A propose-only lens (structure/SSOT) is cross-cutting → propose-only.
+  assert.equal(byTitle["structural"].scope, "cross-cutting");
+  assert.equal(byTitle["structural"].fixDisposition, "propose-only");
+  // An EXPLICIT reviewer scope of cross-cutting is honoured even on an otherwise-fixable lens.
+  assert.equal(byTitle["explicit x-cut on a fixable lens"].scope, "cross-cutting");
+  assert.equal(byTitle["explicit x-cut on a fixable lens"].fixDisposition, "propose-only");
+});
+
 test("C: dedupe by fingerprint prevents duplicate lines (many-to-many provenance kept in-record)", () => {
   const dir = tmp();
   const file = path.join(dir, "audit-findings.jsonl");
