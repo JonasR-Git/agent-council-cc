@@ -17,6 +17,36 @@ test("runs review->fix passes until the dry streak, accumulating committed fixes
   assert.match(out.stopReason, /diminishing returns/);
 });
 
+test("consensus/dedup dep is actually CALLED before the gate and its output is what gets fixed (anti-facade)", async () => {
+  // Two single-seat findings on the same file — the consensus dep fuses them into ONE consensus finding.
+  const review = async () => ({
+    findings: [
+      finding({ file: "a.mjs", line: 10, title: "null deref", seats: ["codex"], scope: "localized", fixDisposition: "localized" }),
+      finding({ file: "a.mjs", line: 31, title: "possible NPE", seats: ["grok"], scope: "localized", fixDisposition: "localized" })
+    ],
+    coverage: { budgetSpent: 2 }
+  });
+  const calls = [];
+  const consensusMerge = async (findings, ctx) => {
+    calls.push({ n: findings.length, pass: ctx?.pass });
+    // Collapse the two into one consensus finding (what the real Grok pass does on a match).
+    return { findings: [finding({ file: "a.mjs", line: 10, title: "null deref", seats: ["codex", "grok"], consensus: "consensus", scope: "localized", fixDisposition: "localized" })], merged: 1 };
+  };
+  let fixedInput = null;
+  const fix = async (actionable) => {
+    fixedInput = actionable;
+    return { fixed: actionable.map((f) => ({ file: f.file, finding: f, commit: "abc" })), failed: [], branch: "council/x", changedFiles: ["a.mjs"], spent: 2 };
+  };
+  const out = await runFixLoop("/x", { budget: 8, dryStreak: 1, maxPasses: 1 }, { review, fix, consensusMerge, checkpoint: noCheckpoint });
+  assert.ok(calls.length >= 1, "the consensus dep was invoked (not a dead dep)");
+  assert.equal(calls[0].pass, 1, "invoked on pass 1 (CONSENSUS_MERGE_EVERY cadence)");
+  assert.equal(calls[0].n, 2, "received both single-seat findings");
+  // The GATE + fixer saw the MERGED single consensus finding, not the two originals — proves the dep's
+  // output is what flows downstream (a facade would fix 2 findings or ignore the merge).
+  assert.equal(fixedInput.length, 1, "the fixer received the merged finding, not the two originals");
+  assert.equal(out.fixed.length, 1);
+});
+
 test("--retry-on-limit backs off and retries a rate-limited review instead of stopping", async () => {
   const sleeps = [];
   let reviewCalls = 0;

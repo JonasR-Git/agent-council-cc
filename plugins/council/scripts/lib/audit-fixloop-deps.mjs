@@ -30,6 +30,8 @@ import path from "node:path";
 
 import { runAuditFix } from "./audit-fix.mjs";
 import { normalizeFindings } from "./audit-normalize.mjs";
+import { runConsensusMerge } from "./audit-consensus-merge.mjs";
+import { runGrokStructured } from "./agents.mjs";
 import { runAuditReview, selectUnits, suspicionRank } from "./audit-review.mjs";
 import { runGroupedReview, READ_MAX_BYTES } from "./audit-grouped-review.mjs";
 import { resolveLensGroups } from "./audit-lens-groups.mjs";
@@ -526,8 +528,25 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   // the checkpoint and restores it here on resume.
   const windowState = { get: () => fullPasses, set: (n) => { fullPasses = Math.max(0, Math.floor(Number(n) || 0)); } };
 
+  // SEMANTIC consensus/dedup dep (runFixLoop calls it on the CONSENSUS_MERGE_EVERY cadence before gating):
+  // a Grok pass that fuses same-file findings different seats meant identically — so a bug both codex and
+  // grok raised reads as CONSENSUS and clears the fix consensus gate, and a duplicate isn't fixed twice.
+  // Wired ONLY when grok is an active seat (skipGrok / no grok backend → undefined → runFixLoop no-ops the
+  // step). runConsensusMerge is itself fail-soft. maxTurns is small: the task is one JSON reply over the
+  // prompt text, no file/tool access needed. Injectable via impl for tests.
+  const grokActive = !options.skipGrok && activeSeatNames(backends, options).includes("grok");
+  const consensusMerge =
+    impl.consensusMerge ??
+    (grokActive
+      ? (findings) =>
+          runConsensusMerge(findings, {
+            grok: (p) => runGrokStructured(cwd, backends, { ...agentPins, maxTurns: 8 }, p),
+            log: typeof options.log === "function" ? options.log : () => {}
+          })
+      : undefined);
+
   // WAVE 2: `sweep` (null unless --epoch-sweep on the grouped path) carries the durable coverage
   // machinery runFixLoop drives — the frozen reviewer set, the epoch fingerprint, the on-disk ledger
   // cursor, the file universe, and the disk-backed manifest builders. null ⇒ the loop runs legacy.
-  return { review, fix, expandScope, verdictsFor, windowState, sweep };
+  return { review, fix, expandScope, verdictsFor, windowState, sweep, consensusMerge };
 }

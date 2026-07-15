@@ -92,15 +92,33 @@ export function isVerifiedSupported(raw = {}) {
   return Boolean(raw?.verified) && !isRefuted(raw);
 }
 
+/**
+ * Distinct number of seats that raised a finding, robust to BOTH shapes: a freshly merged finding carries
+ * `agents` (findings.mjs), a finding read back from the durable store carries `seats` (audit-findings-store
+ * toRecord persists the seat UNION, not `agents`). Reading only `agents` treated every store finding as
+ * having 0 finders → regex-only confidence + consensus:"single", which silently defeated the consensus gate.
+ */
+export function seatsOf(raw = {}) {
+  const src = Array.isArray(raw.agents) ? raw.agents : Array.isArray(raw.seats) ? raw.seats : raw.agent ? [raw.agent] : raw.seat ? [raw.seat] : [];
+  return [...new Set(src.map((s) => String(s).trim().toLowerCase()).filter(Boolean))];
+}
+export function seatCount(raw = {}) {
+  return seatsOf(raw).length;
+}
+
+/** True when ≥2 distinct seats independently raised this finding (the durable multi-seat consensus signal). */
+export function isMultiSeat(raw = {}) {
+  return Boolean(raw.consensus) || seatCount(raw) >= 2;
+}
+
 /** Evidence state → drives the confidence cap/floor (audit-risk deriveConfidence). */
 export function evidenceState(raw = {}) {
   // A REFUTED finding is the WEAKEST evidence state, never the strongest: an independent verifier
   // could not support it. It stays VISIBLE (annotate-only) but must be deprioritized, not promoted.
   if (isRefuted(raw)) return "refuted";
   if (isVerifiedSupported(raw)) return raw.reproduced ? "reproduced" : "adversarial-verified";
-  if (raw.consensus) return "independent-agreement";
-  const finders = raw.agents?.length ?? (raw.agent ? 1 : 0);
-  return finders >= 1 ? "one-finder" : "regex-only";
+  if (isMultiSeat(raw)) return "independent-agreement";
+  return seatCount(raw) >= 1 ? "one-finder" : "regex-only";
 }
 
 const clamp15 = (n, d = 3) => Math.max(1, Math.min(5, Number.isFinite(Number(n)) ? Math.round(Number(n)) : d));
@@ -161,7 +179,10 @@ export function toCanonicalFinding(raw = {}, { unit, ordinal } = {}) {
     failureScenario: String(raw.failureScenario ?? raw.detail ?? raw.title ?? "(no scenario provided)").trim() || "(no scenario provided)",
     standards: getLens(lens)?.standards ?? [],
     scope,
-    consensus: raw.consensus ? "consensus" : raw.contested ? "contested" : "single",
+    // Multi-seat agreement is consensus whether it arrives as an explicit `consensus` flag (merge path) or
+    // as a ≥2-seat `seats`/`agents` union (store round-trip) — see isMultiSeat. This is the signal the fix
+    // consensus gate (audit-fix.mjs) reads and that the Grok consensus/dedup pass populates by unioning seats.
+    consensus: isMultiSeat(raw) ? "consensus" : raw.contested ? "contested" : "single",
     fixDisposition,
     // Only carried when the fix-eligibility lens DIFFERS from the coverage lens (a reattributed finding);
     // absent = the two are identical, so downstream `f.fixLens ?? f.lens` recovers the fix lens uniformly.

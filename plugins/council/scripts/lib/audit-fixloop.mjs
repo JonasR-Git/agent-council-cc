@@ -76,6 +76,13 @@ const RED_ESCALATE_THRESHOLD = 2;
 // non-converging file is caught fast); deterministic (content hashes + fingerprints, never a clock).
 export const LIVELOCK_MAX_CYCLES = 3;
 
+// The SEMANTIC consensus/dedup pass (audit-consensus-merge) runs on this cadence — every Nth pass, starting
+// at pass 1 (the largest raw single-seat backlog is on the first passes). It spends one Grok call to fuse
+// same-file findings that different seats meant identically (the lexical merge misses them), so a bug both
+// codex and grok found becomes CONSENSUS and clears the fix consensus gate. Cadenced (not every pass) so it
+// never dominates the loop's Grok budget. FAIL-SOFT + no-op when the dep is unwired (bare callers/tests).
+const CONSENSUS_MERGE_EVERY = 2;
+
 /** SSOT for the --usage-ceiling terminal stop message — shared by the between-pass backstop AND the
  *  mid-pass quiesce so the two paths report the ceiling breach identically. PURE. */
 function ceilingStopReason(breaches) {
@@ -845,7 +852,22 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       return [...findings, ...normExtra];
     })();
 
-    const gated = gate(gateInput, { changedFiles, pass: passNo });
+    // SEMANTIC consensus/dedup (regelmäßig, CONSENSUS_MERGE_EVERY cadence): before gating, ask Grok whether
+    // same-file single-seat findings from DIFFERENT seats are the SAME underlying issue. Matches → union their
+    // seats (so the finding reads as CONSENSUS, which unblocks the fix consensus gate for reattributed logical
+    // bugs) and drops the duplicate so the fixer isn't offered it twice. FAIL-SOFT: deps.consensusMerge returns
+    // the input unchanged on any Grok error, and the whole step no-ops when the dep is unwired (bare/test callers).
+    let gateFindings = gateInput;
+    if (typeof deps.consensusMerge === "function" && passNo % CONSENSUS_MERGE_EVERY === 1) {
+      try {
+        const r = await deps.consensusMerge(gateInput, { pass: passNo });
+        if (r && Array.isArray(r.findings)) gateFindings = r.findings;
+      } catch {
+        /* fail-soft: gating proceeds on the un-merged findings */
+      }
+    }
+
+    const gated = gate(gateFindings, { changedFiles, pass: passNo });
     for (const p of gated.surfaced ?? []) {
       const k = proposedKey(p);
       if (!seenProposed.has(k)) {
