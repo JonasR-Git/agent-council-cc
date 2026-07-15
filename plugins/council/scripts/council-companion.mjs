@@ -36,7 +36,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { readLedgerEntries, resolveLedgerEntry } from "./lib/ledger.mjs";
 import { renderOverview } from "./lib/overview.mjs";
-import { colorize, formatDashboard, formatDashboardMarkdown, pickFreshestWatchSource, readProgressState, renderProgressDashboard, renderRunDashboard, summarizeCouncilExtras, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
+import { colorize, formatDashboard, formatDashboardMarkdown, pickFreshestWatchSource, readProgressState, renderRunDashboard, summarizeCouncilExtras, summarizeFindings, summarizeProgress } from "./lib/watch.mjs";
 import { makeProgressReporter, mutedFindingsReporter } from "./lib/progress.mjs";
 import { formatExit } from "./lib/util.mjs";
 import { median } from "./lib/stats.mjs";
@@ -47,7 +47,7 @@ import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
 import { evaluateResumeGuard, loadFixLoopCheckpoint, runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
-import { parsePause5hOption, parseUsageCeiling } from "./lib/usage-guard.mjs";
+import { DEFAULT_CEILING, mergeUsageSnapshots, parsePause5hOption, parseUsageCeiling, readUsageSnapshot } from "./lib/usage-guard.mjs";
 import { booleanOptionsFor, fixConfigBooleans, fixConfigValues, loopBudgetCeiling, negatableFlags, valueOptionsFor } from "./lib/cli-registry.mjs";
 import { CONSENT_ENV_VAR, LOCAL_CONSENT_FILE, evaluateAckWrite, formatConsentBanner, resolveConsents, writeConsentAck } from "./lib/consent.mjs";
 import { route } from "./lib/cli-dispatch.mjs";
@@ -2002,39 +2002,56 @@ async function handleWatch(argv) {
 
 /**
  * Watch the universal progress.json (Phase 2) — the fallback path for `council watch` when there is
- * no legacy job. Mirrors handleWatch's json / --md / --once / TTY-loop shape, but renders the
- * kind-agnostic dashboard (renderProgressDashboard, TOTAL/never-throws) and re-reads the file each
- * interval, terminating on `prog.done`. `initial` is the state that was present when the fallback
- * fired; a subsequent read failure falls back to it rather than blanking the screen.
+ * no legacy job. Mirrors handleWatch's json / --md / --once / TTY-loop shape, rendering the ONE unified
+ * dashboard (renderRunDashboard — quota-aware, TOTAL/never-throws) and re-reading the file each interval,
+ * terminating on `prog.done`. `initial` is the state that was present when the fallback fired; a
+ * subsequent read failure falls back to it rather than blanking the screen.
  */
 async function watchProgress(cwd, initial, options) {
   const stateDir = resolveStateDir(cwd);
   const reread = () => readProgressState(stateDir) ?? initial;
-  // Phase 2 + usage guard: when the run stashed a per-model usage snapshot (a `--usage-ceiling`
-  // fix loop), render the RICH quota/token/ceiling markdown box (renderRunDashboard); otherwise the
-  // plain kind-agnostic dashboard, byte-identical to before. renderRunDashboard is markdown-only, so
-  // it also serves the live redraw here (paint() still adds harmless ANSI accents).
-  const renderUniversal = (state, md) => {
-    const usage = state && typeof state === "object" && state.usage && typeof state.usage === "object" ? state.usage : null;
-    return usage
-      ? renderRunDashboard(state, { usage, ceiling: state.usageCeiling ?? null, nowMs: Date.now() })
-      : renderProgressDashboard(state, { md, nowMs: Date.now() });
+  // ONE unified dashboard. Always collect a LIVE usage snapshot so the run box ALWAYS carries the
+  // per-seat quota / 5h / weekly / token / ceiling columns — not only when a `--usage-ceiling` loop
+  // happened to stash usage into progress.json. Quota moves slowly, so collect once here (refreshed on
+  // a TTL in the live loop below) rather than re-reading the CLI logs on every 2s redraw. Fail-soft:
+  // readUsageSnapshot never throws; a null snapshot falls back to the run's own stashed usage, then to
+  // the plain box, so the dashboard can never break on a quota-read hiccup. renderRunDashboard is
+  // markdown-only, so it also serves the ANSI live redraw (paint() adds harmless accents).
+  const USAGE_TTL_MS = 60_000;
+  const collectUsage = () => readUsageSnapshot({ homeDir: os.homedir(), sinceMs: Date.now() - 7 * 24 * 3600 * 1000 }).catch(() => null);
+  // Keep the LAST-GOOD usage per seat across refreshes (mergeUsageSnapshots) so a rate-limited/transient
+  // read never blanks an otherwise-known quota column mid-run. See usage-guard.mjs for the rationale.
+  let usageSnapshot = await collectUsage();
+  let usageFetchedMs = Date.now();
+  const refreshUsageIfStale = async () => {
+    if (Date.now() - usageFetchedMs < USAGE_TTL_MS) return;
+    usageSnapshot = mergeUsageSnapshots(usageSnapshot, await collectUsage());
+    usageFetchedMs = Date.now();
+  };
+  // ONE dashboard renderer for the whole run path: renderRunDashboard carries the per-seat quota / 5h /
+  // weekly / token / ceiling columns AND degrades to the plain seat table on its own when usage is null,
+  // so there is no second competing renderer to route to. It is markdown-only, which also serves the ANSI
+  // live redraw (paint() adds harmless accents).
+  const renderUniversal = (state) => {
+    const usage = usageSnapshot ?? (state && typeof state.usage === "object" ? state.usage : null);
+    const ceiling = (state && state.usageCeiling) ?? DEFAULT_CEILING;
+    return renderRunDashboard(state, { usage, ceiling, nowMs: Date.now() });
   };
 
   if (options.json) {
     const prog = reread();
-    outputResult({ kind: prog?.kind ?? null, done: Boolean(prog?.done), dashboard: renderUniversal(prog, false) }, true);
+    outputResult({ kind: prog?.kind ?? null, done: Boolean(prog?.done), dashboard: renderUniversal(prog) }, true);
     return;
   }
   if (options.md) {
-    console.log(renderUniversal(reread(), true));
+    console.log(renderUniversal(reread()));
     return;
   }
   const paint = (s) => (process.stdout.isTTY ? colorize(s) : s);
   // Single snapshot for --once or non-TTY stdout (no live redraw).
   if (options.once || !process.stdout.isTTY) {
     const prog = reread();
-    console.log(paint(renderUniversal(prog, false)));
+    console.log(paint(renderUniversal(prog)));
     if (!prog?.done) console.log("\n(snapshot; re-run or use a TTY for a live view)");
     return;
   }
@@ -2042,8 +2059,9 @@ async function watchProgress(cwd, initial, options) {
   const timeoutMs = secondsToMs(options.timeout, "--timeout") ?? 3_600_000;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
+    await refreshUsageIfStale();
     const prog = reread();
-    process.stdout.write(`\x1b[2J\x1b[H${paint(renderUniversal(prog, false))}\n`);
+    process.stdout.write(`\x1b[2J\x1b[H${paint(renderUniversal(prog))}\n`);
     if (prog?.done) return;
     if (Date.now() >= deadline) {
       console.log(`\nwatch timed out after ${Math.round(timeoutMs / 1000)}s (progress still running).`);

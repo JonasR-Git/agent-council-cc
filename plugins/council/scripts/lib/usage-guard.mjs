@@ -230,6 +230,30 @@ export async function readUsageSnapshot({ homeDir, sinceMs, readers, nowMs = Dat
 }
 
 /**
+ * Fold a FRESH snapshot over a PREVIOUS one, keeping the LAST-GOOD value per seat.
+ * The provider usage endpoints (esp. Claude's live OAuth read) rate-limit under bursty polling — the
+ * fix loop reads them for the ceiling AND the live dashboard reads them — so a single read can come back
+ * `available:false` for a seat that IS reachable. On the dashboard that would blank an otherwise-known
+ * quota column between refreshes. This merge fixes that: FRESH always wins when it HAS the seat
+ * (`available:true`); it only falls back to PREV when a fresh read LOST a seat that was previously known,
+ * and then the reused value is marked `stale:true` so the renderer can flag it. PURE — never mutates its
+ * inputs. A null/absent side degrades to the other; two nulls → null. Iterates the union of seat keys so
+ * OpenRouter (or-*) seats are carried too, not just the three provider seats.
+ */
+export function mergeUsageSnapshots(prev, fresh) {
+  if (!fresh || typeof fresh !== "object") return prev ?? null;
+  if (!prev || typeof prev !== "object") return fresh;
+  const out = { ...fresh };
+  for (const seat of new Set([...Object.keys(prev), ...Object.keys(fresh)])) {
+    const f = fresh[seat];
+    const p = prev[seat];
+    if (f?.available === false && p?.available === true) out[seat] = { ...p, stale: true };
+    else if (f == null && p != null) out[seat] = p; // fresh dropped the seat entirely → keep last-good
+  }
+  return out;
+}
+
+/**
  * Evaluate a snapshot against a ceiling. Returns `{ breached, breaches, unavailable }`.
  * `--usage-ceiling` is the WEEKLY HARD STOP and NOTHING else: a breach is recorded ONLY for a model
  * that is `available` AND has a numeric WEEKLY `weekPercent` at/over its ceiling —

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { DEFAULT_CEILING, evaluateCeiling, evaluatePause5h, parsePause5hOption, parseUsageCeiling, readUsageSnapshot } from "../plugins/council/scripts/lib/usage-guard.mjs";
+import { DEFAULT_CEILING, evaluateCeiling, evaluatePause5h, mergeUsageSnapshots, parsePause5hOption, parseUsageCeiling, readUsageSnapshot } from "../plugins/council/scripts/lib/usage-guard.mjs";
 
 // --- parseUsageCeiling: every accepted form + the invalid inputs it must reject --
 
@@ -366,4 +366,70 @@ test("evaluatePause5h: no breach → { paused:false, reason:'none' } (fully tota
   assert.deepEqual(p, { paused: false, blockers: [], schedulable: false, resumeAt: null, reason: "none" });
   assert.doesNotThrow(() => evaluatePause5h(null, 85, { nowMs: NOW }));
   assert.doesNotThrow(() => evaluatePause5h(undefined, undefined, {}));
+});
+
+// --- mergeUsageSnapshots: last-good-per-seat resilience for the live dashboard ---------------------
+
+test("mergeUsageSnapshots: fresh WINS when it has the seat available (no stale reuse)", () => {
+  const prev = { claude: { available: true, weekPercent: 50 }, codex: { available: true, weekPercent: 10 } };
+  const fresh = { claude: { available: true, weekPercent: 71 }, codex: { available: true, weekPercent: 17 } };
+  const merged = mergeUsageSnapshots(prev, fresh);
+  assert.equal(merged.claude.weekPercent, 71);
+  assert.equal(merged.codex.weekPercent, 17);
+  assert.ok(!merged.claude.stale, "a fresh-available seat is never marked stale");
+});
+
+test("mergeUsageSnapshots: a seat that went available:false reuses the prior value, marked stale", () => {
+  const prev = { claude: { available: true, weekPercent: 71, fiveHourPercent: 21 }, grok: { available: true, weekPercent: 4 } };
+  const fresh = { claude: { available: false, weekPercent: null }, grok: { available: true, weekPercent: 5 } };
+  const merged = mergeUsageSnapshots(prev, fresh);
+  assert.equal(merged.claude.weekPercent, 71, "rate-limited claude keeps its last-good weekly");
+  assert.equal(merged.claude.fiveHourPercent, 21);
+  assert.equal(merged.claude.stale, true, "the reused value is flagged stale");
+  assert.equal(merged.grok.weekPercent, 5, "grok that stayed available takes the fresh value");
+});
+
+test("mergeUsageSnapshots: a seat dropped entirely from fresh keeps the prior value", () => {
+  const prev = { claude: { available: true, weekPercent: 71 }, codex: { available: true, weekPercent: 17 } };
+  const fresh = { claude: { available: true, weekPercent: 72 } }; // codex absent this read
+  const merged = mergeUsageSnapshots(prev, fresh);
+  assert.equal(merged.codex.weekPercent, 17, "an absent seat falls back to last-good");
+  assert.equal(merged.claude.weekPercent, 72);
+});
+
+test("mergeUsageSnapshots: no prior known-good → a fresh miss stays a miss (no fabrication)", () => {
+  const prev = { claude: { available: false, weekPercent: null } };
+  const fresh = { claude: { available: false, weekPercent: null } };
+  const merged = mergeUsageSnapshots(prev, fresh);
+  assert.equal(merged.claude.available, false);
+  assert.equal(merged.claude.weekPercent, null);
+  assert.ok(!merged.claude.stale, "nothing good to reuse → not marked stale");
+});
+
+test("mergeUsageSnapshots: null/absent sides degrade gracefully (never throws)", () => {
+  const good = { claude: { available: true, weekPercent: 71 } };
+  assert.deepEqual(mergeUsageSnapshots(null, good), good, "no prev → fresh");
+  assert.deepEqual(mergeUsageSnapshots(good, null), good, "no fresh → prev (keep last-good)");
+  assert.equal(mergeUsageSnapshots(null, null), null, "two nulls → null");
+  assert.equal(mergeUsageSnapshots(undefined, undefined), null);
+  assert.doesNotThrow(() => mergeUsageSnapshots("bad", 42));
+});
+
+test("mergeUsageSnapshots: carries OpenRouter (or-*) seats, not just the three providers", () => {
+  const prev = { "or-deepseek": { available: true, weekPercent: 3 } };
+  const fresh = { "or-deepseek": { available: false, weekPercent: null }, claude: { available: true, weekPercent: 71 } };
+  const merged = mergeUsageSnapshots(prev, fresh);
+  assert.equal(merged["or-deepseek"].weekPercent, 3, "an or-* seat is carried by union-of-keys");
+  assert.equal(merged["or-deepseek"].stale, true);
+  assert.equal(merged.claude.weekPercent, 71);
+});
+
+test("mergeUsageSnapshots: PURE — does not mutate its inputs", () => {
+  const prev = { claude: { available: true, weekPercent: 71 } };
+  const fresh = { claude: { available: false, weekPercent: null } };
+  const prevCopy = JSON.parse(JSON.stringify(prev));
+  const freshCopy = JSON.parse(JSON.stringify(fresh));
+  mergeUsageSnapshots(prev, fresh);
+  assert.deepEqual(prev, prevCopy, "prev is untouched");
+  assert.deepEqual(fresh, freshCopy, "fresh is untouched");
 });

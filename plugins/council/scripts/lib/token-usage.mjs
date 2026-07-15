@@ -258,12 +258,18 @@ export async function fetchClaudeLimits(claudeDir, { timeoutMs = 8000 } = {}) {
   }
 }
 
-const GROK_LOG_TAIL_BYTES = 512 * 1024;
+// The billing/credits entry is logged only occasionally (session start / credit refresh), but a single
+// active `grok` session (e.g. a running council review) floods the log with `shell.turn.*` debug lines
+// AFTER it — measured >1 MB of noise between the last billing entry and the file end. A small tail window
+// therefore reads only the noise and reports the weekly quota as "unavailable" even though it is logged.
+// 16 MB covers a very active session's noise while staying bounded; a whole-file read for a smaller log.
+const GROK_LOG_TAIL_BYTES = 16 * 1024 * 1024;
 
 /**
  * The Grok CLI logs its billing/credits config ("billing: fetched credits
- * config") into ~/.grok/logs/unified.jsonl on every run - weekly window only
- * (Grok has no 5h window). Parses the newest complete entry from the log tail.
+ * config") into ~/.grok/logs/unified.jsonl - weekly window only (Grok has no 5h
+ * window). Parses the newest complete `creditUsagePercent` entry, scanning back
+ * far enough that live-session debug noise can't hide it (GROK_LOG_TAIL_BYTES).
  */
 export function collectGrokLimits(grokDir) {
   const logFile = path.join(grokDir, "logs", "unified.jsonl");
