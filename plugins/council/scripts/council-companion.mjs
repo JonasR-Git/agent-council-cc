@@ -2033,7 +2033,9 @@ async function watchProgress(cwd, initial, options) {
       process.exitCode = 1;
       return;
     }
-    await delay(intervalMs);
+    // Clamp the sleep to the time left before the deadline so a large --interval can't overrun a small
+    // --timeout by up to a full interval (e.g. --interval 3600 --timeout 1 slept ~3600s before timing out).
+    await delay(Math.min(intervalMs, Math.max(0, deadline - Date.now())));
   }
 }
 
