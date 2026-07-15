@@ -33,6 +33,18 @@ test("ineligibleReason is fail-closed: needs explicit localized scope + safe fil
   assert.match(ineligibleReason({ severity: "nit", scope: "localized", file: "a.mjs" }), /severity gate/);
 });
 
+test("ineligibleReason: a reattributed logical finding needs multi-seat consensus before auto-fix", () => {
+  // fixLens diverges from lens → surfaced under logical_sense (propose-only coverage lens), routed to
+  // correctness. Single-seat → propose-only; multi-seat consensus (or verified-supported) → eligible.
+  const base = { severity: "P1", scope: "localized", file: "a.mjs", lens: "logical_sense", fixLens: "correctness" };
+  assert.match(ineligibleReason({ ...base, consensus: "single" }), /multi-seat consensus/);
+  assert.match(ineligibleReason({ ...base, consensus: "contested" }), /multi-seat consensus/);
+  assert.equal(ineligibleReason({ ...base, consensus: "consensus" }), null, "multi-seat consensus is auto-eligible");
+  assert.equal(ineligibleReason({ ...base, consensus: "single", verified: { refuted: false } }), null, "adversarial-verified single seat is eligible");
+  // A NATIVE correctness finding (fixLens === lens, i.e. no divergence → fixLens absent) is unaffected.
+  assert.equal(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", lens: "correctness", consensus: "single" }), null, "a native correctness bug is not consensus-gated here");
+});
+
 test("ineligibleReason rejects §6 sensitive classes (auth/crypto/concurrency/data) even when localized", () => {
   assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "security" }), /sensitive/);
   assert.match(ineligibleReason({ severity: "P0", scope: "localized", file: "a.mjs", category: "concurrency" }), /sensitive/);

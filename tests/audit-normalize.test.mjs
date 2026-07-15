@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { categoryToLens, evidenceState, normalizeFindings, toCanonicalFinding } from "../plugins/council/scripts/lib/audit-normalize.mjs";
+import { categoryToLens, evidenceState, fixEligibilityLens, normalizeFindings, toCanonicalFinding } from "../plugins/council/scripts/lib/audit-normalize.mjs";
 import { mergeFindings } from "../plugins/council/scripts/lib/findings.mjs";
 import { SCHEMAS } from "../plugins/council/scripts/lib/schemas.mjs";
 import { validate } from "../plugins/council/scripts/lib/validate.mjs";
@@ -131,4 +131,63 @@ test("normalizeFindings assigns ordinals so same rule+anchor findings don't coll
   const out = normalizeFindings(raws, { unit: "a.mjs" });
   assert.equal(out.length, 2);
   assert.notEqual(out[0].fingerprint, out[1].fingerprint, "two occurrences get distinct identities");
+});
+
+// --- fixEligibilityLens: the Wurzel-Fix — fix eligibility decoupled from the coverage lens -------------
+
+test("fixEligibilityLens: a fixable category group-stamped onto logical_sense reattributes to its native lens", () => {
+  // A bug found under the logical_sense group (relens) — concrete location, no cross-cutting language.
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 42, title: "off-by-one" }, "logical_sense"), "correctness");
+  assert.equal(fixEligibilityLens({ category: "data-loss", file: "a.mjs", line: 9, title: "drops last row" }, "logical_sense"), "data_integrity");
+});
+
+test("fixEligibilityLens: a runtime-fixable coverage lens is never reattributed (keeps identity)", () => {
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 1 }, "correctness"), "correctness");
+  assert.equal(fixEligibilityLens({ category: "auth", file: "a.mjs", line: 1 }, "security_secrets"), "security_secrets");
+});
+
+test("fixEligibilityLens: a category that maps to a propose-only lens stays on the coverage lens", () => {
+  // design → architecture_ssot (propose-only): nothing to gain, stays propose-only.
+  assert.equal(fixEligibilityLens({ category: "design", file: "a.mjs", line: 1 }, "logical_sense"), "logical_sense");
+});
+
+test("fixEligibilityLens: VETO 1 — an explicit cross-cutting scope keeps it propose-only", () => {
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 5, scope: "cross-cutting" }, "logical_sense"), "logical_sense");
+});
+
+test("fixEligibilityLens: VETO 1 — cross-cutting language in the text keeps it propose-only", () => {
+  // classifyScope's CROSS_CUTTING_HINTS fires on 'across'/'refactor'/'api surface'.
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 5, title: "inconsistent handling across modules" }, "logical_sense"), "logical_sense");
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 5, title: "x", detail: "requires an api surface refactor" }, "logical_sense"), "logical_sense");
+});
+
+test("fixEligibilityLens: VETO 1 — no precise location (missing line) is not localizable", () => {
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs" }, "logical_sense"), "logical_sense");
+});
+
+test("fixEligibilityLens: VETO 2 — a removal verdict or survivor target is inherently multi-file", () => {
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 3, verdict: "remove" }, "logical_sense"), "logical_sense");
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 3, verdict: "merge-into", survivor: "b.mjs" }, "logical_sense"), "logical_sense");
+});
+
+test("toCanonicalFinding: a reattributed bug is localized+fixable and carries fixLens; coverage lens stays logical_sense", () => {
+  const f = toCanonicalFinding({ category: "bug", lens: "logical_sense", severity: "P1", file: "a.mjs", line: 42, title: "off-by-one", agents: ["codex", "grok"], consensus: true }, { unit: "a.mjs" });
+  assert.equal(f.lens, "logical_sense", "coverage lens (reporting/tier) is preserved");
+  assert.equal(f.fixLens, "correctness", "fix lens is the category-native lens");
+  assert.equal(f.scope, "localized");
+  assert.equal(f.fixDisposition, "localized");
+});
+
+test("toCanonicalFinding: a true logical design finding stays cross-cutting/propose-only with no fixLens", () => {
+  const f = toCanonicalFinding({ category: "design", lens: "logical_sense", severity: "P2", file: "a.mjs", line: 1, title: "premature abstraction", agents: ["grok"] }, { unit: "a.mjs" });
+  assert.equal(f.lens, "logical_sense");
+  assert.equal(f.scope, "cross-cutting");
+  assert.equal(f.fixDisposition, "propose-only");
+  assert.ok(!("fixLens" in f), "no reattribution → fixLens is absent, downstream falls back to lens");
+});
+
+test("toCanonicalFinding: fingerprint uses the COVERAGE lens so identity is unaffected by reattribution", () => {
+  const reattributed = toCanonicalFinding({ category: "bug", lens: "logical_sense", severity: "P1", file: "a.mjs", line: 42, title: "x", agents: ["codex"] }, { unit: "a.mjs" });
+  const plainLogical = toCanonicalFinding({ category: "bug", lens: "logical_sense", severity: "P1", file: "a.mjs", line: 42, title: "x", scope: "cross-cutting", agents: ["codex"] }, { unit: "a.mjs" });
+  assert.equal(reattributed.fingerprint, plainLogical.fingerprint, "same coverage lens+location+rule → same identity regardless of fix scope");
 });

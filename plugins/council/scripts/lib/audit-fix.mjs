@@ -8,6 +8,7 @@ import { runCommand, runCommandAsync } from "./process.mjs";
 import { snapshotViolation } from "./audit-snapshot.mjs";
 import { evaluatePatchVerdicts } from "./audit-council-gate.mjs";
 import { isStructureClass } from "./structure-gate.mjs";
+import { isVerifiedSupported } from "./audit-normalize.mjs";
 import { requiredPatchSeats } from "./seats.mjs";
 import { retryOnRateLimit } from "./audit-retry.mjs";
 import { coverageOfLines, ingestCoverage, parseDiffLines } from "./audit-coverage-ingest.mjs";
@@ -153,6 +154,15 @@ export function ineligibleReason(f, { maxRank = RANK.P2, protectedRe = PROTECTED
   // An independent seat refuted this finding (annotate-only path) — deprioritize it to
   // propose-only rather than auto-fix a disputed finding. Still visible in the report.
   if (f.verified?.refuted) return "refuted by an independent seat → propose-only";
+  // REATTRIBUTED finding (a fixable category surfaced under a propose-only coverage lens like logical_sense,
+  // then routed to a real fixable lens via fixLens — audit-normalize.mjs) is an intent-sensitive judgement:
+  // "this logic is wrong" from a SINGLE seat is exactly where a green test suite fails to prove the fix is
+  // intent-correct. Require MULTI-SEAT consensus (or an adversarial-verified/supported finding) before
+  // auto-fixing it — Council P1: logical_sense is consensus:true, but this gate never checked it. Native
+  // findings whose fixLens equals their lens are unaffected (fixLens is only carried when it DIVERGES).
+  if (f.fixLens && f.fixLens !== f.lens && f.consensus !== "consensus" && !isVerifiedSupported(f)) {
+    return "reattributed logical finding without multi-seat consensus → propose-only";
+  }
   if (!f.file) return "no target file";
   const file = toPosix(f.file);
   if (/[\r\n]/.test(file) || file.split("/").includes("..") || path.isAbsolute(f.file) || /^[a-zA-Z]:/.test(file)) return "unsafe file path";

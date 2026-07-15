@@ -118,7 +118,11 @@ function toRecord(finding, { session, seq, pass, nowIso, sweepCellKey = null, ep
   // by RE-normalizing accumulated records before the gate (audit-fixloop.mjs ~821), a fragile step whose
   // absence once caused a convergence bug. Persist scope here with the SAME rule as normalizeFindings
   // (audit-normalize.mjs) so the store is self-describing and the classification survives the round-trip.
-  const scope = finding.scope === "cross-cutting" || isProposeOnly(finding.lens) ? "cross-cutting" : "localized";
+  // The rule keys on the FIX-ELIGIBILITY lens (fixLens ?? lens): a reattributed logical_sense→correctness
+  // finding must NOT be re-frozen to cross-cutting by re-reading its COVERAGE lens — that was the exact
+  // round-trip that undid the reattribution. fixLens is persisted below so it survives too.
+  const fixLens = finding.fixLens ?? finding.lens;
+  const scope = finding.scope === "cross-cutting" || isProposeOnly(fixLens) ? "cross-cutting" : "localized";
   const fixDisposition = finding.fixDisposition ?? (scope === "cross-cutting" ? "propose-only" : "localized");
   return {
     schemaVersion: FINDINGS_SCHEMA_VERSION,
@@ -135,6 +139,10 @@ function toRecord(finding, { session, seq, pass, nowIso, sweepCellKey = null, ep
     line: finding.line ?? finding.location?.startLine ?? null,
     scope,
     fixDisposition,
+    // Persist the fix-eligibility lens ONLY when it diverges from the coverage lens (a reattributed
+    // finding), so the round-trip stays byte-identical for ordinary findings and the reattribution
+    // survives (a re-read record keeps fixLens → scope/tier stay correct without re-deriving from lens).
+    ...(finding.fixLens && finding.fixLens !== finding.lens ? { fixLens: finding.fixLens } : {}),
     seats,
     ids,
     pass: pass ?? null,

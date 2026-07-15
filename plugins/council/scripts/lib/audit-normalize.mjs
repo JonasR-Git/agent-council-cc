@@ -6,6 +6,7 @@
 import { cappedSeverity, getLens, isProposeOnly } from "./audit-lenses.mjs";
 import { semanticFingerprint } from "./audit-fingerprint.mjs";
 import { deriveConfidence, riskScore } from "./audit-risk.mjs";
+import { classifyScope } from "./scope.mjs";
 
 const CATEGORY_LENS = {
   bug: "correctness",
@@ -44,6 +45,36 @@ const CATEGORY_LENS = {
 export function categoryToLens(category, fallback = "correctness") {
   const c = String(category ?? "").toLowerCase().trim();
   return CATEGORY_LENS[c] ?? fallback;
+}
+
+// Inherently MULTI-FILE verdicts (from the Tier-0 predicate detector / a model's structural judgement):
+// removing a module, folding it into a survivor, a redesign or relocation is never a single-file fix.
+const REMOVAL_VERDICTS = new Set(["remove", "merge-into", "redesign", "relocate"]);
+
+/**
+ * The FIX-ELIGIBILITY lens — deliberately SEPARATE from the coverage lens (docs/logical-autofix-design.md).
+ * The grouped review stamps the GROUP lens authoritatively on every cell finding (relens,
+ * audit-grouped-review.mjs) — correct for coverage/reporting attribution, but WRONG as a fix classification:
+ * a `category:bug` surfaced under the logical_sense group is a correctness bug that merely appeared during a
+ * logical review, not a cross-cutting design issue. This returns the category-native lens when the coverage
+ * lens is propose-only (logical_sense/architecture_ssot) BUT the finding is really a localized, mechanically
+ * fixable class — so it can flow through the NORMAL correctness fixer instead of being frozen propose-only.
+ * PURE and CONSENT-FREE: consent stays a fix-time gate, never part of the finding's canonical identity
+ * (Council P1: consent in pure normalize is the wrong seam / split-brain). Falls back to the coverage lens
+ * (stays propose-only) unless every guard clears — so the DEFAULT is always the safe, unchanged behaviour.
+ */
+export function fixEligibilityLens(raw = {}, coverageLens) {
+  // Only ever reattribute AWAY from a propose-only coverage lens; a runtime-fixable lens keeps its identity.
+  if (!isProposeOnly(coverageLens)) return coverageLens;
+  const native = categoryToLens(raw.category);
+  // The category must map to a genuinely fixable (non-propose-only) lens — else there is nothing to gain.
+  if (isProposeOnly(native)) return coverageLens;
+  // VETO 1 (Council P1): honour an explicit OR heuristic cross-cutting signal. classifyScope respects an
+  // explicit raw.scope AND the CROSS_CUTTING_HINTS text scan (architect/refactor/across/api surface/…).
+  if (classifyScope(raw) === "cross-cutting") return coverageLens;
+  // VETO 2 (Council P1): a removal/merge/redesign verdict or a survivor target is inherently multi-file.
+  if (REMOVAL_VERDICTS.has(String(raw.verdict ?? "").toLowerCase()) || raw.survivor) return coverageLens;
+  return native;
 }
 
 /**
@@ -94,7 +125,12 @@ export function toCanonicalFinding(raw = {}, { unit, ordinal } = {}) {
   const B = clamp15(raw.blastRadius);
   const E = clamp15(raw.exploitability);
   const risk = riskScore({ severity, likelihood: L, blastRadius: B, exploitability: E, confidence });
-  const scope = raw.scope === "cross-cutting" || isProposeOnly(lens) ? "cross-cutting" : "localized";
+  // `lens` is the COVERAGE lens (reporting/tier attribution); `fixLens` is the FIX-ELIGIBILITY lens — they
+  // differ only when a fixable category was group-stamped onto a propose-only lens (see fixEligibilityLens).
+  // scope/fixDisposition derive from fixLens so a genuinely localized correctness bug found under the
+  // logical_sense group is patchable, while true design/removal findings stay cross-cutting/propose-only.
+  const fixLens = fixEligibilityLens(raw, lens);
+  const scope = raw.scope === "cross-cutting" || isProposeOnly(fixLens) ? "cross-cutting" : "localized";
   const fixDisposition = scope === "cross-cutting" ? "propose-only" : "localized";
   // A refuted finding is neither "confirmed" nor pending verification — verification RAN and did not
   // support it. Surface that honestly so the report/gate deprioritizes it instead of ranking it first.
@@ -126,7 +162,10 @@ export function toCanonicalFinding(raw = {}, { unit, ordinal } = {}) {
     standards: getLens(lens)?.standards ?? [],
     scope,
     consensus: raw.consensus ? "consensus" : raw.contested ? "contested" : "single",
-    fixDisposition
+    fixDisposition,
+    // Only carried when the fix-eligibility lens DIFFERS from the coverage lens (a reattributed finding);
+    // absent = the two are identical, so downstream `f.fixLens ?? f.lens` recovers the fix lens uniformly.
+    ...(fixLens !== lens ? { fixLens } : {})
   };
   finding.fingerprint = semanticFingerprint({ location: finding.location, lens, ruleId: finding.ruleId, title: finding.title, anchor: raw.anchor, symbol: raw.symbol, ordinal });
   return finding;

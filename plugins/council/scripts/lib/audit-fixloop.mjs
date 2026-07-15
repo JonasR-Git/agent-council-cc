@@ -357,6 +357,14 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // never cause demotion thrash (tier-fix council: re-entry guarded by exactly this).
   const autoFixable = (f) => f?.scope !== "cross-cutting" && f?.fixDisposition !== "propose-only";
 
+  // FIX-SIDE tier of a finding — the tier whose pass STAGES it, which is derived from the FIX-ELIGIBILITY
+  // lens (fixLens), NOT the coverage lens. A correctness bug surfaced under the logical_sense group (relens)
+  // carries lens=logical_sense (Tier 0, coverage) but fixLens=correctness (Tier 2): it must be staged when
+  // the loop reaches Tier 2, alongside the native correctness findings — never at Tier 0 where nothing
+  // auto-applies. An explicit numeric f.tier still wins (set by the caller/plan). Coverage/reporting keep
+  // f.lens untouched; only the staging tier consults fixLens. See docs/logical-autofix-design.md.
+  const fixTierOf = (f) => (typeof f?.tier === "number" ? f.tier : tierOfLens(f?.fixLens ?? f?.lens));
+
   if (options.resume) {
     const prior = deps.loadCheckpoint ? deps.loadCheckpoint() : loadFixLoopCheckpoint(cwd);
     if (prior && Array.isArray(prior.fixed)) {
@@ -866,7 +874,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       const lowestActionableTier = Math.min(
         ...gated.actionable
           .filter((f) => autoFixable(f) && !seenProposed.has(proposedKey(f)))
-          .map((f) => (typeof f.tier === "number" ? f.tier : tierOfLens(f.lens)))
+          .map(fixTierOf)
           // FIX #1: never demote below the first auto-fixable tier. Tiers < FIRST_TIER are entirely
           // propose-only (surfaced, never staged), so a stray sub-FIRST_TIER candidate must not pull
           // currentTier below the floor the resume clamp + convergence also honor.
@@ -880,7 +888,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     }
 
     // Per-tier convergence restricts a pass to the CURRENT tier's actionable set.
-    let actionable = perTier ? gated.actionable.filter((f) => (typeof f.tier === "number" ? f.tier : tierOfLens(f.lens)) === currentTier) : gated.actionable;
+    let actionable = perTier ? gated.actionable.filter((f) => fixTierOf(f) === currentTier) : gated.actionable;
     // FIX #1 (surfacing is NOT tier-gated): the tiers BELOW FIRST_TIER are entirely propose-only, so the
     // loop never stages them and they never reach fix() to be rejected+surfaced. Surface those findings as
     // proposals directly, so skipping the un-fixable structural tiers loses NO visibility — a review-sourced
@@ -889,7 +897,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // never become currentTier (currentTier >= FIRST_TIER, re-entry floored), so this never double-surfaces.
     if (perTier) {
       for (const f of gated.actionable) {
-        const t = typeof f.tier === "number" ? f.tier : tierOfLens(f.lens);
+        const t = fixTierOf(f);
         if (t >= FIRST_TIER) continue;
         const p = { ...f, rejectedReason: `structure/logical tier ${t} — propose-only, surfaced (no auto-fixable lens below tier ${FIRST_TIER})` };
         const k = proposedKey(p);
@@ -1243,7 +1251,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       // whose fix drifts its fingerprint would keep reading as FRESH every pass, pinning the tier hot forever
       // and preventing the post-quarantine settle. tierAuto already excludes them (the actionable filter);
       // tierFresh must too. Off the quarantine path this is byte-identical (the predicate is never true).
-      const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier && autoFixable(f) && !(sweepMode && sweepFixExcluded.has(posixKeyPath(f.file ?? f.location?.path)))).length;
+      const tierFresh = freshFindings.filter((f) => fixTierOf(f) === currentTier && autoFixable(f) && !(sweepMode && sweepFixExcluded.has(posixKeyPath(f.file ?? f.location?.path)))).length;
       const tierAuto = actionable.filter(autoFixable).length;
       if (tierAuto > 0 || tierFresh > 0) tierDryStreak = 0;
       else if (passRan) tierDryStreak += 1;
@@ -1262,7 +1270,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
         if (tierPlanIndex < tierPlan.length) currentTier = tierPlan[tierPlanIndex].tier;
       }
     } else if (perTier) {
-      const tierFresh = freshFindings.filter((f) => tierOfLens(f.lens) === currentTier && autoFixable(f)).length;
+      const tierFresh = freshFindings.filter((f) => fixTierOf(f) === currentTier && autoFixable(f)).length;
       const tierAuto = actionable.filter(autoFixable).length;
       if (tierAuto > 0 || tierFresh > 0) tierDryStreak = 0;
       else if (passRan && (tierDryStreak += 1) >= dryStop) {
