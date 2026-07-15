@@ -62,7 +62,7 @@ import { runEndless } from "./lib/audit-endless.mjs";
 import { runSupervised } from "./lib/supervisor.mjs";
 import { runAudit } from "./lib/audit-run.mjs";
 import { toSarif } from "./lib/audit-sarif.mjs";
-import { buildAgentResult, runCodexStructured, runGrokStructured, runStructuredWithRetry, withTempPrompt } from "./lib/agents.mjs";
+import { buildAgentResult, runCodexCli, runCodexStructured, runGrokStructured, runStructuredWithRetry, withTempPrompt } from "./lib/agents.mjs";
 import { writeJobHtml } from "./lib/html-report.mjs";
 import { writeFixReportHtml } from "./lib/fix-report-html.mjs";
 import { assembleFixMeta, changedFilesShape } from "./lib/fix-report-meta.mjs";
@@ -507,24 +507,41 @@ async function runCodexReview(cwd, backends, options, adversarial, focusText) {
   if (options.skipCodex) {
     return { agent: "codex", skipped: true, reason: "skipped by flag" };
   }
-  if (!backends.codex.companionAvailable) {
-    return { agent: "codex", skipped: true, reason: "codex companion not found" };
-  }
 
   const { codexModel } = resolveAgentModels(options);
-  const command = adversarial ? "adversarial-review" : "review";
-  const childArgs = buildCodexReviewArgs(options, adversarial, focusText);
-  const args = [backends.codex.companion, command, ...childArgs];
-  const result = await runCommandAsync(process.execPath, args, {
-    cwd,
-    timeoutMs: options.agentTimeoutMs
-  });
-  return buildAgentResult("codex", "codex-companion", result, {
-    companion: backends.codex.companion,
-    model: codexModel ?? "(Codex default from ~/.codex/config.toml)",
-    skipped: false,
-    command: `node ${args.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`
-  });
+
+  if (backends.codex.companionAvailable) {
+    const command = adversarial ? "adversarial-review" : "review";
+    const childArgs = buildCodexReviewArgs(options, adversarial, focusText);
+    const args = [backends.codex.companion, command, ...childArgs];
+    const result = await runCommandAsync(process.execPath, args, {
+      cwd,
+      timeoutMs: options.agentTimeoutMs
+    });
+    return buildAgentResult("codex", "codex-companion", result, {
+      companion: backends.codex.companion,
+      model: codexModel ?? "(Codex default from ~/.codex/config.toml)",
+      skipped: false,
+      command: `node ${args.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`
+    });
+  }
+
+  // CLI fallback (parity with runGrokReview + the structured path's runCodexCli): the DEEP-review path
+  // was missed when the structured path gained its `codex exec` fallback, so a user with the standalone
+  // codex CLI but without the codex-companion had a SILENTLY DROPPED sixth eye here — even though setup
+  // reports codex reachable via `cli.available`. Fall back to the same read-only `codex exec` invocation.
+  if (!backends.codex.cli.available) {
+    return { agent: "codex", skipped: true, reason: "codex companion + CLI not found" };
+  }
+  const focus = focusText ? `\nFocus: ${focusText}` : "";
+  const kind = adversarial ? "adversarial code review" : "code review";
+  const prompt = [
+    `Perform a read-only ${kind} of the current repository git changes.`,
+    "Use git status/diff. Do not edit files.",
+    "Report bugs, risks, missing tests, and a P0/P1/P2 summary.",
+    focus
+  ].join("\n");
+  return runCodexCli(cwd, backends, { ...options, codexModel }, prompt);
 }
 
 async function runGrokReview(cwd, backends, options, adversarial, focusText) {

@@ -320,7 +320,7 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
  * §6, never refuted — the exact "a configured model is silently dropped" class this codebase just purged
  * everywhere else.
  */
-async function runCodexCli(cwd, backends, options, prompt) {
+export async function runCodexCli(cwd, backends, options, prompt) {
   const bin = backends.codex?.cli?.bin || "codex";
   // --sandbox read-only ENFORCES containment at OUR call, not codex's own config (council final, Codex
   // P2): the grok seat is read-only via its tool deny-list + --disable-web-search and the claude seat via
