@@ -160,12 +160,19 @@ export function readConsentAck(stateDir, { fs = fsDefault } = {}) {
 }
 
 /**
+ * Canonicalize a workspace path for the ack cwd binding: POSIX slashes so the `ack.cwd === cwd` check is
+ * slash-direction-agnostic. WITHOUT this, an ack written with `C:/repo` (a git-toplevel form) never matches
+ * a live `C:\repo` (a native process.cwd) on Windows → the ack silently never validates (refused:no-ack).
+ */
+const canonPath = (p) => String(p ?? "").replace(/\\/g, "/");
+
+/**
  * Write the per-clone ack record to the STATE dir. `now` (clock) + `fs` are injected. The record binds
  * the acknowledgment to the current repo fingerprint + workspace path + timestamp; a later resolveConsents
  * only honors it when `fingerprint` matches the live one — so acking clone A never enables clone B.
  */
 export function writeConsentAck(stateDir, { fingerprint = null, cwd, now = () => new Date(), fs = fsDefault } = {}) {
-  const record = { fingerprint: fingerprint ?? null, cwd: cwd ?? null, acknowledgedAt: now().toISOString() };
+  const record = { fingerprint: fingerprint ?? null, cwd: cwd == null ? null : canonPath(cwd), acknowledgedAt: now().toISOString() };
   fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(consentAckPath(stateDir), `${JSON.stringify(record, null, 2)}\n`, "utf8");
   return record;
@@ -208,7 +215,7 @@ export function resolveConsents({ cwd, options = {}, stateDir, deps = {} } = {})
   const ack = readConsentAck(stateDir, { fs });
   // C + D: a valid ack requires a NON-NULL fingerprint that matches AND the recorded workspace to be THIS
   // one — so null===null cannot validate and a shared/migrated state dir cannot cross-enable clones.
-  const ackValid = !!ack && fingerprint != null && ack.fingerprint === fingerprint && ack.cwd === cwd;
+  const ackValid = !!ack && fingerprint != null && ack.fingerprint === fingerprint && canonPath(ack.cwd) === canonPath(cwd);
 
   // Classify the local grant ONCE (shared across both consents' warnings). "valid" | "tracked" | "mismatch".
   let localState = null;

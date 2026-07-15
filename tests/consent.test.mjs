@@ -188,6 +188,28 @@ test("local consent + matching fingerprint + acknowledgment → APPLIED (source 
   }
 });
 
+test("ack cwd binding is SLASH-DIRECTION-AGNOSTIC (the live-found Windows bug: ack C:/repo vs live C:\\repo)", () => {
+  const stateDir = tmpDir("slash-state");
+  const fpProbe = tmpDir("slash-fp");
+  try {
+    const fp = repoFingerprint(fpProbe, { git: gitOf(ORIGIN_A) });
+    const cwd = makeLocalRepo(fp);
+    const cwdFwd = cwd.replace(/\\/g, "/");
+    try {
+      // The acknowledge path recorded the workspace with the OTHER slash form (git-toplevel `C:/repo`) than
+      // the live process.cwd (`C:\repo`). Before the fix, `ack.cwd === cwd` mismatched → silent refused:no-ack.
+      writeConsentAck(stateDir, { fingerprint: fp, cwd: cwdFwd.replace(/\//g, "\\"), now: FIXED_CLOCK });
+      const r = resolveConsents({ cwd: cwdFwd, options: {}, stateDir, deps: { git: gitOf(ORIGIN_A) } });
+      assert.equal(r.acknowledged, true, "the ack validates regardless of slash direction");
+      assert.equal(r.structureAutoApply, true, "consent applies once the slash-agnostic ack matches");
+    } finally {
+      cleanup(cwd);
+    }
+  } finally {
+    cleanup(stateDir, fpProbe);
+  }
+});
+
 // ── rule 3: missing ack → REFUSED (propose-only) + message ──────────────────────────────────────────
 
 test("local consent + matching fingerprint but NO ack → refused (propose-only) with a clear message", () => {
@@ -289,7 +311,7 @@ test("writeConsentAck records {fingerprint,cwd,acknowledgedAt}; a second resolve
       // Write the ack (the `fix --acknowledge-consents` action), then read it back.
       const rec = writeConsentAck(stateDir, { fingerprint: fp, cwd, now: FIXED_CLOCK });
       assert.equal(rec.fingerprint, fp);
-      assert.equal(rec.cwd, cwd);
+      assert.equal(rec.cwd, cwd.replace(/\\/g, "/"), "cwd is stored POSIX-canonicalized (slash-agnostic ack)");
       assert.equal(rec.acknowledgedAt, "2026-07-14T12:00:00.000Z");
       assert.equal(path.basename(consentAckPath(stateDir)), CONSENT_ACK_FILE);
       const readBack = readConsentAck(stateDir);
