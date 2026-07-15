@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Multi-agent council for Claude Code: six-eyes code review (Claude + Codex + Grok, independent then peer critique), plus autonomous test-gated audit-fix and plan/build — works on any language / any git repo.",
-    "version": "3.0.0"
+    "version": "3.1.0"
   },
   "plugins": [
     {
       "name": "council",
       "description": "Multi-agent council: review/deliberate/adversarial (Claude + Codex + Grok), whole-project audit + safe test-gated auto-fix, and plan/build — with consensus, a findings ledger, and a live dashboard.",
-      "version": "3.0.0",
+      "version": "3.1.0",
       "author": {
         "name": "JonasR-Git"
       },

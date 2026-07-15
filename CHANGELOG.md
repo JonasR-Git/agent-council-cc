@@ -5,6 +5,44 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-07-15
+
+### Changed
+
+- **CLI surface consolidated to SEVEN verbs** (breaking): `review`
+  (`--mode quick|deliberate|adversarial|deep|endless|run`), `fix`, `plan`, `build`,
+  `solve`, `status`, `setup`. The legacy command NAMES (`audit`, `doctor`, `deliberate`,
+  `adversarial`, `result`, `watch`, `wait`, …) were removed — the whole-project audit is
+  now `review --mode deep|endless|run`, the end-to-end self-test is `setup --check`, and
+  the read-only observers live under `status --result|--watch|--wait`.
+- **Fix-loop budget ceiling** decoupled from `--max-cells` (`loopBudgetCeiling =
+  max_passes × max_cells`) so small, fast passes can still cover a whole repo; the
+  usage-ceiling / 5h-pause remain the real bound. `--max-passes` cap raised to 1000.
+
+### Added
+
+- **Consent containment for autonomous auto-apply** — sensitive/structural consents live
+  ONLY in a gitignored `.council.local.yml` (or env `COUNCIL_TRUST_FIX`), bound to the
+  repo's git-origin fingerprint and acknowledged once per clone; a git-tracked consent
+  file is refused. `--explain` dumps every effective knob and its source on any verb.
+- **Epoch-sweep** — provable per-tier 100% cell coverage via a durable run-wide ledger,
+  with an honest COVERAGE-INCOMPLETE debt that a same-epoch `--resume` continues.
+- Facade-class guard test: every documented `council-companion.mjs` invocation must
+  resolve to a real handler.
+
+### Fixed
+
+- **Findings store dropped `scope`/`fixDisposition`** on the durable round-trip, so a
+  finding read back from the store fail-closed to propose-only — `toRecord` now persists
+  them (the fix-loop classification survives the round-trip).
+- **Codex deep-review** returned skipped when the codex-companion was absent even though
+  the standalone `codex exec` CLI was reachable (a silently-dropped sixth eye) — it now
+  falls back to the CLI, matching Grok and the structured path.
+- **`status --watch`** could overrun `--timeout` by up to a full `--interval` — the poll
+  sleep is now clamped to the remaining time.
+- Windows: consent-ack cwd slash-direction mismatch, and the epoch-sweep ledger fsync
+  opening a read-only handle (EPERM on `FlushFileBuffers`).
+
 ## [2.1.0] - 2026-07-10
 
 ### Added

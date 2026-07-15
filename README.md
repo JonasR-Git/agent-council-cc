@@ -7,27 +7,25 @@ clear "fix now / verify / ignore" decision instead of one model's opinion.
 
 ## What it does
 
-Seven slash commands:
+**Seven verbs.** Every capability is one of these — a read-only side and a single write verb
+(`fix`) clearly separated:
 
-| Command | Purpose |
-|---------|---------|
-| `/council:review` | Code review — 3-way deliberate (default), `--quick` dual, `--adversarial`, or `--loop` (review→fix→re-review) |
-| `/council:plan` | Design an approach: independent plans → scored critique → ranked synthesis (no code) |
-| `/council:solve` | Plan + one writer implements on a branch + council review |
-| `/council:audit` | Whole-project audit — static candidates, deep agent `review` of hotspots, safe test-gated `fix`, and an `endless` loop (see below) |
-| `/council:status` | Job control: list/status, `--watch` (live dashboard, `--md` for chat), `--result` (`--summary`/`--html`), `--wait`, `--cancel` |
-| `/council:setup` | Check backends + scaffold `.council.yml` (`--init`) + `--usage` (limits/tokens) |
-| `/council:doctor` | End-to-end self-test (CLIs, state dir, limits, live agent pings) |
+| Command | Purpose | Writes? |
+|---------|---------|---------|
+| `/council:review` | Multi-model review — `--mode quick\|deliberate\|adversarial\|deep\|endless\|run` (diff review or whole-project audit) | **never** |
+| `/council:fix` | The one write verb: autonomous, test-gated review → fix → re-review loop on an **isolated branch** (nothing auto-merged) | isolated branch |
+| `/council:plan` | Multi-model design deliberation → a validated **PlanSpec** (every seat proposes, every seat peer-critiques, one synthesizes) | plan artifact only |
+| `/council:build` | Autonomously implement a PlanSpec on an isolated branch, step by step, each test-gated + council-gated + rolled back on failure | isolated branch |
+| `/council:solve` | Plan + exactly one writer implements on a branch + council review | branch |
+| `/council:status` | Job control: `--watch` (live dashboard, `--md` for chat), `--result` (`--summary`/`--html`), `--wait`, `--cancel`, plus `--history`/`--metrics`/`--usage`/`--ledger`/`--overview` analytics | never |
+| `/council:setup` | Check backends + `--check` self-test + scaffold `.council.yml` (`--init`) + `--usage` (limits/tokens) | `.council.yml` on `--init` |
 
-Plus two commands for building **new** features (see [docs/plan-build-usage.md](docs/plan-build-usage.md)):
+`review --mode deep\|endless\|run` is the **whole-project audit** (was `/council:audit`; see below).
+`setup --check` is the end-to-end self-test (was `/council:doctor`). Hidden internals
+(`worker`, `worktree`, `benchmark`) run as `node scripts/council-companion.mjs <verb>`.
 
-| Command | Purpose |
-|---------|---------|
-| `council plan <request>` | Multi-model design deliberation → a validated **PlanSpec**. Every active seat proposes independently, every seat peer-critiques the others, one synthesizes. **Read-only** (writes only the plan artifact). |
-| `council build --from <plan.json>` | Autonomously implements the PlanSpec on an **isolated branch**, one step at a time, each step test-gated + council-gated + rolled back on any failure. **Never auto-merged.** |
-
-Power-user analytics (`metrics`, `history`, `ledger`, `overview`, `benchmark`,
-`worktree`) stay available as `node scripts/council-companion.mjs <subcommand>`.
+> Add `--explain` to any verb for a read-only dump of every effective knob and where it came from
+> (flag / config / consent / built-in) — nothing runs, nothing is written.
 
 ### What `council build` actually guarantees
 
@@ -72,8 +70,8 @@ Reviewer backends (you only need the ones in your `reviewers` — check with
 | **Grok** | `curl -fsSL https://x.ai/cli/install.sh \| bash` | `grok login` | standalone binary at `~/.grok/bin/grok`; if present but not on PATH, set `GROK_BIN`; needs a SuperGrok/X Premium+ plan; run the installer in a real terminal (headless curls to the URL bot-block) |
 | **Claude** (spawn backend only) | `npm i -g @anthropic-ai/claude-code` | run `claude` once | not needed for the default `session` backend |
 
-`/council:doctor` verifies all of this end-to-end; `/council:setup` prints the
-exact next step for anything missing.
+`/council:setup --check` verifies all of this end-to-end; `/council:setup` prints
+the exact next step for anything missing.
 
 ## Install
 
@@ -121,42 +119,75 @@ Per-seat model/effort flags apply everywhere agents run: `--codex-model` /
 `--grok-model` / `--claude-model`, `--codex-effort` / `--grok-effort`, and
 `--skip-codex` / `--skip-grok` / `--skip-claude`.
 
-### `/council:review` — multi-seat diff review
+### `/council:review` — read-only multi-model review
 
-Default is a 3-way deliberation (Claude + Codex + Grok: independent, then peer critique).
+Default is a 3-way deliberation (Claude + Codex + Grok: independent, then peer critique). The
+**`--mode`** selector is the single entry point for both diff review and the whole-project audit:
+
+| `--mode` | What it does |
+|----------|--------------|
+| `deliberate` (default) | 3-way, independent → peer critique + consensus (diff) |
+| `quick` | dual Codex+Grok, no peer round (you synthesize) |
+| `adversarial` | challenge the design/direction |
+| `deep` | whole-project **audit**: grouped six-eyes review of hotspot modules → `docs/AUDIT.md` proposals |
+| `endless` | bounded whole-project review/propose loop (advances hotspots until returns diminish) |
+| `run` | self-driving audit report + risk register + gate |
 
 | Flag | Effect |
 |------|--------|
-| `--mode quick\|deliberate\|adversarial` | canonical protocol selector. `quick` = dual Codex+Grok, no peer round (you synthesize); `deliberate` = 3-way + peer critique + consensus; `adversarial` = challenge design/direction. `deliberate` / `adversarial` also exist as legacy **alias verbs**. |
 | `--base <ref>` | review the diff vs a git ref instead of the working tree |
 | `--reviewers claude,codex,grok` | choose who participates |
 | `--claude-backend session\|spawn` | run Claude in-session, or as a decoupled spawned CLI |
 | `--verify` | add a refutation pass (deliberate only) |
+| `--format html` / `--doc` / `--sarif` | write a self-contained HTML report / `docs/AUDIT.md` / SARIF 2.1.0 (deep/run) |
 | `--background` / `--wait` | run detached (monitor via `/council:status`) or block synchronously |
 
-### `/council:audit` — whole-project audit + autonomous fix
+### `/council:fix` — the one write verb (autonomous, test-gated)
 
-Subcommands: `run` (self-driving report + risk register + gate), `review` (deep
-six-eyes review of hotspot modules), `fix` (safe **test-gated** auto-fix on an
-isolated branch — nothing auto-merged), `endless` (bounded review/propose loop).
+`fix` is the review → fix → re-review loop: it reviews, applies the **safe** fixes on an isolated
+`council/audit-fix-<sha>` branch, re-reviews, and repeats until it converges — **nothing is
+auto-merged**, `main` is never touched, you review the branch. A bare `fix` reads its whole profile
+from the `fix:` block in `.council.yml`, so no long flag list is needed. Every flag is override-only
+(precedence: flag > `fix.<key>` > built-in); turn a config-true off with `--no-<flag>`.
 
-| Flag | Effect | Applies to |
-|------|--------|-----------|
-| `--deep` | deeper analysis scope | all |
-| `--groups fine\|tier\|lens` | cell-granular grouped six-eyes review | review / endless |
-| `--loop` | autonomous **fix-until-dry** loop on one isolated branch | fix |
-| `--epoch-sweep` | **opt-in** provable per-tier **100% cell coverage** via a durable run-wide ledger (replaces the modulo window's coverage hole); requires `--groups` + per-tier, rejects `--flat` | fix --loop |
-| `--supervise` | survive rate-limit resets across a multi-hour run | fix --loop / endless |
-| `--usage-ceiling [c/x/g]` | **WEEKLY** hard stop at a per-model quota % (bare = 40/50/40; opt-in, off by default) | fix --loop / endless |
-| `--pause-at-5h off\|<pct>\|auto[:<pct>]` | **5h** soft pause (default **ON at 85%**); `auto` waits in-process to the reset then resumes; `off` disables; `<pct>` retunes | fix --loop / endless |
-| `--autonomy <lvl>` | commit/propose dial | fix |
-| `--from <json>` | reuse findings from a prior `review --json` (skip a fresh review) | fix |
-| `--min-severity P0\|P1\|P2` / `--max-fixes <n>` | severity gate (default P2) + fix cap (default 50) | fix |
-| `--max-passes <n>` / `--dry-streak <n>` / `--budget <n>` | loop bounds | loop / endless |
-| `--areas a,b` / `--max-units <n>` / `--max-cells <n>` / `--churn-days <n>` | scope the scan | all |
-| `--sarif` / `--html` / `--doc` | write a SARIF 2.1.0 log / self-contained HTML report / `docs/AUDIT.md` proposals | run / review |
-| `--base <ref>` | scope to a diff | run |
-| `--dry-run` | preview the fix plan without editing | fix |
+| Flag | Effect |
+|------|--------|
+| `--loop` | keep looping review → fix → re-review until convergence (vs a single pass) |
+| `--deep` / `--groups fine\|tier\|lens` | grouped, cell-granular six-eyes review |
+| `--epoch-sweep` | provable per-tier **100% cell coverage** via a durable run-wide ledger; a budget/pass ceiling stops with an explicit COVERAGE-INCOMPLETE debt that a same-epoch `--resume` continues |
+| `--supervise` | survive rate-limit resets across a multi-hour run |
+| `--usage-ceiling c/x/g` | stop between passes on a confirmed **weekly** per-model quota % (e.g. `90/90/90`) |
+| `--pause-at-5h off\|<pct>\|auto[:<pct>]` | **5h** soft pause (default ON at 85%); `auto` waits in-process to the reset then self-resumes |
+| `--autonomy <lvl>` | commit/propose dial |
+| `--min-severity P0\|P1\|P2` / `--max-fixes <n>` | severity gate + fix cap |
+| `--max-passes <n>` / `--dry-streak <n>` / `--budget <n>` / `--max-cells <n>` | loop bounds |
+| `--from <json>` | reuse findings from a prior `review --json` (skip a fresh review) |
+| `--dry-run` | preview the fix plan without editing (always wins over any consent) |
+
+**What actually auto-applies.** A finding is auto-patched only if it is **localized** (single-file,
+bounded), its changed lines are executed by a test, the **full suite stays green**, the public API is
+unchanged, and — for a **sensitive** class (auth/crypto/concurrency/data/security) or a **structural**
+transform — a **unanimous §6 Claude+Codex+Grok review of the exact staged patch** passes. Everything
+else surfaces as a **proposal** in `docs/AUDIT.md`: cross-cutting / SSOT / architecture findings are
+documented migrations, deliberately never blindly auto-patched. On a mature codebase most of the value
+is therefore in the proposals, not auto-patches.
+
+**Consent containment (autonomous auto-apply).** Sensitive/structural auto-apply needs an explicit,
+**contained** consent — never the tracked `.council.yml` (a consent there would spread to every
+clone/fork/PR-checkout and let a bare `fix` write with no consent from that operator). Put consents in
+a **gitignored `.council.local.yml`**:
+
+```yaml
+fix:
+  sensitive_auto_apply: true     # §6-gated sensitive fixes may auto-apply
+  structure_auto_apply: true     # multi-file structural transforms may auto-apply (via the strict M9 ladder)
+trust_fingerprint: <hash>        # must match this repo's git origin (a mismatch refuses)
+```
+
+then run `/council:fix --acknowledge-consents` **once per clone** (the ack is stored in the state dir,
+bound to the origin fingerprint + workspace). A git-tracked `.council.local.yml` is **refused**; env
+`COUNCIL_TRUST_FIX` is the alternative channel. Without consent, sensitive/structural findings stay
+propose-only. `--dry-run` and `--no-<consent>` always win.
 
 ### `/council:plan` — converge a build spec across seats
 
@@ -187,14 +218,14 @@ test gate → rollback on failure → never auto-merged. See the guarantees abov
 | `--background` / `--wait` | run detached / block |
 | `<problem text>` | positional: the problem to solve |
 
-### `/council:setup` · `/council:doctor` — environment
+### `/council:setup` — environment
 
 | Command / flag | Effect |
 |------|--------|
 | `/council:setup` | report backends + suggested next step |
+| `/council:setup --check` | end-to-end self-test — node + CLIs + state dir + live reachability ping (was `/council:doctor`) |
 | `/council:setup --init [--reviewers … --claude-backend … --force]` | write a `.council.yml` |
 | `/council:setup --usage [--days <n>]` | per-seat quota usage (weekly + 5h) |
-| `/council:doctor [--no-ping]` | check node + CLIs + state dir (+ live reachability ping) |
 
 ### `/council:status` — monitor background jobs
 
@@ -255,14 +286,14 @@ original critic. Hard caps: 6 items, 2 rounds.
 
 ## Whole-project audit
 
-`/council:audit` reviews the **entire project** (not a diff), in four layers you
-can run independently:
+The whole-project audit reviews the **entire project** (not a diff), in layers you can run
+independently — all under `review --mode …` (read-only) and the one write verb `fix`:
 
 ```text
-/council:audit                     # static, read-only: candidate findings + hotspots + coverage
-/council:audit review --doc        # deep agent review of the top hotspots -> proposals in docs/AUDIT.md
-/council:audit endless             # bounded review loop: advances hotspots until returns diminish
-/council:audit fix --dry-run       # preview the safe auto-fix plan; drop --dry-run to apply
+/council:review --mode run                 # self-driving report + risk register + gate (read-only)
+/council:review --mode deep --doc          # deep agent review of the top hotspots -> proposals in docs/AUDIT.md
+/council:review --mode endless             # bounded review loop: advances hotspots until returns diminish
+/council:fix --dry-run                     # preview the safe auto-fix plan; drop --dry-run to apply
 ```
 
 The engine is **static analysis as the precision layer, agents as the judgment**:
@@ -272,45 +303,41 @@ candidate list; `review`/`endless` then send the actual source of the top hotspo
 to Codex/Grok. Every static fact is a **candidate, never authority** — nothing is
 deleted or merged from a regex alone.
 
-`audit fix` is the only command that writes code, and only under hard safety
-rules: **localized** findings only (cross-cutting stay proposals), one writer per
-file on an isolated `council/audit-fix-<sha>` branch, each fix must touch **only**
-its target file and keep the project's tests **green** (else it is reverted), each
-kept fix is its own commit, the base branch is never modified and nothing is
-auto-merged. It requires a **clean working tree** and a **test gate** (see the
-per-project note below). `endless` is a review/propose loop — it never auto-fixes
-in a loop. Findings persist to the cross-run **ledger**, so a later run recognizes
-what was already flagged and `audit fix` marks what it fixed as resolved.
+`fix` is the only verb that writes code, and only under hard safety rules: **localized** findings
+only by default (cross-cutting stay proposals unless `structure_auto_apply` is consented), one writer
+per file on an isolated `council/audit-fix-<sha>` branch, each fix must touch **only** its target file
+and keep the project's tests **green** (else it is reverted), each kept fix is its own commit, the base
+branch is never modified and nothing is auto-merged. It requires a **clean working tree** and a **test
+gate** (see the per-project note below). `review --mode endless` is a review/propose loop — it never
+auto-fixes. Findings persist to the cross-run **ledger**, so a later run recognizes what was already
+flagged and `fix` marks what it fixed as resolved.
 
 Design rationale and phasing: [docs/audit-design.md](docs/audit-design.md).
 
 ## Trying it on your project
 
-Works on **any language / any git repo**: `/council:review` (diff — 3-way deliberate by
-default; the companion's canonical selector is `review --mode quick|deliberate|adversarial`,
-with `deliberate`/`adversarial` kept as legacy alias verbs), and the agent-based
-`/council:audit review` / `endless` (the agents read your real source, so language doesn't
-matter).
+Works on **any language / any git repo**: `/council:review` (diff — 3-way deliberate by default,
+selector `--mode quick|deliberate|adversarial`) and the agent-based `review --mode deep|endless`
+(the agents read your real source, so language doesn't matter).
 
 Two things are currently **JS/npm-tuned** — know this before you rely on them:
 
-- **`/council:audit` static analysis** — the import-graph / orphan / cycle layer is
+- **`review --mode run` static analysis** — the import-graph / orphan / cycle layer is
   ESM/JS-specific. On JS/TS you get the full signal; on other languages you still
   get duplication, churn, complexity, smells and the file map, but no import graph.
-  The agent `review` works regardless.
-- **`/council:audit fix`** — the test gate is **`npm test`** only right now. No
-  `package.json` test script → it refuses (rather than commit unverified edits);
-  the test gate is mandatory with no CLI bypass. So the safe fix path is
-  npm-projects-only for now.
+  The agent review works regardless.
+- **`fix` test gate** — it auto-detects the project's **`npm test`** script (e.g. `vitest run`).
+  No `package.json` test script → it refuses (rather than commit unverified edits); the test gate
+  is mandatory with no CLI bypass. So the safe fix path is npm-projects-with-tests only for now.
 
 Recommended first run, read-only → writing:
 
 ```text
-/council:setup                  # 1. which backends are available?
-/council:audit                  # 2. static overview (read-only)
-/council:review --background    # 3. review a branch with changes
-/council:audit review --doc     # 4. deep review + proposals doc
-/council:audit fix --dry-run    # 5. only on an npm project with tests, preview first
+/council:setup                       # 1. which backends are available?
+/council:review --mode run           # 2. static overview (read-only)
+/council:review --background         # 3. review a branch with changes
+/council:review --mode deep --doc    # 4. deep review + proposals doc
+/council:fix --dry-run               # 5. only on an npm project with tests, preview first
 ```
 
 If a backend is down (e.g. Grok), runs degrade gracefully to whoever is available
@@ -345,7 +372,7 @@ localized-vs-cross-cutting action split.
 /council:status
 /council:status --result
 
-/council:review --adversarial --background look for race conditions and soft-delete mistakes
+/council:review --mode adversarial --background look for race conditions and soft-delete mistakes
 ```
 
 ## State and environment
