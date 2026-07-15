@@ -6,6 +6,7 @@ import {
   booleanOptionsFor,
   fixConfigBooleans,
   fixConfigValues,
+  loopBudgetCeiling,
   negatableFlags,
   valueOptionsFor
 } from "../plugins/council/scripts/lib/cli-registry.mjs";
@@ -112,14 +113,14 @@ test("fixConfigValues() keys + opt targets match FIX_CONFIG_VALUES", () => {
 const ORIGINAL_VALIDATORS = {
   groups: (v) => { if (!["fine", "tier", "lens"].includes(String(v))) throw new Error(`must be one of fine|tier|lens (got: ${v})`); },
   max_fixes: (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 1) throw new Error("must be a positive number"); },
-  max_passes: (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 1 || n > 100) throw new Error("must be between 1 and 100"); },
+  max_passes: (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 1 || n > 1000) throw new Error("must be between 1 and 1000"); },
   dry_streak: (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 1) throw new Error("must be a positive number"); },
   max_cells: (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 1) throw new Error("must be a positive number"); },
   budget: (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 2) throw new Error("must be a number >= 2"); },
   usage_ceiling: (v) => { parseUsageCeiling(v); },
   pause_at_5h: (v) => { parsePause5hOption(v); }
 };
-const VALIDATOR_SAMPLES = ["fine", "tier", "lens", "bogus", "", "0", "1", "2", "100", "101", "-3", "3.5", "40/50/40", "45", "claude=40", "auto:90", "85", null, undefined];
+const VALIDATOR_SAMPLES = ["fine", "tier", "lens", "bogus", "", "0", "1", "2", "100", "101", "300", "1000", "1001", "-3", "3.5", "40/50/40", "45", "claude=40", "auto:90", "85", null, undefined];
 
 test("registry validators are behaviorally identical to the original inline validators", () => {
   const derived = fixConfigValues();
@@ -138,6 +139,28 @@ test("registry validators are behaviorally identical to the original inline vali
       );
     }
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// loopBudgetCeiling — the grouped fix-loop budget cap is maxPasses*maxCells (SSOT), so SMALL passes +
+// high maxPasses still permit full-repo coverage. (Regression for the "budget stuck at 2000, never
+// reaches the correctness tier" limit found on the first live run.)
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+test("loopBudgetCeiling = maxPasses*maxCells for grouped runs, floored at 2000", () => {
+  // small passes (40) + many of them (300) → 12000, far above the old flat 2000 → full coverage possible.
+  assert.equal(loopBudgetCeiling({ grouped: true, maxPasses: 300, maxCells: 40 }), 12000);
+  // the product is the ceiling even for big passes.
+  assert.equal(loopBudgetCeiling({ grouped: true, maxPasses: 100, maxCells: 40 }), 4000);
+  // floored at 2000 so a tiny run keeps headroom (8*40=320 → 2000).
+  assert.equal(loopBudgetCeiling({ grouped: true, maxPasses: 8, maxCells: 40 }), 2000);
+  // the old coupling (maxCells*20) is GONE — small passes no longer cap the budget at 800.
+  assert.notEqual(loopBudgetCeiling({ grouped: true, maxPasses: 300, maxCells: 40 }), 40 * 20);
+  // non-grouped (per-file) path has no cell ledger → flat 2000 regardless of passes.
+  assert.equal(loopBudgetCeiling({ grouped: false, maxPasses: 300, maxCells: 40 }), 2000);
+  // defensive: non-finite / sub-1 inputs fall back to 2000, never NaN/negative.
+  assert.equal(loopBudgetCeiling({ grouped: true, maxPasses: NaN, maxCells: 40 }), 2000);
+  assert.equal(loopBudgetCeiling({ grouped: true, maxPasses: 0, maxCells: 40 }), 2000);
+  assert.equal(loopBudgetCeiling({ grouped: true, maxPasses: 300, maxCells: 0 }), 2000);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────

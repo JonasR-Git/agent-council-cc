@@ -48,7 +48,7 @@ import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./l
 import { evaluateResumeGuard, loadFixLoopCheckpoint, runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { parsePause5hOption, parseUsageCeiling } from "./lib/usage-guard.mjs";
-import { booleanOptionsFor, fixConfigBooleans, fixConfigValues, negatableFlags, valueOptionsFor } from "./lib/cli-registry.mjs";
+import { booleanOptionsFor, fixConfigBooleans, fixConfigValues, loopBudgetCeiling, negatableFlags, valueOptionsFor } from "./lib/cli-registry.mjs";
 import { CONSENT_ENV_VAR, LOCAL_CONSENT_FILE, evaluateAckWrite, formatConsentBanner, resolveConsents, writeConsentAck } from "./lib/consent.mjs";
 import { route } from "./lib/cli-dispatch.mjs";
 import { assertCodeWriteAllowed } from "./lib/cli-mutation.mjs";
@@ -435,8 +435,8 @@ function scaffoldPolicyFile(cwd, options) {
     "#   retry_on_limit: true",
     "#   usage_ceiling: 90/90/90",
     "#   pause_at_5h: auto:90",
-    "#   max_passes: 100",
-    "#   budget: 2000",
+    "#   max_passes: 300               # small passes + many of them = full-repo coverage, quota-bound",
+    "#   budget: 12000                 # ceiling = max_passes * max_cells (loopBudgetCeiling)",
     "",
     "# --- Auto-apply consents live OUT OF TREE (Appendix D) -------------------------------------",
     "# Create a gitignored `.council.local.yml` (NOT this file) in the repo root:",
@@ -2684,7 +2684,7 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
       let maxPasses = 8;
       if (options["max-passes"] != null) {
         const n = Number(options["max-passes"]);
-        if (!Number.isFinite(n) || n < 1 || n > 100) throw new Error("--max-passes must be between 1 and 100");
+        if (!Number.isFinite(n) || n < 1 || n > 1000) throw new Error("--max-passes must be between 1 and 1000");
         maxPasses = Math.floor(n);
       }
       let dryStreak = 2;
@@ -2754,9 +2754,11 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
       // The loop budget is in AGENT CALLS. A per-file pass is a handful; a GROUPED pass is up to
       // maxCells calls, so a grouped loop's budget must be CELL-SCALE — else one pass blows the 60
       // default and the loop stops after a single pass (council Grok R9). Default a grouped run to ~4
-      // passes' worth of cells, and raise the ceiling accordingly. The per-pass cell dispatch is capped
+      // passes' worth of cells; the CEILING is what maxPasses passes of maxCells could ever spend
+      // (loopBudgetCeiling — SSOT, so SMALL passes + high maxPasses still permit full-repo coverage;
+      // the usage-ceiling / 5h-pause remain the real cost bound). The per-pass cell dispatch is capped
       // to the remaining budget (makeFixLoopDeps), so this bounds total spend honestly.
-      const budgetMax = loopLensGroups ? Math.max(2000, loopMaxCells * 20) : 2000;
+      const budgetMax = loopBudgetCeiling({ grouped: !!loopLensGroups, maxPasses, maxCells: loopMaxCells });
       let loopBudget = loopLensGroups ? loopMaxCells * 4 : 60;
       if (options.budget != null) {
         const n = Number(options.budget);

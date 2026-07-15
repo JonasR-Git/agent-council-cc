@@ -25,11 +25,26 @@ function validateGroups(v) {
 }
 function validateMaxPasses(v) {
   const n = Number(v);
-  if (!Number.isFinite(n) || n < 1 || n > 100) throw new Error("must be between 1 and 100");
+  if (!Number.isFinite(n) || n < 1 || n > 1000) throw new Error("must be between 1 and 1000");
 }
 function validateBudget(v) {
   const n = Number(v);
   if (!Number.isFinite(n) || n < 2) throw new Error("must be a number >= 2");
+}
+
+// The fix-LOOP budget is denominated in AGENT CALLS. A grouped pass reviews up to `maxCells` cells
+// (= calls); across `maxPasses` passes the loop can NEVER spend more than maxPasses*maxCells. So the
+// budget CEILING is exactly that product (floored at 2000 so a small-pass run keeps headroom) — NOT an
+// arbitrary multiple of maxCells. This lets a run keep SMALL passes (fast review→fix cycles + quota
+// response) while raising maxPasses for full-repo coverage: budget scales with the passes that can
+// actually spend it. The real cost bound stays the usage-ceiling / 5h-pause, not this anti-typo guard.
+// The per-file (non-grouped) path has no cell ledger, so it keeps a flat 2000.
+export function loopBudgetCeiling({ grouped, maxPasses, maxCells }) {
+  if (!grouped) return 2000;
+  const mp = Number(maxPasses);
+  const mc = Number(maxCells);
+  if (!Number.isFinite(mp) || !Number.isFinite(mc) || mp < 1 || mc < 1) return 2000;
+  return Math.max(2000, Math.floor(mp) * Math.floor(mc));
 }
 function validateUsageCeiling(v) { parseUsageCeiling(v); }
 function validatePause5h(v) { parsePause5hOption(v); }
@@ -63,7 +78,7 @@ export const CLI_FLAGS = [
   { flag: "from", type: "value", verbs: ["audit"], block: null, configKey: null, validate: null, negatable: false, negOrder: null, aliasOf: null, mutationClass: "none", help: "findings source for fix" },
   { flag: "min-severity", type: "value", verbs: ["audit"], block: "fix", configKey: "min_severity", validate: null, negatable: false, negOrder: null, aliasOf: null, mutationClass: "none", help: "minimum severity to act on" },
   { flag: "max-fixes", type: "value", verbs: ["audit"], block: "fix", configKey: "max_fixes", validate: fixRequirePositive, negatable: false, negOrder: null, aliasOf: null, mutationClass: "none", help: "cap the number of fixes applied" },
-  { flag: "max-passes", type: "value", verbs: ["audit"], block: "fix", configKey: "max_passes", validate: validateMaxPasses, negatable: false, negOrder: null, aliasOf: null, mutationClass: "none", help: "cap the fix-loop pass count (1..100)" },
+  { flag: "max-passes", type: "value", verbs: ["audit"], block: "fix", configKey: "max_passes", validate: validateMaxPasses, negatable: false, negOrder: null, aliasOf: null, mutationClass: "none", help: "cap the fix-loop pass count (1..1000)" },
   { flag: "dry-streak", type: "value", verbs: ["audit"], block: "fix", configKey: "dry_streak", validate: fixRequirePositive, negatable: false, negOrder: null, aliasOf: null, mutationClass: "none", help: "consecutive dry passes before stopping" },
   { flag: "sarif-path", type: "value", verbs: ["audit"], block: null, configKey: null, validate: null, negatable: false, negOrder: null, aliasOf: null, mutationClass: "state-only", help: "output path for the --sarif report" },
   { flag: "autonomy", type: "value", verbs: ["audit"], block: "fix", configKey: "autonomy", validate: null, negatable: false, negOrder: null, aliasOf: null, mutationClass: "none", help: "autonomy tier for fix apply" },

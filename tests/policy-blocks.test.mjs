@@ -163,7 +163,7 @@ test("the repo's current .council.yml parses policy.fix byte-identical to the kn
     loop: true, deep: true, epoch_sweep: true, per_tier: true, supervise: true,
     autonomy: "aggressive",
     retry_on_limit: true, usage_ceiling: "90/90/90", pause_at_5h: "auto:90",
-    max_passes: 100, budget: 2000
+    max_passes: 300, budget: 12000
   });
 });
 

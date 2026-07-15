@@ -177,11 +177,13 @@ test("out-of-range fix.budget fails loud (< 2)", () => {
   );
 });
 
-test("out-of-range fix.max_passes fails loud (> 100)", () => {
+test("out-of-range fix.max_passes fails loud (> 1000)", () => {
   assert.throws(
-    () => applyFixPolicyDefaults({}, { max_passes: 500 }),
-    /Invalid \.council\.yml fix\.max_passes:.*between 1 and 100/
+    () => applyFixPolicyDefaults({}, { max_passes: 5000 }),
+    /Invalid \.council\.yml fix\.max_passes:.*between 1 and 1000/
   );
+  // 300 (the quota-bound autonomous default) is now in-range — no throw.
+  assert.doesNotThrow(() => applyFixPolicyDefaults({}, { max_passes: 300 }));
 });
 
 test("bad fix.groups fails loud", () => {
