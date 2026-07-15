@@ -417,7 +417,11 @@ export function makeTierSweepCursor(filePath, { deps = {} } = {}) {
   const fsyncFile =
     deps.fsyncFile ??
     ((p) => {
-      const fd = fs.openSync(p, "r");
+      // "r+" (read-WRITE), NOT "r": on Windows FlushFileBuffers requires write access, so fsync on a
+      // read-only handle throws EPERM (live-found — it aborted the first real epoch-sweep run on pass 1;
+      // unit tests inject a fake fsyncFile so the real handle mode was never exercised). The file always
+      // exists here (appendFile created/appended it before this fsync).
+      const fd = fs.openSync(p, "r+");
       try {
         fs.fsyncSync(fd);
       } finally {

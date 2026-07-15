@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import {
   posixKeyPath,
@@ -307,4 +310,17 @@ test("modelIdentityHash keys on backend/model/effort, not seat; reviewerSetHash 
   assert.equal(a, modelIdentityHash({ backend: "codex", model: "gpt-5-codex", effort: "high" }));
   assert.notEqual(a, modelIdentityHash({ backend: "codex", model: "gpt-5-codex", effort: "low" })); // effort matters
   assert.equal(reviewerSetHash(REVIEWERS), reviewerSetHash([...REVIEWERS].reverse())); // order-independent
+});
+
+test("makeTierSweepCursor with the REAL fs ports fsyncs without EPERM (Windows FlushFileBuffers needs write access — live-found; every other test injects a fake fsync so the real handle mode was never exercised)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-fsync-"));
+  const file = path.join(dir, "audit-tier-sweep-cursor.jsonl");
+  try {
+    const cur = makeTierSweepCursor(file, {}); // NO injected fsyncFile → exercises the real "r+" fsync path
+    assert.doesNotThrow(() => cur.appendHeader({ runId: "t", epochHash: "e", reviewers: [], tierPlan: [] }), "appendHeader fsync must not EPERM");
+    assert.doesNotThrow(() => cur.markDone("k1", { pass: 1 }), "markDone append+fsync must not EPERM");
+    assert.equal(cur.doneCount(), 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
