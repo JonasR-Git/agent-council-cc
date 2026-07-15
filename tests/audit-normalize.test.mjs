@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { categoryToLens, evidenceState, fixEligibilityLens, normalizeFindings, toCanonicalFinding } from "../plugins/council/scripts/lib/audit-normalize.mjs";
+import { categoryToLens, evidenceState, fixEligibilityLens, isMultiSeat, normalizeFindings, seatsOf, toCanonicalFinding } from "../plugins/council/scripts/lib/audit-normalize.mjs";
 import { mergeFindings } from "../plugins/council/scripts/lib/findings.mjs";
 import { SCHEMAS } from "../plugins/council/scripts/lib/schemas.mjs";
 import { validate } from "../plugins/council/scripts/lib/validate.mjs";
@@ -168,6 +168,52 @@ test("fixEligibilityLens: VETO 1 — no precise location (missing line) is not l
 test("fixEligibilityLens: VETO 2 — a removal verdict or survivor target is inherently multi-file", () => {
   assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 3, verdict: "remove" }, "logical_sense"), "logical_sense");
   assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 3, verdict: "merge-into", survivor: "b.mjs" }, "logical_sense"), "logical_sense");
+});
+
+test("fixEligibilityLens: FAIL-CLOSED allowlist — unknown/other/test/docs categories stay propose-only (council P1)", () => {
+  // categoryToLens fails OPEN to correctness for these; the positive allowlist must keep them propose-only.
+  assert.equal(fixEligibilityLens({ category: "other", file: "a.mjs", line: 5 }, "logical_sense"), "logical_sense", "the 92-strong 'other' bucket is NOT auto-eligible");
+  assert.equal(fixEligibilityLens({ category: "test", file: "a.mjs", line: 5 }, "logical_sense"), "logical_sense");
+  assert.equal(fixEligibilityLens({ category: "docs", file: "a.mjs", line: 5 }, "logical_sense"), "logical_sense");
+  assert.equal(fixEligibilityLens({ category: undefined, file: "a.mjs", line: 5 }, "logical_sense"), "logical_sense", "missing category never reattributes");
+  assert.equal(fixEligibilityLens({ category: "logic-error", file: "a.mjs", line: 5 }, "logical_sense"), "logical_sense", "unmapped free-text category stays propose-only");
+});
+
+test("fixEligibilityLens: allowlisted sensitive synonyms reattribute to their sensitive lens (the §6 gate then applies)", () => {
+  assert.equal(fixEligibilityLens({ category: "secret", file: "a.mjs", line: 5 }, "logical_sense"), "security_secrets");
+  assert.equal(fixEligibilityLens({ category: "resource", file: "a.mjs", line: 5 }, "logical_sense"), "concurrency_resources");
+  assert.equal(fixEligibilityLens({ category: "data", file: "a.mjs", line: 5 }, "logical_sense"), "data_integrity");
+});
+
+test("fixEligibilityLens: only logical_sense reattributes — architecture_ssot (Tier 1) stays propose-only", () => {
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 5 }, "architecture_ssot"), "architecture_ssot");
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 5 }, "dependencies_supply_chain"), "dependencies_supply_chain");
+});
+
+test("fixEligibilityLens: precise-line veto is EXPLICIT — a missing/zero line is not localizable", () => {
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs" }, "logical_sense"), "logical_sense", "no line → propose-only");
+  assert.equal(fixEligibilityLens({ category: "bug", file: "a.mjs", line: 0 }, "logical_sense"), "logical_sense", "line 0 is not a real location");
+});
+
+test("isMultiSeat: STRICT on the consensus string — 'single'/'contested' never fabricate consensus (council P1)", () => {
+  assert.equal(isMultiSeat({ consensus: "single" }), false, "the truthy string 'single' must NOT read as consensus");
+  assert.equal(isMultiSeat({ consensus: "contested" }), false, "an actively contested finding is not consensus");
+  assert.equal(isMultiSeat({ consensus: "consensus" }), true);
+  assert.equal(isMultiSeat({ consensus: true }), true);
+  assert.equal(isMultiSeat({ seats: ["codex", "grok"] }), true, "a real ≥2-seat union is consensus");
+  assert.equal(isMultiSeat({ seats: ["codex"] }), false);
+});
+
+test("toCanonicalFinding: idempotent on consensus — re-normalizing a canonical single finding never promotes it", () => {
+  const once = toCanonicalFinding({ category: "bug", lens: "correctness", severity: "P1", file: "a.mjs", line: 5, title: "x", agents: ["codex"] }, { unit: "a.mjs" });
+  assert.equal(once.consensus, "single");
+  const twice = toCanonicalFinding(once, { unit: "a.mjs" });
+  assert.equal(twice.consensus, "single", "a second canonicalization must not turn 'single' into 'consensus'");
+});
+
+test("seatsOf: an empty agents array does not shadow a populated seats array (consensus-deciding)", () => {
+  assert.deepEqual(seatsOf({ agents: [], seats: ["codex", "grok"] }).sort(), ["codex", "grok"]);
+  assert.deepEqual(seatsOf({ agents: ["claude"], seats: ["codex"] }), ["claude"], "a populated agents still wins");
 });
 
 test("toCanonicalFinding: a reattributed bug is localized+fixable and carries fixLens; coverage lens stays logical_sense", () => {

@@ -6,7 +6,7 @@
 import { cappedSeverity, getLens, isProposeOnly } from "./audit-lenses.mjs";
 import { semanticFingerprint } from "./audit-fingerprint.mjs";
 import { deriveConfidence, riskScore } from "./audit-risk.mjs";
-import { classifyScope } from "./scope.mjs";
+import { classifyScope, textSoundsCrossCutting } from "./scope.mjs";
 
 const CATEGORY_LENS = {
   bug: "correctness",
@@ -51,28 +51,59 @@ export function categoryToLens(category, fallback = "correctness") {
 // removing a module, folding it into a survivor, a redesign or relocation is never a single-file fix.
 const REMOVAL_VERDICTS = new Set(["remove", "merge-into", "redesign", "relocate"]);
 
+// POSITIVE allowlist of the ONLY categories a propose-only finding may be reattributed to a fixable lens on
+// (council diff-review P1 — the design's narrow allowlist). A negative "not propose-only" test failed OPEN:
+// categoryToLens has fallback="correctness", so an unmapped / missing / free-text category, plus `other`
+// (the 92-strong bucket) and `test`/`docs`, all mapped to fixable lenses and became auto-eligible against the
+// design. Only these mechanically-fixable classes (+ their categoryToLens synonyms) reattribute; everything
+// else (other/design/dead-code/test/docs/ssot/config/compliance/deps) stays on the propose-only coverage lens.
+const AUTOFIX_CATEGORIES = new Set([
+  "bug", "correctness",
+  "concurrency", "resource",
+  "security", "auth", "secret", "injection",
+  "data-loss", "data",
+  "reliability", "error-handling", "observability",
+  "performance"
+]);
+
+/** A real, model-set positive line — NOT the normalize default (Math.max(1, …||1) coerces missing to 1). */
+function hasPreciseLine(raw = {}) {
+  const n = Number(raw.line ?? raw.location?.startLine);
+  return raw.line != null && Number.isFinite(n) && n >= 1;
+}
+
 /**
  * The FIX-ELIGIBILITY lens — deliberately SEPARATE from the coverage lens (docs/logical-autofix-design.md).
  * The grouped review stamps the GROUP lens authoritatively on every cell finding (relens,
  * audit-grouped-review.mjs) — correct for coverage/reporting attribution, but WRONG as a fix classification:
  * a `category:bug` surfaced under the logical_sense group is a correctness bug that merely appeared during a
  * logical review, not a cross-cutting design issue. This returns the category-native lens when the coverage
- * lens is propose-only (logical_sense/architecture_ssot) BUT the finding is really a localized, mechanically
- * fixable class — so it can flow through the NORMAL correctness fixer instead of being frozen propose-only.
- * PURE and CONSENT-FREE: consent stays a fix-time gate, never part of the finding's canonical identity
- * (Council P1: consent in pure normalize is the wrong seam / split-brain). Falls back to the coverage lens
- * (stays propose-only) unless every guard clears — so the DEFAULT is always the safe, unchanged behaviour.
+ * lens is propose-only (logical_sense/architecture_ssot) AND the finding is a localized, allowlisted,
+ * mechanically fixable class — so it can flow through the NORMAL correctness fixer instead of being frozen
+ * propose-only. PURE and CONSENT-FREE: consent stays a fix-time gate, never part of the finding's canonical
+ * identity (Council P1: consent in pure normalize is the wrong seam / split-brain). FAIL-CLOSED: falls back
+ * to the coverage lens (stays propose-only) unless EVERY guard clears — the DEFAULT is the safe, unchanged
+ * behaviour, so an unknown/missing category can never slip through.
  */
 export function fixEligibilityLens(raw = {}, coverageLens) {
-  // Only ever reattribute AWAY from a propose-only coverage lens; a runtime-fixable lens keeps its identity.
-  if (!isProposeOnly(coverageLens)) return coverageLens;
+  // Reattribute ONLY a logical_sense (Tier-0) coverage finding — the empirically-mislabeled class (248/608
+  // live findings were concrete bugs group-stamped logical_sense). Other propose-only lenses stay put: an
+  // architecture_ssot / dependencies_supply_chain (Tier-1) finding is genuinely structural/cross-cutting, and
+  // reattributing it to a single-file correctness fix is neither the design intent nor safe. Runtime-fixable
+  // coverage lenses already keep their identity. This narrow gate is the conservative default.
+  if (coverageLens !== "logical_sense") return coverageLens;
+  // GATE 1 (fail-closed allowlist): the category must be an explicitly mechanically-fixable class.
+  if (!AUTOFIX_CATEGORIES.has(String(raw.category ?? "").trim().toLowerCase())) return coverageLens;
   const native = categoryToLens(raw.category);
-  // The category must map to a genuinely fixable (non-propose-only) lens — else there is nothing to gain.
+  // GATE 2 (defensive): the allowlisted category must map to a genuinely fixable (non-propose-only) lens.
   if (isProposeOnly(native)) return coverageLens;
-  // VETO 1 (Council P1): honour an explicit OR heuristic cross-cutting signal. classifyScope respects an
-  // explicit raw.scope AND the CROSS_CUTTING_HINTS text scan (architect/refactor/across/api surface/…).
-  if (classifyScope(raw) === "cross-cutting") return coverageLens;
-  // VETO 2 (Council P1): a removal/merge/redesign verdict or a survivor target is inherently multi-file.
+  // VETO 1 (Council P1): a precise, model-set single-file location is required — the design's own
+  // "precise-location" veto, made EXPLICIT here rather than relying on a classifyScope side effect.
+  if (!hasPreciseLine(raw)) return coverageLens;
+  // VETO 2 (Council P1): honour any cross-cutting signal — the classifyScope result AND, independently, the
+  // text-hint scan, so an explicit raw.scope:"localized" cannot override cross-cutting vocabulary in the text.
+  if (classifyScope(raw) === "cross-cutting" || textSoundsCrossCutting(raw)) return coverageLens;
+  // VETO 3 (Council P1): a removal/merge/redesign verdict or a survivor target is inherently multi-file.
   if (REMOVAL_VERDICTS.has(String(raw.verdict ?? "").toLowerCase()) || raw.survivor) return coverageLens;
   return native;
 }
@@ -99,16 +130,31 @@ export function isVerifiedSupported(raw = {}) {
  * having 0 finders → regex-only confidence + consensus:"single", which silently defeated the consensus gate.
  */
 export function seatsOf(raw = {}) {
-  const src = Array.isArray(raw.agents) ? raw.agents : Array.isArray(raw.seats) ? raw.seats : raw.agent ? [raw.agent] : raw.seat ? [raw.seat] : [];
+  // Prefer a NON-EMPTY agents array, then a non-empty seats array — an empty `agents:[]` must not shadow a
+  // populated `seats` (council diff-review nit): seatCount is now consensus-deciding, so a store record that
+  // carries seats but an empty agents must still count its seats.
+  const src =
+    Array.isArray(raw.agents) && raw.agents.length ? raw.agents
+    : Array.isArray(raw.seats) && raw.seats.length ? raw.seats
+    : raw.agent ? [raw.agent]
+    : raw.seat ? [raw.seat]
+    : [];
   return [...new Set(src.map((s) => String(s).trim().toLowerCase()).filter(Boolean))];
 }
 export function seatCount(raw = {}) {
   return seatsOf(raw).length;
 }
 
-/** True when ≥2 distinct seats independently raised this finding (the durable multi-seat consensus signal). */
+/**
+ * True when ≥2 distinct seats independently raised this finding (the durable multi-seat consensus signal).
+ * The `raw.consensus` check is STRICT (council diff-review P1): a canonical finding carries consensus as the
+ * STRING enum "single" | "contested" | "consensus" — "single" and "contested" are truthy, so a loose
+ * Boolean(raw.consensus) would promote a single-seat or actively CONTESTED finding to consensus on any
+ * re-normalize round-trip, silently defeating the auto-fix consensus gate (the exact fabricated-consensus
+ * anti-goal). Only an explicit boolean-true (merge path) or the "consensus" string, or a real ≥2-seat union.
+ */
 export function isMultiSeat(raw = {}) {
-  return Boolean(raw.consensus) || seatCount(raw) >= 2;
+  return raw.consensus === true || raw.consensus === "consensus" || seatCount(raw) >= 2;
 }
 
 /** Evidence state → drives the confidence cap/floor (audit-risk deriveConfidence). */

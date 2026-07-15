@@ -390,3 +390,30 @@ test("verdictsFor returns the configured verdict map (empty by default)", () => 
   assert.deepEqual(makeFixLoopDeps("/x", model, {}, {}).verdictsFor(), {});
   assert.deepEqual(makeFixLoopDeps("/x", model, {}, { verdictMap: { "a.mjs": { verdict: "remove" } } }).verdictsFor(), { "a.mjs": { verdict: "remove" } });
 });
+
+test("consensusMerge dep: wired only when grok is active; undefined when skipped (council anti-facade)", () => {
+  const grokBackends = { grok: { cli: { available: true } } };
+  assert.equal(typeof makeFixLoopDeps("/x", model, grokBackends, {}).consensusMerge, "function", "grok active → a real consensus dep is built");
+  assert.equal(makeFixLoopDeps("/x", model, grokBackends, { skipGrok: true }).consensusMerge, undefined, "skipGrok → no dep (loop no-ops the step)");
+  assert.equal(makeFixLoopDeps("/x", model, {}, {}).consensusMerge, undefined, "no grok backend → no dep");
+});
+
+test("consensusMerge dep: the REAL build (not a stubbed dep) drives runConsensusMerge through the grok closure", async () => {
+  // Inject runGrokStructured (the seam) so the ACTUAL consensusMerge closure + runConsensusMerge run — proves
+  // the wired dep works end to end (grok call shape, stdout parse, merge), not just that the loop calls a stub.
+  let promptSeen = null;
+  const runGrokStructured = async (cwd, backends, opts, prompt) => {
+    promptSeen = prompt;
+    return { status: 0, stdout: '{ "clusters": [[0, 1]] }' };
+  };
+  const deps = makeFixLoopDeps("/x", model, { grok: { cli: { available: true } } }, {}, { runGrokStructured });
+  const findings = [
+    { file: "a.mjs", line: 10, title: "null deref", seats: ["codex"], id: "c" },
+    { file: "a.mjs", line: 12, title: "NPE", seats: ["grok"], id: "g" }
+  ];
+  const res = await deps.consensusMerge(findings, { pass: 1 });
+  assert.match(promptSeen, /FILE a\.mjs/, "the real closure built the prompt and called grok");
+  assert.equal(res.merged, 1, "the real dep upgraded the cross-seat pair to consensus");
+  assert.equal(res.findings.length, 1);
+  assert.equal(res.findings[0].consensus, "consensus");
+});

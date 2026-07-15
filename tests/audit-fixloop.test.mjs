@@ -17,6 +17,24 @@ test("runs review->fix passes until the dry streak, accumulating committed fixes
   assert.match(out.stopReason, /diminishing returns/);
 });
 
+test("reattributed logical bug is STAGED at its fixLens tier through the REAL default gate (council #7 e2e)", async () => {
+  // lens=logical_sense (coverage Tier 0) but fixLens=correctness (Tier 2). The default gate (applyTierGating)
+  // stamps f.tier from the coverage lens; fixTierOf must still route it to Tier 2 so it is FIXED, not surfaced
+  // as a sub-tier proposal. consensus:"consensus" clears the reattribution consensus gate (ineligibleReason).
+  let p = 0;
+  const reattributed = { lens: "logical_sense", fixLens: "correctness", category: "bug", severity: "P1", scope: "localized", fixDisposition: "localized", consensus: "consensus", file: "a.mjs", line: 10, title: "off-by-one" };
+  const review = async () => (p++ === 0 ? { findings: [reattributed], coverage: { budgetSpent: 2 } } : { findings: [], coverage: { budgetSpent: 1 } });
+  const fixedTitles = [];
+  const fix = async (actionable) => {
+    fixedTitles.push(...actionable.map((x) => x.title)); // accumulate across passes (each pass re-invokes fix)
+    return { fixed: actionable.map((x) => ({ file: x.file, finding: x, commit: "abc" })), failed: [], branch: "council/x", changedFiles: ["a.mjs"], spent: 2 };
+  };
+  // Default gate (no injected `gate`), per-tier convergence ON (the CLI default) so tier routing is exercised.
+  const out = await runFixLoop("/x", { budget: 40, dryStreak: 2, maxPasses: 8, perTierConvergence: true }, { review, fix, checkpoint: noCheckpoint });
+  assert.ok(fixedTitles.includes("off-by-one"), "the reattributed bug reached fix() at Tier 2, not surfaced as a Tier-0 proposal");
+  assert.equal(out.fixed.length, 1);
+});
+
 test("consensus/dedup dep is actually CALLED before the gate and its output is what gets fixed (anti-facade)", async () => {
   // Two single-seat findings on the same file — the consensus dep fuses them into ONE consensus finding.
   const review = async () => ({

@@ -535,12 +535,16 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
   // step). runConsensusMerge is itself fail-soft. maxTurns is small: the task is one JSON reply over the
   // prompt text, no file/tool access needed. Injectable via impl for tests.
   const grokActive = !options.skipGrok && activeSeatNames(backends, options).includes("grok");
+  // impl.runGrokStructured is a test seam so a test can drive the REAL consensusMerge build (the grok closure
+  // shape + runConsensusMerge) rather than only a fully-stubbed impl.consensusMerge — the council flagged the
+  // real dep build as an untested facade risk.
+  const grokStructured = impl.runGrokStructured ?? runGrokStructured;
   const consensusMerge =
     impl.consensusMerge ??
     (grokActive
       ? (findings) =>
           runConsensusMerge(findings, {
-            grok: (p) => runGrokStructured(cwd, backends, { ...agentPins, maxTurns: 8 }, p),
+            grok: (p) => grokStructured(cwd, backends, { ...agentPins, maxTurns: 8 }, p),
             log: typeof options.log === "function" ? options.log : () => {}
           })
       : undefined);

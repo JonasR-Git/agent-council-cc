@@ -8,6 +8,16 @@
 const CROSS_CUTTING_HINTS =
   /\b(architect|refactor|pattern|across|throughout|everywhere|consistent(?:ly|cy)?|design|abstraction|coupling|systemic|wide|multiple files|api surface|convention|migration|rename)\b/i;
 
+/**
+ * True when a finding's title/detail contains cross-cutting vocabulary (architect/refactor/across/api
+ * surface/…), INDEPENDENT of any explicit `scope` field. classifyScope lets an explicit scope:"localized"
+ * short-circuit before the hint scan; the fix-eligibility reattribution needs the hint signal as a veto that
+ * an explicit "localized" cannot override (council diff-review P1), so it calls this directly.
+ */
+export function textSoundsCrossCutting(finding) {
+  return CROSS_CUTTING_HINTS.test(`${finding?.title ?? ""} ${finding?.detail ?? ""}`);
+}
+
 export function classifyScope(finding) {
   const explicit = String(finding?.scope ?? "").toLowerCase();
   if (explicit === "localized" || explicit === "cross-cutting") return explicit;

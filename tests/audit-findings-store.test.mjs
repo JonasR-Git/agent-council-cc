@@ -58,6 +58,20 @@ test("C: toRecord PERSISTS scope + fixDisposition so the fix loop's classifyFixa
   assert.equal(byTitle["explicit x-cut on a fixable lens"].fixDisposition, "propose-only");
 });
 
+test("C: a RAW logical_sense bug (no fixLens yet) reattributes on append so the store round-trip stays fixable (council P1 #5)", () => {
+  const dir = tmp();
+  const file = path.join(dir, "audit-findings.jsonl");
+  const app = makeFindingsAppender(file, { session: "s1", nowIso: () => "2026-07-13T00:00:00Z" });
+  // The grouped-review appends RAW cell findings BEFORE normalize — no fixLens set yet. toRecord must derive
+  // it, else scope freezes to cross-cutting and the finding can never be reattributed/fixed on re-read.
+  app.append([finding({ title: "off-by-one", lens: "logical_sense", category: "bug", file: "a.mjs", line: 42 })], { pass: 1 });
+  const rec = readFindingsStore(file).find((r) => r.title === "off-by-one");
+  assert.equal(rec.scope, "localized", "a raw logical bug is stored as fixable, not frozen cross-cutting");
+  assert.equal(rec.fixDisposition, "localized");
+  assert.equal(rec.fixLens, "correctness", "the derived fix-eligibility lens is persisted");
+  assert.equal(rec.lens, "logical_sense", "the coverage lens is unchanged");
+});
+
 test("C: dedupe by fingerprint prevents duplicate lines (many-to-many provenance kept in-record)", () => {
   const dir = tmp();
   const file = path.join(dir, "audit-findings.jsonl");

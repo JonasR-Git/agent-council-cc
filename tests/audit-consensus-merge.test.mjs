@@ -118,6 +118,46 @@ test("applyConsensusClusters: findings outside any cluster pass through unchange
   assert.deepEqual(out.map((o) => o.id), ["keep-0", "a", "keep-3"], "untouched findings keep order; cluster collapses to its rep");
 });
 
+test("applyConsensusClusters: a CROSS-FILE cluster is rejected in code (council P1 — not prompt-only)", () => {
+  const findings = [f({ file: "a.mjs", line: 10, seats: ["codex"], id: "a" }), f({ file: "b.mjs", line: 10, seats: ["grok"], id: "b" })];
+  const { findings: out, merges } = applyConsensusClusters(findings, [[0, 1]]);
+  assert.equal(out.length, 2, "cross-file members are never fused");
+  assert.equal(merges.length, 0);
+});
+
+test("applyConsensusClusters: members too far apart are rejected (line-proximity guard vs. distinct bugs)", () => {
+  const findings = [f({ file: "a.mjs", line: 10, seats: ["codex"], id: "a" }), f({ file: "a.mjs", line: 400, seats: ["grok"], id: "b" })];
+  const { findings: out, merges } = applyConsensusClusters(findings, [[0, 1]]);
+  assert.equal(out.length, 2, "two same-file findings 390 lines apart are likely distinct → not fused");
+  assert.equal(merges.length, 0);
+});
+
+test("applyConsensusClusters: a REFUTED or cross-cutting member is never absorbed + consensus-stamped", () => {
+  const refuted = [f({ file: "a.mjs", line: 10, seats: ["codex"], id: "a" }), f({ file: "a.mjs", line: 12, seats: ["grok"], id: "b", verified: { refuted: true } })];
+  assert.equal(applyConsensusClusters(refuted, [[0, 1]]).merges.length, 0, "a refuted peer blocks the merge");
+  const xcut = [f({ file: "a.mjs", line: 10, seats: ["codex"], id: "a" }), f({ file: "a.mjs", line: 12, seats: ["grok"], id: "b", scope: "cross-cutting" })];
+  assert.equal(applyConsensusClusters(xcut, [[0, 1]]).merges.length, 0, "a cross-cutting peer blocks the merge");
+});
+
+test("applyConsensusClusters: conflicting fixLenses block the merge", () => {
+  const findings = [f({ file: "a.mjs", line: 10, seats: ["codex"], id: "a", fixLens: "correctness" }), f({ file: "a.mjs", line: 12, seats: ["grok"], id: "b", fixLens: "security_secrets" })];
+  assert.equal(applyConsensusClusters(findings, [[0, 1]]).merges.length, 0, "different fix-eligibility lenses → not the same fixable issue");
+});
+
+test("applyConsensusClusters: a merged finding's agents track the seat union (seatsOf agrees post-merge)", () => {
+  const findings = [f({ file: "a.mjs", line: 10, seats: ["codex"], agents: ["codex"], id: "a" }), f({ file: "a.mjs", line: 12, seats: ["grok"], agents: ["grok"], id: "b" })];
+  const { findings: out } = applyConsensusClusters(findings, [[0, 1]]);
+  assert.deepEqual(out[0].agents.sort(), ["codex", "grok"], "agents is set to the union so seatsOf reports 2 seats");
+});
+
+test("runConsensusMerge: a failed Grok result (non-zero status / timed out) is NOT parsed (council P2)", async () => {
+  const findings = [f({ file: "a.mjs", seats: ["codex"], id: "c" }), f({ file: "a.mjs", seats: ["grok"], id: "g" })];
+  const nonZero = await runConsensusMerge(findings, { grok: async () => ({ status: 1, stdout: '{ "clusters": [[0,1]] }' }) });
+  assert.equal(nonZero.merged, 0, "a non-zero exit is fail-soft, even with a parseable stdout fragment");
+  const timedOut = await runConsensusMerge(findings, { grok: async () => ({ status: 0, timedOut: true, stdout: '{ "clusters": [[0,1]] }' }) });
+  assert.equal(timedOut.merged, 0, "a timed-out call is fail-soft");
+});
+
 // --- runConsensusMerge (orchestrator) ----------------------------------------------------------------
 
 test("runConsensusMerge: end-to-end upgrades a cross-seat pair to consensus", async () => {

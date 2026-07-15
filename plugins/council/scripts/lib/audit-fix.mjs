@@ -138,7 +138,16 @@ export function isSensitiveClass(f) {
   // TRIM + lowercase BOTH sides (kept in sync with structure-gate.mjs's isSensitiveStructureClass):
   // category was case-folded but NOT trimmed and lens was exact, so "security " (trailing space) or
   // "Security_Secrets" mis-classified as non-sensitive would defeat the §6 consent gate.
-  return SENSITIVE_CATEGORIES.has(String(f?.category ?? "").trim().toLowerCase()) || SENSITIVE_LENSES.has(String(f?.lens ?? "").trim().toLowerCase());
+  // fixLens MUST be checked too (council diff-review P1): after reattribution the COVERAGE lens stays
+  // logical_sense while the native SENSITIVE lens moves into fixLens — a reattributed {category:"secret"|
+  // "injection"|"resource"|"data", fixLens:"security_secrets"|"concurrency_resources"|"data_integrity"} would
+  // otherwise pass the sensitive gate and never hit the §6 patch-review branch. Checking fixLens against
+  // SENSITIVE_LENSES catches every synonym category automatically (their fixLens IS a sensitive lens).
+  return (
+    SENSITIVE_CATEGORIES.has(String(f?.category ?? "").trim().toLowerCase()) ||
+    SENSITIVE_LENSES.has(String(f?.lens ?? "").trim().toLowerCase()) ||
+    SENSITIVE_LENSES.has(String(f?.fixLens ?? "").trim().toLowerCase())
+  );
 }
 
 /**

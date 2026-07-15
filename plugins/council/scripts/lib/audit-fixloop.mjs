@@ -364,13 +364,20 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // never cause demotion thrash (tier-fix council: re-entry guarded by exactly this).
   const autoFixable = (f) => f?.scope !== "cross-cutting" && f?.fixDisposition !== "propose-only";
 
-  // FIX-SIDE tier of a finding — the tier whose pass STAGES it, which is derived from the FIX-ELIGIBILITY
-  // lens (fixLens), NOT the coverage lens. A correctness bug surfaced under the logical_sense group (relens)
+  // FIX-SIDE tier of a finding — the tier whose pass STAGES it, derived from the FIX-ELIGIBILITY lens
+  // (fixLens), NOT the coverage lens. A correctness bug surfaced under the logical_sense group (relens)
   // carries lens=logical_sense (Tier 0, coverage) but fixLens=correctness (Tier 2): it must be staged when
   // the loop reaches Tier 2, alongside the native correctness findings — never at Tier 0 where nothing
-  // auto-applies. An explicit numeric f.tier still wins (set by the caller/plan). Coverage/reporting keep
-  // f.lens untouched; only the staging tier consults fixLens. See docs/logical-autofix-design.md.
-  const fixTierOf = (f) => (typeof f?.tier === "number" ? f.tier : tierOfLens(f?.fixLens ?? f?.lens));
+  // auto-applies. CRITICAL (council diff-review P1): applyTierGating stamps a numeric `f.tier` from the
+  // COVERAGE lens BEFORE this runs, so a reattributed finding must consult its fixLens tier FIRST — else the
+  // coverage-derived tier (0) drags it back to a propose-only tier and the reattributed bug is never staged
+  // (the whole feature was inert on the default gate path). Only a NON-reattributed finding honours a
+  // caller/plan-set numeric tier. Coverage/reporting keep f.lens untouched; only the staging tier uses fixLens.
+  const fixTierOf = (f) => {
+    const fl = f?.fixLens;
+    if (fl && fl !== f?.lens) return tierOfLens(fl); // reattributed → operative tier is the fixLens tier, always
+    return typeof f?.tier === "number" ? f.tier : tierOfLens(f?.lens);
+  };
 
   if (options.resume) {
     const prior = deps.loadCheckpoint ? deps.loadCheckpoint() : loadFixLoopCheckpoint(cwd);
@@ -857,17 +864,17 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     // seats (so the finding reads as CONSENSUS, which unblocks the fix consensus gate for reattributed logical
     // bugs) and drops the duplicate so the fixer isn't offered it twice. FAIL-SOFT: deps.consensusMerge returns
     // the input unchanged on any Grok error, and the whole step no-ops when the dep is unwired (bare/test callers).
-    let gateFindings = gateInput;
+    let mergedGateInput = gateInput;
     if (typeof deps.consensusMerge === "function" && passNo % CONSENSUS_MERGE_EVERY === 1) {
       try {
         const r = await deps.consensusMerge(gateInput, { pass: passNo });
-        if (r && Array.isArray(r.findings)) gateFindings = r.findings;
+        if (r && Array.isArray(r.findings)) mergedGateInput = r.findings;
       } catch {
         /* fail-soft: gating proceeds on the un-merged findings */
       }
     }
 
-    const gated = gate(gateFindings, { changedFiles, pass: passNo });
+    const gated = gate(mergedGateInput, { changedFiles, pass: passNo });
     for (const p of gated.surfaced ?? []) {
       const k = proposedKey(p);
       if (!seenProposed.has(k)) {

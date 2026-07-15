@@ -53,6 +53,17 @@ test("ineligibleReason rejects §6 sensitive classes (auth/crypto/concurrency/da
   assert.equal(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", category: "correctness" }), null, "ordinary bugs stay fixable");
 });
 
+test("isSensitiveClass: a reattributed finding whose fixLens is sensitive is caught (council P1 — §6 bypass)", () => {
+  // Coverage lens stays logical_sense; the native sensitive lens lives in fixLens. Must still be sensitive.
+  assert.equal(isSensitiveClass({ category: "secret", lens: "logical_sense", fixLens: "security_secrets" }), true);
+  assert.equal(isSensitiveClass({ category: "resource", lens: "logical_sense", fixLens: "concurrency_resources" }), true);
+  assert.equal(isSensitiveClass({ category: "data", lens: "logical_sense", fixLens: "data_integrity" }), true);
+  // And the gate reflects it: such a finding stays propose-only without sensitiveAutoApply.
+  assert.match(ineligibleReason({ severity: "P1", scope: "localized", file: "a.mjs", consensus: "consensus", lens: "logical_sense", fixLens: "security_secrets", category: "secret" }), /sensitive/);
+  // A non-sensitive reattributed finding (fixLens correctness) is NOT falsely flagged sensitive.
+  assert.equal(isSensitiveClass({ category: "bug", lens: "logical_sense", fixLens: "correctness" }), false);
+});
+
 test("isSensitiveClass trims + case-folds BOTH category and lens (kept in sync with structure-gate's twin)", () => {
   // trailing-space category must still classify as sensitive (a normalizer/model slip)
   assert.equal(isSensitiveClass({ category: "security " }), true, "trailing-space category must still be sensitive");
