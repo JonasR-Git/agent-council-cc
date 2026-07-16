@@ -112,6 +112,23 @@ test("runCommandAsync without input closes stdin so stdin-readers see EOF", asyn
   assert.equal(result.timedOut, false);
 });
 
+test("runCommandAsync KILLS a never-exiting child at options.timeoutMs (the seat-CLI hang guard)", async (t) => {
+  // A seat CLI (grok/codex/claude) that never returns must NOT hang the caller forever. This is exactly
+  // what agents.mjs relies on by always passing a bounded timeoutMs (DEFAULT_AGENT_TIMEOUT_MS) — without a
+  // timeout, a hung grok.exe hung the whole fix loop live. A child that sleeps 60s under a ~300ms cap must
+  // come back promptly as timedOut with status 124.
+  const start = Date.now();
+  const result = await runCommandAsync(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { timeoutMs: 300 });
+  if (spawnBlocked(result)) {
+    t.skip("child_process.spawn is blocked by this sandbox");
+    return;
+  }
+  const elapsed = Date.now() - start;
+  assert.equal(result.timedOut, true, "a child that never exits is reported timedOut");
+  assert.equal(result.status, 124, "a timed-out child returns status 124");
+  assert.ok(elapsed < 5000, `expected the ~300ms cap to cut it short, took ${elapsed}ms`);
+});
+
 test("runCommandAsync timeout kills long-running process", async (t) => {
   const result = await runCommandAsync(
     process.execPath,

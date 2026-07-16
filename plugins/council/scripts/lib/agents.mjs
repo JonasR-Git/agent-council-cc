@@ -9,6 +9,15 @@ import { fileURLToPath } from "node:url";
 import { findGrokBinary } from "./discover.mjs";
 import { runCommandAsync } from "./process.mjs";
 
+// DEFAULT wall-clock cap for EVERY structured seat CLI call (grok/codex/claude/openrouter). Without it a
+// caller that does not thread options.agentTimeoutMs would pass timeoutMs=undefined, and runCommandAsync
+// (process.mjs) only arms its timeout when timeoutMs is set — so a hung seat CLI (observed live: a grok.exe
+// that never returned during a §6 patch review) hangs the ENTIRE fix loop indefinitely. A 5-minute floor
+// matches the fix-author/patch-reviewer defaults (audit-fix.mjs / audit-patch-reviewer.mjs) and turns a hung
+// call into a clean timedOut result → the fix attempt fails and is reverted/surfaced, never a dead run. An
+// explicit options.agentTimeoutMs still overrides it.
+export const DEFAULT_AGENT_TIMEOUT_MS = 300_000;
+
 // A read-only review never needs to write, execute, OR reach the network. This is the GROK
 // seat's built-in-tool DENY-list (passed to grok --disallowed-tools). It is FAIL-OPEN: any tool
 // grok exposes whose exact name is NOT enumerated stays allowed (unknown names are ignored per
@@ -266,7 +275,7 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
   if (grokEffort) args.push("--effort", grokEffort);
 
   try {
-    let result = await runCommandAsync(bin, args, { cwd, timeoutMs: options.agentTimeoutMs });
+    let result = await runCommandAsync(bin, args, { cwd, timeoutMs: options.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS });
     let retriedWithoutOverrides = false;
     // Valid model/effort ids depend on the CLI login (e.g. "grok models" may not
     // list a configured id at all). Rather than failing the whole round, retry
@@ -277,7 +286,7 @@ export async function runGrokStructured(cwd, backends, options, prompt) {
       !result.timedOut &&
       /invalid params|unknown model/i.test(`${result.stderr}\n${result.stdout}`)
     ) {
-      result = await runCommandAsync(bin, baseArgs, { cwd, timeoutMs: options.agentTimeoutMs });
+      result = await runCommandAsync(bin, baseArgs, { cwd, timeoutMs: options.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS });
       retriedWithoutOverrides = true;
     }
     let stdout = result.stdout;
@@ -336,7 +345,7 @@ export async function runCodexCli(cwd, backends, options, prompt) {
   const lastMsgFile = path.join(os.tmpdir(), `council-codex-out-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
   const args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never", "--output-last-message", lastMsgFile];
   if (options.codexModel) args.push("--model", options.codexModel);
-  const result = await runCommandAsync(bin, args, { cwd, input: String(prompt ?? ""), timeoutMs: options.agentTimeoutMs });
+  const result = await runCommandAsync(bin, args, { cwd, input: String(prompt ?? ""), timeoutMs: options.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS });
   let finalMessage = "";
   try {
     finalMessage = fs.readFileSync(lastMsgFile, "utf8");
@@ -390,7 +399,7 @@ export async function runCodexStructured(cwd, backends, options, prompt, label) 
   try {
     const result = await runCommandAsync(process.execPath, args, {
       cwd,
-      timeoutMs: options.agentTimeoutMs
+      timeoutMs: options.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS
     });
     // The adversarial-review fallback only carries a short focus string, never
     // the structured prompt — it can only stand in for a plain R1 review.
@@ -405,7 +414,7 @@ export async function runCodexStructured(cwd, backends, options, prompt, label) 
       fallbackArgs.push(focus);
       const fb = await runCommandAsync(process.execPath, fallbackArgs, {
         cwd,
-        timeoutMs: options.agentTimeoutMs
+        timeoutMs: options.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS
       });
       return buildAgentResult("codex", "codex-companion-adversarial-fallback", fb, {
         model: options.codexModel ?? "(default)",
