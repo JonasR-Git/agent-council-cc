@@ -252,3 +252,53 @@ test("fix phase heartbeat: a reporter that throws never breaks a fix (telemetry 
   );
   assert.equal(out.fixed.length, 1, "the fix committed despite a throwing reporter");
 });
+
+// WHERE DO FIXES DIE? The run reported `proposed: N` but never at WHICH gate the work was lost, so
+// diagnosing a 0-commit run meant hours of forensics over a black box (and, twice, a wrong hypothesis).
+// One counter per revert site makes the funnel a live FACT the dashboard already renders.
+test("revert counters: each gate that kills a fix is attributed, not lumped into 'proposed'", async () => {
+  const cases = [
+    // [label, deps override, options, expected counter]
+    ["enforceTouched", { applyFix: async () => git.setChanged(["a.mjs", "sneaky.mjs"]) }, {}, "revertTouched"],
+    // The oracle gate only ARMS when its baseline is green (else a pre-existing red would revert every
+    // fix). So the fake must answer green ONCE for the baseline probe, then red for the post-fix check —
+    // a flat `ok:false` disables the gate instead of tripping it, and would silently test nothing.
+    [
+      "oracle",
+      (() => {
+        let calls = 0;
+        return { applyFix: async () => git.setChanged(["a.mjs"]), runOracle: async () => ({ ok: ++calls === 1 }) };
+      })(),
+      {},
+      "revertOracle"
+    ],
+    ["test red", { applyFix: async () => git.setChanged(["a.mjs"]), runTests: async () => ({ ok: false }) }, {}, "revertTestRed"],
+    ["test timeout", { applyFix: async () => git.setChanged(["a.mjs"]), runTests: async () => ({ ok: false, timedOut: true }) }, {}, "revertTestTimeout"]
+  ];
+  let git;
+  for (const [label, over, opts, counter] of cases) {
+    git = fakeGit();
+    const { reporter } = reporterWithSink();
+    await runAuditFix(tmp(), [loc({ file: "a.mjs", title: label })], {}, { reporter, ...opts }, baseDeps(git, over));
+    const snap = reporter.snapshot();
+    assert.equal(snap.counters[counter], 1, `${label} → ${counter} must be counted exactly once`);
+    assert.equal(snap.counters.fixed ?? 0, 0, `${label} must not report a fix`);
+  }
+});
+
+test("revert counters: a deterministic test-red and a test TIMEOUT are never conflated", async () => {
+  // A red is a real signal (the fix or the test is wrong); a timeout is noise. Counting them together
+  // would hide the one number that matters for the test-arbitration work.
+  const git = fakeGit();
+  const { reporter } = reporterWithSink();
+  await runAuditFix(
+    tmp(),
+    [loc({ file: "a.mjs", title: "times out" })],
+    {},
+    { reporter },
+    baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]), runTests: async () => ({ ok: false, timedOut: true }) })
+  );
+  const c = reporter.snapshot().counters;
+  assert.equal(c.revertTestTimeout, 1);
+  assert.equal(c.revertTestRed ?? 0, 0, "a timeout must NOT count as a deterministic red");
+});

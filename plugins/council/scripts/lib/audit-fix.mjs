@@ -743,6 +743,11 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           const guard = enforceTouched(changed, task.file);
           if (!guard.ok) {
             revert(snapshot);
+            // WHERE DO FIXES DIE? `proposed: 390` told us fixes were lost but never at WHICH gate, so every
+            // diagnosis was guesswork over hours. One counter per revert site turns that into a fact the
+            // dashboard shows live. This one is not hypothetical: it was caught twice in a live run, where the
+            // writer extracted a helper module (the finding asked for exactly that) and lost ALL the work here.
+            reporter.counter("revertTouched");
             rejected.push({ finding, reason: `touched files outside target: ${guard.violations.join(", ")}` });
             log(`  reverted — touched ${guard.violations.join(", ")}`);
             continue;
@@ -754,6 +759,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           const cAfter = contentProtectionReason(afterSource);
           if (cAfter) {
             revert(snapshot);
+            reporter.counter("revertProtectedContent");
             rejected.push({ finding, reason: `fix introduced protected content: ${cAfter}` });
             log(`  reverted — fix introduced protected content (${cAfter})`);
             continue;
@@ -766,6 +772,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             const viol = snapshotViolation(source, afterSource);
             if (viol) {
               revert(snapshot);
+              reporter.counter("revertExportSurface");
               rejected.push({ finding, reason: `export surface changed (${viol})` });
               log(`  reverted — export surface changed (${viol})`);
               continue;
@@ -784,6 +791,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             const cov = changedLines.length === 0 ? { allCovered: true, uncovered: [] } : coverageOfLines(options.coverage, task.file, changedLines);
             if (!cov.allCovered) {
               revert(snapshot);
+              reporter.counter("revertCoverage");
               rejected.push({ finding, reason: `changed lines not executed by any test (${cov.uncovered.length} uncovered) → propose-only` });
               log(`  reverted — changed lines uncovered (coverage gate)`);
               continue;
@@ -801,6 +809,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
                 log(`  oracle timed out — gate skipped for this fix`);
               } else {
                 revert(snapshot);
+                reporter.counter("revertOracle");
                 rejected.push({ finding, reason: `oracle regression (${oracleName})` });
                 log(`  reverted — oracle regression (${oracleName})`);
                 continue;
@@ -812,6 +821,9 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             const t = await runTests();
             if (!t.ok) {
               revert(snapshot);
+              // Split the two: a deterministic red is a real signal (the fix or the test is wrong — the loop
+              // cannot yet tell those apart), a timeout is just noise. Counting them together would hide that.
+              reporter.counter(t.timedOut ? "revertTestTimeout" : "revertTestRed");
               // F-A: tag ONLY a DETERMINISTIC test-red (not a timeout) with testRed:true. enforceTouched
               // already passed above, so the fix stayed IN-FILE yet the suite went red — a strong cross-file
               // coupling / semantic signal the fix loop escalates after N reds. A TIMEOUT is transient/flaky
@@ -834,6 +846,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             }
             if (!verdict.pass) {
               revert(snapshot);
+              reporter.counter("revertCharTest");
               rejected.push({ finding, reason: `§5 char-test: ${verdict.reason} → propose-only` });
               log(`  reverted — §5 char-test failed (${verdict.reason})`);
               continue;
@@ -858,6 +871,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             if (typeof git.diffText !== "function") {
               reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
               revert(snapshot);
+              reporter.counter("revertCouncil");
               rejected.push({ finding, reason: "§6 council: cannot produce a diff to review → propose-only" });
               log(`  reverted — §6 no diff available for council review`);
               continue;
@@ -869,6 +883,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             } catch (err) {
               reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
               revert(snapshot);
+              reporter.counter("revertCouncil");
               rejected.push({ finding, reason: `§6 council review error: ${String(err?.message ?? err)} → propose-only` });
               log(`  reverted — §6 council review error`);
               continue;
@@ -879,6 +894,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             if (!councilVerdict.approved) {
               reporter.gate({ name: "§6-council", state: "veto" });
               revert(snapshot);
+              reporter.counter("revertCouncil");
               rejected.push({ finding, reason: `§6 council not unanimous (${councilVerdict.summary}) → propose-only`, council: councilVerdict });
               log(`  reverted — §6 council not unanimous (${councilVerdict.summary})`);
               continue;
@@ -890,6 +906,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             if (!postReview.ok) {
               reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
               revert(snapshot);
+              reporter.counter("revertCouncil");
               rejected.push({ finding, reason: `§6 changed set drifted during review (${postReview.violations.join(", ")}) → propose-only`, council: councilVerdict });
               log(`  reverted — §6 changed set drifted during review`);
               continue;
@@ -904,6 +921,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               if (git.stageAndDiffCached(task.file, snapshot) !== diff) {
                 reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
                 revert(snapshot);
+                reporter.counter("revertCouncil");
                 rejected.push({ finding, reason: "§6 reviewed bytes changed during review (staged diff drift) → propose-only", council: councilVerdict });
                 log(`  reverted — §6 reviewed bytes drifted during review`);
                 continue;
@@ -912,6 +930,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             } else if (git.diffText(task.file, snapshot) !== diff) {
               reporter.gate({ name: "§6-council", state: "veto" }); // terminal: never leave the gate "running"
               revert(snapshot);
+              reporter.counter("revertCouncil");
               rejected.push({ finding, reason: "§6 reviewed bytes changed during review (diff drift) → propose-only", council: councilVerdict });
               log(`  reverted — §6 reviewed bytes drifted during review`);
               continue;
