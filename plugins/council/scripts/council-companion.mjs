@@ -3142,7 +3142,14 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
     // Same disclosure the --loop path emits (see emitConsentUseDisclosure): a consented gate that never
     // fired is an unreachable feature, and this path used to stay silent about it. BEFORE the --json return
     // so automation gets it too.
-    emitConsentUseDisclosure(consent, reporter, out);
+    //
+    // Disclose the EFFECTIVE consent, not the CONFIGURED one: this path wires no §6 patch reviewer, so
+    // runAuditFix forces the sensitive consent off (audit-fix.mjs: `Boolean(options.sensitiveAutoApply) &&
+    // typeof deps.reviewPatch === "function"`) — which is exactly why :3103 warns about it above. Passing the
+    // configured consent here would report that DELIBERATELY inert gate as a facade: 0 gate runs with
+    // candidates present. That is the crying-wolf failure the detector is designed to avoid, and a warning
+    // on a correct run is worse than no warning at all — it teaches the reader to ignore the real one.
+    emitConsentUseDisclosure({ ...(consent ?? {}), sensitiveAutoApply: false }, reporter, out);
     if (options.json) {
       outputResult(out, true);
       return;
