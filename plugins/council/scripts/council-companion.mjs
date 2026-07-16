@@ -46,6 +46,7 @@ import { runGroupedReview } from "./lib/audit-grouped-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectCoverageCmd, detectTestCmd, isSensitiveClass, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
 import { isStructureClass } from "./lib/structure-gate.mjs";
+import { buildLoopOpts } from "./lib/fix-loop-opts.mjs";
 import { evaluateResumeGuard, loadFixLoopCheckpoint, runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { DEFAULT_CEILING, mergeUsageSnapshots, parsePause5hOption, parseUsageCeiling, readUsageSnapshot } from "./lib/usage-guard.mjs";
@@ -2932,33 +2933,27 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
       // B5: per-tier convergence (structure → correctness → quality) is ON by default so a
       // Structure/SSOT consolidation lands before Correctness runs on the consolidated code; --flat
       // opts out (single flat convergence).
-      const loopOpts = {
-        budget: loopBudget, maxPasses, dryStreak, maxUnits, perTierConvergence: !options.flat,
-        // F-B: thread the structure consent into the loop so runFixLoop derives a CAPABILITY-AWARE
-        // FIRST_TIER. Without this the loop's static floor (2) filtered every tier-0/1 structure finding
-        // out BEFORE fix() saw it, so `audit fix --loop --structure-auto-apply` silently no-op'd the
-        // enabled transformer (only --flat worked). The inner :2619 runAuditFix `structureAutoApply:true`
-        // on the impl seam stays — that consents the PER-PASS fixer; this consents the tier FLOOR.
+      // SSOT — see lib/fix-loop-opts.mjs. This object used to be built inline here, unreachable by any test,
+      // so the suite hand-rolled 165 approximations of it and drifted (that is how the M9 facade survived a
+      // green suite). Tests MUST call buildLoopOpts too; then CLI/test divergence is impossible.
+      const loopOpts = buildLoopOpts({
+        budget: loopBudget,
+        maxPasses,
+        dryStreak,
+        maxUnits,
+        flat: options.flat,
         structureAutoApply,
-        // WAVE 2: pin the sweep mode + the ledger's true base branch into the run so runFixLoop drives
-        // scheduling/tier-advance off the durable ledger and a resume can't flip the mode.
-        epochSweep, ledgerBaseBranch: baseBranch,
-        retryOnLimit: options["retry-on-limit"], retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined,
-        logicalProposals: logical.findings, usageCeiling, usageSince, pause5h, reporter, onProgress: reporter.line,
-        // B: the mid-pass checkpoint-and-resume quota guard — on the grouped path a quota breach quiesces
-        // the pass (finish the in-flight cell, flush partial findings + cursor) and emits the SAME
-        // hard-stop / pause the between-pass backstop does. Inert on the per-file path (no cells).
-        midPassGuard: true,
-        // C: durable findings SSOT (audit-findings.jsonl) — the grouped review appends each finding as
-        // discovered; the gate reads the accumulated ledger; the dashboard tails it. Autonomous FIXING
-        // fails CLOSED if the store can't be opened (no untracked fix ever lands).
-        durableFindings: true,
-        failClosedFindings: true,
-        // D: deterministic correlation — one writer per same-file cluster; multi-file / cross-cutting /
-        // SSOT clusters escalate to proposal instead of a symptom fix. Uses the model's import graph.
-        correlate: true,
-        correlateImporters: model.graph?.importers ?? {}
-      };
+        epochSweep,
+        baseBranch,
+        retryOnLimit: options["retry-on-limit"],
+        retryLimit: options["retry-limit"] != null ? Number(options["retry-limit"]) : undefined,
+        logicalProposals: logical.findings,
+        usageCeiling,
+        usageSince,
+        pause5h,
+        reporter,
+        importers: model.graph?.importers ?? {}
+      });
       // C3/M10: --supervise wraps the loop in the endless supervisor so a multi-hour autonomous run
       // survives rate-limit resets — a resumable stop (throttled/backends-down/did-not-run) waits
       // reset-aware then --resumes from the checkpoint; a terminal convergence returns as normal.

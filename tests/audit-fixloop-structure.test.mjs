@@ -26,6 +26,7 @@ import path from "node:path";
 
 import { runFixLoop } from "../plugins/council/scripts/lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "../plugins/council/scripts/lib/audit-fixloop-deps.mjs";
+import { buildLoopOpts } from "../plugins/council/scripts/lib/fix-loop-opts.mjs";
 import { runAuditFix } from "../plugins/council/scripts/lib/audit-fix.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "council-fixloop-structure-"));
@@ -128,16 +129,23 @@ function loopHarness({ consent = false, runner = null, reviewFindings }) {
     }
   };
   const deps = makeFixLoopDeps(cwd, model, {}, {}, impl);
-  // HARNESS FIDELITY: the CLI threads the structure consent into BOTH places — the runAuditFix impl seam
-  // above AND runFixLoop's own options (council-companion.mjs:2941 `structureAutoApply,` inside loopOpts).
-  // This harness used to thread only the seam, so runFixLoop itself always saw structureAutoApply as
-  // undefined. Every loop-level decision keyed on it (the tier floor, the tier plan's per-tier `fix` flag,
-  // the correlate exemption) was therefore exercised in a configuration the CLI NEVER runs — which is
-  // exactly how the M9 starvation stayed invisible behind a green suite. Mirror the CLI: consent ⇒ both.
+  // HARNESS FIDELITY: build the loop options with the SAME function the CLI uses (lib/fix-loop-opts.mjs),
+  // never by hand. This harness used to thread the structure consent ONLY into the runAuditFix impl seam,
+  // so runFixLoop itself always saw structureAutoApply as undefined and every loop-level decision keyed on
+  // it (tier floor, per-tier `fix`, the correlate exemption) ran in a configuration the CLI NEVER uses —
+  // which is exactly how the M9 starvation hid behind a green suite. Going through buildLoopOpts makes that
+  // whole class of drift impossible: a key the CLI sets cannot be silently missing here.
+  // The two EXPLICIT opt-outs below are the only deviations, and they are visible on purpose: this harness
+  // injects no durable findings store, and runFixLoop refuses to start fail-closed without one.
   const run = (opts = {}) =>
     runFixLoop(
       cwd,
-      { budget: 40, maxPasses: 6, dryStreak: 2, ...(consent ? { structureAutoApply: true } : {}), ...opts },
+      {
+        ...buildLoopOpts({ budget: 40, maxPasses: 6, dryStreak: 2, structureAutoApply: consent, flat: true }),
+        durableFindings: false,
+        failClosedFindings: false,
+        ...opts
+      },
       { ...deps, checkpoint: () => {} }
     );
   return { run, git, reviewScopes, reviewCalls: () => reviewCalls, fixCalls: () => fixCalls };
@@ -176,7 +184,13 @@ test("M9×M3: WITHOUT consent the runner is NEVER called — and the default loo
   assert.equal(ran, 0, "no structureAutoApply === true → the transform machinery is inert");
   assert.equal(outNoConsent.fixed.length, 0);
   assert.equal(outNoConsent.proposed.length, 1, "the structural finding is surfaced as a proposal, never dropped");
-  assert.match(outNoConsent.proposed[0].rejectedReason, /cross-cutting → propose-only/);
+  // The REASON is correlate's, not ineligibleReason's. This assertion used to expect the latter
+  // ("cross-cutting → propose-only", produced INSIDE runAuditFix) — which only happens when correlate is
+  // off, i.e. in a configuration the CLI never runs. Now that the harness builds its options with the CLI's
+  // own buildLoopOpts (correlate: true), the finding is escalated to a proposal one step EARLIER and never
+  // reaches runAuditFix at all. The safety properties asserted around this line are unchanged and still
+  // hold; only the reason string was documenting a fiction.
+  assert.match(outNoConsent.proposed[0].rejectedReason, /correlation: cross-cutting \/ SSOT \/ propose-only cluster/);
   assert.deepEqual(noConsent.git.calls, [], "the tree is never touched — no branch, no commit, no reset");
 
   // The TRUE default (no runner, no consent — the CLI passes no impl seam at all without the
