@@ -51,7 +51,7 @@ import { evaluateResumeGuard, loadFixLoopCheckpoint, runFixLoop } from "./lib/au
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { DEFAULT_CEILING, mergeUsageSnapshots, parsePause5hOption, parseUsageCeiling, readUsageSnapshot } from "./lib/usage-guard.mjs";
 import { booleanOptionsFor, fixConfigBooleans, fixConfigValues, loopBudgetCeiling, negatableFlags, valueOptionsFor } from "./lib/cli-registry.mjs";
-import { CONSENT_ENV_VAR, LOCAL_CONSENT_FILE, evaluateAckWrite, formatConsentBanner, formatConsentUseDisclosure, resolveConsents, writeConsentAck } from "./lib/consent.mjs";
+import { CONSENT_ENV_VAR, LOCAL_CONSENT_FILE, consentCandidatesFrom, evaluateAckWrite, formatConsentBanner, formatConsentUseDisclosure, resolveConsents, writeConsentAck } from "./lib/consent.mjs";
 import { route } from "./lib/cli-dispatch.mjs";
 import { assertCodeWriteAllowed } from "./lib/cli-mutation.mjs";
 import { explainHintsFromDispatch, formatExplainTable, hasExplainFlag, hasJsonFlag, isExplainableVerb, resolveExplain } from "./lib/cli-explain.mjs";
@@ -2988,12 +2988,7 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
       // nothing and errors never. Printed to stderr EVEN under --json (mirrors the banner): a consent that
       // silently does nothing must never be invisible to automation. Best-effort — a reporter without a
       // snapshot (NOOP) yields no counters, which the pure formatter reports as "unknown" and never warns.
-      {
-        const counters = reporter?.snapshot?.()?.counters ?? {};
-        const seen = [...(out.proposed ?? []), ...(out.fixed ?? []).map((f) => f?.finding ?? f)].filter(Boolean);
-        const candidates = { structure: seen.filter(isStructureClass).length, sensitive: seen.filter(isSensitiveClass).length };
-        for (const line of formatConsentUseDisclosure(consent, { counters, candidates })) console.error(line);
-      }
+      emitConsentUseDisclosure(consent, reporter, out);
       // A crash or a failed return-to-base is a HARD failure: non-zero exit so automation never reads it
       // as success. On a crash, surface it and stop before the report renderers (which assume loop fields).
       if (supervisorCrashed) {
@@ -3144,6 +3139,10 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
       recordAuditMetrics(cwd, "fix", { wallClockMs: Date.now() - tFix, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, rejected: out.rejected?.length ?? 0, ledgerResolved: out.ledgerResolved ?? 0, integrationFailed: Boolean(out.integrationFailed) }, nowIso());
     }
     reporter.done({ ok: out.ok !== false, stopReason: out.aborted ?? null });
+    // Same disclosure the --loop path emits (see emitConsentUseDisclosure): a consented gate that never
+    // fired is an unreachable feature, and this path used to stay silent about it. BEFORE the --json return
+    // so automation gets it too.
+    emitConsentUseDisclosure(consent, reporter, out);
     if (options.json) {
       outputResult(out, true);
       return;
@@ -3989,6 +3988,28 @@ export function makeBuildStepDeps(root, cwd, backends, options, buildGit) {
     // refuses under any skip flag and build-step computes the required set with EMPTY options.
     reviewStep: makeBuildStepReviewer(cwd, backends, options)
   };
+}
+
+/**
+ * FACADE DETECTION at the end of a fix run — the closing counterpart to the effective-policy banner. The
+ * banner says what was CONSENTED; this says what the consent actually DID (lib/consent.mjs explains why a
+ * runtime count is the only thing that catches an unreachable feature).
+ *
+ * ONE helper for BOTH the --loop and the single-shot path, deliberately: it was first wired only into the
+ * loop, so a bare `fix` silently lost the warning — the detector for half-wired features was itself half
+ * wired. Duplicating the block instead would have re-created exactly the CLI/test drift buildLoopOpts was
+ * extracted to kill.
+ *
+ * The two paths report different shapes, which is the whole reason this normalises: the loop returns
+ * flattened `proposed` findings, the single-shot path returns `rejected: [{ finding, reason }]`.
+ * Best-effort throughout: a reporter without snapshot() yields no counters, which the pure formatter
+ * reports as "unknown" and never warns about. Prints to stderr EVEN under --json, mirroring the banner —
+ * a consent that quietly does nothing must not be invisible to automation.
+ */
+function emitConsentUseDisclosure(consent, reporter, out) {
+  const counters = reporter?.snapshot?.()?.counters ?? {};
+  const candidates = consentCandidatesFrom(out, { isStructure: isStructureClass, isSensitive: isSensitiveClass });
+  for (const line of formatConsentUseDisclosure(consent, { counters, candidates })) console.error(line);
 }
 
 // --- M9 `audit fix --structure-auto-apply` REAL adapters (the CLI-owned deps of runStructureTransform)

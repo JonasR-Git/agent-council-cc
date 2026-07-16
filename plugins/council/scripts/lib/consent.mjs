@@ -430,3 +430,25 @@ export function formatConsentUseDisclosure(resolution, { counters = {}, candidat
   }
   return lines;
 }
+
+/**
+ * Count the findings of each consent class a fix run actually SAW — the denominator formatConsentUseDisclosure
+ * needs to tell a facade (`candidates > 0, gate ran 0×`) from correct silence (`candidates 0, ran 0×`).
+ *
+ * Pure; the class predicates are INJECTED rather than imported, which keeps this module free of a dependency
+ * on audit-fix/structure-gate (and of the import cycle that would come with it).
+ *
+ * Exists as its own export because the two fix paths report DIFFERENT shapes and the normalisation is the
+ * part that can silently go wrong: the --loop path returns flattened `proposed` findings, while the
+ * single-shot path returns `rejected: [{ finding, reason }]`. Reading the wrong one yields 0 candidates,
+ * which makes the detector go quiet exactly when it should shout — a facade detector that is itself a
+ * facade. Living inline in the CLI it was untestable; here it is pinned.
+ */
+export function consentCandidatesFrom(out, { isStructure = () => false, isSensitive = () => false } = {}) {
+  const seen = [
+    ...(Array.isArray(out?.proposed) ? out.proposed : []),
+    ...(Array.isArray(out?.rejected) ? out.rejected.map((r) => r?.finding ?? r) : []),
+    ...(Array.isArray(out?.fixed) ? out.fixed.map((f) => f?.finding ?? f) : [])
+  ].filter(Boolean);
+  return { structure: seen.filter((f) => Boolean(isStructure(f))).length, sensitive: seen.filter((f) => Boolean(isSensitive(f))).length };
+}

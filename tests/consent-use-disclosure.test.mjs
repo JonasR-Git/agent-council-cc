@@ -70,3 +70,44 @@ test("tolerates a missing resolution / options entirely", () => {
   assert.deepEqual(formatConsentUseDisclosure(undefined), []);
   assert.deepEqual(formatConsentUseDisclosure(null, {}), []);
 });
+
+// consentCandidatesFrom normalises the TWO different result shapes the fix paths return. Getting this wrong
+// yields 0 candidates, which silences the detector exactly when it should shout — a facade detector that is
+// itself a facade. (Which is not hypothetical: the disclosure was first wired ONLY into the --loop path, so a
+// bare `fix` lost the warning entirely.)
+import { consentCandidatesFrom } from "../plugins/council/scripts/lib/consent.mjs";
+
+const isStruct = (f) => f?.lens === "architecture_ssot";
+const isSens = (f) => f?.lens === "data_integrity";
+const preds = { isStructure: isStruct, isSensitive: isSens };
+
+test("counts the --loop shape (flattened `proposed` findings)", () => {
+  const out = { proposed: [{ lens: "architecture_ssot" }, { lens: "data_integrity" }, { lens: "correctness" }] };
+  assert.deepEqual(consentCandidatesFrom(out, preds), { structure: 1, sensitive: 1 });
+});
+
+test("counts the SINGLE-SHOT shape (`rejected: [{finding, reason}]`) — the shape that was being missed", () => {
+  const out = { rejected: [{ finding: { lens: "architecture_ssot" }, reason: "x" }, { finding: { lens: "data_integrity" }, reason: "y" }] };
+  assert.deepEqual(consentCandidatesFrom(out, preds), { structure: 1, sensitive: 1 });
+});
+
+test("an APPLIED finding still counts as a candidate (it was offered to the gate)", () => {
+  const out = { fixed: [{ finding: { lens: "architecture_ssot" }, commit: "abc" }] };
+  assert.deepEqual(consentCandidatesFrom(out, preds), { structure: 1, sensitive: 0 });
+});
+
+test("both shapes at once, and junk entries never throw or inflate the count", () => {
+  const out = {
+    proposed: [{ lens: "architecture_ssot" }, null],
+    rejected: [{ finding: { lens: "architecture_ssot" } }, { reason: "no finding key" }],
+    fixed: [undefined]
+  };
+  // 2 real structure findings; `{reason}` has no finding → falls back to the entry itself → not structural.
+  assert.deepEqual(consentCandidatesFrom(out, preds), { structure: 2, sensitive: 0 });
+});
+
+test("a missing/garbage result degrades to zeros instead of throwing", () => {
+  assert.deepEqual(consentCandidatesFrom(undefined, preds), { structure: 0, sensitive: 0 });
+  assert.deepEqual(consentCandidatesFrom({ proposed: "not-an-array" }, preds), { structure: 0, sensitive: 0 });
+  assert.deepEqual(consentCandidatesFrom({ proposed: [{}] }), { structure: 0, sensitive: 0 }, "no predicates → never claims a candidate");
+});
