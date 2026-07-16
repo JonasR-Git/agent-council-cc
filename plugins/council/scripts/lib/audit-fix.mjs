@@ -641,7 +641,28 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     } catch (err) {
       return { ok: false, error: `could not open integration branch: ${String(err?.message ?? err)}` };
     }
-    reporter.phase("fix", `${tasks.length} targets`);
+    // Telemetry is BEST-EFFORT everywhere in this function: a reporter fault must never break a fix or
+    // strand a half-applied patch. (The phase call below used to be unguarded — a throwing reporter would
+    // have aborted runAuditFix before a single finding ran.)
+    const safePhase = (detail) => {
+      try {
+        reporter.phase("fix", detail);
+      } catch {
+        /* ignore */
+      }
+    };
+    safePhase(`${tasks.length} targets`);
+    // LIVENESS (extends 3f951f8 to the fix phase): "N targets" was the LAST progress stamp until the whole
+    // pass ended. A target is a FILE, but the loop below runs per FINDING, and each finding costs an agent
+    // write (up to 300s) + typecheck + the FULL suite — so a 2-target pass ran 100+ MINUTES with progress.json
+    // frozen. Nothing distinguished working / looping / hung: not the timestamp, not CPU (an LLM call is
+    // network-blocked at ~0%), not the phase. Even with full code access the run was un-diagnosable. So stamp
+    // the CURRENT finding and the CURRENT step — a run must always be able to say what it is doing.
+    const fixTotal = tasks.reduce((n, t) => n + (t.findings?.length ?? 0), 0);
+    let fixDone = 0;
+    // fixDone is incremented at the TOP of each finding iteration (never at the bottom — the body has a dozen
+    // `continue` exits, so a bottom increment would silently under-count and the counter would lie).
+    const fixStep = (step, file) => safePhase(`${fixDone}/${fixTotal} ${step} — ${file}`);
 
     // Oracle state (docs/enterprise-fix-design.md §6): none (no oracle) | disabled
     // (baseline not green / opted out) | active. Only gate when the tree is green to
@@ -663,6 +684,8 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     for (const task of tasks) {
       if (fatalAbort) break;
       for (const finding of task.findings) {
+        fixDone += 1;
+        fixStep("starting", task.file);
         const snapshot = git.head();
         const source = readFile(task.file);
         if (source.length > MAX_FIX_BYTES) {
@@ -681,6 +704,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         }
         const prompt = buildFixPrompt(task.file, source, finding);
         log(`fix: ${finding.severity} ${task.file} — ${finding.title}`);
+        fixStep("authoring", task.file);
         // §5 char-test ACCEPT (on the CLEAN tree, BEFORE the refactor): pin the target's behaviour with a
         // generated, deterministic, non-vacuous test. Only for behaviour-preserving refactor classes; a
         // correctness/security fix INTENDS to change behaviour and is not char-test-gated. Fail-closed:
@@ -770,6 +794,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           // NOT a regression: skip the gate for this fix rather than revert a
           // possibly-correct change.
           if (oracleState === "active") {
+            fixStep(`typecheck (${oracleName})`, task.file);
             const o = await runOracle();
             if (!o.ok) {
               if (o.timedOut) {
@@ -783,6 +808,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             }
           }
           if (gated) {
+            fixStep("full test suite", task.file);
             const t = await runTests();
             if (!t.ok) {
               revert(snapshot);

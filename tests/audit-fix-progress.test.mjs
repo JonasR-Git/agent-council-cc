@@ -207,3 +207,48 @@ test("runAuditFix without a reporter is unchanged (NOOP fallback, no throw)", as
   const out = await runAuditFix(tmp(), [loc({ file: "a.mjs", title: "fix me" })], {}, {}, baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]) }));
   assert.equal(out.fixed.length, 1, "omitting options.reporter falls back to NOOP_REPORTER and changes nothing");
 });
+
+// LIVENESS in the fix phase (extends the 3f951f8 wait-heartbeat). The only stamp used to be
+// `fix: N targets`, where a target is a FILE -- but the loop runs per FINDING, and each finding costs an
+// agent write (up to 300s) + typecheck + the FULL suite. A live 2-target pass therefore sat 100+ MINUTES
+// with progress.json frozen, and NOTHING could tell working from looping from hung: not the timestamp,
+// not CPU (an LLM call is network-blocked at ~0%), not the phase. These pin that a run can always say
+// which finding it is on and which step it is in.
+test("fix phase heartbeat: every finding + expensive step stamps a phase (the 100-min blackbox)", async () => {
+  const git = fakeGit();
+  const { reporter } = reporterWithSink();
+  const phases = [];
+  const spy = { ...reporter, phase: (p, d) => (phases.push(`${p}|${d}`), reporter.phase(p, d)) };
+  // TWO findings in the SAME file -> one "target", two per-finding iterations.
+  const findings = [loc({ file: "a.mjs", title: "first" }), loc({ file: "a.mjs", title: "second" })];
+  const out = await runAuditFix(
+    tmp(),
+    findings,
+    {},
+    { reporter: spy, oracleGate: false },
+    baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]) })
+  );
+  assert.equal(out.fixed.length, 2, "both findings still commit — the heartbeat is additive");
+
+  assert.ok(phases.includes("fix|1 targets"), "the original target announcement is preserved");
+  // The counter must run over FINDINGS (2), not targets (1) — that mismatch is what hid the cost.
+  assert.ok(phases.some((p) => p.startsWith("fix|1/2 ")), "finding 1 of 2 announced");
+  assert.ok(phases.some((p) => p.startsWith("fix|2/2 ")), "finding 2 of 2 announced");
+  // The expensive steps must be nameable, or a stall is again indistinguishable from work.
+  assert.ok(phases.some((p) => /^fix\|\d+\/2 authoring — a\.mjs$/.test(p)), "the agent write is announced");
+  assert.ok(phases.some((p) => /^fix\|\d+\/2 full test suite — a\.mjs$/.test(p)), "the suite run is announced");
+});
+
+test("fix phase heartbeat: a reporter that throws never breaks a fix (telemetry is best-effort)", async () => {
+  const git = fakeGit();
+  const { reporter } = reporterWithSink();
+  const hostile = { ...reporter, phase: () => { throw new Error("reporter exploded"); } };
+  const out = await runAuditFix(
+    tmp(),
+    [loc({ file: "a.mjs", title: "fix me" })],
+    {},
+    { reporter: hostile, oracleGate: false },
+    baseDeps(git, { applyFix: async () => git.setChanged(["a.mjs"]) })
+  );
+  assert.equal(out.fixed.length, 1, "the fix committed despite a throwing reporter");
+});
