@@ -12,11 +12,13 @@ import { runCommandAsync } from "./process.mjs";
 // DEFAULT wall-clock cap for EVERY structured seat CLI call (grok/codex/claude/openrouter). Without it a
 // caller that does not thread options.agentTimeoutMs would pass timeoutMs=undefined, and runCommandAsync
 // (process.mjs) only arms its timeout when timeoutMs is set — so a hung seat CLI (observed live: a grok.exe
-// that never returned during a §6 patch review) hangs the ENTIRE fix loop indefinitely. A 5-minute floor
-// matches the fix-author/patch-reviewer defaults (audit-fix.mjs / audit-patch-reviewer.mjs) and turns a hung
-// call into a clean timedOut result → the fix attempt fails and is reverted/surfaced, never a dead run. An
-// explicit options.agentTimeoutMs still overrides it.
-export const DEFAULT_AGENT_TIMEOUT_MS = 300_000;
+// that never returned during a §6 patch review) hangs the ENTIRE fix loop indefinitely. This is a HANG
+// backstop, NOT a tight SLA, so it is deliberately GENEROUS: a large fix (a big source file in the prompt)
+// or a multi-seat §6 review can legitimately take several minutes, and clipping those would cause false
+// reverts. 10 minutes gives comfortable headroom for any realistic single LLM call while still turning a
+// TRUE hang (idle/indefinite) into a clean timedOut result → the fix attempt fails and is reverted/surfaced,
+// never a dead run. An explicit options.agentTimeoutMs still overrides it in either direction.
+export const DEFAULT_AGENT_TIMEOUT_MS = 600_000;
 
 // A read-only review never needs to write, execute, OR reach the network. This is the GROK
 // seat's built-in-tool DENY-list (passed to grok --disallowed-tools). It is FAIL-OPEN: any tool
