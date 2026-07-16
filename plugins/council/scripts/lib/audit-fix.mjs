@@ -14,7 +14,7 @@ import { retryOnRateLimit } from "./audit-retry.mjs";
 import { coverageOfLines, ingestCoverage, parseDiffLines } from "./audit-coverage-ingest.mjs";
 import { ensureStateDir, nowIso, resolveStateDir, workspaceRoot } from "./state.mjs";
 import { wrapMarkdownFence } from "./markdown-fence.mjs";
-import { NOOP_REPORTER } from "./progress.mjs";
+import { NOOP_REPORTER, observableWait } from "./progress.mjs";
 
 // Audit V3 - the SAFE auto-fix path. The council's hard-won rule holds:
 //   detect -> propose -> verify -> fix ONLY what is provably safe + tested.
@@ -525,7 +525,10 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
   const withLimitRetry = options.retryOnLimit
     ? (fn) => retryOnRateLimit(fn, {
         retries: Math.max(1, Math.min(20, options.retryLimit ?? 5)),
-        sleep: deps.sleep,
+        // Observable backoff (see audit-fixloop): the real-run fallback heartbeats via the reporter
+        // so a multi-minute wait at the model-call layer keeps progress.json fresh instead of looking
+        // hung. `reporter` is declared below but only read when this closure runs, deep in the fix loop.
+        sleep: deps.sleep ?? ((ms) => observableWait(ms, { reporter, reason: "rate-limit backoff" })),
         onRetry: ({ attempt, ms }) => log(`  rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt})`)
       })
     : (fn) => fn();

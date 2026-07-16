@@ -24,7 +24,7 @@ import { recordAndAnnotate } from "./ledger.mjs";
 import { buildEvidence } from "./deliberate.mjs";
 import { shouldVerify, verifyFindings } from "./verify.mjs";
 import { nowIso, workspaceRoot } from "./state.mjs";
-import { NOOP_REPORTER } from "./progress.mjs";
+import { NOOP_REPORTER, observableWait } from "./progress.mjs";
 
 // SSOT (Wave 2 G): the review-eligibility size ceiling. EXPORTED so the sweep manifest builder
 // (audit-fixloop-deps) imports the SAME constant AND the same `>` comparison — manifest eligibility and
@@ -193,7 +193,11 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
     models,
     maxInflight: options.maxInflight,
     retryOnLimit: options.retryOnLimit,
-    sleep: deps.sleep,
+    // Observable per-cell backoff: a single throttled cell can back off up to several minutes; a bare
+    // setTimeout froze progress.json for that stretch and made the whole review pass look hung (this is
+    // the likeliest trigger of the CubeServHub kills). The real-run fallback heartbeats via the reporter;
+    // tests still inject deps.sleep. cellsDone stamps advance between cells; this covers the WITHIN-cell wait.
+    sleep: deps.sleep ?? ((ms) => observableWait(ms, { reporter, reason: "rate-limit backoff (review cell)" })),
     guard,
     onRetry: progress ? ({ attempt, ms }) => progress(`  cell rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt})…`) : undefined,
     onCell: (r) => {

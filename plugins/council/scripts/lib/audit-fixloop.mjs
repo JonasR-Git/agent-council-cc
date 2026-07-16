@@ -14,7 +14,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { dedupeNew, endlessKey, endlessStopReason } from "./audit-endless.mjs";
-import { NOOP_REPORTER } from "./progress.mjs";
+import { NOOP_REPORTER, observableWait } from "./progress.mjs";
 import { readUsageSnapshot } from "./usage-guard.mjs";
 import { MAX_AUTONOMOUS_WAIT_MS, evaluateBetweenPassGuards } from "./audit-loop-guards.mjs";
 import { retryOnRateLimit } from "./audit-retry.mjs";
@@ -194,7 +194,13 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // retry backoff — both default to real setTimeout).
   const pause5h = options.pause5h && typeof options.pause5h === "object" && options.pause5h.enabled ? options.pause5h : null;
   const nowFn = typeof deps.now === "function" ? deps.now : () => Date.now();
-  const sleepFn = typeof deps.sleep === "function" ? deps.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+  // Long in-process waits (the --pause-at-5h quota wait here; the rate-limit backoff below) must stay
+  // OBSERVABLY ALIVE or a watcher/monitor mistakes the silent sleep for a hang and kills a healthy run.
+  // Tests inject deps.sleep (kept byte-identical); a real run's default sleep heartbeats via the reporter.
+  const sleepFn =
+    typeof deps.sleep === "function"
+      ? deps.sleep
+      : (ms) => observableWait(ms, { reporter, reason: "quota pause — waiting for 5h window reset" });
 
   // C — the DURABLE findings SSOT + the reviewed-cell CURSOR (B). Both are OPT-IN so the pure unit
   // tests (injected review/fix, no fs) stay byte-identical:
@@ -252,7 +258,10 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   const withLimitRetry = options.retryOnLimit
     ? (fn) => retryOnRateLimit(fn, {
         retries: clamp(options.retryLimit ?? 5, 1, 20),
-        sleep: deps.sleep,
+        // Observable backoff so a multi-minute rate-limit wait keeps progress.json fresh (a bare
+        // setTimeout froze it, and a monitor then killed the healthy backing-off run). Tests inject
+        // deps.sleep; the real-run fallback heartbeats via the reporter.
+        sleep: deps.sleep ?? ((ms) => observableWait(ms, { reporter, reason: "rate-limit backoff" })),
         onRetry: ({ attempt, ms }) => onProgress(`rate-limited — backing off ${Math.round(ms / 1000)}s (retry ${attempt}/${clamp(options.retryLimit ?? 5, 1, 20)})…`)
       })
     : (fn) => fn();

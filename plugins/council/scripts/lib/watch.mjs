@@ -508,6 +508,10 @@ function normalizeProgressState(state) {
   // not finished-green — surface a distinct "paused" status so the dashboard shows ⏸️, not 🟢 (B residual).
   const paused = !failed && phase === "paused";
   const done = failed || s.done === true || phase === "done";
+  // Liveness during a long in-process wait (rate-limit backoff / --pause-at-5h quota wait). Surfaced so a
+  // watcher SEES the run is alive-and-waiting (not hung) with a countdown; suppressed once terminal.
+  const wRaw = s.waiting && typeof s.waiting === "object" && !Array.isArray(s.waiting) ? s.waiting : null;
+  const waiting = wRaw && !done ? { reason: asStr(wRaw.reason, 80), remainingMs: asNum(wRaw.remainingMs), resumeAt: asTs(wRaw.resumeAt) } : null;
   return {
     kind: asStr(s.kind, 40),
     jobId: asStr(s.jobId, 60),
@@ -524,10 +528,24 @@ function normalizeProgressState(state) {
     budget,
     etaMs: asNum(s.etaMs),
     recent,
+    waiting,
     done,
     status: failed ? "failed" : paused ? "paused" : done ? "done" : "running",
     stopReason: asStr(s.stopReason, 100)
   };
+}
+
+// Human one-liner for an active in-process wait, e.g. "waiting: rate-limit backoff — resuming in 3m12s".
+// Prefers a fresh countdown from resumeAt vs the render clock (remainingMs is a stamp snapshot, up to one
+// heartbeat stale); falls back to the stamped remainingMs. Returns null when nothing renderable.
+function formatWaiting(waiting, nowMs) {
+  if (!waiting || typeof waiting !== "object") return null;
+  const reason = waiting.reason || "waiting";
+  let remaining = null;
+  if (Number.isFinite(waiting.resumeAt) && Number.isFinite(nowMs)) remaining = waiting.resumeAt - nowMs;
+  if (remaining == null || remaining < 0) remaining = Number.isFinite(waiting.remainingMs) ? waiting.remainingMs : null;
+  const eta = remaining != null && remaining > 0 ? ` — resuming in ~${formatDuration(remaining)}` : "";
+  return `waiting: ${reason}${eta}`;
 }
 
 // Elapsed (startedAt -> nowMs, frozen at updatedAt once done) + remaining ETA,
@@ -600,6 +618,8 @@ function renderProgressBox(state, { nowMs, width } = {}) {
   if (n.title) lines.push(row(n.title));
   lines.push(row([n.jobId ?? "-", n.status, ...progressTimeParts(n, nowMs)].join("  │  ")));
   if (n.phase || n.phaseDetail) lines.push(row(`phase  ${[n.phase ?? "?", n.phaseDetail].filter(Boolean).join(" — ")}`));
+  const waitLine = formatWaiting(n.waiting, nowMs);
+  if (waitLine) lines.push(row(`⏳ ${waitLine}`));
   if (n.stopReason) lines.push(row(`stop   ${n.stopReason}`));
 
   if (n.seats.length) {
@@ -666,6 +686,8 @@ function renderProgressMarkdown(state, { prior, nowMs } = {}) {
   const meta = [`**${n.status}**`, ...progressTimeParts(n, nowMs)];
   if (n.phase || n.phaseDetail) meta.push(`phase \`${n.phase ?? "?"}\`${n.phaseDetail ? ` — ${n.phaseDetail}` : ""}`);
   L.push(meta.join(" · "));
+  const pmWait = formatWaiting(n.waiting, nowMs);
+  if (pmWait) L.push(`> ⏳ ${pmWait}`); // liveness callout: a backing-off / paused run is ALIVE, not hung
   L.push("");
 
   if (hasUnits(n) || hasPasses(n)) {
@@ -865,6 +887,8 @@ function renderRunDashboardMarkdown(progressState, { usage, ceiling, prior, nowM
   if (hasUnits(n)) status.push(`\`${progressBar(n.progress.unitsDone ?? 0, n.progress.unitsTotal ?? 0, 8)}\` ${unitsText(n.progress.unitsDone, n.progress.unitsTotal, "?")}`);
   if (n.phaseDetail) status.push(n.phaseDetail);
   L.push(status.join(" · "));
+  const mdWait = formatWaiting(n.waiting, nowMs);
+  if (mdWait) L.push(`> ⏳ ${mdWait}`); // liveness callout: a backing-off / paused run is ALIVE, not hung
   L.push("");
 
   // Seats & Quota — raised, weekly quota, Claude 5h, tokens this run, and a bar vs the ceiling.

@@ -50,6 +50,12 @@ export function initialProgressState({ kind = null, title = null, jobId = null, 
     recentLines: [],
     usage: null,
     usageCeiling: null,
+    // Liveness during a long IN-PROCESS wait that emits no other events: a rate-limit backoff
+    // (up to ~15 min) or a --pause-at-5h quota wait (up to hours) otherwise freezes updatedAt, so
+    // a watcher/monitor can't tell a healthy waiting run from a dead one and KILLS it. `waiting`
+    // (set by observableWait, cleared to null when the wait ends) carries the reason + a live
+    // countdown, and every waiting stamp advances updatedAt — the proof-of-life the monitor needs.
+    waiting: null,
     done: false,
     ok: null,
     stopReason: null
@@ -208,6 +214,23 @@ export function mergeProgressEvent(state, event) {
     case "eta":
       next.etaMs = Number.isFinite(e.ms) ? e.ms : null;
       break;
+    case "waiting": {
+      // Set/refresh (or clear, on null) the transient liveness-wait descriptor. Each stamp also
+      // advances updatedAt (via the shared `at`), so a monitor watching progress.json freshness
+      // sees a backoff/pause as ALIVE-and-waiting, not hung. Fields are sanitized fail-soft.
+      const w = e.waiting;
+      if (w == null || typeof w !== "object" || Array.isArray(w)) {
+        next.waiting = null;
+        break;
+      }
+      const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+      next.waiting = {
+        reason: String(w.reason ?? "waiting").slice(0, 80),
+        remainingMs: num(w.remainingMs),
+        resumeAt: typeof w.resumeAt === "string" ? w.resumeAt : null
+      };
+      break;
+    }
     case "line": {
       const lines = Array.isArray(base.recentLines) ? base.recentLines.slice() : [];
       lines.push(String(e.line ?? ""));
@@ -219,6 +242,7 @@ export function mergeProgressEvent(state, event) {
       next.done = true;
       next.ok = e.ok ?? null;
       next.stopReason = e.stopReason ?? null;
+      next.waiting = null; // a terminal run is not waiting on anything
       // Terminal phase mirrors the outcome; ok=null (unknown) still reads "done". An explicit
       // `phase` overrides that default so a terminal-but-not-completed state (e.g. "paused": a
       // --pause-at-5h suspend that exits 75 pending --resume) reads as SUSPENDED, not finished-green.
@@ -265,6 +289,9 @@ export const NOOP_REPORTER = Object.freeze({
   usage() {
     return NOOP_REPORTER;
   },
+  waiting() {
+    return NOOP_REPORTER;
+  },
   line() {
     return NOOP_REPORTER;
   },
@@ -296,6 +323,7 @@ export function mutedFindingsReporter(reporter) {
     budget: (...a) => (base.budget(...a), wrapper),
     eta: (...a) => (base.eta(...a), wrapper),
     usage: (...a) => (base.usage?.(...a), wrapper),
+    waiting: (...a) => (base.waiting?.(...a), wrapper),
     line: (...a) => (base.line(...a), wrapper),
     done: (...a) => (base.done(...a), wrapper),
     snapshot: () => base.snapshot()
@@ -361,6 +389,10 @@ export function makeProgressReporter({
   // Stash the latest per-model usage snapshot (+ optional active ceiling) into progress.json so the
   // live dashboard renders real quota without its own I/O. Additive + fail-soft like every other event.
   reporter.usage = (snapshot, ceiling) => apply({ type: "usage", usage: snapshot, ceiling });
+  // Liveness during a long in-process wait: `info = { reason, remainingMs, resumeAt }` refreshes the
+  // waiting descriptor (and advances updatedAt); `null` clears it. Driven by observableWait so a
+  // rate-limit backoff / quota pause stays observably alive to a watcher instead of looking hung.
+  reporter.waiting = (info) => apply({ type: "waiting", waiting: info });
   reporter.line = (msg) => {
     try {
       logSink(msg); // verbatim - byte-compatible with today's onProgress
@@ -375,4 +407,53 @@ export function makeProgressReporter({
 
   persist(); // announce the run immediately so watchers see it from second zero
   return reporter;
+}
+
+/**
+ * Sleep `totalMs` while keeping progress.json OBSERVABLY ALIVE. A rate-limit backoff (up to
+ * ~15 min) or a --pause-at-5h quota wait (up to hours) emits no other events, so a bare
+ * `setTimeout` freezes updatedAt for the whole wait — a live dashboard or an autonomous monitor
+ * then can't distinguish a healthy waiting run from a dead/hung one and KILLS it (this is exactly
+ * why the CubeServHub fix loop kept getting killed mid-backoff). Breaks the wait into <=stepMs
+ * chunks; before each chunk it stamps `reporter.waiting({ reason, remainingMs, resumeAt })` — which
+ * advances updatedAt AND surfaces a live countdown — and clears the waiting state when the wait ends
+ * (including on throw). Pure + injectable: `sleep(ms)` and `clock()` (ms-since-epoch) default to the
+ * real timers/clock, so tests drive it deterministically. Returns a Promise that resolves after the
+ * full wait. A non-positive/NaN totalMs resolves immediately without touching the reporter.
+ */
+export async function observableWait(totalMs, { reporter = NOOP_REPORTER, reason = "waiting", stepMs = 20_000, sleep, clock } = {}) {
+  const total = Number(totalMs);
+  if (!Number.isFinite(total) || total <= 0) return;
+  const rep = reporter ?? NOOP_REPORTER;
+  const doSleep = typeof sleep === "function" ? sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+  const nowMs = typeof clock === "function" ? clock : () => Date.now();
+  const step = Math.max(1, Math.min(Number(stepMs) > 0 ? Number(stepMs) : 20_000, total));
+  const startedAt = nowMs();
+  const endsAt = startedAt + total;
+  const resumeAt = (() => {
+    try {
+      return new Date(endsAt).toISOString();
+    } catch {
+      return null;
+    }
+  })();
+  try {
+    for (;;) {
+      const remaining = endsAt - nowMs();
+      if (remaining <= 0) break;
+      try {
+        rep.waiting?.({ reason, remainingMs: remaining, resumeAt });
+      } catch {
+        /* fail-soft: telemetry must never break the wait */
+      }
+      // eslint-disable-next-line no-await-in-loop -- a wait IS sequential by construction
+      await doSleep(Math.min(step, remaining));
+    }
+  } finally {
+    try {
+      rep.waiting?.(null);
+    } catch {
+      /* fail-soft */
+    }
+  }
 }
