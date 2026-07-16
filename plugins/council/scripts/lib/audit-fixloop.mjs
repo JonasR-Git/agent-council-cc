@@ -26,7 +26,7 @@ import { findingCountsByFile, findingsStorePath, makeFindingsAppender, readFindi
 import { makeMidPassGuard, makeReviewCursor, reviewCursorPath } from "./audit-midpass-guard.mjs";
 import { normalizeFindings } from "./audit-normalize.mjs";
 import { correlateFindings } from "./audit-correlate.mjs";
-import { STRUCTURE_LENSES } from "./structure-gate.mjs";
+import { STRUCTURE_LENSES, isStructureClass } from "./structure-gate.mjs";
 import { expectedKeys, manifestDigest, posixKeyPath, reviewerSetHash, scopeGroupsForTier, sortManifest } from "./audit-tier-sweep.mjs";
 
 // NOTE: an in-process multi-hour autonomous pause wait is FRAGILE — the machine/terminal must stay up —
@@ -960,9 +960,25 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
       if (escalated.length) {
         const escIds = new Set(escalated.flatMap((c) => c.findingIds.map(String)));
         const isEsc = (f, i) => escIds.has(String(f?.id ?? f?.fingerprint ?? `f${i}`));
+        // M9 STARVATION FIX: correlate escalates every cross-cutting / SSOT / propose-only finding OUT of
+        // `actionable`. That is RIGHT while the only writer is the single-file fixer — it cannot apply a
+        // multi-file consolidation, so auto-fixing one member of the cluster patches a symptom. But the M9
+        // structure pass IS the multi-file writer, and it draws its inputs ONLY from runAuditFix's
+        // `rejected` (audit-fix.mjs:934) — which is only ever populated by findings that REACHED fix().
+        // Dropping them here therefore starved M9 to ZERO attempts: --structure-auto-apply was consented,
+        // wired and reachable, yet every structural finding died at this filter and the transform never ran
+        // once (measured on CubeServHub: 1550/1557 proposals carried this escalation reason, 0 transforms).
+        // Two individually-correct features cancelling out — the same class as the FIX #0 import-edge
+        // starvation noted above. So: with the operator's structure consent, a structure-class finding STAYS
+        // actionable. Nothing is auto-patched by the single-file writer regardless — classifyFixable still
+        // rejects it as cross-cutting; it lands in `rejected`, and M9 attempts it under its FULL ladder
+        // (plan-declared file boundary, suite green, public API provably unchanged, UNANIMOUS §6 over the
+        // exact staged diff), reverting to a proposal on any gate failure. Without the consent, or for a
+        // non-structure finding, the escalation is unchanged.
+        const m9Handles = (f) => options.structureAutoApply === true && isStructureClass(f);
         for (let i = 0; i < actionable.length; i += 1) {
           const f = actionable[i];
-          if (!isEsc(f, i)) continue;
+          if (!isEsc(f, i) || m9Handles(f)) continue;
           // F-E: the removed multi-file-dependency escalation is GONE — this reason must not claim it.
           const p = { ...f, rejectedReason: "correlation: cross-cutting / SSOT / propose-only cluster — escalated to proposal (not auto-fixed)" };
           const k = proposedKey(p);
@@ -971,7 +987,7 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
             proposedAll.push(p);
           }
         }
-        actionable = actionable.filter((f, i) => !isEsc(f, i));
+        actionable = actionable.filter((f, i) => !isEsc(f, i) || m9Handles(f));
       }
     }
     // F-A: exclude a TEST-RED-PROMOTED finding from staging so its tier can dry-advance instead of being

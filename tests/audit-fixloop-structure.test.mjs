@@ -128,7 +128,18 @@ function loopHarness({ consent = false, runner = null, reviewFindings }) {
     }
   };
   const deps = makeFixLoopDeps(cwd, model, {}, {}, impl);
-  const run = (opts = {}) => runFixLoop(cwd, { budget: 40, maxPasses: 6, dryStreak: 2, ...opts }, { ...deps, checkpoint: () => {} });
+  // HARNESS FIDELITY: the CLI threads the structure consent into BOTH places — the runAuditFix impl seam
+  // above AND runFixLoop's own options (council-companion.mjs:2941 `structureAutoApply,` inside loopOpts).
+  // This harness used to thread only the seam, so runFixLoop itself always saw structureAutoApply as
+  // undefined. Every loop-level decision keyed on it (the tier floor, the tier plan's per-tier `fix` flag,
+  // the correlate exemption) was therefore exercised in a configuration the CLI NEVER runs — which is
+  // exactly how the M9 starvation stayed invisible behind a green suite. Mirror the CLI: consent ⇒ both.
+  const run = (opts = {}) =>
+    runFixLoop(
+      cwd,
+      { budget: 40, maxPasses: 6, dryStreak: 2, ...(consent ? { structureAutoApply: true } : {}), ...opts },
+      { ...deps, checkpoint: () => {} }
+    );
   return { run, git, reviewScopes, reviewCalls: () => reviewCalls, fixCalls: () => fixCalls };
 }
 
@@ -246,4 +257,37 @@ test("M9×M3: a STRANDED transform aborts the LOOP on that pass — no later pas
   // (abort; zero further passes) holds; only the reason STRING is conflated. If the loop ever
   // threads fx.aborted into the stop reason, flip this assertion to match the true cause.
   assert.ok(!/unrestorable|stranded/i.test(out.stopReason), "pins the current (conflated) reason text — see comment above");
+});
+
+// REGRESSION (the M9 starvation): every test above runs the loop WITHOUT `correlate`, but the CLI
+// ALWAYS passes correlate:true (council-companion.mjs:2958). correlate escalates every cross-cutting /
+// SSOT / propose-only finding OUT of `actionable` — and since the M9 pass draws its inputs ONLY from
+// runAuditFix's `rejected` (populated exclusively by findings that REACHED fix()), that escalation made
+// the transform runner unreachable on the ONLY code path users actually run. The suite stayed green while
+// the consented feature was dead in production: measured on CubeServHub, 1550/1557 proposals carried the
+// correlation escalation reason and runStructureTransform was called ZERO times across 17 passes.
+// These two pin the CLI's real configuration, so the facade cannot come back.
+test("M9×M3 + correlate (the CLI's real config): a structural finding still REACHES the transform runner", async () => {
+  const offered = [];
+  const runner = async (args, ctx) => {
+    offered.push({ args, ctx });
+    return { ok: false, reason: "gate not satisfied (test stub)" };
+  };
+  const h = loopHarness({ consent: true, runner, reviewFindings: oncePass1 });
+  await h.run({ correlate: true }); // <- the ONLY difference from the passing test above
+
+  assert.equal(offered.length, 1, "correlate must not starve M9: the structural finding still reached the runner");
+  assert.equal(offered[0].args.finding.lens, "architecture_ssot");
+});
+
+test("correlate still escalates a structural finding to a proposal WITHOUT the structure consent", async () => {
+  // The exemption is consent-bound: no consent → no multi-file writer exists → escalating is correct.
+  const h = loopHarness({ consent: false, runner: null, reviewFindings: oncePass1 });
+  const out = await h.run({ correlate: true });
+  assert.equal(out.fixed.length, 0, "nothing auto-applies without the consent");
+  const reasons = (out.proposed ?? []).map((p) => String(p.rejectedReason ?? ""));
+  assert.ok(
+    reasons.some((r) => /correlation: cross-cutting/.test(r)),
+    "without consent the correlation escalation is unchanged — the finding stays a visible proposal"
+  );
 });
