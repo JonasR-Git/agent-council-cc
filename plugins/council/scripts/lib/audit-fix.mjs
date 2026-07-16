@@ -821,6 +821,11 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           let councilVerdict = null;
           let councilCommitStaged = false;
           if (sensitiveAutoApply && isSensitiveClass(finding)) {
+            // FACADE DETECTION: count the gate's REAL invocations. A consent the operator granted whose
+            // gate then runs 0× means the feature is unreachable, not idle — exactly how the M9 starvation
+            // (9ce65a7) hid for 17 passes behind a green suite. consentUseDisclosure() turns this count
+            // into a loud warning at the end of the run. A fact, not an expectation.
+            reporter.counter("sensitiveGates");
             reporter.gate({ name: "§6-council", state: "running" });
             // The reviewers judge the EXACT patch; without a real diff we fail closed
             // rather than hand them the whole file as if it were the change.
@@ -936,6 +941,10 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         if (!isStructureClass(entry?.finding)) continue;
         const snapshot = git.head();
         let res;
+        // FACADE DETECTION: see the §6 counter above. THIS is the counter that would have exposed the M9
+        // starvation on day one — structure_auto_apply was consented, wired and reachable, yet this line
+        // was never once executed on a real run (0 across 17 passes over 907 structural findings).
+        reporter.counter("structureAttempts");
         try {
           res = await withLimitRetry(() => deps.runStructureTransform({ finding: entry.finding, snapshot }, { git, options, now: deps.now }));
         } catch (err) {

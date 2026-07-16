@@ -44,12 +44,13 @@ import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs"
 import { activeReviewerCount, runAuditReview } from "./lib/audit-review.mjs";
 import { runGroupedReview } from "./lib/audit-grouped-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
-import { detectCoverageCmd, detectTestCmd, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
+import { detectCoverageCmd, detectTestCmd, isSensitiveClass, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
+import { isStructureClass } from "./lib/structure-gate.mjs";
 import { evaluateResumeGuard, loadFixLoopCheckpoint, runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
 import { DEFAULT_CEILING, mergeUsageSnapshots, parsePause5hOption, parseUsageCeiling, readUsageSnapshot } from "./lib/usage-guard.mjs";
 import { booleanOptionsFor, fixConfigBooleans, fixConfigValues, loopBudgetCeiling, negatableFlags, valueOptionsFor } from "./lib/cli-registry.mjs";
-import { CONSENT_ENV_VAR, LOCAL_CONSENT_FILE, evaluateAckWrite, formatConsentBanner, resolveConsents, writeConsentAck } from "./lib/consent.mjs";
+import { CONSENT_ENV_VAR, LOCAL_CONSENT_FILE, evaluateAckWrite, formatConsentBanner, formatConsentUseDisclosure, resolveConsents, writeConsentAck } from "./lib/consent.mjs";
 import { route } from "./lib/cli-dispatch.mjs";
 import { assertCodeWriteAllowed } from "./lib/cli-mutation.mjs";
 import { explainHintsFromDispatch, formatExplainTable, hasExplainFlag, hasJsonFlag, isExplainableVerb, resolveExplain } from "./lib/cli-explain.mjs";
@@ -2985,6 +2986,19 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
       // B: finalize telemetry via the shared helper — a --pause-at-5h stop (out.pause, below) is recorded
       // as a distinct "paused" phase, NOT done+ok, so the dashboard never shows a suspended run as done.
       finalizeLoopReporter(reporter, out, { ok: !out.stranded && !supervisorCrashed, stopReason: out.stopReason });
+      // FACADE DETECTION (the closing counterpart to the effective-policy banner at :2422). The banner says
+      // what was CONSENTED; this says what the consent actually DID. A consent whose gate fired 0× while
+      // findings of its class existed is an unreachable feature — the M9 starvation (9ce65a7) hid exactly
+      // that way for 17 passes behind a green suite, because a fail-closed path that is never reached logs
+      // nothing and errors never. Printed to stderr EVEN under --json (mirrors the banner): a consent that
+      // silently does nothing must never be invisible to automation. Best-effort — a reporter without a
+      // snapshot (NOOP) yields no counters, which the pure formatter reports as "unknown" and never warns.
+      {
+        const counters = reporter?.snapshot?.()?.counters ?? {};
+        const seen = [...(out.proposed ?? []), ...(out.fixed ?? []).map((f) => f?.finding ?? f)].filter(Boolean);
+        const candidates = { structure: seen.filter(isStructureClass).length, sensitive: seen.filter(isSensitiveClass).length };
+        for (const line of formatConsentUseDisclosure(consent, { counters, candidates })) console.error(line);
+      }
       // A crash or a failed return-to-base is a HARD failure: non-zero exit so automation never reads it
       // as success. On a crash, surface it and stop before the report renderers (which assume loop fields).
       if (supervisorCrashed) {

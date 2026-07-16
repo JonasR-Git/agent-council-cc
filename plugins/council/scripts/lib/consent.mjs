@@ -386,3 +386,47 @@ export function formatConsentBanner(resolution, { verb = "fix" } = {}) {
   const fp = resolution.fingerprint ? ` fingerprint=${resolution.fingerprint.slice(0, 12)}…` : " fingerprint=none";
   return `effective-policy [${verb}]: ${parts.join(" ")}${resolution.dryRun ? " dry_run=true" : ""}${fp}`;
 }
+
+/** Reporter counter that records each consent's gate ACTUALLY firing (audit-fix.mjs). */
+export const CONSENT_USE_COUNTER = Object.freeze({ structure: "structureAttempts", sensitive: "sensitiveGates" });
+
+/**
+ * FACADE DETECTION — the closing counterpart to formatConsentBanner. The banner says what the operator
+ * CONSENTED to; this says what that consent actually DID.
+ *
+ * Motivation (a real bug, not a hypothetical): --structure-auto-apply was consented, wired, reachable and
+ * covered by a green test — yet its transform ran ZERO times across 17 live passes over 907 structural
+ * findings, because an unrelated filter removed its inputs upstream (fixed in 9ce65a7). A fail-CLOSED path
+ * that is never reached raises no error and logs nothing; it is indistinguishable from "nothing to do".
+ * Tests could not catch it because they exercised a configuration the CLI never runs. So the only reliable
+ * detector is a RUNTIME FACT: how often did the gate actually fire?
+ *
+ * Judging it needs BOTH numbers, which is the whole point of taking `candidates`:
+ *   candidates 0, runs 0   → correct silence (no finding of that class existed). NOT a warning — crying
+ *                            wolf on a healthy run is how a real signal gets ignored.
+ *   candidates > 0, runs 0 → the consented path was NEVER reached though work existed → FACADE.
+ *   runs > 0               → the consent is live; the gate may still refuse (that is its job).
+ *
+ * Pure: no I/O, no clock. `counters` is progress.mjs's counter bag; `candidates` maps consent → how many
+ * findings of that class were offered this run (omit a key to state it is unknown, which never warns).
+ */
+export function formatConsentUseDisclosure(resolution, { counters = {}, candidates = {} } = {}) {
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
+  const lines = [];
+  for (const c of CONSENTS) {
+    const on = c === "structure" ? resolution?.structureAutoApply : resolution?.sensitiveAutoApply;
+    if (!on) continue; // not consented → the gate SHOULD be silent; nothing to disclose
+    const key = CONSENT_CONFIG_KEY[c];
+    const runs = num(counters?.[CONSENT_USE_COUNTER[c]]);
+    const cand = Object.hasOwn(candidates, c) ? num(candidates[c]) : null;
+    if (runs > 0) lines.push(`consent-use: ${key}=true — its gate ran ${runs}×.`);
+    else if (cand === null) lines.push(`consent-use: ${key}=true — its gate ran 0× (no candidate count available; 0 is only expected if no finding of this class was found).`);
+    else if (cand === 0) lines.push(`consent-use: ${key}=true — its gate ran 0×, and 0 findings of this class were found: correct silence.`);
+    else
+      lines.push(
+        `⚠ consent-use: ${key}=true but its gate ran 0× while ${cand} finding(s) of this class WERE found — ` +
+          `the consented path was never reached (an unreachable feature), so nothing could be auto-applied under it. This is a BUG, not a refusal.`
+      );
+  }
+  return lines;
+}
