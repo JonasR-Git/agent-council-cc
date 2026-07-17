@@ -399,8 +399,24 @@ function realGit(root) {
     diffLines: (file, ref) => parseDiffLines(g(["diff", "--unified=0", String(ref), "--", file]).stdout),
     // Full unified diff text of `file` vs `ref` — the exact patch handed to the §6
     // council seats for verification.
-    diffText: (file, ref) => g(["diff", String(ref), "--", file]).stdout
+    diffText: (file, ref) => g(["diff", String(ref), "--", file]).stdout,
+    // Flake-attribution probe (below): stash the just-written fix so the suite can run on the CLEAN
+    // baseline, then restore it. --include-untracked so a fix that added a file is stashed too. Returns
+    // false if there was nothing to stash or the op failed (caller then skips the probe, fails safe).
+    stashPush: () => g(["stash", "push", "--include-untracked", "-m", "audit-fix flake-attribution probe"]).status === 0,
+    stashPop: () => g(["stash", "pop"]).status === 0
   };
+}
+
+// Count of FAILING test files from a runner's output (vitest: "Test Files  N failed | M passed").
+// ANSI-stripped. Returns null when no such summary is present (caller then can't compare → fails safe).
+function parseFailingFileCount(output) {
+  const clean = String(output ?? "").replace(/\[[0-9;]*m/g, "");
+  const m = clean.match(/Test Files\s+(\d+)\s+failed/i);
+  if (m) return Number(m[1]);
+  // No failures reported in the summary at all → zero failing files (a green summary).
+  if (/Test Files\s+\d+\s+passed/i.test(clean) && !/failed/i.test(clean)) return 0;
+  return null;
 }
 
 /** Detect a coverage-producing command (project script) if the project defines one. */
@@ -854,6 +870,36 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
             if (t.ok && testRetries > 0) {
               reporter.counter("testFlakeCleared");
               log(`  test suite GREEN on retry ${testRetries} — the earlier red was a suite flake, not this fix`);
+            }
+            // Flake ATTRIBUTION (rate-independent): retries did not clear the red. Before blaming the fix,
+            // run the suite on the CLEAN baseline (this fix stashed away). If the baseline is ALSO red AND
+            // this fix does not INCREASE the count of failing test files, the failure is pre-existing/flaky
+            // and the fix did not cause it — reverting a correct fix over someone else's flaky test is the
+            // exact "wrong/flaky tests block correct fixes" bug the user asked to defend against. A fix that
+            // ADDS a failing file (a real regression) fails the count check and is still reverted. NOTE: the
+            // check is COUNT-based, not failing-set-based — a fix that breaks file X exactly as an unrelated
+            // flaky file Y flips green is not caught here (rare; the six-eyes review is the backstop).
+            if (!t.ok && !t.timedOut && typeof git.stashPush === "function" && typeof git.stashPop === "function") {
+              const postFails = parseFailingFileCount(t.output);
+              if (git.stashPush()) {
+                fixStep("baseline test suite (flake attribution)", task.file);
+                const base = await runTests();
+                const restored = git.stashPop();
+                if (!restored) {
+                  log(`  attribution aborted — could not restore the fix after the baseline probe (fail-safe revert)`);
+                } else if (base.ok || base.timedOut) {
+                  log(`  attribution: baseline suite is GREEN without this fix → this fix caused the red → reverting`);
+                } else {
+                  const baseFails = parseFailingFileCount(base.output);
+                  if (postFails != null && baseFails != null && postFails <= baseFails) {
+                    reporter.counter("committedOverFlake");
+                    log(`  attribution: suite ALREADY red without this fix (${baseFails} file(s) fail at baseline); this fix adds no new failing file (${postFails}) → pre-existing flake, NOT this fix → keeping the fix`);
+                    t = { ok: true, attributedFlake: true };
+                  } else {
+                    log(`  attribution: this fix INCREASES failing files (baseline ${baseFails ?? "?"} → post-fix ${postFails ?? "?"}) → a real regression → reverting`);
+                  }
+                }
+              }
             }
             if (!t.ok) {
               revert(snapshot);

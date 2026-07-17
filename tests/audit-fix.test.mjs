@@ -191,11 +191,15 @@ function fakeGit({ clean = true, repo = true } = {}) {
   const calls = [];
   let head = "base0000ffffffff";
   let changed = [];
+  let stashed = null;
   return {
     calls,
     setChanged(c) {
       changed = c;
     },
+    // Flake-attribution probe support: stash the working-tree change (tree → baseline) and restore it.
+    stashPush: () => { if (!changed.length) return false; calls.push(["stashPush"]); stashed = changed; changed = []; return true; },
+    stashPop: () => { if (stashed == null) return false; calls.push(["stashPop"]); changed = stashed; stashed = null; return true; },
     isRepo: () => repo,
     isClean: () => clean,
     head: () => head,
@@ -641,6 +645,44 @@ test("runAuditFix: a flaky test-red that clears on retry KEEPS the fix (no rever
   assert.equal(out.fixed.length, 1, "a flake that clears on retry must not revert a correct fix");
   assert.equal(out.failed.length, 0, "no failure recorded for a cleared flake");
   assert.ok(calls >= 2, "the suite was re-run after the flaky red");
+});
+
+test("runAuditFix: a red suite ALSO red at baseline (no new failing files) KEEPS the fix (flake attribution)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(
+    tmp(),
+    [loc({ file: "a.mjs", title: "inert-fix" })],
+    {},
+    {},
+    baseDeps(git, {
+      applyFix: async () => git.setChanged(["a.mjs"]),
+      // ALWAYS red with the SAME failing-file count whether the fix is present or stashed → a pre-existing
+      // flake the fix did not add. Must commit, not revert.
+      runTests: async () => ({ ok: false, output: "Test Files  1 failed | 55 passed (56)\n Tests  1 failed | 900 passed (901)" })
+    })
+  );
+  assert.equal(out.fixed.length, 1, "kept — the suite is red at baseline too; the fix added no failing file");
+  assert.equal(out.failed.length, 0, "not recorded as a failure");
+  assert.ok(git.calls.some((c) => c[0] === "stashPush"), "the baseline was probed via stash");
+});
+
+test("runAuditFix: a red suite GREEN at baseline reverts the fix (a real regression, not a flake)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(
+    tmp(),
+    [loc({ file: "a.mjs", title: "regression" })],
+    {},
+    {},
+    baseDeps(git, {
+      applyFix: async () => git.setChanged(["a.mjs"]),
+      // Red WITH the fix in the tree, GREEN once stashed → the fix caused it → revert.
+      runTests: async () => (git.changedFiles().length > 0
+        ? { ok: false, output: "Test Files  1 failed | 55 passed (56)" }
+        : { ok: true, output: "Test Files  56 passed (56)" })
+    })
+  );
+  assert.equal(out.fixed.length, 0, "a real regression is reverted even with attribution");
+  assert.equal(out.failed.length, 1, "recorded as a test failure");
 });
 
 test("runAuditFix refuses without git, on a dirty tree, and without a test gate", async () => {
