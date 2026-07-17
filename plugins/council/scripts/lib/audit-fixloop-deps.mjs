@@ -479,6 +479,11 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
         stayOnBranch: ctx.stayOnBranch,
         minSeverity: options.minSeverity ?? "P2",
         maxFixes: options.maxFixesPerPass ?? 10,
+        // The M9 structure pass needs its OWN per-pass cap: it iterates the ACCUMULATED structural backlog
+        // (measured: 1763 findings on a real repo) and each transform costs minutes, so uncapped a single
+        // pass runs for days and the loop never regains control. Same default as maxFixes — bounding WORK
+        // per pass, not the evidence horizon.
+        maxStructurePerPass: options.maxStructurePerPass ?? 10,
         allowUntested: options.allowUntested,
         coverage: options.coverage, // §5 coverage gate (a fix on an unexecuted line -> propose-only)
         // §6: consented council-gated auto-apply. sensitiveAutoApply only takes effect in

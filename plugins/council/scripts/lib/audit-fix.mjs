@@ -981,9 +981,27 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     // sensitiveAutoApply === true) and reverts on any gate failure. Without all of that, the finding
     // stays exactly where it was: a visible proposal.
     if (!fatalAbort && typeof deps.runStructureTransform === "function" && options.structureAutoApply === true) {
+      // PER-PASS CAP — mirrors the single-file writer's maxFixes. This loop is over the ACCUMULATED
+      // `rejected` set, which on a real repo is the whole structural backlog (measured: 1763 findings), and
+      // each transform costs a planner + author + a UNANIMOUS §6 council, i.e. MINUTES. Uncapped, ONE pass
+      // would run for days and never hand control back to the loop — no re-review, no tier advance, no
+      // quota checkpoint. The cap was harmless while M9 was starved (it never ran, 0 attempts across 17
+      // passes); unblocking it in 9ce65a7 woke a dormant unbounded loop. Bounding it here restores the
+      // loop's own "small passes × many of them" contract: each pass attempts a few, the next pass takes
+      // the rest, and quota/convergence guards get to run in between.
+      // Truncation is EXPLICIT, never silent (audit-cell-scheduler's rule): the skipped findings stay
+      // proposals with their reason and the log says how many were deferred.
+      const maxStructure = Number.isFinite(options.maxStructurePerPass) ? Math.max(1, Math.floor(options.maxStructurePerPass)) : 10;
+      let structureDone = 0;
+      let structureDeferred = 0;
       for (let i = rejected.length - 1; i >= 0; i -= 1) {
         const entry = rejected[i];
         if (!isStructureClass(entry?.finding)) continue;
+        if (structureDone >= maxStructure) {
+          structureDeferred += 1;
+          continue; // stays a proposal with its existing reason; the next pass picks it up
+        }
+        structureDone += 1;
         const snapshot = git.head();
         let res;
         // FACADE DETECTION: see the §6 counter above. THIS is the counter that would have exposed the M9
@@ -1013,6 +1031,12 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           entry.reason = `${entry.reason} · structure transform not applied: ${res?.reason ?? "gate not satisfied"}`;
           log(`  structure transform NOT applied — ${res?.reason ?? "gate not satisfied"}`);
         }
+      }
+      // NEVER truncate silently: a cap that hides what it dropped reads as "that was everything" when it
+      // was not. Say the number, and say it is deferred (not refused) — the next pass takes them.
+      if (structureDeferred > 0) {
+        reporter.counter("structureDeferred", structureDeferred);
+        log(`  structure: ${structureDone}/${structureDone + structureDeferred} attempted this pass — ${structureDeferred} deferred to the next pass (cap ${maxStructure})`);
       }
     }
 

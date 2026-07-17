@@ -725,3 +725,55 @@ test("M9: a transform that cannot restore the tree ABORTS the run as stranded (n
   assert.equal(out.ok, false);
   assert.equal(out.stranded, true, "an unrestorable tree is fatal — a later fix must never stage un-reviewed bytes");
 });
+
+// M9 PER-PASS CAP. The transform loop runs over the ACCUMULATED structural backlog (measured on a real
+// repo: 1763 findings) and each transform costs a planner + author + a UNANIMOUS section-6 council, i.e.
+// MINUTES. Uncapped, ONE pass runs for DAYS and never hands control back — no re-review, no tier advance,
+// no quota checkpoint. The gap was dormant while M9 was starved (0 attempts across 17 live passes) and only
+// became reachable when that starvation was fixed. These pin the bound and, just as important, that the cap
+// DEFERS rather than drops.
+test("M9 cap: at most maxStructurePerPass transforms run in one pass; the rest are DEFERRED, not dropped", async () => {
+  const git = fakeGit();
+  let ran = 0;
+  const findings = Array.from({ length: 25 }, (_, i) => structural({ file: `f${i}.mjs`, title: `ssot dup ${i}` }));
+  const out = await runAuditFix(
+    tmp(),
+    findings,
+    {},
+    { structureAutoApply: true, maxStructurePerPass: 3 },
+    baseDeps(git, { runStructureTransform: async () => { ran += 1; return { ok: false, reason: "gate not satisfied" }; } })
+  );
+  assert.equal(ran, 3, "exactly the cap ran — not all 25");
+  // Nothing is lost: every finding is still a visible proposal, capped ones included.
+  assert.equal(out.rejected.length, 25, "all 25 remain proposals — the cap defers, it never drops");
+});
+
+test("M9 cap: defaults to 10 when unset (an unbounded pass must never be the default)", async () => {
+  const git = fakeGit();
+  let ran = 0;
+  const findings = Array.from({ length: 25 }, (_, i) => structural({ file: `f${i}.mjs`, title: `ssot dup ${i}` }));
+  await runAuditFix(
+    tmp(),
+    findings,
+    {},
+    { structureAutoApply: true }, // no maxStructurePerPass
+    baseDeps(git, { runStructureTransform: async () => { ran += 1; return { ok: false, reason: "gate not satisfied" }; } })
+  );
+  assert.equal(ran, 10, "the built-in default bounds the pass even when the caller forgets");
+});
+
+test("M9 cap: an APPLIED transform still counts against the cap (cost is per attempt, not per success)", async () => {
+  const git = fakeGit();
+  let ran = 0;
+  const findings = Array.from({ length: 8 }, (_, i) => structural({ file: `f${i}.mjs`, title: `ssot dup ${i}` }));
+  const out = await runAuditFix(
+    tmp(),
+    findings,
+    {},
+    { structureAutoApply: true, maxStructurePerPass: 2 },
+    baseDeps(git, { runStructureTransform: async () => { ran += 1; return { ok: true, commit: `c${ran}` }; } })
+  );
+  assert.equal(ran, 2);
+  assert.equal(out.fixed.length, 2, "both applied");
+  assert.equal(out.rejected.length, 6, "the other 6 stay proposals for the next pass");
+});
