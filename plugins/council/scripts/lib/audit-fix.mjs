@@ -866,6 +866,12 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               // (no discriminator) → it keeps retrying, never escalates.
               failed.push({ finding, file: task.file, reason: t.timedOut ? "tests timed out after fix" : "tests failed after fix", output: String(t.output ?? "").slice(-800), ...(t.timedOut ? {} : { testRed: true }) });
               log("  reverted — tests failed");
+              // DIAGNOSTIC: surface WHICH tests failed inline so a flaky/contaminated suite is
+              // distinguishable from a real regression without waiting for the pass checkpoint. Compact:
+              // only vitest's verdict + fail markers (never the whole multi-hundred-line log).
+              const failSummary = (String(t.output ?? "").match(/Test Files.*|Tests\s+\d.*|FAIL\s+\S+|×\s+.+|Error:\s.+/g) ?? [])
+                .slice(-6).join(" · ").replace(/\s+/g, " ").slice(0, 500);
+              if (failSummary) log(`    ↳ test failure: ${failSummary}`);
               continue;
             }
           }
