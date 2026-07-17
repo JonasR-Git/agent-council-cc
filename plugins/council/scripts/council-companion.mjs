@@ -2914,6 +2914,14 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
         // ancestor and falsely promotes it to durable 'fixed' though it was never merged to base
         // (council Opus O7). Pin the real base for the ledger.
         ledgerBaseBranch: baseBranch,
+        // ROOT-CAUSE of the 0-diagnostic fix pass: audit-fixloop-deps.mjs forwards `onProgress:
+        // options.onProgress` into runAuditFix's options, but this options object never SET onProgress —
+        // only `reporter`. So the forward carried `undefined`, and audit-fix.mjs's `const log = ...
+        // options.onProgress ... : () => {}` silently no-op'd EVERY fix-phase line on the --loop path (the
+        // only path autonomous runs use). a21d723 fixed the pipe; the faucet upstream (here) was off. The
+        // loop-level phase lines worked only because they ride a SEPARATE opts object (fix-loop-opts.mjs).
+        // reporter.line is the same sink those pass-level lines already use (stderr + progress.recentLines).
+        onProgress: reporter.line,
         reporter // Phase 2: threaded into the review + fix closures (see makeFixLoopDeps)
       }, structureTransformRunner ? {
         // M9: every loop pass fixes through runAuditFix — thread the structure consent + the

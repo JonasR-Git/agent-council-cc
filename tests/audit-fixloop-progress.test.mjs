@@ -75,6 +75,26 @@ test("makeFixLoopDeps threads the SAME reporter into BOTH the per-pass runAuditR
   assert.equal(fixGot, sentinel, "the fix closure passed the run reporter to runAuditFix");
 });
 
+test("makeFixLoopDeps threads onProgress into runAuditFix's options (the fix-phase LOG sink)", async () => {
+  // Regression for the 0-diagnostic fix pass: the fix closure MUST forward options.onProgress to
+  // runAuditFix, because audit-fix.mjs derives its `log` sink from options.onProgress. When the CLI
+  // sets onProgress (it does now), this forward is the only thing that carries it to the writer — a
+  // missing forward silently no-op'd every "reverted — <gate>" / "committed <sha>" line on the loop path.
+  const model = { files: [{ id: "a.mjs", isTest: false }], graph: { importers: {} }, dupClusters: [] };
+  const sink = () => {};
+  let fixOnProgress = "unset";
+  const impl = {
+    runAuditReview: async () => ({ findings: [], coverage: { unitsSelected: 0, budgetSpent: 1 } }),
+    runAuditFix: async (_cwd, _findings, _backends, opts) => {
+      fixOnProgress = opts.onProgress;
+      return { ok: true, fixed: [], failed: [], rejected: [], changedFiles: [], spent: 1 };
+    }
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, { onProgress: sink, maxUnits: 1 }, impl);
+  await deps.fix([], { branch: null, stayOnBranch: true, pass: 1 });
+  assert.equal(fixOnProgress, sink, "the fix closure forwarded options.onProgress to runAuditFix (log sink live)");
+});
+
 test("makeFixLoopDeps without a reporter passes reporter:undefined (NOOP fallback downstream)", async () => {
   const model = { files: [{ id: "a.mjs", isTest: false }], graph: { importers: {} }, dupClusters: [] };
   let reviewGot = "unset";
