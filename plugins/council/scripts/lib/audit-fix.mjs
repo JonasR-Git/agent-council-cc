@@ -45,6 +45,13 @@ const RANK = { P0: 0, P1: 1, P2: 2, nit: 3 };
 const MAX_FIX_BYTES = 2_000_000;
 // Retry the oracle baseline probe so one flaky red doesn't disable the gate all run.
 const ORACLE_BASELINE_TRIES = 3;
+// Flaky-suite tolerance for the post-fix test gate: re-run a DETERMINISTIC red this many extra times
+// before blaming the fix. A real regression stays red on every attempt; a flake clears. Measured need:
+// on CubeServHub a correct fix to a file OUTSIDE vitest's include globs (verify-rls.mjs — not collected,
+// not imported by any test, so provably inert to the suite result) still saw vitest go green→red→red on
+// successive inert edits — a flaky suite reverting correct fixes. The oracle gate already retries; the
+// test gate did not, so every flake reverted a good fix (1 commit / 4 reverts observed before this).
+const TEST_FLAKE_RETRIES = 2;
 
 /** Normalize any path to repo-relative posix (strips backslashes + ./ prefix). */
 export function toPosix(p) {
@@ -831,7 +838,23 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           }
           if (gated) {
             fixStep("full test suite", task.file);
-            const t = await runTests();
+            let t = await runTests();
+            // Flaky-suite tolerance: re-run a DETERMINISTIC red (never a timeout — that has its own path)
+            // before blaming the fix. enforceTouched already proved the change stayed in-file; if the suite
+            // still flips red on some runs but green on others, the red is the SUITE's flake, not this fix,
+            // and reverting it silently loses a correct fix (the exact "wrong/flaky tests block correct
+            // fixes" failure). A genuine regression stays red on every retry and is still reverted below.
+            let testRetries = 0;
+            while (!t.ok && !t.timedOut && testRetries < TEST_FLAKE_RETRIES) {
+              testRetries += 1;
+              log(`  test suite red — re-running to rule out a suite flake (retry ${testRetries}/${TEST_FLAKE_RETRIES})`);
+              fixStep(`full test suite (retry ${testRetries})`, task.file);
+              t = await runTests();
+            }
+            if (t.ok && testRetries > 0) {
+              reporter.counter("testFlakeCleared");
+              log(`  test suite GREEN on retry ${testRetries} — the earlier red was a suite flake, not this fix`);
+            }
             if (!t.ok) {
               revert(snapshot);
               // Split the two: a deterministic red is a real signal (the fix or the test is wrong — the loop

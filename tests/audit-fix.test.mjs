@@ -601,16 +601,17 @@ test("runAuditFix: a RED final integration run reports ok:false, base still retu
 
 test("runAuditFix: same-file second-fix failure reverts to the FIRST fix's commit, keeping it", async () => {
   const git = fakeGit();
-  let n = 0;
+  let current = null;
   const out = await runAuditFix(
     tmp(),
     [loc({ severity: "P1", file: "a.mjs", title: "first" }), loc({ severity: "P2", file: "a.mjs", title: "second" })],
     {},
     {},
     baseDeps(git, {
-      applyFix: async () => git.setChanged(["a.mjs"]),
-      // gate calls: 1=first(ok) 2=second(red) ; final integration=3(ok)
-      runTests: async () => ({ ok: ++n !== 2 })
+      applyFix: async (_prompt, _task, finding) => { git.setChanged(["a.mjs"]); current = finding?.title ?? null; },
+      // The second fix is DETERMINISTICALLY red (its uncommitted change stays red across every flake-retry),
+      // so it is not a flake and is correctly reverted; the final integration run (change gone) is green.
+      runTests: async () => ({ ok: !(git.changedFiles().length > 0 && current === "second") })
     })
   );
   assert.equal(out.fixed.length, 1, "first fix kept");
@@ -621,6 +622,25 @@ test("runAuditFix: same-file second-fix failure reverts to the FIRST fix's commi
   const resets = git.calls.filter((c) => c[0] === "resetHard").map((c) => c[1]);
   assert.ok(resets.includes(firstCommit), "second failure reset to the first fix's commit, not to base");
   void commitSha;
+});
+
+test("runAuditFix: a flaky test-red that clears on retry KEEPS the fix (no revert of a correct fix)", async () => {
+  const git = fakeGit();
+  let calls = 0;
+  const out = await runAuditFix(
+    tmp(),
+    [loc({ file: "a.mjs", title: "flaky-suite" })],
+    {},
+    {},
+    baseDeps(git, {
+      applyFix: async () => git.setChanged(["a.mjs"]),
+      // First run RED (a suite flake), the retry is GREEN → the red was the suite, not this fix.
+      runTests: async () => ({ ok: ++calls !== 1 })
+    })
+  );
+  assert.equal(out.fixed.length, 1, "a flake that clears on retry must not revert a correct fix");
+  assert.equal(out.failed.length, 0, "no failure recorded for a cleared flake");
+  assert.ok(calls >= 2, "the suite was re-run after the flaky red");
 });
 
 test("runAuditFix refuses without git, on a dirty tree, and without a test gate", async () => {
