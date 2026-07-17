@@ -95,6 +95,24 @@ test("makeFixLoopDeps threads onProgress into runAuditFix's options (the fix-pha
   assert.equal(fixOnProgress, sink, "the fix closure forwarded options.onProgress to runAuditFix (log sink live)");
 });
 
+test("makeFixLoopDeps threads agentTimeoutMs into runAuditFix's options (large-file writer budget)", async () => {
+  // Regression for "reverted — write runner timed out": the policy sets agent_timeout_minutes (30min);
+  // without this thread the loop writer fell back to realApplyFix's 300_000ms floor and every large-file
+  // fix timed out before the test gate. Assert the fix closure forwards options.agentTimeoutMs.
+  const model = { files: [{ id: "a.mjs", isTest: false }], graph: { importers: {} }, dupClusters: [] };
+  let fixTimeout = "unset";
+  const impl = {
+    runAuditReview: async () => ({ findings: [], coverage: { unitsSelected: 0, budgetSpent: 1 } }),
+    runAuditFix: async (_cwd, _findings, _backends, opts) => {
+      fixTimeout = opts.agentTimeoutMs;
+      return { ok: true, fixed: [], failed: [], rejected: [], changedFiles: [], spent: 1 };
+    }
+  };
+  const deps = makeFixLoopDeps("/x", model, {}, { agentTimeoutMs: 1_800_000, maxUnits: 1 }, impl);
+  await deps.fix([], { branch: null, stayOnBranch: true, pass: 1 });
+  assert.equal(fixTimeout, 1_800_000, "the fix closure forwarded the policy agent timeout to the writer");
+});
+
 test("makeFixLoopDeps without a reporter passes reporter:undefined (NOOP fallback downstream)", async () => {
   const model = { files: [{ id: "a.mjs", isTest: false }], graph: { importers: {} }, dupClusters: [] };
   let reviewGot = "unset";

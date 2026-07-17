@@ -2891,6 +2891,15 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
         grokEffort: merged["grok-effort"] ?? merged.grokEffort,
         claudeEffort: merged["claude-effort"] ?? merged.claudeEffort,
         openrouterEffort: merged["openrouter-effort"] ?? merged.openrouterEffort,
+        // ROOT-CAUSE of "reverted — write runner timed out" on large files: the policy sets
+        // agent_timeout_minutes (default 30 → 1_800_000ms), but this options object never carried
+        // agentTimeoutMs, so makeFixLoopDeps' agentPins.agentTimeoutMs was undefined and realApplyFix
+        // fell back to its 300_000ms (5min) floor. The agentic writer (xhigh effort, whole-file source in
+        // the prompt) needs longer than 5min on a large target (measured: a 1407-line/154KB file timed out
+        // and NOTHING landed) — so every large-file fix reverted before the test gate ever ran. Same
+        // facade class as onProgress: a value configured at the CLI/policy layer that never reached the
+        // loop's fix deps. Thread the policy-merged timeout so the writer gets its intended budget.
+        agentTimeoutMs: merged.agentTimeoutMs,
         completenessCritic: completenessCritic && Boolean(loopLensGroups), // M8: only on the grouped loop
         skipCodex: merged.skipCodex,
         skipGrok: merged.skipGrok,
