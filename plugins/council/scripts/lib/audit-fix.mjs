@@ -852,6 +852,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
               }
             }
           }
+          let attributedFlake = false; // set when the test gate keeps a fix over a pre-existing flaky red
           if (gated) {
             fixStep("full test suite", task.file);
             let t = await runTests();
@@ -895,6 +896,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
                     reporter.counter("committedOverFlake");
                     log(`  attribution: suite ALREADY red without this fix (${baseFails} file(s) fail at baseline); this fix adds no new failing file (${postFails}) → pre-existing flake, NOT this fix → keeping the fix`);
                     t = { ok: true, attributedFlake: true };
+                    attributedFlake = true;
                   } else {
                     log(`  attribution: this fix INCREASES failing files (baseline ${baseFails ?? "?"} → post-fix ${postFails ?? "?"}) → a real regression → reverting`);
                   }
@@ -1029,10 +1031,14 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           const commit = councilCommitStaged
             ? git.commitIndex(`audit-fix: ${finding.title} (${task.file})`)
             : git.commitFile(task.file, `audit-fix: ${finding.title} (${task.file})`);
-          fixed.push({ finding, file: task.file, commit, verified: gated, council: councilVerdict });
+          // HONEST audit trail: an attributed-flake commit was NOT verified fully green — the suite was
+          // red at baseline too and the fix merely added no new failing file. Mark it distinctly so the
+          // report + the human reviewer see it was committed over a pre-existing flaky red, not a clean run.
+          fixed.push({ finding, file: task.file, commit, verified: gated && !attributedFlake, attributedFlake, council: councilVerdict });
           reporter.counter("fixed");
           reporter.counter("committed");
-          log(`  committed ${String(commit).slice(0, 8)}${gated ? " (tests green)" : " (UNVERIFIED)"}${councilVerdict ? " (§6 council ✓)" : ""}`);
+          const verdictNote = !gated ? " (UNVERIFIED)" : attributedFlake ? " (kept over a PRE-EXISTING flaky red — fix added no new failing test)" : " (tests green)";
+          log(`  committed ${String(commit).slice(0, 8)}${verdictNote}${councilVerdict ? " (§6 council ✓)" : ""}`);
         } catch (err) {
           // Any error in apply/enforce/gate/commit reverts this unit and is recorded.
           // If the revert itself cannot restore a clean tree (resetHard threw, or a

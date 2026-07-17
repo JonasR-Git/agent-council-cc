@@ -664,6 +664,8 @@ test("runAuditFix: a red suite ALSO red at baseline (no new failing files) KEEPS
   assert.equal(out.fixed.length, 1, "kept — the suite is red at baseline too; the fix added no failing file");
   assert.equal(out.failed.length, 0, "not recorded as a failure");
   assert.ok(git.calls.some((c) => c[0] === "stashPush"), "the baseline was probed via stash");
+  assert.equal(out.fixed[0].attributedFlake, true, "marked as committed over a pre-existing flaky red");
+  assert.equal(out.fixed[0].verified, false, "honest audit trail: NOT a fully-green verification");
 });
 
 test("runAuditFix: a red suite GREEN at baseline reverts the fix (a real regression, not a flake)", async () => {
