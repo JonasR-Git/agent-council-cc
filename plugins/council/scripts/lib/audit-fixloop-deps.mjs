@@ -475,6 +475,16 @@ export function makeFixLoopDeps(cwd, model, backends, options = {}, impl = {}) {
         // Phase 2: thread the loop's reporter so runAuditFix's live fix counters (fixed/proposed/
         // reverted/committed) + gate state land on the SAME progress.json the review progress does.
         reporter: options.reporter,
+        // …and its LOG sink. Without this, `const log = typeof options.onProgress === "function" ? ... : () => {}`
+        // (audit-fix.mjs) made every diagnostic line of the fix pass a silent no-op ON THE --loop PATH — the
+        // only path an autonomous run uses. The single-shot path always passed it, so the gap was invisible
+        // to anyone testing `fix` by hand. Thrown away were exactly the lines that explain a 0-commit run:
+        //   "reverted — touched a.ts, b.ts" · "structure transform NOT applied — <reason>"
+        //   "oracle (typecheck) baseline not green — gate disabled for this run" · "committed abc1234"
+        // Measured cost: a live run performed 143 multi-file transforms — planned, written, gated, reverted —
+        // and reported not one word about why. Two days of forensics went into reconstructing from process
+        // trees what this line prints for free.
+        onProgress: options.onProgress,
         branch: ctx.branch,
         stayOnBranch: ctx.stayOnBranch,
         minSeverity: options.minSeverity ?? "P2",

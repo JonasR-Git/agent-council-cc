@@ -305,3 +305,40 @@ test("correlate still escalates a structural finding to a proposal WITHOUT the s
     "without consent the correlation escalation is unchanged — the finding stays a visible proposal"
   );
 });
+
+// THE LOG SINK. audit-fix.mjs does `const log = typeof options.onProgress === "function" ? options.onProgress
+// : () => {}`. The single-shot CLI path always passed onProgress; the --loop deps did NOT — so on the ONLY
+// path an autonomous run uses, every diagnostic line of the fix pass was silently discarded:
+//   "reverted — touched a.ts, b.ts" · "structure transform NOT applied — <reason>"
+//   "oracle (typecheck) baseline not green — gate disabled" · "committed abc1234 (tests green)"
+// A live run performed 143 multi-file transforms — planned, written, gated, reverted — and reported not one
+// word about why, which is what made a 0-commit run un-diagnosable for two days. Pin the wiring.
+test("loop path: runAuditFix's log lines REACH the caller's onProgress (they used to vanish)", async () => {
+  const seen = [];
+  const impl = {
+    runAuditReview: async () => ({ findings: [], coverage: { unitsSelected: 1, unitsReviewed: 1, budgetSpent: 1 } }),
+    // Mirror audit-fix.mjs's own resolution EXACTLY — that expression is what the bug lived in.
+    runAuditFix: (fixCwd, fixFindings, fixBackends, fixOptions) => {
+      const log = typeof fixOptions.onProgress === "function" ? fixOptions.onProgress : () => {};
+      log("structure transform NOT applied — §6 council not unanimous");
+      return { ok: true, fixed: [], failed: [], rejected: [], skipped: [] };
+    }
+  };
+  const deps = makeFixLoopDeps(tmp(), model, {}, { onProgress: (m) => seen.push(m) }, impl);
+  await deps.fix([{ file: "a.mjs", scope: "localized", severity: "P1", title: "t" }], { budget: 5, pass: 1, branch: "b", stayOnBranch: true });
+  assert.deepEqual(seen, ["structure transform NOT applied — §6 council not unanimous"], "the reason reaches the operator");
+});
+
+test("loop path: a caller without onProgress still runs (the sink is optional, never required)", async () => {
+  const impl = {
+    runAuditReview: async () => ({ findings: [], coverage: { unitsSelected: 1, unitsReviewed: 1, budgetSpent: 1 } }),
+    runAuditFix: (fixCwd, fixFindings, fixBackends, fixOptions) => {
+      const log = typeof fixOptions.onProgress === "function" ? fixOptions.onProgress : () => {};
+      log("this must not throw");
+      return { ok: true, fixed: [], failed: [], rejected: [], skipped: [] };
+    }
+  };
+  const deps = makeFixLoopDeps(tmp(), model, {}, {}, impl); // no onProgress at all
+  const out = await deps.fix([{ file: "a.mjs", scope: "localized", severity: "P1", title: "t" }], { budget: 5, pass: 1, branch: "b", stayOnBranch: true });
+  assert.equal(out.ok, true);
+});
