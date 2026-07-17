@@ -177,7 +177,10 @@ test("buildFixWriteArgs enables edit tools but denies exec/network, non-interact
   assert.ok(args.includes("Edit") && args.includes("Write"));
   assert.ok(args.indexOf("Bash") > args.indexOf("--disallowed-tools"), "Bash only in the deny list");
   assert.ok(args.includes("--strict-mcp-config"));
-  assert.equal(args[args.indexOf("--permission-mode") + 1], "acceptEdits");
+  // bypassPermissions (not acceptEdits): acceptEdits silently no-op'd every Edit in a headless
+  // spawn (workflow-review lock), so no autonomous fix ever landed. The sandbox stays intact via
+  // --disallowed-tools (Bash below is still deny-only); bypassPermissions only drops the approval gate.
+  assert.equal(args[args.indexOf("--permission-mode") + 1], "bypassPermissions");
   assert.equal(args[args.indexOf("--model") + 1], "claude-opus-4-8");
   assert.equal(args[args.indexOf("--effort") + 1], "xhigh", "A2: fixer reasons at xhigh by default");
 });
