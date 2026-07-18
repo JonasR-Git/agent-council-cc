@@ -504,7 +504,7 @@ test("interleaveTriplesByFile spreads a capped pass across files instead of drai
   const prefixFiles = new Set(capCells(cells, 9, { modelCount: 3 }).cells.map((c) => c.file));
   assert.deepEqual([...prefixFiles], ["dense.mjs"], "baseline: file-ordered cap starves other files");
   // Interleaved: the SAME 3-triple cap now spans all three files (one triple each).
-  const woven = interleaveTriplesByFile(cells, 3);
+  const woven = interleaveTriplesByFile(cells);
   const wovenFiles = new Set(capCells(woven, 9, { modelCount: 3 }).cells.map((c) => c.file));
   assert.deepEqual([...wovenFiles].sort(), ["a.mjs", "b.mjs", "dense.mjs"], "breadth: all files reached in the first pass");
   // Coverage preserved: interleave is a permutation (same multiset of cells).
@@ -516,4 +516,28 @@ test("interleaveTriplesByFile spreads a capped pass across files instead of drai
     assert.equal(new Set(tri.map((c) => `${c.file}#${c.chunk}#${c.groupId}`)).size, 1, "triple's cells share one (file,chunk,group)");
     assert.equal(new Set(tri.map((c) => c.model)).size, 3, "triple has all 3 models");
   }
+});
+
+test("interleaveTriplesByFile keeps a PARTIAL triple intact (resumed run: some models already done)", () => {
+  // A resumed pending set: file X has a FULL triple (g0,chunk0: 3 models) and a PARTIAL one (g0,chunk1:
+  // only claude left — codex/grok were dropped as done). The keyed grouping must not merge the lone claude
+  // cell into the full triple.
+  const cells = [
+    { model: "codex", groupId: "g0", file: "x.mjs", chunk: 0 },
+    { model: "grok", groupId: "g0", file: "x.mjs", chunk: 0 },
+    { model: "claude", groupId: "g0", file: "x.mjs", chunk: 0 },
+    { model: "claude", groupId: "g0", file: "x.mjs", chunk: 1 }, // partial: only 1 model left
+    { model: "codex", groupId: "g0", file: "y.mjs", chunk: 0 },
+    { model: "grok", groupId: "g0", file: "y.mjs", chunk: 0 },
+    { model: "claude", groupId: "g0", file: "y.mjs", chunk: 0 }
+  ];
+  const woven = interleaveTriplesByFile(cells);
+  assert.equal(woven.length, cells.length, "no cell lost");
+  // First round: one triple from x (the full chunk-0), one from y → then x's partial chunk-1.
+  const roundFiles = [woven[0].file, woven[3].file]; // first cell of round0-triple0 and round0-triple1
+  assert.deepEqual(roundFiles.sort(), ["x.mjs", "y.mjs"], "round 1 spans both files");
+  // The partial triple (x chunk1) is a clean 1-cell group, never merged with x chunk0's models.
+  const xChunk1 = woven.filter((c) => c.file === "x.mjs" && c.chunk === 1);
+  assert.equal(xChunk1.length, 1);
+  assert.equal(xChunk1[0].model, "claude");
 });

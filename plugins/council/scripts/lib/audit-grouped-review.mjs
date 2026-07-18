@@ -156,7 +156,7 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   // BREADTH-FIRST: interleave pending triples across files so a capped pass spans MANY files instead of
   // draining one dense file's chunks first (which starved the rest of the repo for many passes). Coverage
   // is unchanged — the durable ledger keys on cell identity, not order; this only picks a wider spread now.
-  const { cells, dropped, capped } = capCells(interleaveTriplesByFile(pending, models.length), options.maxCells ?? DEFAULT_MAX_CELLS, { modelCount: models.length });
+  const { cells, dropped, capped } = capCells(interleaveTriplesByFile(pending), options.maxCells ?? DEFAULT_MAX_CELLS, { modelCount: models.length });
 
   // Surface the planned cost BEFORE spending it (council Grok P1 / Claude nit): a grouped run can
   // dispatch ~1000+ paid spawns; the operator sees the count (and any cap / oversize skip) up front.
