@@ -687,6 +687,24 @@ test("runAuditFix: a red suite GREEN at baseline reverts the fix (a real regress
   assert.equal(out.failed.length, 1, "recorded as a test failure");
 });
 
+test("runAuditFix: integration red but BASE red too (same fail count) ACCEPTS the branch (ok:true)", async () => {
+  const git = fakeGit();
+  const out = await runAuditFix(
+    tmp(),
+    [loc({ file: "a.mjs", title: "inert" })],
+    {},
+    {},
+    baseDeps(git, {
+      applyFix: async () => git.setChanged(["a.mjs"]),
+      // Suite is ALWAYS red at the same count — base included. The fix adds no failing file, so both the
+      // per-fix gate (keeps the fix) and the integration gate (accepts the branch) must attribute it away.
+      runTests: async () => ({ ok: false, output: "Test Files  2 failed | 54 passed (56)" })
+    })
+  );
+  assert.equal(out.fixed.length, 1, "the fix is kept over the pre-existing red base");
+  assert.equal(out.ok, true, "branch accepted — base is red too and the branch added no new failing file");
+});
+
 test("runAuditFix refuses without git, on a dirty tree, and without a test gate", async () => {
   const noRepo = await runAuditFix(tmp(), [], {}, {}, baseDeps(fakeGit({ repo: false })));
   assert.match(noRepo.error, /not a git repository/);

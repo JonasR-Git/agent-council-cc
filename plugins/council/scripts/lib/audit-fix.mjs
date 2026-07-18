@@ -1139,7 +1139,34 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     // but the run is NOT reported as success.
     let integration = null;
     if (!fatalAbort && gated && fixed.length) integration = await runTests();
-    const integrationFailed = integration ? !integration.ok : false;
+    let integrationFailed = integration ? !integration.ok : false;
+    // Integration-level flake attribution (mirrors the per-fix gate): a base branch whose suite is NOT
+    // green would fail EVERY integration run and get every correct fix reported "branch may be discarded"
+    // — the exact failure that made a 9-fix run report "0 committed" on CubeServHub (base main is itself
+    // 1-2 vitest files red). If the branch is red but BASE is red too and adds no new failing file, the
+    // fixes did not worsen the suite → accept the branch. Guarded on a clean tree so the base excursion
+    // (checkout base → test → checkout back) is safe; any failure to return to the branch fails safe.
+    if (integrationFailed && integration && !integration.timedOut && gated
+        && typeof git.checkout === "function" && git.isClean() && baseBranch && baseBranch !== branch) {
+      const branchFails = parseFailingFileCount(integration.output);
+      if (branchFails != null && git.checkout(baseBranch)) {
+        const baseTest = await runTests();
+        if (!git.checkout(branch)) {
+          log(`  integration attribution ABORTED — could not return to ${branch} after the base probe (fail-safe: branch stays unblessed)`);
+        } else if (baseTest.ok || baseTest.timedOut) {
+          log(`  integration: base ${baseBranch} is GREEN → the fixes caused the red → branch kept for review, not blessed`);
+        } else {
+          const baseFails = parseFailingFileCount(baseTest.output);
+          if (baseFails != null && branchFails <= baseFails) {
+            reporter.counter("integrationOverFlake");
+            log(`  integration: base ${baseBranch} is ALSO red (${baseFails} failing file(s)); this branch adds none (${branchFails}) → pre-existing suite failure, NOT the fixes → accepting the branch`);
+            integrationFailed = false;
+          } else {
+            log(`  integration: this branch INCREASES failing files (base ${baseFails ?? "?"} → branch ${branchFails}) → not blessed`);
+          }
+        }
+      }
+    }
 
     // Resolve to 'fixed' only for VERIFIED fixes on a test-gated, green run: an
     // unverified (--allow-untested) or ungated fix must not suppress re-detection,
