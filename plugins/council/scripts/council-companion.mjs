@@ -2960,6 +2960,7 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
         maxUnits,
         flat: options.flat,
         structureAutoApply,
+        structureFirst: Boolean(merged.structureFirst ?? merged["structure-first"] ?? options.structureFirst),
         epochSweep,
         baseBranch,
         retryOnLimit: options["retry-on-limit"],

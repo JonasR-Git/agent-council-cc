@@ -25,8 +25,8 @@ const GOLDEN_AUDIT_VALUE_OPTIONS = ["areas", "churn-days", "budget", "max-units"
 // council-companion.mjs handleAudit parseCommandInput booleanOptions (incl. no-* twins). Stage 4
 // (Appendix D — consent containment) ADDED the `acknowledge-consents` base flag (records a per-clone
 // consent ack); the consent flags + their --no-* twins are UNCHANGED (only their CONFIG binding moved).
-const GOLDEN_AUDIT_BOOLEAN_OPTIONS = ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "acknowledge-consents", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep", "epoch-sweep",
-  "no-deep", "no-loop", "no-epoch-sweep", "no-supervise", "no-flat", "no-structure-auto-apply", "no-sensitive-auto-apply", "no-retry-on-limit", "no-chartest", "no-skip-openrouter", "no-completeness-critic"];
+const GOLDEN_AUDIT_BOOLEAN_OPTIONS = ["json", "write-map", "doc", "dry-run", "resume", "sarif", "loop", "flat", "html", "retry-on-limit", "sensitive-auto-apply", "structure-auto-apply", "structure-first", "acknowledge-consents", "supervise", "completeness-critic", "skip-openrouter", "chartest", "deep", "epoch-sweep",
+  "no-deep", "no-loop", "no-epoch-sweep", "no-supervise", "no-flat", "no-structure-auto-apply", "no-sensitive-auto-apply", "no-retry-on-limit", "no-chartest", "no-skip-openrouter", "no-completeness-critic", "no-structure-first"];
 
 // council-companion.mjs FIX_CONFIG_BOOLEANS. Stage 4 (Appendix D) REMOVED structure_auto_apply /
 // sensitive_auto_apply from the tracked-config binding — consents are resolved out-of-tree (gitignored
@@ -39,14 +39,15 @@ const GOLDEN_FIX_CONFIG_BOOLEANS = {
   retry_on_limit: "retry-on-limit",
   chartest: "chartest",
   completeness_critic: "completeness-critic",
-  skip_openrouter: "skip-openrouter"
+  skip_openrouter: "skip-openrouter",
+  structure_first: "structure-first"
 };
 
 // council-companion.mjs FIX_NEGATABLE_FLAGS (verbatim @ ef93217):
 const GOLDEN_FIX_NEGATABLE_FLAGS = [
   "deep", "loop", "epoch-sweep", "supervise", "flat",
   "structure-auto-apply", "sensitive-auto-apply", "retry-on-limit",
-  "chartest", "skip-openrouter", "completeness-critic"
+  "chartest", "skip-openrouter", "completeness-critic", "structure-first"
 ];
 
 // council-companion.mjs FIX_CONFIG_VALUES targets — the { configKey → opt } mapping (verbatim @ ef93217).

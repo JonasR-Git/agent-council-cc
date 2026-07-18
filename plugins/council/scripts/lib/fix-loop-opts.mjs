@@ -26,6 +26,7 @@ export function buildLoopOpts({
   maxUnits,
   flat = false,
   structureAutoApply = false,
+  structureFirst = false,
   epochSweep = false,
   baseBranch = null,
   retryOnLimit = undefined,
@@ -51,6 +52,9 @@ export function buildLoopOpts({
     // PER-PASS fixer; THIS consents the tier FLOOR. Both are required; that split is exactly what the old
     // hand-rolled test harness got wrong.
     structureAutoApply,
+    // Tier PRIORITY: opt-in structure/SSOT/code-reduction before correctness (needs the structure consent;
+    // deriveTierPlan reads it). Default correctness-first (5f48237); this is for refactoring-primary runs.
+    structureFirst,
     // WAVE 2: pin the sweep mode + the ledger's true base branch into the run so runFixLoop drives
     // scheduling/tier-advance off the durable ledger and a resume can't flip the mode.
     epochSweep,

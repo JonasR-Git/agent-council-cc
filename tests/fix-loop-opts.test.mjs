@@ -100,7 +100,13 @@ test("the key set is pinned — an accidental drop is a silent behaviour change,
     "retryLimit",
     "retryOnLimit",
     "structureAutoApply",
+    "structureFirst",
     "usageCeiling",
     "usageSince"
   ]);
+});
+
+test("buildLoopOpts threads structureFirst (opt-in structure/SSOT-before-correctness), default false", () => {
+  assert.equal(buildLoopOpts({}).structureFirst, false, "default is correctness-first");
+  assert.equal(buildLoopOpts({ structureFirst: true }).structureFirst, true, "opt-in threads through to runFixLoop's deriveTierPlan");
 });

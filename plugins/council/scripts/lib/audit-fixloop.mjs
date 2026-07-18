@@ -455,10 +455,18 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // while the planner seat returns null). "Consolidate before correctness" is not load-bearing: that ladder
   // (not the tier order) is what keeps a later consolidation from dropping a correctness fix. So correctness
   // fixes lead; with structure consent, structure (0) + architecture (1) still auto-apply, AFTER correctness.
-  const deriveTierPlan = () =>
-    options.structureAutoApply
-      ? [{ tier: 2, fix: true }, { tier: 0, fix: true }, { tier: 1, fix: true }, { tier: 3, fix: true }]
-      : [{ tier: 2, fix: true }, { tier: 3, fix: true }, { tier: 0, fix: false }, { tier: 1, fix: false }];
+  const deriveTierPlan = () => {
+    // Without structure consent, tiers 0/1 are propose-only and sink to the end (report-only).
+    if (!options.structureAutoApply) return [{ tier: 2, fix: true }, { tier: 3, fix: true }, { tier: 0, fix: false }, { tier: 1, fix: false }];
+    // STRUCTURE-FIRST (opt-in --structure-first): run structure/SSOT (0) + architecture/deps (1) BEFORE
+    // correctness — for operators whose PRIMARY goal is refactoring / SSOT consolidation / code reduction,
+    // so a multi-file consolidation lands before correctness runs on the consolidated code (the original
+    // ordering, made explicit + opt-in). Default stays correctness-first (0-starvation fix 5f48237): the
+    // high-yield, always-landing correctness tier leads, structure follows.
+    return options.structureFirst
+      ? [{ tier: 0, fix: true }, { tier: 1, fix: true }, { tier: 2, fix: true }, { tier: 3, fix: true }]
+      : [{ tier: 2, fix: true }, { tier: 0, fix: true }, { tier: 1, fix: true }, { tier: 3, fix: true }];
+  };
   if (sweepMode) {
     tierPlan = deriveTierPlan();
     const cursor = sweep.cursor;
