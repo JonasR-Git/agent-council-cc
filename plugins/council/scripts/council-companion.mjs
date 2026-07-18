@@ -46,6 +46,7 @@ import { runGroupedReview } from "./lib/audit-grouped-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
 import { detectCoverageCmd, detectTestCmd, isSensitiveClass, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
 import { isStructureClass } from "./lib/structure-gate.mjs";
+import { computeCodeImpact, renderCodeImpactLine } from "./lib/code-impact.mjs";
 import { buildLoopOpts } from "./lib/fix-loop-opts.mjs";
 import { evaluateResumeGuard, loadFixLoopCheckpoint, runFixLoop } from "./lib/audit-fixloop.mjs";
 import { makeFixLoopDeps } from "./lib/audit-fixloop-deps.mjs";
@@ -2995,6 +2996,11 @@ export async function handleAudit(argv, { verb: dispatchVerb } = {}) {
         const co = await runCommandAsync("git", ["checkout", baseBranch], { cwd, timeoutMs: 30_000 });
         out.stranded = co.status !== 0;
       }
+      // Code-impact metric (the operator's #1 concern: refactoring/SSOT/code-reduction VISIBILITY). Derived
+      // from the integration branch's numstat vs base — the ground truth of what the committed fixes did to
+      // the tree; a structure run should trend net-negative. Best-effort: any git failure → null → the report
+      // says "not measured" rather than a fabricated 0. Computed post-checkout (refs still resolve).
+      out.codeImpact = await computeCodeImpact(cwd, out, runCommandAsync);
       recordAuditMetrics(cwd, "fixloop", { wallClockMs: Date.now() - tLoop, fixed: out.fixed?.length ?? 0, failed: out.failed?.length ?? 0, proposed: out.proposed?.length ?? 0, passes: out.passesRun ?? 0, spent: out.spent ?? 0 }, nowIso());
       // B: finalize telemetry via the shared helper — a --pause-at-5h stop (out.pause, below) is recorded
       // as a distinct "paused" phase, NOT done+ok, so the dashboard never shows a suspended run as done.
@@ -3481,6 +3487,10 @@ function renderFixLoopReport(out) {
   // first scheduler fix c06b80f). Cheap, derived; 0 files reads naturally when nothing committed.
   const fileCount = new Set((out.fixed ?? []).map((f) => f?.file).filter(Boolean)).size;
   L.push(`${out.passesRun} pass(es) · ${out.fixed.length} fix(es) committed across ${fileCount} file(s) · ${out.failed.length} reverted · ${out.proposed.length} proposal(s). Stopped: ${out.stopReason ?? "—"}.`);
+  // Code-reduction visibility (operator's #1 concern): net line delta of the committed fixes + how many
+  // were structural. Absent (git failure / nothing committed) → skip the line, never print a fake 0.
+  const impactLine = renderCodeImpactLine(out.codeImpact);
+  if (impactLine) L.push(impactLine);
   if (out.branch) L.push(`Integration branch **${out.branch}** — review + merge or discard. Nothing was auto-merged.`);
   if (out.stranded) L.push(`⚠ Could not return to base **${out.baseBranch}** — you are still on the integration branch. Resolve the tree, then \`git checkout ${out.baseBranch}\`.`);
   L.push(`Budget: ${out.spent}/${out.budget} agent calls.`);
