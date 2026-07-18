@@ -410,7 +410,9 @@ function realGit(root) {
 
 // Count of FAILING test files from a runner's output (vitest: "Test Files  N failed | M passed").
 // ANSI-stripped. Returns null when no such summary is present (caller then can't compare → fails safe).
-function parseFailingFileCount(output) {
+// Exported as the SSOT parser for BOTH the single-file fixer's flake attribution and the M9 structure
+// transform's (council-companion's runFullSuite) — one format contract, judged identically.
+export function parseFailingFileCount(output) {
   const clean = String(output ?? "").replace(/\[[0-9;]*m/g, "");
   const m = clean.match(/Test Files\s+(\d+)\s+failed/i);
   if (m) return Number(m[1]);
@@ -422,7 +424,7 @@ function parseFailingFileCount(output) {
 // NAMES of the failing test files (vitest prints "FAIL <path>" / "❯ <path>"), ANSI-stripped + deduped.
 // Purely diagnostic — names the culprits so the operator can fix a flaky/red suite (which is what forces
 // the slow per-fix attribution). Best-effort: an empty list just means the format wasn't recognized.
-function parseFailingFiles(output) {
+export function parseFailingFiles(output) {
   const clean = String(output ?? "").replace(/\u001b?\[[0-9;]*m/g, "");
   const files = new Set();
   for (const m of clean.matchAll(/(?:^|\s)(?:FAIL|❯)\s+([^\s:()]+\.[cm]?[jt]sx?)\b/g)) files.add(m[1]);
@@ -1132,13 +1134,18 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
         }
         if (res?.ok && res.commit) {
           rejected.splice(i, 1); // it is no longer a proposal — it was applied under the full gate ladder
-          fixed.push({ finding: entry.finding, file: entry.finding.file ?? null, commit: res.commit, verified: true, structure: res.gates ?? null });
+          // Honour the transform's flake attribution: a consolidation kept over a PRE-EXISTING flaky red is
+          // applied but NOT verified-green (verified:false), exactly like the single-file fixer's records —
+          // never claim "tests green" when the differential only proved "no NEW failing file".
+          const structFlake = res.attributedFlake === true;
+          fixed.push({ finding: entry.finding, file: entry.finding.file ?? null, commit: res.commit, verified: !structFlake, attributedFlake: structFlake, structure: res.gates ?? null });
           // This structural finding was already counted as "proposed" (the pre-loop rejected batch);
           // now that it applied, undo that count so it isn't shown as BOTH proposed AND fixed.
           reporter.counter("proposed", -1);
           reporter.counter("fixed");
           reporter.counter("committed");
-          log(`  structure transform applied (${String(res.commit).slice(0, 8)}) — §6 unanimous, tests green`);
+          if (structFlake) reporter.counter("committedOverFlake");
+          log(`  structure transform applied (${String(res.commit).slice(0, 8)}) — §6 unanimous, ${structFlake ? "kept over a PRE-EXISTING flaky red (adds no new failing file)" : "tests green"}`);
         } else {
           entry.reason = `${entry.reason} · structure transform not applied: ${res?.reason ?? "gate not satisfied"}`;
           log(`  structure transform NOT applied — ${res?.reason ?? "gate not satisfied"}`);

@@ -44,7 +44,8 @@ import { buildCodebaseModel, renderAuditReport } from "./lib/codebase-model.mjs"
 import { activeReviewerCount, runAuditReview } from "./lib/audit-review.mjs";
 import { runGroupedReview } from "./lib/audit-grouped-review.mjs";
 import { writeAuditDoc } from "./lib/audit-doc.mjs";
-import { detectCoverageCmd, detectTestCmd, isSensitiveClass, loadCoverage, runAuditFix } from "./lib/audit-fix.mjs";
+import { detectCoverageCmd, detectTestCmd, isSensitiveClass, loadCoverage, parseFailingFileCount, runAuditFix } from "./lib/audit-fix.mjs";
+import { attributeRedSuite } from "./lib/flake-attribution.mjs";
 import { isStructureClass } from "./lib/structure-gate.mjs";
 import { computeCodeImpact, renderCodeImpactLine } from "./lib/code-impact.mjs";
 import { buildLoopOpts } from "./lib/fix-loop-opts.mjs";
@@ -4170,8 +4171,31 @@ export function makeStructureTransformDeps(root, cwd, backends, options, buildGi
   const testCmd = detectTestCmd(root);
   const runFullSuite = async () => {
     if (!testCmd) return { ok: false, reason: "no test command detected — a structure transform requires the full-suite gate" };
-    const res = await runCommandAsync(testCmd.cmd, testCmd.args, { cwd: root, timeoutMs: options.testTimeoutMs ?? 600_000 });
-    return { ok: res.status === 0 && !res.timedOut };
+    const runSuite = () => runCommandAsync(testCmd.cmd, testCmd.args, { cwd: root, timeoutMs: options.testTimeoutMs ?? 600_000 });
+    const post = await runSuite();
+    if (post.status === 0 && !post.timedOut) return { ok: true };
+    if (post.timedOut) return { ok: false }; // a timeout is never attributed to flake — always revert
+    // BASELINE-DIFFERENTIAL flake attribution — the SAME defence the single-file fixer applies, so a
+    // behaviour-preserving consolidation is not reverted over a repo's PRE-EXISTING flaky/red suite (the
+    // exact wall M9 hit on CubeServHub, where the strict-green gate could never pass). Stash the transform,
+    // run the CLEAN baseline, restore; the shared PURE verdict (flake-attribution.mjs) keeps the transform
+    // ONLY if the baseline is ALSO red and the transform adds no new failing file. Fail-SAFE at every step
+    // (un-stashable / un-restorable / green baseline / higher count → revert). M9 is additionally gated by
+    // publicApi + a unanimous §6 council over the exact staged diff, so this count-based check is backstopped.
+    const git = (a) => runCommandAsync("git", a, { cwd: root, timeoutMs: 60_000 });
+    const postFails = parseFailingFileCount(`${post.stdout ?? ""}\n${post.stderr ?? ""}`);
+    if ((await git(["stash", "push", "--include-untracked", "-m", "M9 flake-attribution probe"])).status !== 0) {
+      return { ok: false }; // could not isolate the baseline → cannot attribute → revert
+    }
+    const base = await runSuite();
+    const restored = (await git(["stash", "pop"])).status === 0;
+    const verdict = attributeRedSuite({
+      restored,
+      baseGreen: base.status === 0 && !base.timedOut,
+      postFails,
+      baseFails: parseFailingFileCount(`${base.stdout ?? ""}\n${base.stderr ?? ""}`)
+    });
+    return verdict.attributedFlake ? { ok: true, attributedFlake: true } : { ok: false };
   };
 
   // The other half: the export-surface check, built on audit-snapshot's snapshotViolation over the

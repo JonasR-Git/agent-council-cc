@@ -208,6 +208,27 @@ test("runStructureTransform omits a protected finding-file's content from the pl
   assert.doesNotMatch(planPrompt, /BEGIN CURRENT SOURCE/, "a protected file contributes no plan-context bytes");
 });
 
+test("attributedFlake rides from runFullSuite → gates.fullSuite AND the applied result (verified:false-able)", async () => {
+  // A transform kept over a PRE-EXISTING flaky red: runFullSuite returns {ok:true, attributedFlake:true}.
+  // The transform must still LAND (all other gates green) but carry attributedFlake so the caller can
+  // record verified:false — never silently claim tests-green.
+  const world = makeWorld();
+  const deps = makeDeps(world, { runFullSuite: async () => ({ ok: true, attributedFlake: true }) });
+  const res = await runStructureTransform({ finding: makeFinding(), snapshot: "basehead" }, deps);
+  assert.equal(res.applied, true);
+  assert.equal(res.attributedFlake, true, "the applied result surfaces the flake attribution");
+  assert.equal(res.gates.fullSuite.ok, true);
+  assert.equal(res.gates.fullSuite.attributedFlake, true);
+});
+
+test("a strictly-green suite lands with attributedFlake FALSE (the normal, verified path)", async () => {
+  const world = makeWorld();
+  const res = await runStructureTransform({ finding: makeFinding(), snapshot: "basehead" }, makeDeps(world));
+  assert.equal(res.applied, true);
+  assert.equal(res.attributedFlake, false, "a green suite is verified, never flake-attributed");
+  assert.equal(res.gates.fullSuite.attributedFlake, false);
+});
+
 test("buildTransformAuthorPrompt: lists the exact planned files, embeds plan + current sources", () => {
   const p = buildTransformAuthorPrompt(makeFinding(), makePlan(), { "src/a.mjs": OLD_A });
   assert.match(p, /Author ONLY these planned files, ALL of them, exactly: src\/a\.mjs, src\/b\.mjs/);

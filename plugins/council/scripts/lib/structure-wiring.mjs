@@ -508,7 +508,11 @@ export async function runStructureTransform({ finding = null, snapshot = null } 
     b = budgetGate("the full suite");
     if (b) return b;
     if (suite?.ok !== true) return fail("fullSuite", "full test suite RED on the transformed tree — a structure transform must keep every existing test green; reverted");
-    gates.fullSuite = { ok: true };
+    // attributedFlake: the suite was RED but the baseline-differential proved the transform adds no new
+    // failing file (a pre-existing flaky/red suite). The transform is KEPT but NOT verified-green — surfaced
+    // so the caller records it verified:false, exactly like the single-file fixer's flake-attributed commits.
+    const suiteFlake = Boolean(suite?.attributedFlake);
+    gates.fullSuite = { ok: true, attributedFlake: suiteFlake };
 
     // 6b. PUBLIC API unchanged — the other half. Only an explicit `false` (provably unchanged)
     // passes; true/null/undefined/a throw all block, matching behaviourEquivalent's fail-closed
@@ -595,7 +599,9 @@ export async function runStructureTransform({ finding = null, snapshot = null } 
     phase = "commit";
     const commit = git.commitIndex(commitMessage(finding, planCheck.type));
     gates.commit = { ok: true, commit };
-    return result({ applied: true, proposeOnly: false, gate, commit });
+    // attributedFlake rides out on the applied result so the caller records it verified:false — a
+    // transform kept over a pre-existing flaky red is applied, but NOT proven behaviour-equivalent by tests.
+    return result({ applied: true, proposeOnly: false, gate, commit, attributedFlake: suiteFlake });
   } catch (err) {
     // Any unexpected throw in a gate is that gate's failure — fail-closed, revert, propose-only.
     return fail(phase, `unexpected ${phase} error: ${String(err?.message ?? err)}`);
