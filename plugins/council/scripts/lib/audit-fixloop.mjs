@@ -832,6 +832,10 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
     }
     const findings = rev?.findings ?? [];
     charge(rev?.coverage?.budgetSpent, Math.max(1, passBudget)); // a review always costs >= 1
+    // Surface the REVIEW spend now, not only at pass end: a pass with a long fix phase (e.g. flaky-suite
+    // attribution runs the suite 4× per fix) otherwise shows a frozen pre-charge "spent 0" for many
+    // minutes, reading as "no budget used / nothing happening" while the review already cost real calls.
+    reporter.budget(spent, totalBudget);
     const freshFindings = dedupeNew(findings, seenReview);
     reviewedAll.push(...freshFindings);
 
