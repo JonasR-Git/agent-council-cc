@@ -4088,39 +4088,48 @@ export function makeStructureTransformDeps(root, cwd, backends, options, buildGi
   // structure-wiring rejects fail-closed (the finding stays propose-only).
   const authorOpts = { ...options, agentTimeoutMs: options.agentTimeoutMs ?? STEP_AUTHOR_TIMEOUT_MS };
   const runners = makeSeatRunners(cwd, backends, authorOpts);
-  const authorSeat = activeSeatNames(backends, authorOpts).find((s) => typeof runners[s] === "function") ?? null;
+  // Seat FALLBACK (codex → grok → claude): the M9 planner used only the FIRST active seat, so when that
+  // seat returned null — measured: the codex seat replies the literal "null" to the structure-plan prompt
+  // (it DECLINES; not a parse bug) — every transform died even though another reachable seat could have
+  // produced a valid plan. Try each active seat in turn; the first that yields a parseable object wins.
+  // Only when ALL fail is it null (fail-closed). The M9 ladder (suite green + public-API unchanged +
+  // §6-unanimous over the exact staged diff) still gates whatever plan is produced, so a fallback seat
+  // cannot lower the bar — it only recovers transforms the first seat would have silently dropped.
+  const seats = activeSeatNames(backends, authorOpts).filter((s) => typeof runners[s] === "function");
   const seatData = async (prompt, parse) => {
-    if (!authorSeat) {
+    if (!seats.length) {
       console.error("§M9 seat: no reachable seat → null (structure transform fails closed)");
       return null;
     }
-    const res = await runStructuredWithRetry(
-      (p) => runners[authorSeat](p),
-      prompt,
-      (stdout) => ({ parseOk: parse(stdout) != null }),
-      { maxRetries: 1 }
-    );
-    // DIAGNOSTIC (a console.error, so it survives regardless of the log sink): structure-wiring reports
-    // EVERY null from here as "plan reply was not a JSON object", which conflates a genuine parse failure
-    // with a seat that timed out / was truncated / exited non-zero. Measured on a live run: 90 of 188 M9
-    // transforms (48%) died with that one message and we could not tell which cause. Name the ACTUAL cause,
-    // and for the parse case show a short reply preview so "fenced JSON we reject" is distinguishable from
-    // "genuinely broken". Additive only — the null return and fail-closed behaviour are unchanged.
-    if (!res) {
-      console.error(`§M9 seat[${authorSeat}]: no result object → null`);
-      return null;
+    for (const seat of seats) {
+      const res = await runStructuredWithRetry(
+        (p) => runners[seat](p),
+        prompt,
+        (stdout) => ({ parseOk: parse(stdout) != null }),
+        { maxRetries: 1 }
+      );
+      // Name the ACTUAL cause per seat (a console.error survives regardless of the log sink) so a decline
+      // ("null"), a timeout, a truncation, an exit code, and a genuine parse failure stay distinguishable.
+      if (!res) {
+        console.error(`§M9 seat[${seat}]: no result object → next seat`);
+        continue;
+      }
+      if (res.skipped || res.timedOut || res.truncated || res.status !== 0) {
+        const why = res.timedOut ? "TIMED OUT" : res.truncated ? "TRUNCATED" : res.skipped ? "SKIPPED" : `EXIT ${res.status}`;
+        console.error(`§M9 seat[${seat}]: ${why} → next seat (NOT a JSON parse failure — the seat never produced a clean reply)`);
+        continue;
+      }
+      const parsed = parse(res.stdout);
+      if (parsed == null) {
+        const preview = String(res.stdout ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
+        console.error(`§M9 seat[${seat}]: reply present but UNPARSEABLE as the required object → next seat. preview: ${JSON.stringify(preview)}`);
+        continue;
+      }
+      if (seat !== seats[0]) console.error(`§M9 seat[${seat}]: produced a valid plan after earlier seat(s) declined — fallback succeeded`);
+      return parsed;
     }
-    if (res.skipped || res.timedOut || res.truncated || res.status !== 0) {
-      const why = res.timedOut ? "TIMED OUT" : res.truncated ? "TRUNCATED" : res.skipped ? "SKIPPED" : `EXIT ${res.status}`;
-      console.error(`§M9 seat[${authorSeat}]: ${why} → null (NOT a JSON parse failure — the seat never produced a clean reply)`);
-      return null;
-    }
-    const parsed = parse(res.stdout);
-    if (parsed == null) {
-      const preview = String(res.stdout ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
-      console.error(`§M9 seat[${authorSeat}]: reply present but UNPARSEABLE as the required object → null. preview: ${JSON.stringify(preview)}`);
-    }
-    return parsed;
+    console.error(`§M9: all ${seats.length} reachable seat(s) failed to produce a valid plan → null (fail-closed)`);
+    return null;
   };
   const proposePlan = (prompt) => seatData(prompt, parseTransformPlanObject);
   const authorTransform = (prompt) => seatData(prompt, parseAuthoredFilesMap);
@@ -4199,7 +4208,7 @@ export function makeStructureTransformDeps(root, cwd, backends, options, buildGi
   };
 
   return {
-    authorSeat, // surfaced for logs; runStructureTransform ignores non-port keys
+    authorSeat: seats[0] ?? null, // first active seat, surfaced for logs; the planner now falls back across all seats
     git: buildGit,
     proposePlan,
     authorTransform,
