@@ -419,6 +419,16 @@ function parseFailingFileCount(output) {
   return null;
 }
 
+// NAMES of the failing test files (vitest prints "FAIL <path>" / "❯ <path>"), ANSI-stripped + deduped.
+// Purely diagnostic — names the culprits so the operator can fix a flaky/red suite (which is what forces
+// the slow per-fix attribution). Best-effort: an empty list just means the format wasn't recognized.
+function parseFailingFiles(output) {
+  const clean = String(output ?? "").replace(/\u001b?\[[0-9;]*m/g, "");
+  const files = new Set();
+  for (const m of clean.matchAll(/(?:^|\s)(?:FAIL|❯)\s+([^\s:()]+\.[cm]?[jt]sx?)\b/g)) files.add(m[1]);
+  return [...files];
+}
+
 /** Detect a coverage-producing command (project script) if the project defines one. */
 export function detectCoverageCmd(root) {
   try {
@@ -717,6 +727,7 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
     // Set if a revert leaves the tree unrestorable: we must stop rather than let a later
     // finding stage a stranded, never-accepted patch. Surfaced as ok:false + stranded.
     let fatalAbort = null;
+    let flakyFilesReported = false; // name the pre-existing red test files ONCE per run (diagnostic)
     for (const task of tasks) {
       if (fatalAbort) break;
       for (const finding of task.findings) {
@@ -895,6 +906,13 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
                   if (postFails != null && baseFails != null && postFails <= baseFails) {
                     reporter.counter("committedOverFlake");
                     log(`  attribution: suite ALREADY red without this fix (${baseFails} file(s) fail at baseline); this fix adds no new failing file (${postFails}) → pre-existing flake, NOT this fix → keeping the fix`);
+                    if (!flakyFilesReported) {
+                      const culprits = parseFailingFiles(base.output);
+                      if (culprits.length) {
+                        flakyFilesReported = true;
+                        log(`  ⓘ pre-existing red test file(s), independent of the council's fixes: ${culprits.join(", ")} — fixing these makes runs green-verified + much faster (no per-fix attribution needed)`);
+                      }
+                    }
                     t = { ok: true, attributedFlake: true };
                     attributedFlake = true;
                   } else {
@@ -1159,7 +1177,9 @@ export async function runAuditFix(cwd, findings, backends = {}, options = {}, de
           const baseFails = parseFailingFileCount(baseTest.output);
           if (baseFails != null && branchFails <= baseFails) {
             reporter.counter("integrationOverFlake");
-            log(`  integration: base ${baseBranch} is ALSO red (${baseFails} failing file(s)); this branch adds none (${branchFails}) → pre-existing suite failure, NOT the fixes → accepting the branch`);
+            const culprits = parseFailingFiles(baseTest.output);
+            log(`  integration: base ${baseBranch} is ALSO red (${baseFails} failing file(s)${culprits.length ? `: ${culprits.join(", ")}` : ""}); this branch adds none (${branchFails}) → pre-existing suite failure, NOT the fixes → accepting the branch`);
+            if (culprits.length) log(`  ⓘ these ${culprits.length} test file(s) are red on ${baseBranch} itself — fixing them makes future runs green-verified + much faster (no attribution needed)`);
             integrationFailed = false;
           } else {
             log(`  integration: this branch INCREASES failing files (base ${baseFails ?? "?"} → branch ${branchFails}) → not blessed`);
