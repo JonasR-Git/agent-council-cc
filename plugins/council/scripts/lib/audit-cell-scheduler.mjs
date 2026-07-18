@@ -75,6 +75,39 @@ export function capCells(cells, maxCells = DEFAULT_MAX_CELLS, { modelCount } = {
   return { cells: cells.slice(0, keep), dropped: cells.length - keep, capped: true };
 }
 
+/**
+ * Reorder cells BREADTH-FIRST across files (round-robin), keeping each (group,file,chunk) triple's
+ * models contiguous. enumerateCells emits file-by-file, so a single dense file (many chunks × groups)
+ * fills the whole per-pass capCells prefix and STARVES every other file — a run then reviews (and fixes)
+ * one file for many passes while the rest of the repo is never touched (measured: 337 files, 10+ passes,
+ * findings on ONE 1751-line file). Round-robin one triple per file per round so a capped pass spans MANY
+ * files. Coverage is UNAFFECTED: the durable ledger keys on cell identity, not order — every cell is still
+ * covered, just breadth-first. Deterministic (stable file order + per-file triple order) → resume-safe.
+ */
+export function interleaveTriplesByFile(cells, modelCount) {
+  const m = Number.isFinite(modelCount) && modelCount > 0 ? Math.floor(modelCount) : new Set(cells.map((c) => c.model)).size || 1;
+  const byFile = new Map(); // file → cells (input order preserved)
+  for (const c of cells) {
+    if (!byFile.has(c.file)) byFile.set(c.file, []);
+    byFile.get(c.file).push(c);
+  }
+  // Split each file's cells into whole m-sized triples (models are enumerateCells' innermost dimension).
+  const queues = [];
+  for (const fileCells of byFile.values()) {
+    const triples = [];
+    for (let i = 0; i < fileCells.length; i += m) triples.push(fileCells.slice(i, i + m));
+    queues.push(triples);
+  }
+  const out = [];
+  for (let round = 0, anyLeft = true; anyLeft; round += 1) {
+    anyLeft = false;
+    for (const q of queues) {
+      if (round < q.length) { out.push(...q[round]); anyLeft = true; }
+    }
+  }
+  return out;
+}
+
 /** Distinct (groupId, file, chunk) triples across a cell list — the units six-eyes is measured on. */
 export function triplesOf(cells) {
   const seen = new Set();

@@ -13,7 +13,7 @@ import path from "node:path";
 import { resolveLensGroups } from "./audit-lens-groups.mjs";
 import { cellSweepKey, scopeGroupsForTier } from "./audit-tier-sweep.mjs";
 import { chunkSource } from "./audit-group-prompt.mjs";
-import { DEFAULT_MAX_CELLS, capCells, cellKey, enumerateCells, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
+import { DEFAULT_MAX_CELLS, capCells, cellKey, enumerateCells, interleaveTriplesByFile, makeCellReviewer, runCellMatrix } from "./audit-cell-scheduler.mjs";
 import { makeBudget, reviewerActive, selectUnits } from "./audit-review.mjs";
 import { activeSeatNames, allSeatNames, makeSeatRunners } from "./seats.mjs";
 import { runCompletenessAssessment } from "./completeness-critic.mjs";
@@ -153,7 +153,10 @@ export async function runGroupedReview(cwd, model, backends, options = {}, deps 
   // Pass the ACTIVE seat count explicitly (council Grok P2): capCells caps on TRIPLE boundaries, and
   // inferring the model count from the cell slice alone would mis-round if the enumeration order ever
   // changed or a test injected a partial list — planning an uncompletable triple again.
-  const { cells, dropped, capped } = capCells(pending, options.maxCells ?? DEFAULT_MAX_CELLS, { modelCount: models.length });
+  // BREADTH-FIRST: interleave pending triples across files so a capped pass spans MANY files instead of
+  // draining one dense file's chunks first (which starved the rest of the repo for many passes). Coverage
+  // is unchanged — the durable ledger keys on cell identity, not order; this only picks a wider spread now.
+  const { cells, dropped, capped } = capCells(interleaveTriplesByFile(pending, models.length), options.maxCells ?? DEFAULT_MAX_CELLS, { modelCount: models.length });
 
   // Surface the planned cost BEFORE spending it (council Grok P1 / Claude nit): a grouped run can
   // dispatch ~1000+ paid spawns; the operator sees the count (and any cap / oversize skip) up front.

@@ -7,6 +7,7 @@ import {
   capCells,
   cellKey,
   enumerateCells,
+  interleaveTriplesByFile,
   makeCellReviewer,
   makeCoverageMatrix,
   runCellMatrix,
@@ -491,4 +492,28 @@ test("B4 (council grok-4): enumerateCells threads per-file static facts onto eac
   const review = makeCellReviewer("/x", {}, {}, { runCodex: async (p) => { seen = p; return { status: 0, stdout: '{"agent":"codex","findings":[]}' }; } });
   await review(cells[0]);
   assert.match(seen, /loc=42 hotspot=9/, "the static facts reach the group prompt");
+});
+
+test("interleaveTriplesByFile spreads a capped pass across files instead of draining one dense file", () => {
+  // 3 files: a DENSE file (5 chunks) + two small ones. 1 group, 3 models → triple = 3 cells.
+  const models = ["claude", "codex", "grok"];
+  const groups = [{ id: "g", lenses: ["correctness"] }];
+  const chunksOf = (f) => (f === "dense.mjs" ? [0, 1, 2, 3, 4] : [0]).map((i) => ({ text: `${f}#${i}` }));
+  const cells = enumerateCells(["dense.mjs", "a.mjs", "b.mjs"], groups, models, chunksOf);
+  // File-ordered: capping to 3 triples (9 cells) would take ONLY dense.mjs (the bug).
+  const prefixFiles = new Set(capCells(cells, 9, { modelCount: 3 }).cells.map((c) => c.file));
+  assert.deepEqual([...prefixFiles], ["dense.mjs"], "baseline: file-ordered cap starves other files");
+  // Interleaved: the SAME 3-triple cap now spans all three files (one triple each).
+  const woven = interleaveTriplesByFile(cells, 3);
+  const wovenFiles = new Set(capCells(woven, 9, { modelCount: 3 }).cells.map((c) => c.file));
+  assert.deepEqual([...wovenFiles].sort(), ["a.mjs", "b.mjs", "dense.mjs"], "breadth: all files reached in the first pass");
+  // Coverage preserved: interleave is a permutation (same multiset of cells).
+  assert.equal(woven.length, cells.length, "no cell dropped or duplicated");
+  assert.deepEqual(new Set(woven.map(cellKey)), new Set(cells.map(cellKey)), "same cell set, only reordered");
+  // Each triple stays intact (its 3 models contiguous) so capCells' triple-rounding still holds.
+  for (let i = 0; i < woven.length; i += 3) {
+    const tri = woven.slice(i, i + 3);
+    assert.equal(new Set(tri.map((c) => `${c.file}#${c.chunk}#${c.groupId}`)).size, 1, "triple's cells share one (file,chunk,group)");
+    assert.equal(new Set(tri.map((c) => c.model)).size, 3, "triple has all 3 models");
+  }
 });
