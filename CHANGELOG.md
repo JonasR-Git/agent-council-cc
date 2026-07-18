@@ -5,6 +5,63 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-07-19
+
+The release where the autonomous fix loop went from "reviews well, commits nothing" to
+**landing verified fixes on real repositories** — the whole 0-fixes root-cause chain was
+found and fixed live, validated by multi-pass runs that committed 22 test-gated fixes
+across multiple files on an external project.
+
+### Fixed
+
+- **THE 0-fixes root**: the fix writer ran `claude -p` with `--permission-mode acceptEdits`,
+  which silently applies NO edits in a headless spawn — the writer "succeeded" while the tree
+  stayed byte-identical. It now uses `bypassPermissions` (tool allow-list still blocks
+  Bash/network; the sandbox holds).
+- The chain hiding behind it, each found by live-run observability: the loop's fix phase
+  discarded its entire log; `onProgress` was never threaded into the fix deps; the policy
+  agent-timeout never reached the writer (5 min hard-killed 15-minute writes); seat CLI
+  calls had no default wall-clock timeout (infinite hangs); the M9 structure pass was
+  starved to zero attempts by the correlate escalation and, once woken, ran unbounded.
+- **M9 structure engine actually reaches landing now**: the planner falls back across all
+  active seats instead of dying on the first decline; the plan seat receives the referenced
+  file's CODE (all three models declined blind plans — measured live); the full-suite gate
+  applies the same baseline-differential flake attribution as the single-file fixer, so a
+  behaviour-preserving consolidation is not reverted over a repo's pre-existing red suite.
+- Breadth-first cell scheduling: one finding-dense file no longer starves the rest of the
+  repo (interleave by real triple key); the facade detector no longer cries wolf on the
+  single-shot path and is itself reachable.
+
+### Added
+
+- **`--structure-first`** — run the structure/SSOT/code-reduction tiers BEFORE correctness
+  (opt-in, needs the structure consent) for refactoring-primary runs.
+- **Code-impact metric** in the fix report: `+A / -R lines (net N) · K structure/SSOT
+  fix(es) — net code reduction`, derived from the integration branch's numstat (SSOT parser,
+  fail-safe: "not measured" over a fabricated 0).
+- **Flake attribution** (per-fix, integration gate, and M9 suite gate) with a shared pure
+  verdict module: a fix is kept over a RED suite ONLY when the clean baseline is also red
+  and the fix adds no NEW failing test file; kept fixes are honestly `verified:false` and
+  the culprit red files are named so the operator can fix the suite itself.
+- **Grok semantic consensus/dedup pass** — closes the single-seat consensus gap; plus
+  fix-eligibility lens decoupled from the coverage lens (logical-lens bugs auto-fixable).
+- **Facade detection**: every consented gate discloses at run end whether it ACTUALLY fired
+  (a consent whose gate ran 0× while findings of its class existed is an unreachable
+  feature — the class of bug that hid the M9 starvation).
+- **Revert attribution** — every reverted fix names WHERE it died (write / test / gate),
+  live per-pass; liveness heartbeats during the fix phase and long in-process waits;
+  budget disclosure mid-pass; distinct-file breadth in the loop header.
+- Unified quota-aware run dashboard; grok/claude weekly usage probing hardened.
+
+### Changed
+
+- **Correctness-first default tier order** under `--structure-auto-apply` (`[2,0,1,3]`):
+  the always-landing correctness tier leads; `--structure-first` restores `[0,1,2,3]` as a
+  deliberate per-run choice.
+- `buildLoopOpts` extracted as the SSOT for the loop's option object — tests MUST build
+  options through it, making CLI/test drift (how the M9 facade survived a green suite)
+  impossible by construction.
+
 ## [3.1.0] - 2026-07-15
 
 ### Changed
