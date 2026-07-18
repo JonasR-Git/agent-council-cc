@@ -448,9 +448,16 @@ export async function runFixLoop(cwd, options = {}, deps = {}) {
   // missing header / checkpoint-ahead / manifest-digest). The ledger lives in the state dir, NEVER the
   // working tree; the resume validation touches nothing. `failClosedStop` (already the SSOT for a
   // terminal-before-first-pass stop) carries a blocked resume so computeTerminalStop ends the run cleanly.
+  // TIER ORDER: correctness (2) leads in BOTH plans. The structure-first order [0,1,2,3] starved the
+  // high-value, high-yield correctness tier behind full coverage of the mostly-propose-only structure
+  // tiers (measured: a run reached only tier-0/1 for many passes; and the M9 structure transform, gated by
+  // the SAME full-suite-green + §6-unanimous + public-API-unchanged ladder, rarely lands — currently ~never
+  // while the planner seat returns null). "Consolidate before correctness" is not load-bearing: that ladder
+  // (not the tier order) is what keeps a later consolidation from dropping a correctness fix. So correctness
+  // fixes lead; with structure consent, structure (0) + architecture (1) still auto-apply, AFTER correctness.
   const deriveTierPlan = () =>
     options.structureAutoApply
-      ? [{ tier: 0, fix: true }, { tier: 1, fix: true }, { tier: 2, fix: true }, { tier: 3, fix: true }]
+      ? [{ tier: 2, fix: true }, { tier: 0, fix: true }, { tier: 1, fix: true }, { tier: 3, fix: true }]
       : [{ tier: 2, fix: true }, { tier: 3, fix: true }, { tier: 0, fix: false }, { tier: 1, fix: false }];
   if (sweepMode) {
     tierPlan = deriveTierPlan();
