@@ -3475,7 +3475,11 @@ function renderFixLoopReport(out) {
   const L = [];
   L.push("# Council Audit — autonomous fix loop (M3)");
   L.push("");
-  L.push(`${out.passesRun} pass(es) · ${out.fixed.length} fix(es) committed · ${out.failed.length} reverted · ${out.proposed.length} proposal(s). Stopped: ${out.stopReason ?? "—"}.`);
+  // Breadth metric: distinct files touched by the committed fixes — a run that fixed 40 things across 12
+  // files is very different from 40 fixes on ONE file, and the header should say which (see the breadth-
+  // first scheduler fix c06b80f). Cheap, derived; 0 files reads naturally when nothing committed.
+  const fileCount = new Set((out.fixed ?? []).map((f) => f?.file).filter(Boolean)).size;
+  L.push(`${out.passesRun} pass(es) · ${out.fixed.length} fix(es) committed across ${fileCount} file(s) · ${out.failed.length} reverted · ${out.proposed.length} proposal(s). Stopped: ${out.stopReason ?? "—"}.`);
   if (out.branch) L.push(`Integration branch **${out.branch}** — review + merge or discard. Nothing was auto-merged.`);
   if (out.stranded) L.push(`⚠ Could not return to base **${out.baseBranch}** — you are still on the integration branch. Resolve the tree, then \`git checkout ${out.baseBranch}\`.`);
   L.push(`Budget: ${out.spent}/${out.budget} agent calls.`);
